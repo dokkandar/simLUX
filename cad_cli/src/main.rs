@@ -86,7 +86,7 @@ fn main() {
             | Ok(Command::Redo) | Ok(Command::MatchProps) | Ok(Command::Reverse)
             | Ok(Command::ChangeLayer) | Ok(Command::Offset(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
-            | Ok(Command::Stretch) => {
+            | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend) => {
                 writeln!(out, "(editing op ignored — CLI has no interactive selection)").ok();
             }
             Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }

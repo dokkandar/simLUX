@@ -45,6 +45,13 @@ pub struct UserEnv {
     /// Suppress file-navigation dialogs (true = use OS dialogs; false = type).
     pub FlDlgM: bool,
 
+    // ---- editing behaviour ----
+    /// Edge-mode for TRIM / EXTEND. ON = treat cutting / boundary edges as
+    /// their infinite extensions for "imaginary intersection" cuts. OFF =
+    /// use only intersections on the visible curve. Default ON (matches the
+    /// AutoCAD `EDGEMODE 1` convention most CAD users expect today).
+    pub EdgMod: bool,
+
     // ---- display ----
     /// Dragging display during MOVE/COPY. 0=off, 1=on, 2=auto.
     pub DrDspM: u8,
@@ -91,6 +98,7 @@ impl Default for UserEnv {
             AtPrmM: true,
             CmDlgM: true,
             FlDlgM: true,
+            EdgMod: true,
             DrDspM: 2,
             MnuBar: false,
             TltEnb: true,
@@ -154,6 +162,7 @@ impl UserEnv {
         push_bool(&mut s, "AtPrmM", self.AtPrmM);
         push_bool(&mut s, "CmDlgM", self.CmDlgM);
         push_bool(&mut s, "FlDlgM", self.FlDlgM);
+        push_bool(&mut s, "EdgMod", self.EdgMod);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
         push_bool(&mut s, "TltEnb", self.TltEnb);
@@ -197,6 +206,7 @@ impl UserEnv {
             "AtPrmM" => if let Some(v) = parse_bool(val) { self.AtPrmM = v; }
             "CmDlgM" => if let Some(v) = parse_bool(val) { self.CmDlgM = v; }
             "FlDlgM" => if let Some(v) = parse_bool(val) { self.FlDlgM = v; }
+            "EdgMod" => if let Some(v) = parse_bool(val) { self.EdgMod = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
             "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }
             "TltEnb" => if let Some(v) = parse_bool(val) { self.TltEnb = v; }

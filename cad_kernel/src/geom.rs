@@ -386,6 +386,270 @@ impl Geom {
         }
     }
 
+    /// Return an "infinite" / "extended" copy of this geometry for use as a
+    /// cutting / boundary edge in trim / extend with `EdgMod` ON. The point
+    /// is to make intersections fire for "imaginary" geometry that the
+    /// visible curve alone would miss.
+    /// - Line: extended HUGE in both directions (still a Line, just very
+    ///   long — keeps the segment-based intersect math working)
+    /// - Arc → full Circle of the same center+radius
+    /// - EllipseArc → full Ellipse
+    /// - Already-closed (Circle, Ellipse) or dimensionless (Point) → clone
+    /// - Polyline: per-segment "extend" doesn't generalise; clone for now
+    pub fn extended_for_edgemode(&self) -> Geom {
+        const EXT: f64 = 1.0e6;     // big enough to clear any drawing
+        match self {
+            Geom::Line(l) => {
+                let d = l.b - l.a;
+                let len = d.len();
+                if len < EPS { return Geom::Line(*l); }
+                let u = d / len;
+                Geom::Line(Line { a: l.a - u * EXT, b: l.b + u * EXT })
+            }
+            Geom::Arc(a) => Geom::Circle(Circle { center: a.center, radius: a.radius }),
+            Geom::EllipseArc(ea) => Geom::Ellipse(ea.ellipse),
+            other => other.clone(),
+        }
+    }
+
+    /// Trim this geometry by the given cutting edges. `pick` is a click point
+    /// indicating the segment to REMOVE (AutoCAD convention). `edge_mode`
+    /// controls whether the cutters are treated as their infinite extensions.
+    ///
+    /// Returns the surviving piece(s) — 0 (whole curve removed), 1 (single
+    /// piece), or 2 (clicked segment was in the middle; outer pieces survive).
+    ///
+    /// Supported targets in v1: Line, Arc, EllipseArc. Other variants return
+    /// an Err so the caller can leave them untouched and report.
+    pub fn trim_at(
+        &self,
+        cutters: &[Geom],
+        pick: Vec2,
+        edge_mode: bool,
+    ) -> Result<Vec<Geom>, &'static str> {
+        use crate::intersect::intersect;
+
+        // Gather intersection points with every cutter.
+        let mut hits: Vec<Vec2> = Vec::new();
+        for c in cutters {
+            // Skip self-as-cutter (same handle would be ideal; here equality
+            // by geometry shape is enough to avoid trivial 0-length cuts).
+            let c_eff = if edge_mode { c.extended_for_edgemode() } else { c.clone() };
+            hits.extend(intersect(self, &c_eff));
+        }
+        if hits.is_empty() {
+            return Err("trim: target has no intersection with the cutting edges");
+        }
+
+        match self {
+            Geom::Line(l) => {
+                let d = l.b - l.a;
+                let len_sq = d.len_sq();
+                if len_sq < EPS { return Err("trim: zero-length line"); }
+                let len = len_sq.sqrt();
+                // Project each hit and the pick onto the parameter t ∈ [0,1].
+                let to_t = |p: Vec2| -> f64 { (p - l.a).dot(d) / len_sq };
+                let pick_t = to_t(pick).clamp(0.0, 1.0);
+                let mut params: Vec<f64> = hits.iter()
+                    .map(|&p| to_t(p))
+                    .filter(|&t| t > EPS / len && t < 1.0 - EPS / len)
+                    .collect();
+                params.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                params.dedup_by(|a, b| (*a - *b).abs() < EPS / len);
+                // Find the bounds of the click's segment.
+                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
+                let after  = params.iter().find(|&&t| t > pick_t).copied();
+                let mut out: Vec<Geom> = Vec::new();
+                match (before, after) {
+                    (Some(t1), Some(t2)) => {
+                        // Middle segment removed; outer pieces survive.
+                        if t1 > EPS / len {
+                            out.push(Geom::Line(Line { a: l.a, b: l.a + d * t1 }));
+                        }
+                        if t2 < 1.0 - EPS / len {
+                            out.push(Geom::Line(Line { a: l.a + d * t2, b: l.b }));
+                        }
+                    }
+                    (Some(t1), None) => {
+                        // Click is past the last intersection — trim toward b
+                        out.push(Geom::Line(Line { a: l.a, b: l.a + d * t1 }));
+                    }
+                    (None, Some(t2)) => {
+                        // Click is before the first intersection — trim toward a
+                        out.push(Geom::Line(Line { a: l.a + d * t2, b: l.b }));
+                    }
+                    (None, None) => {
+                        return Err("trim: pick on the wrong side of all intersections");
+                    }
+                }
+                Ok(out)
+            }
+            Geom::Arc(arc) => {
+                if arc.radius < EPS { return Err("trim: zero-radius arc"); }
+                let to_local = |p: Vec2| -> f64 {
+                    ((p - arc.center).angle() - arc.start_angle)
+                        .rem_euclid(std::f64::consts::TAU)
+                };
+                let pick_t = to_local(pick).clamp(0.0, arc.sweep_angle);
+                let mut params: Vec<f64> = hits.iter()
+                    .map(|&p| to_local(p))
+                    .filter(|&t| t > EPS && t < arc.sweep_angle - EPS)
+                    .collect();
+                params.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
+                let after  = params.iter().find(|&&t| t > pick_t).copied();
+                let mk = |s: f64, w: f64| Geom::Arc(Arc {
+                    center: arc.center, radius: arc.radius,
+                    start_angle: (arc.start_angle + s).rem_euclid(std::f64::consts::TAU),
+                    sweep_angle: w,
+                });
+                let mut out: Vec<Geom> = Vec::new();
+                match (before, after) {
+                    (Some(t1), Some(t2)) => {
+                        if t1 > EPS { out.push(mk(0.0, t1)); }
+                        if t2 < arc.sweep_angle - EPS {
+                            out.push(mk(t2, arc.sweep_angle - t2));
+                        }
+                    }
+                    (Some(t1), None) => out.push(mk(0.0, t1)),
+                    (None, Some(t2)) => out.push(mk(t2, arc.sweep_angle - t2)),
+                    (None, None) => return Err("trim: pick on the wrong side of all intersections"),
+                }
+                Ok(out)
+            }
+            Geom::EllipseArc(ea) => {
+                // Same shape as Arc, but with parameter space (sweep_param).
+                let to_local = |p: Vec2| -> f64 {
+                    (ea.ellipse.nearest_param(p) - ea.start_param)
+                        .rem_euclid(std::f64::consts::TAU)
+                };
+                let pick_t = to_local(pick).clamp(0.0, ea.sweep_param);
+                let mut params: Vec<f64> = hits.iter()
+                    .map(|&p| to_local(p))
+                    .filter(|&t| t > EPS && t < ea.sweep_param - EPS)
+                    .collect();
+                params.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                let before = params.iter().rev().find(|&&t| t < pick_t).copied();
+                let after  = params.iter().find(|&&t| t > pick_t).copied();
+                let mk = |s: f64, w: f64| Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: (ea.start_param + s).rem_euclid(std::f64::consts::TAU),
+                    sweep_param: w,
+                });
+                let mut out: Vec<Geom> = Vec::new();
+                match (before, after) {
+                    (Some(t1), Some(t2)) => {
+                        if t1 > EPS { out.push(mk(0.0, t1)); }
+                        if t2 < ea.sweep_param - EPS {
+                            out.push(mk(t2, ea.sweep_param - t2));
+                        }
+                    }
+                    (Some(t1), None) => out.push(mk(0.0, t1)),
+                    (None, Some(t2)) => out.push(mk(t2, ea.sweep_param - t2)),
+                    (None, None) => return Err("trim: pick on the wrong side of all intersections"),
+                }
+                Ok(out)
+            }
+            Geom::Circle(_) =>
+                Err("trim: Circle requires two-pick cut (v2) — pick removed segment on an Arc instead"),
+            Geom::Ellipse(_) =>
+                Err("trim: Ellipse requires two-pick cut (v2)"),
+            Geom::Polyline(_) =>
+                Err("trim: Polyline trim not implemented yet (per-segment dispatch TBD)"),
+            Geom::Point(_) =>
+                Err("trim: Point has nothing to trim"),
+        }
+    }
+
+    /// Extend this geometry toward the nearest boundary intersection on the
+    /// side indicated by `pick`. Symmetric to `trim_at`. Supported targets
+    /// in v1: Line and Arc (extend at whichever endpoint the click is closer to).
+    pub fn extend_to(
+        &self,
+        boundaries: &[Geom],
+        pick: Vec2,
+        edge_mode: bool,
+    ) -> Result<Geom, &'static str> {
+        use crate::intersect::intersect;
+        // Build intersections of the target's INFINITE form with each
+        // (possibly extended) boundary — extension is the whole point.
+        let target_infinite = self.extended_for_edgemode();
+        let mut hits: Vec<Vec2> = Vec::new();
+        for b in boundaries {
+            let b_eff = if edge_mode { b.extended_for_edgemode() } else { b.clone() };
+            hits.extend(intersect(&target_infinite, &b_eff));
+        }
+        if hits.is_empty() {
+            return Err("extend: target has no intersection with the boundary");
+        }
+        match self {
+            Geom::Line(l) => {
+                let d = l.b - l.a;
+                let len_sq = d.len_sq();
+                if len_sq < EPS { return Err("extend: zero-length line"); }
+                let to_t = |p: Vec2| -> f64 { (p - l.a).dot(d) / len_sq };
+                let at_b = pick.dist(l.b) < pick.dist(l.a);
+                if at_b {
+                    // Extend forward: smallest t > 1
+                    let candidate = hits.iter().map(|&p| to_t(p))
+                        .filter(|&t| t > 1.0 + EPS).fold(f64::INFINITY, f64::min);
+                    if candidate.is_infinite() {
+                        return Err("extend: no boundary intersection past the end of the line");
+                    }
+                    Ok(Geom::Line(Line { a: l.a, b: l.a + d * candidate }))
+                } else {
+                    // Extend backward: largest t < 0
+                    let candidate = hits.iter().map(|&p| to_t(p))
+                        .filter(|&t| t < -EPS).fold(f64::NEG_INFINITY, f64::max);
+                    if candidate.is_infinite() {
+                        return Err("extend: no boundary intersection before the start of the line");
+                    }
+                    Ok(Geom::Line(Line { a: l.a + d * candidate, b: l.b }))
+                }
+            }
+            Geom::Arc(arc) => {
+                if arc.radius < EPS { return Err("extend: zero-radius arc"); }
+                let to_local = |p: Vec2| -> f64 {
+                    ((p - arc.center).angle() - arc.start_angle)
+                        .rem_euclid(std::f64::consts::TAU)
+                };
+                let (e1, e2) = arc.endpoints();
+                let at_end = pick.dist(e2) < pick.dist(e1);
+                if at_end {
+                    // Extend sweep: smallest t > sweep_angle
+                    let candidate = hits.iter().map(|&p| to_local(p))
+                        .filter(|&t| t > arc.sweep_angle + EPS).fold(f64::INFINITY, f64::min);
+                    if candidate.is_infinite() || candidate >= std::f64::consts::TAU {
+                        return Err("extend: no boundary intersection past the arc end");
+                    }
+                    Ok(Geom::Arc(Arc {
+                        center: arc.center, radius: arc.radius,
+                        start_angle: arc.start_angle, sweep_angle: candidate,
+                    }))
+                } else {
+                    // Extend start backward: largest t < 0 (or equivalently t > sweep going CCW past TAU)
+                    let candidate = hits.iter().map(|&p| {
+                        let raw = to_local(p);
+                        if raw > arc.sweep_angle + EPS { raw - std::f64::consts::TAU } else { raw }
+                    }).filter(|&t| t < -EPS).fold(f64::NEG_INFINITY, f64::max);
+                    if candidate.is_infinite() {
+                        return Err("extend: no boundary intersection before the arc start");
+                    }
+                    let new_start = (arc.start_angle + candidate)
+                        .rem_euclid(std::f64::consts::TAU);
+                    Ok(Geom::Arc(Arc {
+                        center: arc.center, radius: arc.radius,
+                        start_angle: new_start,
+                        sweep_angle: arc.sweep_angle - candidate,
+                    }))
+                }
+            }
+            _ => Err("extend: only Line / Arc are supported in v1"),
+        }
+    }
+
     /// Split into two pieces at the projection of `at` onto the curve.
     /// Both pieces inherit nothing from style — the caller wraps them in
     /// DObjects with the original's style.
@@ -909,6 +1173,68 @@ mod transform_tests {
         // Click near (0, 0) — the a-end — to extend backwards.
         let earlier = g.lengthened(3.0, Vec2::new(-1.0, 0.0)).unwrap();
         if let Geom::Line(l) = earlier { assert!(approx_eq(l.a.x, -3.0)); } else { panic!(); }
+    }
+
+    #[test]
+    fn trim_line_at_single_cutter_keeps_other_side() {
+        // Horizontal line 0→10. Vertical cutter at x=5. Click at x=7 (right
+        // of the cut) → that side is removed; we keep 0→5.
+        let target  = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let cutter  = Geom::Line(Line { a: Vec2::new(5.0, -5.0), b: Vec2::new(5.0, 5.0) });
+        let out = target.trim_at(&[cutter], Vec2::new(7.0, 0.0), false).unwrap();
+        assert_eq!(out.len(), 1);
+        if let Geom::Line(l) = &out[0] {
+            assert!(approx_eq(l.a.x, 0.0)); assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn trim_line_between_two_cutters_keeps_outer_pieces() {
+        // 0→10 cut at x=3 and x=7; click at x=5 (middle) removes 3..7.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let c1 = Geom::Line(Line { a: Vec2::new(3.0, -5.0), b: Vec2::new(3.0, 5.0) });
+        let c2 = Geom::Line(Line { a: Vec2::new(7.0, -5.0), b: Vec2::new(7.0, 5.0) });
+        let out = target.trim_at(&[c1, c2], Vec2::new(5.0, 0.0), false).unwrap();
+        assert_eq!(out.len(), 2);
+        // Outer pieces 0→3 and 7→10
+        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
+            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
+        }).collect();
+        xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(approx_eq(xs[0].0, 0.0)); assert!(approx_eq(xs[0].1, 3.0));
+        assert!(approx_eq(xs[1].0, 7.0)); assert!(approx_eq(xs[1].1, 10.0));
+    }
+
+    #[test]
+    fn trim_uses_edge_mode_for_imaginary_intersection() {
+        // Target line 0→10 at y=0. Cutter is a SHORT segment that, in its
+        // visible form, does NOT cross the target. With EdgMod ON it
+        // extends to a full line that DOES cross at x=5.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let short_cutter = Geom::Line(Line {
+            a: Vec2::new(5.0, 3.0), b: Vec2::new(5.0, 4.0),    // y=3..4 only
+        });
+        // EdgMod OFF — no intersection; trim fails.
+        assert!(target.trim_at(&[short_cutter.clone()], Vec2::new(7.0, 0.0), false).is_err());
+        // EdgMod ON — imaginary intersection at (5,0); right side trimmed.
+        let out = target.trim_at(&[short_cutter], Vec2::new(7.0, 0.0), true).unwrap();
+        assert_eq!(out.len(), 1);
+        if let Geom::Line(l) = &out[0] {
+            assert!(approx_eq(l.b.x, 5.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn extend_line_grows_toward_boundary() {
+        // Target line 0→4 at y=0. Boundary at x=10.
+        let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(4.0, 0.0) });
+        let boundary = Geom::Line(Line { a: Vec2::new(10.0, -5.0), b: Vec2::new(10.0, 5.0) });
+        // Click near the right end (b) — extend that side toward x=10.
+        let out = target.extend_to(&[boundary], Vec2::new(4.0, 0.5), false).unwrap();
+        if let Geom::Line(l) = out {
+            assert!(approx_eq(l.a.x, 0.0));
+            assert!(approx_eq(l.b.x, 10.0));
+        } else { panic!(); }
     }
 
     #[test]

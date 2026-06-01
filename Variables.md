@@ -121,6 +121,7 @@ in `cad_app::settings::UserEnv`. Every row tracks:
 | `BndTyp` | Xref bind type | ○ Stub (no xrefs) | — |
 | `CmDlgM` | Dialog boxes for PLOT, etc. | ○ Stub (no plot) | — |
 | `DblClkE` | Double-click editing on/off | ◐ Planned | — |
+| `EdgMod` | Edge-mode for trim / extend. ON = treat cutting / boundary edges as their infinite extensions for "imaginary intersection" cuts; OFF = use only intersections on the visible curve. AutoCAD analog: `EDGEMODE` | ◐ Planned (queued for Slice M.1 / M.2) | — |
 | `HpMaxA` | Maximum hatch area for preview | ○ Stub (no hatch) | — |
 | `HpObjW` | Hatch dobject warning limit | ○ Stub | — |
 | `HpSep` | Separate hatch dobjects on/off | ○ Stub | — |

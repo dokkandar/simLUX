@@ -253,6 +253,15 @@ pub struct CadApp {
     break_state:    BreakState,
     align_state:    AlignState,
     stretch_state:  StretchState,
+
+    // ---- Slice M.1 / M.2: trim / extend (two-basket) ----
+    trim_state:   TrimState,
+    extend_state: ExtendState,
+    /// When a trim/extend session begins, the main `selection` is stashed
+    /// here so the cutting-edge/boundary-edge select-session can reuse
+    /// `self.selection` as its working basket without nuking the user's
+    /// real selection. Restored on finalise/cancel.
+    pre_op_selection: Vec<usize>,
 }
 
 const UNDO_STACK_CAP: usize = 64;
@@ -265,6 +274,12 @@ pub enum SelectMode {
     Off,
     ForList,
     ForSelect,
+    /// Selecting cutting edges for `trim`. On Enter, the basket
+    /// transfers to `TrimState::PickingTargets` and the user's main
+    /// `selection` is restored from `pre_op_selection`.
+    ForCuttingEdges,
+    /// Selecting boundary edges for `extend`. Symmetric to ForCuttingEdges.
+    ForBoundaryEdges,
 }
 
 /// Displacement-tool state machine. `WaitingForBase` is entered when the
@@ -364,6 +379,23 @@ pub enum StretchState {
     WaitingForDest(Vec2, Vec2, Vec2),   // window + base; click dest to apply
 }
 
+/// Trim/extend session state. Each holds the confirmed cutting/boundary
+/// basket; the target-pick phase loops on canvas clicks until the user
+/// presses Enter or Esc.
+#[derive(Clone, Debug)]
+pub enum TrimState {
+    Off,
+    SelectingCutters,             // running a ForCuttingEdges select session
+    PickingTargets(Vec<usize>),   // cutters confirmed; loop on click
+}
+
+#[derive(Clone, Debug)]
+pub enum ExtendState {
+    Off,
+    SelectingBoundaries,
+    PickingTargets(Vec<usize>),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     Cpu,
@@ -435,6 +467,9 @@ impl Default for CadApp {
             break_state:    BreakState::Off,
             align_state:    AlignState::Off,
             stretch_state:  StretchState::Off,
+            trim_state:     TrimState::Off,
+            extend_state:   ExtendState::Off,
+            pre_op_selection: Vec::new(),
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -773,6 +808,22 @@ impl CadApp {
                 self.history.push(
                     "  stretch — Click FIRST corner of crossing window (Esc cancels)".into());
             }
+            Ok(Command::Trim) => {
+                // Stash main selection so the cutting-edge select session
+                // can use `self.selection` as its scratch basket.
+                self.pre_op_selection = std::mem::take(&mut self.selection);
+                self.trim_state = TrimState::SelectingCutters;
+                self.begin_selection(SelectMode::ForCuttingEdges);
+                self.history.push(
+                    "  trim — Select CUTTING edges (click / window / `all` / `before` / Shift-rem). Enter to confirm, Esc to cancel".into());
+            }
+            Ok(Command::Extend) => {
+                self.pre_op_selection = std::mem::take(&mut self.selection);
+                self.extend_state = ExtendState::SelectingBoundaries;
+                self.begin_selection(SelectMode::ForBoundaryEdges);
+                self.history.push(
+                    "  extend — Select BOUNDARY edges (click / window / `all` / `before` / Shift-rem). Enter to confirm, Esc to cancel".into());
+            }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
                     // No basket yet — auto-enter a selection session that
@@ -855,6 +906,41 @@ impl CadApp {
                 self.history.push(format!(
                     "  select — {} dobject(s) kept as the active selection",
                     self.selection.len()));
+            }
+            SelectMode::ForCuttingEdges => {
+                let cutters = std::mem::take(&mut self.selection);
+                // Restore the user's main selection — trim must not nuke it.
+                self.selection = std::mem::take(&mut self.pre_op_selection);
+                self.select_mode        = SelectMode::Off;
+                self.window_first       = None;
+                self.select_remove_mode = false;
+                if cutters.is_empty() {
+                    self.history.push("  ! trim: no cutting edges selected — cancelled".into());
+                    self.trim_state = TrimState::Off;
+                    return;
+                }
+                self.history.push(format!(
+                    "  trim — {} cutter(s) captured. Click each TARGET to cut (Enter / Esc to finish)",
+                    cutters.len()));
+                self.trim_state = TrimState::PickingTargets(cutters);
+                return;
+            }
+            SelectMode::ForBoundaryEdges => {
+                let bounds = std::mem::take(&mut self.selection);
+                self.selection = std::mem::take(&mut self.pre_op_selection);
+                self.select_mode        = SelectMode::Off;
+                self.window_first       = None;
+                self.select_remove_mode = false;
+                if bounds.is_empty() {
+                    self.history.push("  ! extend: no boundary edges selected — cancelled".into());
+                    self.extend_state = ExtendState::Off;
+                    return;
+                }
+                self.history.push(format!(
+                    "  extend — {} boundary edge(s) captured. Click each TARGET END to extend (Enter / Esc to finish)",
+                    bounds.len()));
+                self.extend_state = ExtendState::PickingTargets(bounds);
+                return;
             }
         }
         self.select_mode        = SelectMode::Off;
@@ -2000,6 +2086,90 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
+    // ---- Slice M.1 / M.2: trim / extend apply methods ----
+
+    fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) {
+        // Don't allow a cutter to trim itself.
+        if cutters.contains(&target_idx) {
+            self.history.push(format!(
+                "  ! trim: dobject #{} is in the cutting basket — skipping",
+                target_idx));
+            return;
+        }
+        // Snapshot ONCE per click so undo rolls back this single trim.
+        self.snapshot_doc();
+        let edge_mode = self.env.EdgMod;
+        let cutter_geoms: Vec<Geom> = cutters.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
+            .collect();
+        let Some(target) = self.doc.dobjects.get(target_idx) else { return; };
+        let target_style = target.style;
+        match target.geom.trim_at(&cutter_geoms, pick, edge_mode) {
+            Ok(pieces) => {
+                let n_pieces = pieces.len();
+                // Remove the original first, then push each surviving piece
+                // with the original's style preserved.
+                self.doc.dobjects.remove(target_idx);
+                for g in pieces {
+                    let mut d = DObject::new(g);
+                    d.style = target_style;
+                    self.doc.push(d);
+                }
+                // Indices shift after removal; the cutter list passed in for
+                // subsequent picks references OLD indices and may now be
+                // wrong. The trim_state's cutter Vec is patched after this
+                // method returns (see canvas handler).
+                self.history.push(format!(
+                    "  ✂ trim: #{} cut → {} piece(s) survive (EdgMod {})",
+                    target_idx, n_pieces, if edge_mode {"ON"} else {"OFF"}));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                // Roll back the snapshot — nothing changed.
+                if let Some(prev) = self.undo_stack.pop() {
+                    self.doc = prev;
+                }
+                self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
+            }
+        }
+    }
+
+    fn apply_extend_pick(&mut self, bounds: &[usize], target_idx: usize, pick: Vec2) {
+        if bounds.contains(&target_idx) {
+            self.history.push(format!(
+                "  ! extend: dobject #{} is in the boundary basket — skipping",
+                target_idx));
+            return;
+        }
+        self.snapshot_doc();
+        let edge_mode = self.env.EdgMod;
+        let boundary_geoms: Vec<Geom> = bounds.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
+            .collect();
+        let Some(target) = self.doc.dobjects.get(target_idx) else { return; };
+        match target.geom.extend_to(&boundary_geoms, pick, edge_mode) {
+            Ok(new_geom) => {
+                if let Some(d) = self.doc.dobjects.get_mut(target_idx) {
+                    d.geom = new_geom;
+                }
+                self.history.push(format!(
+                    "  ⟼ extend: #{} extended to boundary (EdgMod {})",
+                    target_idx, if edge_mode {"ON"} else {"OFF"}));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() {
+                    self.doc = prev;
+                }
+                self.history.push(format!("  ! extend #{}: {}", target_idx, msg));
+            }
+        }
+    }
+
     fn apply_chlayer(&mut self) {
         if self.selection.is_empty() {
             self.history.push("  ! chlayer: empty basket".into());
@@ -3134,6 +3304,24 @@ impl eframe::App for CadApp {
                 self.stretch_state = StretchState::Off;
                 self.history.push("  stretch cancelled".into());
             }
+            // Trim / extend cancel — also restore the stashed main selection
+            // if we're still in the cutting/boundary select phase.
+            let trim_running = !matches!(self.trim_state, TrimState::Off);
+            let extend_running = !matches!(self.extend_state, ExtendState::Off);
+            if trim_running {
+                self.trim_state = TrimState::Off;
+                self.history.push("  trim cancelled".into());
+            }
+            if extend_running {
+                self.extend_state = ExtendState::Off;
+                self.history.push("  extend cancelled".into());
+            }
+            if (trim_running || extend_running) && !self.pre_op_selection.is_empty() {
+                // Restore the main selection that was stashed when the op
+                // began. (For ForCuttingEdges/ForBoundaryEdges we already
+                // restored on finalise; this catches the cancel path.)
+                self.selection = std::mem::take(&mut self.pre_op_selection);
+            }
         }
 
         // Enter (when the command line is empty) finalises an in-progress
@@ -3144,6 +3332,21 @@ impl eframe::App for CadApp {
             && ctx.input(|i| i.key_pressed(egui::Key::Enter))
         {
             self.finalise_selection();
+        }
+
+        // Enter (empty cmd line) during trim/extend target-pick phase ends
+        // the session cleanly.
+        if self.cmd.trim().is_empty()
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
+            if matches!(self.trim_state, TrimState::PickingTargets(_)) {
+                self.trim_state = TrimState::Off;
+                self.history.push("  trim — session ended".into());
+            }
+            if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
+                self.extend_state = ExtendState::Off;
+                self.history.push("  extend — session ended".into());
+            }
         }
 
         // Polyline tool: Enter (with empty cmd line) finishes the open
@@ -3977,6 +4180,43 @@ impl eframe::App for CadApp {
                             ScaleState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
+                    } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
+                        // Single-pick mode for trim. (Wand-drag mode is v2;
+                        // each click trims one dobject.)
+                        let cutters = if let TrimState::PickingTargets(c) = &self.trim_state {
+                            c.clone()
+                        } else { Vec::new() };
+                        let tol_world = 10.0 / self.scale as f64;
+                        if let Some(tgt) = self.nearest_entity_under(world, tol_world) {
+                            self.apply_trim_pick(&cutters, tgt, click_world);
+                            // The trim removed the target — patch the cutter
+                            // list so indices above `tgt` shift down and the
+                            // appended pieces are excluded.
+                            if let TrimState::PickingTargets(c) = &mut self.trim_state {
+                                let original_len = self.doc.dobjects.len();
+                                c.retain(|&i| i != tgt);
+                                for c_i in c.iter_mut() {
+                                    if *c_i > tgt { *c_i -= 1; }
+                                }
+                                let _ = original_len;
+                            }
+                        } else {
+                            self.history.push(
+                                "  trim — no dobject under cursor (Enter / Esc to finish)".into());
+                        }
+                        self.refocus_cmd = true;
+                    } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
+                        let bounds = if let ExtendState::PickingTargets(b) = &self.extend_state {
+                            b.clone()
+                        } else { Vec::new() };
+                        let tol_world = 10.0 / self.scale as f64;
+                        if let Some(tgt) = self.nearest_entity_under(world, tol_world) {
+                            self.apply_extend_pick(&bounds, tgt, click_world);
+                        } else {
+                            self.history.push(
+                                "  extend — no dobject under cursor (Enter / Esc to finish)".into());
+                        }
+                        self.refocus_cmd = true;
                     } else if self.offset_state != OffsetState::Off {
                         if let OffsetState::WaitingForSide(d) = self.offset_state {
                             self.apply_offset(d, click_world);
@@ -4750,9 +4990,11 @@ impl eframe::App for CadApp {
             // blue); right-to-left = "crossing" window (dashed green).
             if self.select_mode != SelectMode::Off {
                 let label = match self.select_mode {
-                    SelectMode::ForList   => "LIST: select dobjects, Enter when done (Esc cancels)",
-                    SelectMode::ForSelect => "SELECT: pick dobjects, Enter when done (Esc cancels)",
-                    SelectMode::Off       => unreachable!(),
+                    SelectMode::ForList         => "LIST: select dobjects, Enter when done (Esc cancels)",
+                    SelectMode::ForSelect       => "SELECT: pick dobjects, Enter when done (Esc cancels)",
+                    SelectMode::ForCuttingEdges => "TRIM: pick CUTTING edges, Enter when done (Esc cancels)",
+                    SelectMode::ForBoundaryEdges=> "EXTEND: pick BOUNDARY edges, Enter when done (Esc cancels)",
+                    SelectMode::Off             => unreachable!(),
                 };
                 painter.text(
                     rect.left_top() + egui::vec2(10.0, 48.0),

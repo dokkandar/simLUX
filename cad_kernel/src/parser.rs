@@ -81,6 +81,11 @@ pub enum Command {
     /// Stretch: crossing window + 2 clicks (base + dest). Vertices inside
     /// the window translate by (dest - base).
     Stretch,
+    /// Trim: two-basket flow (cutting edges + targets). App drives the
+    /// select sessions and target-click phase.
+    Trim,
+    /// Extend: two-basket flow (boundary edges + targets). Mirror of trim.
+    Extend,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -157,6 +162,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "break" | "br"    => Ok(Command::Break),
         "align"           => Ok(Command::Align),
         "stretch" | "s"   => Ok(Command::Stretch),
+        "trim" | "tr"     => Ok(Command::Trim),
+        "extend" | "ex"   => Ok(Command::Extend),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?

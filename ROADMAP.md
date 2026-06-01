@@ -9,6 +9,19 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice M.1 + M.2 — Trim / Extend: ● DONE.** Two-basket flow per the
+`feedback_rust_cad_trim_extend_selection_model` memory. New
+`EdgMod` SYSVAR (default ON) controls whether cutting / boundary
+edges are treated as their infinite extensions for "imaginary
+intersections" — works exactly like AutoCAD's EDGEMODE 1. The user's
+main `selection` is stashed at session start and restored at finalise
+or cancel, so the trim cutter basket is genuinely independent. Wand-
+drag mode for the target-pick phase is deferred to v2; v1 is
+single-click per target. Kernel: `Geom::trim_at` (Line / Arc /
+EllipseArc; Circle / Ellipse error pending 2-pick v2), `Geom::extend_to`
+(Line / Arc), `extended_for_edgemode` helper. 4 new kernel tests
+covering the cutter cascade and the EdgMod imaginary-intersection path.
+
 **Slice J — Editing operations: ● DONE.** `Geom::rotated()`,
 `Geom::scaled()`, `Geom::mirrored()` added to the kernel (delegating
 methods on `DObject` preserve style + handle). Six new commands wired
@@ -186,15 +199,15 @@ selection and editing stay orthogonal.
 | L.4 | **align** | Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1 | 4 clicks | ● Done |
 | L.5 | **stretch** | Crossing window selects which vertices move; clicked base/dest gives the delta | crossing window + 2 clicks | ● Done |
 
-### Slice M — Complex (deferred; revisit after K+L review)
+### Slice M — Complex (M.1 + M.2 done; M.3–M.5 queued)
 
-| # | Action | Notes |
-|---|---|---|
-| M.1 | **trim** | Cutting edges + targets; clip to nearest intersection |
-| M.2 | **extend** | Like trim but extends toward boundary |
-| M.3 | **fillet** | Tangent arc between two curves at radius |
-| M.4 | **chamfer** | Bevel between two lines with two distances |
-| M.5 | **join** | Merge collinear lines / coincident polylines / arcs sharing center+radius |
+| # | Action | Spec | Status |
+|---|---|---|---|
+| M.1 | **trim** / **tr** | Two-basket flow per `feedback_rust_cad_trim_extend_selection_model` memory: prompt "Select cutting edges" → user picks via the project's existing select engine → Enter confirms cutting-edge basket → prompt "Pick targets" → click each target to trim. **`EdgMod` SYSVAR (ON/OFF)** controls infinite-extension intersections. Main editing basket stashed and restored. **No LibreCAD selection-idiom inheritance.** Wand-drag mode deferred to v2 — single-click in v1. | ● Done |
+| M.2 | **extend** / **ex** | Symmetric: boundary basket → click each target end to extend toward the nearest boundary intersection (same `EdgMod`). | ● Done |
+| M.3 | **fillet** | Tangent arc between two curves at radius | typed r + 2 clicks |
+| M.4 | **chamfer** | Bevel between two lines with two distances | typed d1, d2 + 2 line clicks |
+| M.5 | **join** | Merge collinear lines / coincident polylines / arcs sharing center+radius | (none) |
 
 ### Slice N — Strange / Exotic (deferred indefinitely)
 

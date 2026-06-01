@@ -140,7 +140,7 @@ tr:hover td { background: rgba(255, 255, 255, 0.025); }
 <section class="cover">
 <h1>RUST_CAD — Engineering Discussion Pack</h1>
 <div class="meta">
-Generated <strong>2026-06-01 14:40</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-01 15:10</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
 Branch: <code>main</code> &nbsp;•&nbsp;
 Current slice: <strong>A — Property foundation (done)</strong>
@@ -249,6 +249,7 @@ and <strong>(6)</strong> every open question / decision pending.
 <blockquote><p>Living document. Update at the start of every new slice. The three reference docs (<code>Variables.md</code>, <code>Dobject_DXF.md</code>, <code>Dobject_Properties.md</code>) are the <em>contracts</em>; this file tracks <strong>what we&#x27;re working on, why, and how we plan to get there</strong>.</p></blockquote>
 <hr/>
 <h2 id="roadmap-where-we-are-now-2026-06-01">Where we are now (2026-06-01)<a class="anchor" href="#roadmap-where-we-are-now-2026-06-01">¶</a></h2>
+<p><strong>Slice M.1 + M.2 — Trim / Extend: <span class="status-ok">●</span> DONE.</strong> Two-basket flow per the <code>feedback_rust_cad_trim_extend_selection_model</code> memory. New <code>EdgMod</code> SYSVAR (default ON) controls whether cutting / boundary edges are treated as their infinite extensions for &quot;imaginary intersections&quot; — works exactly like AutoCAD&#x27;s EDGEMODE 1. The user&#x27;s main <code>selection</code> is stashed at session start and restored at finalise or cancel, so the trim cutter basket is genuinely independent. Wand- drag mode for the target-pick phase is deferred to v2; v1 is single-click per target. Kernel: <code>Geom::trim_at</code> (Line / Arc / EllipseArc; Circle / Ellipse error pending 2-pick v2), <code>Geom::extend_to</code> (Line / Arc), <code>extended_for_edgemode</code> helper. 4 new kernel tests covering the cutter cascade and the EdgMod imaginary-intersection path.</p>
 <p><strong>Slice J — Editing operations: <span class="status-ok">●</span> DONE.</strong> <code>Geom::rotated()</code>, <code>Geom::scaled()</code>, <code>Geom::mirrored()</code> added to the kernel (delegating methods on <code>DObject</code> preserve style + handle). Six new commands wired into the parser: <code>copy</code>, <code>rotate</code>, <code>scale</code>, <code>mirror</code>, <code>delete</code>, <code>undo</code>. Each uses the QueuedOp pattern: if nothing is selected, the command opens a selection session and re-enters the op when Enter finalises. Interactive flows (pivot + reference + target clicks) live in new state machines per op. <strong>Snapshot-based undo</strong> — every mutation clones the Document onto a 64-deep stack; <code>undo</code> pops and restores. 4 new geom transform tests; 89 tests passing workspace-wide.</p>
 <p><strong>Slice I — .rsm binary format: <span class="status-ok">●</span> DONE.</strong> Hand-rolled little-endian versioned format in <code>cad_io::rsm</code>. Lossless <code>Document</code> round-trip including every Geom variant, every layer/linetype/pen field, and <strong>stable handles</strong> (DXF can&#x27;t preserve our handles — RSM does). No external deps, no compression in v1 (~64 B per Line, well under 100 KB for 1000 lines). Wired into the same <code>open &lt;path.rsm&gt;</code> / <code>save &lt;path.rsm&gt;</code> commands as DXF — file dispatcher picks by extension. 6 RSM round-trip tests.</p>
 <p><strong>Slice H — cad_io / DXF: <span class="status-ok">●</span> DONE.</strong> New <code>cad_io</code> crate with <code>dxf::read_dxf(&amp;str) -&gt; Document</code> and <code>dxf::write_dxf(&amp;Document) -&gt; String</code>. Round-trips all current <code>Geom</code> variants (Line / Circle / Arc / Ellipse / EllipseArc / Point / LWPolyline) plus the LAYER and LTYPE tables. Files written by RUST_CAD open cleanly in LibreCAD. Wired into cad_app as <code>open &lt;path.dxf&gt;</code> and <code>save &lt;path.dxf&gt;</code> commands on the command line — no native file dialog yet. 9 DXF round-trip tests.</p>
@@ -503,37 +504,43 @@ and <strong>(6)</strong> every open question / decision pending.
 <td><span class="status-ok">●</span> Done</td>
 </tr>
 </tbody></table></div>
-<h3 id="roadmap-slice-m-complex-deferred-revisit-after-kl-review">Slice M — Complex (deferred; revisit after K+L review)<a class="anchor" href="#roadmap-slice-m-complex-deferred-revisit-after-kl-review">¶</a></h3>
+<h3 id="roadmap-slice-m-complex-m1-m2-done-m3m5-queued">Slice M — Complex (M.1 + M.2 done; M.3–M.5 queued)<a class="anchor" href="#roadmap-slice-m-complex-m1-m2-done-m3m5-queued">¶</a></h3>
 <div class="tbl-wrap"><table>
 <thead><tr>
 <th>#</th>
 <th>Action</th>
-<th>Notes</th>
+<th>Spec</th>
+<th>Status</th>
 </tr></thead><tbody>
 <tr>
 <td>M.1</td>
-<td><strong>trim</strong></td>
-<td>Cutting edges + targets; clip to nearest intersection</td>
+<td><strong>trim</strong> / <strong>tr</strong></td>
+<td>Two-basket flow per <code>feedback_rust_cad_trim_extend_selection_model</code> memory: prompt &quot;Select cutting edges&quot; → user picks via the project&#x27;s existing select engine → Enter confirms cutting-edge basket → prompt &quot;Pick targets&quot; → click each target to trim. <strong><code>EdgMod</code> SYSVAR (ON/OFF)</strong> controls infinite-extension intersections. Main editing basket stashed and restored. <strong>No LibreCAD selection-idiom inheritance.</strong> Wand-drag mode deferred to v2 — single-click in v1.</td>
+<td><span class="status-ok">●</span> Done</td>
 </tr>
 <tr>
 <td>M.2</td>
-<td><strong>extend</strong></td>
-<td>Like trim but extends toward boundary</td>
+<td><strong>extend</strong> / <strong>ex</strong></td>
+<td>Symmetric: boundary basket → click each target end to extend toward the nearest boundary intersection (same <code>EdgMod</code>).</td>
+<td><span class="status-ok">●</span> Done</td>
 </tr>
 <tr>
 <td>M.3</td>
 <td><strong>fillet</strong></td>
 <td>Tangent arc between two curves at radius</td>
+<td>typed r + 2 clicks</td>
 </tr>
 <tr>
 <td>M.4</td>
 <td><strong>chamfer</strong></td>
 <td>Bevel between two lines with two distances</td>
+<td>typed d1, d2 + 2 line clicks</td>
 </tr>
 <tr>
 <td>M.5</td>
 <td><strong>join</strong></td>
 <td>Merge collinear lines / coincident polylines / arcs sharing center+radius</td>
+<td>(none)</td>
 </tr>
 </tbody></table></div>
 <h3 id="roadmap-slice-n-strange-exotic-deferred-indefinitely">Slice N — Strange / Exotic (deferred indefinitely)<a class="anchor" href="#roadmap-slice-n-strange-exotic-deferred-indefinitely">¶</a></h3>
@@ -1084,6 +1091,12 @@ and <strong>(6)</strong> every open question / decision pending.
 <td><code>DblClkE</code></td>
 <td>Double-click editing on/off</td>
 <td><span class="status-partial">◐</span> Planned</td>
+<td>—</td>
+</tr>
+<tr>
+<td><code>EdgMod</code></td>
+<td>Edge-mode for trim / extend. ON = treat cutting / boundary edges as their infinite extensions for &quot;imaginary intersection&quot; cuts; OFF = use only intersections on the visible curve. AutoCAD analog: <code>EDGEMODE</code></td>
+<td><span class="status-partial">◐</span> Planned (queued for Slice M.1 / M.2)</td>
 <td>—</td>
 </tr>
 <tr>
