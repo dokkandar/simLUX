@@ -666,6 +666,18 @@ impl CadApp {
                     self.history.push("    → ADD mode (clicks now add/toggle)".into());
                 }
             }
+            Ok(Command::SelectWindow) => {
+                if self.select_mode == SelectMode::Off {
+                    self.history.push("  ! `window` only works during a select session (run `select` or `trim` first)".into());
+                } else {
+                    // Note: window selection already works implicitly when
+                    // the user clicks empty space, but typing `window`
+                    // gives the same affordance as AutoCAD's W keyword.
+                    self.window_first = None;   // make sure we're armed for the FIRST corner
+                    self.history.push(
+                        "    window — click FIRST corner on empty space, then OPPOSITE corner. L→R = inside; R→L = crossing. Shift = remove.".into());
+                }
+            }
             Ok(Command::Open(path)) => {
                 self.do_open(&path);
             }
@@ -815,14 +827,14 @@ impl CadApp {
                 self.trim_state = TrimState::SelectingCutters;
                 self.begin_selection(SelectMode::ForCuttingEdges);
                 self.history.push(
-                    "  trim — Select CUTTING edges (click / window / `all` / `before` / Shift-rem). Enter to confirm, Esc to cancel".into());
+                    "  trim — Select CUTTING edges. Click a dobject to add. Click empty space then opposite corner = window (L→R inside, R→L crossing). Shift-click removes. Type `all`/`before`/`none`/`window`. Enter to confirm, Esc to cancel.".into());
             }
             Ok(Command::Extend) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
                 self.extend_state = ExtendState::SelectingBoundaries;
                 self.begin_selection(SelectMode::ForBoundaryEdges);
                 self.history.push(
-                    "  extend — Select BOUNDARY edges (click / window / `all` / `before` / Shift-rem). Enter to confirm, Esc to cancel".into());
+                    "  extend — Select BOUNDARY edges. Click a dobject to add. Click empty space then opposite corner = window (L→R inside, R→L crossing). Shift-click removes. Type `all`/`before`/`none`/`window`. Enter to confirm, Esc to cancel.".into());
             }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {

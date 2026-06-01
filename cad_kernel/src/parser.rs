@@ -45,6 +45,10 @@ pub enum Command {
     SelectNone,
     SelectRemoveMode,
     SelectAddMode,
+    /// Arm window-selection: the next click captures the first corner of a
+    /// window (selection mode only). Recognised both as a top-level
+    /// convenience and as a sub-command during a select session.
+    SelectWindow,
     /// Translate the current selection by the vector (end - base). The app
     /// captures the two clicks interactively.
     Move,
@@ -137,6 +141,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "none" | "deselect" => Ok(Command::SelectNone),
         "rem"  | "remove"  => Ok(Command::SelectRemoveMode),
         "addmode" | "amode" => Ok(Command::SelectAddMode),
+        "window" | "win" | "crossing" => Ok(Command::SelectWindow),
         "move" | "m"      => Ok(Command::Move),
         "copy" | "cp" | "co" => Ok(Command::Copy),
         "rotate" | "ro"   => Ok(Command::Rotate),

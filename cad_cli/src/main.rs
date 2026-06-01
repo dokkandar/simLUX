@@ -72,7 +72,7 @@ fn main() {
             }
             Ok(Command::SelectAll) | Ok(Command::SelectPrevious)
             | Ok(Command::SelectNone) | Ok(Command::SelectRemoveMode)
-            | Ok(Command::SelectAddMode) => {
+            | Ok(Command::SelectAddMode) | Ok(Command::SelectWindow) => {
                 writeln!(out, "(selection sub-command ignored — CLI has no selection session)").ok();
             }
             Ok(Command::Move) => {
