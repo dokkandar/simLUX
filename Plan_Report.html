@@ -140,7 +140,7 @@ tr:hover td { background: rgba(255, 255, 255, 0.025); }
 <section class="cover">
 <h1>RUST_CAD — Engineering Discussion Pack</h1>
 <div class="meta">
-Generated <strong>2026-06-01 13:23</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-01 13:54</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
 Branch: <code>main</code> &nbsp;•&nbsp;
 Current slice: <strong>A — Property foundation (done)</strong>
@@ -249,6 +249,9 @@ and <strong>(6)</strong> every open question / decision pending.
 <blockquote><p>Living document. Update at the start of every new slice. The three reference docs (<code>Variables.md</code>, <code>Dobject_DXF.md</code>, <code>Dobject_Properties.md</code>) are the <em>contracts</em>; this file tracks <strong>what we&#x27;re working on, why, and how we plan to get there</strong>.</p></blockquote>
 <hr/>
 <h2 id="roadmap-where-we-are-now-2026-06-01">Where we are now (2026-06-01)<a class="anchor" href="#roadmap-where-we-are-now-2026-06-01">¶</a></h2>
+<p><strong>Slice J — Editing operations: <span class="status-ok">●</span> DONE.</strong> <code>Geom::rotated()</code>, <code>Geom::scaled()</code>, <code>Geom::mirrored()</code> added to the kernel (delegating methods on <code>DObject</code> preserve style + handle). Six new commands wired into the parser: <code>copy</code>, <code>rotate</code>, <code>scale</code>, <code>mirror</code>, <code>delete</code>, <code>undo</code>. Each uses the QueuedOp pattern: if nothing is selected, the command opens a selection session and re-enters the op when Enter finalises. Interactive flows (pivot + reference + target clicks) live in new state machines per op. <strong>Snapshot-based undo</strong> — every mutation clones the Document onto a 64-deep stack; <code>undo</code> pops and restores. 4 new geom transform tests; 89 tests passing workspace-wide.</p>
+<p><strong>Slice I — .rsm binary format: <span class="status-ok">●</span> DONE.</strong> Hand-rolled little-endian versioned format in <code>cad_io::rsm</code>. Lossless <code>Document</code> round-trip including every Geom variant, every layer/linetype/pen field, and <strong>stable handles</strong> (DXF can&#x27;t preserve our handles — RSM does). No external deps, no compression in v1 (~64 B per Line, well under 100 KB for 1000 lines). Wired into the same <code>open &lt;path.rsm&gt;</code> / <code>save &lt;path.rsm&gt;</code> commands as DXF — file dispatcher picks by extension. 6 RSM round-trip tests.</p>
+<p><strong>Slice H — cad_io / DXF: <span class="status-ok">●</span> DONE.</strong> New <code>cad_io</code> crate with <code>dxf::read_dxf(&amp;str) -&gt; Document</code> and <code>dxf::write_dxf(&amp;Document) -&gt; String</code>. Round-trips all current <code>Geom</code> variants (Line / Circle / Arc / Ellipse / EllipseArc / Point / LWPolyline) plus the LAYER and LTYPE tables. Files written by RUST_CAD open cleanly in LibreCAD. Wired into cad_app as <code>open &lt;path.dxf&gt;</code> and <code>save &lt;path.dxf&gt;</code> commands on the command line — no native file dialog yet. 9 DXF round-trip tests.</p>
 <p><strong>Slice E (Point + Polyline only): <span class="status-ok">●</span> DONE.</strong> <code>Geom</code> enum gains two new variants — <code>Point { location, style, size }</code> (AutoCAD POINT) and <code>Polyline { vertices: Vec&lt;PolyVertex&gt;, closed }</code> (LWPOLYLINE; bulge field on PolyVertex accepted but renderer treats every segment as straight today). Drafting tools wired to the toolbar (<code>point</code>, <code>pline</code>); polyline draws on click and finishes on Enter (<code>c</code> Enter closes). <code>From&lt;Point&gt;</code> / <code>From&lt;Polyline&gt;</code> impls keep ergonomic construction. All snap kinds extended (END snaps polyline vertices, MID snaps every segment midpoint, NEA/PER project onto each segment, Point acts as its own END snap). 70 tests still passing.</p>
 <p>Text / MText / DimRotated are deliberately deferred — they need new tables (TextStyleTable, DimStyleTable) which are slices of their own.</p>
 <p><strong>Slice D — Entity Info panel: <span class="status-ok">●</span> DONE.</strong> Egui dock with two modes: single-Dobject (full geometry breakdown + editable Layer / Visibility / Color / Linetype / LinetypeScale / Lineweight) and multi-selection (Geom-type counts + bulk layer reassign, bulk show/hide, bulk &quot;ByLayer reset&quot;). Combos for Layer/Linetype/Lineweight are populated live from <code>Document.layers</code> / <code>linetypes</code> so editing one is reflected everywhere.</p>
@@ -372,20 +375,20 @@ and <strong>(6)</strong> every open question / decision pending.
 </tr>
 <tr>
 <td><strong>H. <code>cad_io</code> (DXF reader / writer)</strong></td>
-<td><span class="status-planned">○</span></td>
-<td>Round-trip LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC first; then per-entity dispatchers</td>
-<td>Yes — open .dxf files</td>
+<td><span class="status-ok">●</span> Done</td>
+<td>Round-trips LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC / POINT / LWPOLYLINE; LAYER + LTYPE tables. <code>open</code> / <code>save</code> commands on cmd line. File dialog (rfd) is a small follow-up.</td>
+<td>Yes — <code>open file.dxf</code> / <code>save file.dxf</code></td>
 </tr>
 <tr>
 <td><strong>I. <code>.rsm</code> binary format (AutoRASM-native)</strong></td>
-<td><span class="status-planned">○</span></td>
-<td>Fast load/save for big drawings; our own format</td>
-<td>Yes</td>
+<td><span class="status-ok">●</span> Done</td>
+<td>Hand-rolled LE binary, versioned header, lossless. Handle preservation; no deps.</td>
+<td>Yes — <code>open file.rsm</code> / <code>save file.rsm</code></td>
 </tr>
 <tr>
 <td><strong>J. Editing operations</strong></td>
-<td><span class="status-planned">○</span></td>
-<td>copy / rotate / scale / mirror / delete / undo. Each consumes selection via QueuedOp pattern</td>
+<td><span class="status-ok">●</span> Done</td>
+<td>copy / rotate / scale / mirror / delete / undo. All consume selection via QueuedOp pattern; snapshot-based undo stack (64-deep).</td>
 <td>Yes</td>
 </tr>
 </tbody></table></div>
