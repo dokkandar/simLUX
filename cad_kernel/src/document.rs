@@ -9,11 +9,13 @@
 use crate::dobject::DObject;
 use crate::layer::LayerTable;
 use crate::linetype::LinetypeTable;
+use crate::pen::PenTable;
 
 pub struct Document {
     pub dobjects:  Vec<DObject>,
     pub layers:    LayerTable,
     pub linetypes: LinetypeTable,
+    pub pens:      PenTable,
     // Reserved for future slices — leave the field list extensible:
     // pub blocks:      BlockTable,
     // pub text_styles: TextStyleTable,
@@ -29,6 +31,7 @@ impl Default for Document {
             dobjects:  Vec::new(),
             layers:    LayerTable::with_defaults(),
             linetypes: LinetypeTable::with_defaults(),
+            pens:      PenTable::default(),
         }
     }
 }

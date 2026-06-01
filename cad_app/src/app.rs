@@ -216,6 +216,10 @@ pub struct CadApp {
     layer_rename_buf: String,
     /// Counter for default layer names ("Layer1", "Layer2", …).
     layer_name_counter: u32,
+
+    // ---- Pen palette (Slice C) ----
+    /// Is the pen palette dock open? Toggled from the top toolbar.
+    pen_panel_open: bool,
 }
 
 /// Active selection-gathering session. `ForList` dumps the chosen dobjects
@@ -309,6 +313,7 @@ impl Default for CadApp {
             layer_rename:       None,
             layer_rename_buf:   String::new(),
             layer_name_counter: 0,
+            pen_panel_open:     true,
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -904,6 +909,105 @@ impl CadApp {
                 if rename_cancel {
                     self.layer_rename = None;
                     self.layer_rename_buf.clear();
+                }
+            });
+    }
+
+    // ===================================================================
+    // Slice C — Pen palette
+    // ===================================================================
+    //
+    // Egui-port of LibreCAD's `lc_penpalettewidget`. Each pen is a named
+    // bundle of (color, linetype, lineweight). Clicking "Apply" rewrites
+    // those three fields on every Dobject in the current selection.
+    // Pens themselves are not persisted on Dobjects — they're a UI
+    // shortcut for setting multiple style fields together.
+
+    fn render_pen_palette(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::left("pens")
+            .min_width(220.0)
+            .default_width(260.0)
+            .show(ctx, |ui| {
+                ui.heading(format!("Pens ({})", self.doc.pens.len()));
+                ui.separator();
+
+                if self.selection.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 180, 200),
+                        "(select dobjects first — `select` / Shift-click / window)",
+                    );
+                } else {
+                    ui.label(format!("Apply to {} selected dobject(s):", self.selection.len()));
+                }
+                ui.add_space(4.0);
+
+                let mut apply: Option<usize> = None;
+                egui::ScrollArea::vertical().auto_shrink([false; 2]).show(ui, |ui| {
+                    egui::Grid::new("pen_rows")
+                        .num_columns(3)
+                        .spacing([8.0, 6.0])
+                        .striped(true)
+                        .show(ui, |ui| {
+                            for (i, pen) in self.doc.pens.pens.iter().enumerate() {
+                                // ---- color swatch ----
+                                let (r, g, b) = match pen.color {
+                                    Color::TrueColor(_) =>
+                                        pen.color.rgb_bytes().unwrap_or((128, 128, 128)),
+                                    Color::Aci(idx) => aci_palette(idx),
+                                    Color::ByLayer | Color::ByBlock => (180, 180, 200),
+                                };
+                                let arr = [r, g, b];
+                                let (rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(22.0, 18.0), egui::Sense::hover());
+                                ui.painter().rect_filled(rect, 2.0,
+                                    egui::Color32::from_rgb(arr[0], arr[1], arr[2]));
+                                ui.painter().rect_stroke(rect, 2.0,
+                                    egui::Stroke::new(0.7, egui::Color32::from_rgb(70, 80, 95)));
+
+                                // ---- name + description ----
+                                ui.vertical(|ui| {
+                                    ui.label(&pen.name);
+                                    let lt = self.doc.linetypes.get(pen.linetype)
+                                        .map(|l| l.name.as_str()).unwrap_or("?");
+                                    let lw = match pen.lineweight {
+                                        Lineweight::ByLayer    => "ByLayer".to_string(),
+                                        Lineweight::ByBlock    => "ByBlock".to_string(),
+                                        Lineweight::Default    => "Default".to_string(),
+                                        Lineweight::Custom(mm) => format!("{:.2} mm", mm),
+                                    };
+                                    ui.small(format!("{} · {}", lt, lw));
+                                });
+
+                                // ---- apply button ----
+                                let enabled = !self.selection.is_empty();
+                                ui.add_enabled_ui(enabled, |ui| {
+                                    if ui.button("apply").clicked() {
+                                        apply = Some(i);
+                                    }
+                                });
+                                ui.end_row();
+                            }
+                        });
+                });
+
+                // Deferred mutation outside the borrow chain.
+                if let Some(i) = apply {
+                    if let Some(pen) = self.doc.pens.get(i) {
+                        let (c, lt, lw) = (pen.color, pen.linetype, pen.lineweight);
+                        let pen_name = pen.name.clone();
+                        let count = self.selection.len();
+                        for &idx in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get_mut(idx) {
+                                d.style.color      = c;
+                                d.style.linetype   = lt;
+                                d.style.lineweight = lw;
+                            }
+                        }
+                        self.history.push(format!(
+                            "  pen '{}' applied to {} dobject(s)", pen_name, count
+                        ));
+                        self.gpu_dirty = true;
+                    }
                 }
             });
     }
@@ -1960,6 +2064,14 @@ impl eframe::App for CadApp {
                 {
                     self.layer_panel_open = !self.layer_panel_open;
                 }
+                // Pen palette toggle
+                let pen_btn = if self.pen_panel_open { "pens ▾" } else { "pens ▸" };
+                if ui.button(pen_btn)
+                    .on_hover_text("Pen palette — preset (color + linetype + lineweight) bundles; click to apply to selection")
+                    .clicked()
+                {
+                    self.pen_panel_open = !self.pen_panel_open;
+                }
                 ui.add_space(20.0);
                 ui.label("intersect:");
                 // View-mode: intersect only dobjects visible in the current viewport.
@@ -2336,6 +2448,11 @@ impl eframe::App for CadApp {
         // ---- left panel: Layer dock (Slice B) ---------------------------
         if self.layer_panel_open {
             self.render_layer_panel(ctx);
+        }
+
+        // ---- left panel (further left): Pen palette (Slice C) -----------
+        if self.pen_panel_open {
+            self.render_pen_palette(ctx);
         }
 
         // ---- right panel: dobjects + intersection list ------------------

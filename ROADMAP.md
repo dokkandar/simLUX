@@ -9,6 +9,14 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice C — Pen palette: ● DONE.** Egui dock to the left of the Layer
+panel; toggle from the toolbar ("pens ▾/▸"). 7 default presets in
+`Document.pens` (a new `PenTable` in cad_kernel) — ByLayer, Red/Green/Blue
+0.25 mm, Heavy black 0.7 mm, Dashed gray, Dash-dot center. Each row
+shows a color swatch + name + linetype/lineweight description, with an
+"apply" button that rewrites `style.color / linetype / lineweight` on
+every Dobject in the current selection.
+
 **Slice B — Layer panel: ● DONE.** Egui dock at left side; toggle from
 toolbar ("layers ▾/▸"). Per-layer visibility / freeze / lock, color
 swatch (egui color picker), double-click name to rename, active-layer
@@ -71,7 +79,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 |-------|--------|-------|------------------------------|
 | **A. Property foundation** (kernel) | ● Done | Layer/Linetype/Color/Lineweight types, Style struct, DObject wrapper, Document container, renderer resolves ByLayer | (internals — visible to next slice) |
 | **B. Layer panel** (UI) | ● Done | Egui dock — list/add/rename/delete/freeze/lock/visibility/active | Yes — first new panel |
-| **C. Pen palette** (UI) | ○ | Egui dock — pen presets (color + linetype + lineweight bundles), "Apply to selection" | Yes |
+| **C. Pen palette** (UI) | ● Done | Egui dock — pen presets (color + linetype + lineweight bundles), "Apply to selection" | Yes |
 | **D. Entity Info panel** (UI) | ○ | Read-only / partially-editable property inspector for current selection | Yes |
 | **E. New Dobject types** | ○ | `DobjectPoint` → `Polyline` → `Text` → `MText` → `DimRotated`. Each gets the full property model for free. | Yes — many new shapes |
 | **F. Block table + Block panel** | ○ | `BlockTable` on `Document`; INSERT references; egui Blocks dock | Yes |
