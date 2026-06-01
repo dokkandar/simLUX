@@ -180,11 +180,11 @@ selection and editing stay orthogonal.
 
 | # | Action | What it does | Inputs | Status |
 |---|---|---|---|---|
-| L.1 | **offset** / **o** | Parallel copy at distance d on side of click. Line / Circle / Arc in v1; Ellipse / Polyline politely skipped | typed distance + side click | ○ Next |
-| L.2 | **lengthen** / **len** | Delta-mode only in v1: extend length of selected Line / Arc / EllipseArc by signed delta; click side to extend | typed delta + side click | ○ Next |
-| L.3 | **break** / **br** | For each dobject in basket: project click onto the curve and split. Line → two Lines, Arc → two Arcs, Polyline → two Polylines. Circle requires 2 clicks (v2) — v1 errors gracefully | 1 click on the cut point | ○ Next |
-| L.4 | **align** | Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1 | 4 clicks | ○ Next |
-| L.5 | **stretch** | Crossing window selects which vertices move; clicked base/dest gives the delta | crossing window + 2 clicks | ○ Next |
+| L.1 | **offset** / **o** | Parallel copy at distance d on side of click. Line / Circle / Arc in v1; Ellipse / Polyline politely skipped | typed distance + side click | ● Done |
+| L.2 | **lengthen** / **len** | Delta-mode only in v1: extend length of selected Line / Arc / EllipseArc by signed delta; click side to extend | typed delta + side click | ● Done |
+| L.3 | **break** / **br** | For each dobject in basket: project click onto the curve and split. Line → two Lines, Arc → two Arcs, Polyline → two Polylines. Circle requires 2 clicks (v2) — v1 errors gracefully | 1 click on the cut point | ● Done |
+| L.4 | **align** | Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1 | 4 clicks | ● Done |
+| L.5 | **stretch** | Crossing window selects which vertices move; clicked base/dest gives the delta | crossing window + 2 clicks | ● Done |
 
 ### Slice M — Complex (deferred; revisit after K+L review)
 

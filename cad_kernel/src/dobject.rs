@@ -76,6 +76,13 @@ impl DObject {
         DObject { geom: self.geom.reversed(),
                   style: self.style, handle: self.handle }
     }
+
+    /// Offset by `dist` on the side of `side_hint`. Style preserved; new
+    /// handle (offset is a duplicate, not a transform).
+    pub fn offset(&self, dist: f64, side_hint: Vec2) -> Result<DObject, &'static str> {
+        let g = self.geom.offset(dist, side_hint)?;
+        Ok(DObject { geom: g, style: self.style, handle: next_handle() })
+    }
 }
 
 // ---- ergonomic constructors ------------------------------------------------

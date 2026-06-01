@@ -69,6 +69,18 @@ pub enum Command {
     Reverse,
     /// Bulk-set every selected dobject's `style.layer` to the active layer.
     ChangeLayer,
+    /// Offset every selected dobject by a distance. App captures a side click.
+    Offset(f64),
+    /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
+    /// App captures a click on the end to extend.
+    Lengthen(f64),
+    /// Split a single selected dobject at the next click point.
+    Break,
+    /// Align: 4 clicks (2 source + 2 target). Translate + rotate.
+    Align,
+    /// Stretch: crossing window + 2 clicks (base + dest). Vertices inside
+    /// the window translate by (dest - base).
+    Stretch,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -131,6 +143,20 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "matchprop" | "mp" => Ok(Command::MatchProps),
         "reverse" | "rev" => Ok(Command::Reverse),
         "chlayer" | "cl"  => Ok(Command::ChangeLayer),
+        "offset" | "o"    => {
+            let d: f64 = toks.get(1).ok_or("usage: offset <distance>")?
+                .parse().map_err(|_| "bad distance".to_string())?;
+            if d.abs() < 1e-12 { return Err("offset distance must be non-zero".into()); }
+            Ok(Command::Offset(d))
+        }
+        "lengthen" | "len" => {
+            let d: f64 = toks.get(1).ok_or("usage: lengthen <delta>")?
+                .parse().map_err(|_| "bad delta".to_string())?;
+            Ok(Command::Lengthen(d))
+        }
+        "break" | "br"    => Ok(Command::Break),
+        "align"           => Ok(Command::Align),
+        "stretch" | "s"   => Ok(Command::Stretch),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?

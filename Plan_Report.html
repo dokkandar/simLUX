@@ -140,7 +140,7 @@ tr:hover td { background: rgba(255, 255, 255, 0.025); }
 <section class="cover">
 <h1>RUST_CAD — Engineering Discussion Pack</h1>
 <div class="meta">
-Generated <strong>2026-06-01 13:54</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-01 14:40</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
 Branch: <code>main</code> &nbsp;•&nbsp;
 Current slice: <strong>A — Property foundation (done)</strong>
@@ -417,6 +417,127 @@ and <strong>(6)</strong> every open question / decision pending.
 <li><strong>Cad_snap dual maintenance</strong>: changes to <code>cad_kernel::snap</code> public API</li>
 </ul>
 <p>must update <code>cad_snap</code> re-exports, example, README in the same change.</p>
+<hr/>
+<h2 id="roadmap-edit-modify-actions-extended-roadmap-slices-kn">Edit / Modify actions — extended roadmap (slices K–N)<a class="anchor" href="#roadmap-edit-modify-actions-extended-roadmap-slices-kn">¶</a></h2>
+<p>Slice J landed the core 6 (move / copy / rotate / scale / mirror / delete + undo). Following slices extend the editor in tiers — every action consumes the basket via the existing select engine (basket-first, command on top), so selection and editing stay orthogonal.</p>
+<h3 id="roadmap-slice-k-simple-this-run">Slice K — Simple (this run)<a class="anchor" href="#roadmap-slice-k-simple-this-run">¶</a></h3>
+<div class="tbl-wrap"><table>
+<thead><tr>
+<th>#</th>
+<th>Action</th>
+<th>What it does</th>
+<th>Inputs</th>
+<th>Status</th>
+</tr></thead><tbody>
+<tr>
+<td>K.1</td>
+<td><strong>redo</strong></td>
+<td>Re-apply the last undone op (mirror of undo)</td>
+<td>(none)</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>K.2</td>
+<td><strong>matchprop</strong> / <strong>mp</strong></td>
+<td>Copy style (layer + color + linetype + lineweight + visibility) from a clicked source to every dobject in the basket</td>
+<td>1 click on source</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>K.3</td>
+<td><strong>reverse</strong> / <strong>rev</strong></td>
+<td>Flip direction of every selected Line / Arc / EllipseArc / Polyline</td>
+<td>(none)</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>K.4</td>
+<td><strong>chlayer</strong> / <strong>cl</strong></td>
+<td>Bulk-set basket&#x27;s layer to the active layer</td>
+<td>(none)</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+</tbody></table></div>
+<h3 id="roadmap-slice-l-medium-this-run">Slice L — Medium (this run)<a class="anchor" href="#roadmap-slice-l-medium-this-run">¶</a></h3>
+<div class="tbl-wrap"><table>
+<thead><tr>
+<th>#</th>
+<th>Action</th>
+<th>What it does</th>
+<th>Inputs</th>
+<th>Status</th>
+</tr></thead><tbody>
+<tr>
+<td>L.1</td>
+<td><strong>offset</strong> / <strong>o</strong></td>
+<td>Parallel copy at distance d on side of click. Line / Circle / Arc in v1; Ellipse / Polyline politely skipped</td>
+<td>typed distance + side click</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>L.2</td>
+<td><strong>lengthen</strong> / <strong>len</strong></td>
+<td>Delta-mode only in v1: extend length of selected Line / Arc / EllipseArc by signed delta; click side to extend</td>
+<td>typed delta + side click</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>L.3</td>
+<td><strong>break</strong> / <strong>br</strong></td>
+<td>For each dobject in basket: project click onto the curve and split. Line → two Lines, Arc → two Arcs, Polyline → two Polylines. Circle requires 2 clicks (v2) — v1 errors gracefully</td>
+<td>1 click on the cut point</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>L.4</td>
+<td><strong>align</strong></td>
+<td>Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1</td>
+<td>4 clicks</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+<tr>
+<td>L.5</td>
+<td><strong>stretch</strong></td>
+<td>Crossing window selects which vertices move; clicked base/dest gives the delta</td>
+<td>crossing window + 2 clicks</td>
+<td><span class="status-ok">●</span> Done</td>
+</tr>
+</tbody></table></div>
+<h3 id="roadmap-slice-m-complex-deferred-revisit-after-kl-review">Slice M — Complex (deferred; revisit after K+L review)<a class="anchor" href="#roadmap-slice-m-complex-deferred-revisit-after-kl-review">¶</a></h3>
+<div class="tbl-wrap"><table>
+<thead><tr>
+<th>#</th>
+<th>Action</th>
+<th>Notes</th>
+</tr></thead><tbody>
+<tr>
+<td>M.1</td>
+<td><strong>trim</strong></td>
+<td>Cutting edges + targets; clip to nearest intersection</td>
+</tr>
+<tr>
+<td>M.2</td>
+<td><strong>extend</strong></td>
+<td>Like trim but extends toward boundary</td>
+</tr>
+<tr>
+<td>M.3</td>
+<td><strong>fillet</strong></td>
+<td>Tangent arc between two curves at radius</td>
+</tr>
+<tr>
+<td>M.4</td>
+<td><strong>chamfer</strong></td>
+<td>Bevel between two lines with two distances</td>
+</tr>
+<tr>
+<td>M.5</td>
+<td><strong>join</strong></td>
+<td>Merge collinear lines / coincident polylines / arcs sharing center+radius</td>
+</tr>
+</tbody></table></div>
+<h3 id="roadmap-slice-n-strange-exotic-deferred-indefinitely">Slice N — Strange / Exotic (deferred indefinitely)<a class="anchor" href="#roadmap-slice-n-strange-exotic-deferred-indefinitely">¶</a></h3>
+<p>PEDIT (per-vertex polyline edit) · explode · stretch-by-grip · polar array · path array · group / ungroup. Each is its own slice when a real need surfaces.</p>
 <hr/>
 <h2 id="roadmap-crate-layout">Crate layout<a class="anchor" href="#roadmap-crate-layout">¶</a></h2>
 <div class="tbl-wrap"><table>

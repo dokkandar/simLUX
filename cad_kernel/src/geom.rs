@@ -310,6 +310,224 @@ impl Geom {
         }
     }
 
+    /// Extend the length by signed `delta` at the end nearer to `near`.
+    /// Negative delta shortens.
+    /// - Line: move whichever endpoint is closer to `near` further along
+    ///   the segment's direction by `delta`.
+    /// - Arc / EllipseArc: extend the start or end angle/param so the
+    ///   total arc length changes by `delta`.
+    /// Other variants return Err.
+    pub fn lengthened(&self, delta: f64, near: Vec2) -> Result<Geom, &'static str> {
+        if delta.abs() < EPS { return Ok(self.clone()); }
+        match self {
+            Geom::Line(l) => {
+                let dir = l.b - l.a;
+                let len = dir.len();
+                if len < EPS { return Err("lengthen: zero-length line"); }
+                let u = dir / len;
+                let at_b = near.dist(l.b) < near.dist(l.a);
+                if at_b {
+                    Ok(Geom::Line(Line { a: l.a, b: l.b + u * delta }))
+                } else {
+                    Ok(Geom::Line(Line { a: l.a - u * delta, b: l.b }))
+                }
+            }
+            Geom::Arc(a) => {
+                if a.radius < EPS { return Err("lengthen: zero-radius arc"); }
+                let d_angle = delta / a.radius;
+                let (e1, e2) = a.endpoints();
+                let at_end = near.dist(e2) < near.dist(e1);
+                let new_sweep = a.sweep_angle + d_angle;
+                if new_sweep <= 0.0 || new_sweep >= std::f64::consts::TAU {
+                    return Err("lengthen: would close arc or invert");
+                }
+                if at_end {
+                    Ok(Geom::Arc(Arc {
+                        center: a.center, radius: a.radius,
+                        start_angle: a.start_angle, sweep_angle: new_sweep,
+                    }))
+                } else {
+                    let new_start = (a.start_angle - d_angle)
+                        .rem_euclid(std::f64::consts::TAU);
+                    Ok(Geom::Arc(Arc {
+                        center: a.center, radius: a.radius,
+                        start_angle: new_start, sweep_angle: new_sweep,
+                    }))
+                }
+            }
+            Geom::EllipseArc(ea) => {
+                // For an ellipse, "arc length" varies with parameter — we
+                // approximate by scaling sweep_param by (delta / current
+                // chord), which is correct only for near-circular ellipses
+                // but acceptable for v1 (refine when needed).
+                let (e1, e2) = ea.endpoints();
+                let approx_len = e1.dist(e2).max(EPS);
+                let dp = ea.sweep_param * (delta / approx_len);
+                let at_end = near.dist(e2) < near.dist(e1);
+                let new_sweep = ea.sweep_param + dp;
+                if new_sweep <= 0.0 || new_sweep >= std::f64::consts::TAU {
+                    return Err("lengthen: would close ellipse-arc or invert");
+                }
+                if at_end {
+                    Ok(Geom::EllipseArc(EllipseArc {
+                        ellipse: ea.ellipse,
+                        start_param: ea.start_param, sweep_param: new_sweep,
+                    }))
+                } else {
+                    let new_start = (ea.start_param - dp)
+                        .rem_euclid(std::f64::consts::TAU);
+                    Ok(Geom::EllipseArc(EllipseArc {
+                        ellipse: ea.ellipse,
+                        start_param: new_start, sweep_param: new_sweep,
+                    }))
+                }
+            }
+            _ => Err("lengthen: only Line / Arc / EllipseArc are supported"),
+        }
+    }
+
+    /// Split into two pieces at the projection of `at` onto the curve.
+    /// Both pieces inherit nothing from style — the caller wraps them in
+    /// DObjects with the original's style.
+    /// Returns Err for Circle (single click can't define which side to keep)
+    /// and Point (nothing to split). Closed polylines split into two open
+    /// polylines.
+    pub fn split_at(&self, at: Vec2) -> Result<(Geom, Geom), &'static str> {
+        match self {
+            Geom::Line(l) => {
+                let d = l.b - l.a;
+                let len_sq = d.len_sq();
+                if len_sq < EPS { return Err("split: zero-length line"); }
+                let t = ((at - l.a).dot(d) / len_sq).clamp(EPS, 1.0 - EPS);
+                let mid = l.a + d * t;
+                Ok((Geom::Line(Line { a: l.a, b: mid }),
+                    Geom::Line(Line { a: mid, b: l.b })))
+            }
+            Geom::Arc(a) => {
+                if a.radius < EPS { return Err("split: zero-radius arc"); }
+                let ang = ((at - a.center).angle() - a.start_angle)
+                    .rem_euclid(std::f64::consts::TAU);
+                let split = ang.clamp(EPS, a.sweep_angle - EPS);
+                Ok((Geom::Arc(Arc {
+                    center: a.center, radius: a.radius,
+                    start_angle: a.start_angle, sweep_angle: split,
+                }), Geom::Arc(Arc {
+                    center: a.center, radius: a.radius,
+                    start_angle: (a.start_angle + split).rem_euclid(std::f64::consts::TAU),
+                    sweep_angle: a.sweep_angle - split,
+                })))
+            }
+            Geom::EllipseArc(ea) => {
+                let t = ea.ellipse.nearest_param(at);
+                let local = (t - ea.start_param).rem_euclid(std::f64::consts::TAU);
+                let split = local.clamp(EPS, ea.sweep_param - EPS);
+                Ok((Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: ea.start_param, sweep_param: split,
+                }), Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: (ea.start_param + split).rem_euclid(std::f64::consts::TAU),
+                    sweep_param: ea.sweep_param - split,
+                })))
+            }
+            Geom::Polyline(p) => {
+                if p.vertices.len() < 2 { return Err("split: polyline needs 2+ vertices"); }
+                // Find the segment closest to `at`; split that one.
+                let n = p.vertices.len();
+                let pairs = if p.closed { n } else { n - 1 };
+                let mut best: Option<(usize, f64, Vec2)> = None;
+                for i in 0..pairs {
+                    let a = p.vertices[i].pos;
+                    let b = p.vertices[(i + 1) % n].pos;
+                    let d = b - a;
+                    let len_sq = d.len_sq();
+                    if len_sq < EPS { continue; }
+                    let t = ((at - a).dot(d) / len_sq).clamp(0.0, 1.0);
+                    let foot = a + d * t;
+                    let dist = foot.dist(at);
+                    if best.map_or(true, |(_, bd, _)| dist < bd) {
+                        best = Some((i, dist, foot));
+                    }
+                }
+                let (seg, _, foot) = best.ok_or("split: degenerate polyline")?;
+                // Build first piece: vertices[0..=seg] + foot
+                let mut first: Vec<PolyVertex> = p.vertices[..=seg].iter().cloned().collect();
+                first.push(PolyVertex { pos: foot, bulge: 0.0 });
+                // Build second piece: foot + vertices[seg+1..] (or wrap for closed)
+                let mut second: Vec<PolyVertex> =
+                    vec![PolyVertex { pos: foot, bulge: 0.0 }];
+                if p.closed {
+                    for i in 0..n {
+                        let idx = (seg + 1 + i) % n;
+                        second.push(p.vertices[idx].clone());
+                        if idx == seg { break; }
+                    }
+                } else {
+                    for v in &p.vertices[seg + 1..] {
+                        second.push(v.clone());
+                    }
+                }
+                Ok((Geom::Polyline(Polyline { vertices: first,  closed: false }),
+                    Geom::Polyline(Polyline { vertices: second, closed: false })))
+            }
+            Geom::Circle(_) =>
+                Err("split: circle needs TWO break points (1-click break not allowed)"),
+            Geom::Ellipse(_) =>
+                Err("split: closed ellipse needs TWO break points"),
+            Geom::Point(_) =>
+                Err("split: cannot split a point"),
+        }
+    }
+
+    /// Return a parallel copy offset by `dist` to the side of `side` (a
+    /// world point used to disambiguate which of the two parallel results
+    /// to return — the one closer to `side` wins).
+    ///
+    /// Returns `Err` for Geom types we don't yet offset (Ellipse,
+    /// EllipseArc — true offset of an ellipse isn't an ellipse;
+    /// Polyline — corner intersection math TBD; Point — no meaningful
+    /// offset).
+    pub fn offset(&self, dist: f64, side: Vec2) -> Result<Geom, &'static str> {
+        if dist.abs() < EPS { return Ok(self.clone()); }
+        match self {
+            Geom::Line(l) => {
+                let d = l.b - l.a;
+                let len_sq = d.len_sq();
+                if len_sq < EPS { return Err("offset: zero-length line"); }
+                let n = d.perp().normalized();
+                // Project (side - midpoint) onto n; sign chooses direction.
+                let mid = (l.a + l.b) * 0.5;
+                let sgn = if (side - mid).dot(n) >= 0.0 { 1.0 } else { -1.0 };
+                let shift = n * (dist * sgn);
+                Ok(Geom::Line(Line { a: l.a + shift, b: l.b + shift }))
+            }
+            Geom::Circle(c) => {
+                // Side-of-radius — inside or outside.
+                let v = side - c.center;
+                let outside = v.len() >= c.radius;
+                let new_r = if outside { c.radius + dist.abs() } else { c.radius - dist.abs() };
+                if new_r <= EPS { return Err("offset: would collapse to a point or smaller"); }
+                Ok(Geom::Circle(Circle { center: c.center, radius: new_r }))
+            }
+            Geom::Arc(a) => {
+                let v = side - a.center;
+                let outside = v.len() >= a.radius;
+                let new_r = if outside { a.radius + dist.abs() } else { a.radius - dist.abs() };
+                if new_r <= EPS { return Err("offset: would collapse"); }
+                Ok(Geom::Arc(Arc {
+                    center: a.center, radius: new_r,
+                    start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+                }))
+            }
+            Geom::Ellipse(_) | Geom::EllipseArc(_) =>
+                Err("offset on ellipse not implemented (true offset is not an ellipse)"),
+            Geom::Polyline(_) =>
+                Err("offset on polyline not implemented yet (corner math TBD)"),
+            Geom::Point(_) =>
+                Err("offset on point is undefined"),
+        }
+    }
+
     /// Return a copy with direction flipped, where direction is defined.
     /// - Line: swap a/b
     /// - Arc / EllipseArc: start at the OTHER end, same sweep magnitude
@@ -643,6 +861,71 @@ mod transform_tests {
             assert!(approx_eq(p.vertices[0].bulge, 0.4));
             assert!(approx_eq(p.vertices[1].bulge, -0.2));
         } else { panic!(); }
+    }
+
+    #[test]
+    fn offset_line_picks_side_by_hint() {
+        // Horizontal line from (0,0) to (10,0). Side hint above → offset up.
+        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let up = g.offset(2.0, Vec2::new(5.0, 5.0)).unwrap();
+        if let Geom::Line(l) = up {
+            assert!(approx_eq(l.a.y, 2.0)); assert!(approx_eq(l.b.y, 2.0));
+        } else { panic!(); }
+        let dn = g.offset(2.0, Vec2::new(5.0, -5.0)).unwrap();
+        if let Geom::Line(l) = dn {
+            assert!(approx_eq(l.a.y, -2.0)); assert!(approx_eq(l.b.y, -2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn offset_circle_outward_grows_radius() {
+        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
+        let outside_hint = Vec2::new(10.0, 0.0);
+        let out = g.offset(2.0, outside_hint).unwrap();
+        if let Geom::Circle(c) = out { assert!(approx_eq(c.radius, 7.0)); } else { panic!(); }
+        let inside_hint = Vec2::new(1.0, 0.0);
+        let inn = g.offset(2.0, inside_hint).unwrap();
+        if let Geom::Circle(c) = inn { assert!(approx_eq(c.radius, 3.0)); } else { panic!(); }
+    }
+
+    #[test]
+    fn offset_polyline_errors_politely() {
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::ZERO, bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 0.0 },
+            ],
+            closed: false,
+        });
+        assert!(g.offset(1.0, Vec2::ZERO).is_err());
+    }
+
+    #[test]
+    fn lengthen_line_extends_at_clicked_end() {
+        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        // Click near (10, 0) — the b-end — to extend it.
+        let longer = g.lengthened(3.0, Vec2::new(10.0, 1.0)).unwrap();
+        if let Geom::Line(l) = longer { assert!(approx_eq(l.b.x, 13.0)); } else { panic!(); }
+        // Click near (0, 0) — the a-end — to extend backwards.
+        let earlier = g.lengthened(3.0, Vec2::new(-1.0, 0.0)).unwrap();
+        if let Geom::Line(l) = earlier { assert!(approx_eq(l.a.x, -3.0)); } else { panic!(); }
+    }
+
+    #[test]
+    fn break_line_at_midpoint_makes_two() {
+        let g = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
+        let (l1, l2) = g.split_at(Vec2::new(5.0, 0.0)).unwrap();
+        if let (Geom::Line(a), Geom::Line(b)) = (l1, l2) {
+            assert!(approx_eq(a.b.x, 5.0));
+            assert!(approx_eq(b.a.x, 5.0));
+            assert!(approx_eq(b.b.x, 10.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn break_circle_errors() {
+        let g = Geom::Circle(Circle { center: Vec2::ZERO, radius: 5.0 });
+        assert!(g.split_at(Vec2::new(5.0, 0.0)).is_err());
     }
 
     #[test]

@@ -246,6 +246,13 @@ pub struct CadApp {
 
     // ---- Slice K: matchprop click capture ----
     matchprops_state: MatchPropsState,
+
+    // ---- Slice L: medium editing actions ----
+    offset_state:   OffsetState,
+    lengthen_state: LengthenState,
+    break_state:    BreakState,
+    align_state:    AlignState,
+    stretch_state:  StretchState,
 }
 
 const UNDO_STACK_CAP: usize = 64;
@@ -333,6 +340,30 @@ pub enum MatchPropsState {
     WaitingForSource,
 }
 
+/// State machines for the Slice-L click-driven actions.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum OffsetState   { Off, WaitingForSide(f64) }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum LengthenState { Off, WaitingForSide(f64) }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BreakState    { Off, WaitingForPoint }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AlignState {
+    Off,
+    WaitingForSrc1,
+    WaitingForSrc2(Vec2),
+    WaitingForTgt1(Vec2, Vec2),
+    WaitingForTgt2(Vec2, Vec2, Vec2),
+}
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum StretchState {
+    Off,
+    WaitingForWin1,
+    WaitingForWin2(Vec2),         // first corner captured
+    WaitingForBase(Vec2, Vec2),   // window captured, click base
+    WaitingForDest(Vec2, Vec2, Vec2),   // window + base; click dest to apply
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     Cpu,
@@ -399,6 +430,11 @@ impl Default for CadApp {
             undo_stack:   Vec::new(),
             redo_stack:   Vec::new(),
             matchprops_state: MatchPropsState::Off,
+            offset_state:   OffsetState::Off,
+            lengthen_state: LengthenState::Off,
+            break_state:    BreakState::Off,
+            align_state:    AlignState::Off,
+            stretch_state:  StretchState::Off,
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -692,6 +728,51 @@ impl CadApp {
             }
             Ok(Command::Reverse)     => self.apply_reverse(),
             Ok(Command::ChangeLayer) => self.apply_chlayer(),
+            Ok(Command::Offset(d)) => {
+                if self.selection.is_empty() {
+                    self.history.push("  ! offset: empty basket — `select` first".into());
+                } else {
+                    self.offset_state = OffsetState::WaitingForSide(d);
+                    self.history.push(format!(
+                        "  offset — distance {:.3}; {} in basket. Click SIDE to offset toward (Esc cancels)",
+                        d, self.selection.len()));
+                }
+            }
+            Ok(Command::Lengthen(d)) => {
+                if self.selection.is_empty() {
+                    self.history.push("  ! lengthen: empty basket — `select` first".into());
+                } else {
+                    self.lengthen_state = LengthenState::WaitingForSide(d);
+                    self.history.push(format!(
+                        "  lengthen — delta {:.3}; {} in basket. Click END to extend (Esc cancels)",
+                        d, self.selection.len()));
+                }
+            }
+            Ok(Command::Break) => {
+                if self.selection.is_empty() {
+                    self.history.push("  ! break: empty basket — `select` first".into());
+                } else {
+                    self.break_state = BreakState::WaitingForPoint;
+                    self.history.push(format!(
+                        "  break — {} in basket. Click CUT point (Esc cancels)",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Align) => {
+                if self.selection.is_empty() {
+                    self.history.push("  ! align: empty basket — `select` first".into());
+                } else {
+                    self.align_state = AlignState::WaitingForSrc1;
+                    self.history.push(format!(
+                        "  align — {} in basket. Click SOURCE point 1 (Esc cancels)",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Stretch) => {
+                self.stretch_state = StretchState::WaitingForWin1;
+                self.history.push(
+                    "  stretch — Click FIRST corner of crossing window (Esc cancels)".into());
+            }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
                     // No basket yet — auto-enter a selection session that
@@ -1720,6 +1801,200 @@ impl CadApp {
             "  ⇋ reverse: {} flipped, {} no-op (direction-agnostic)",
             flipped, noop
         ));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    // ---- Slice L apply methods ----
+
+    fn apply_offset(&mut self, dist: f64, side: Vec2) {
+        if self.selection.is_empty() { return; }
+        self.snapshot_doc();
+        let mut ok = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        let mut new_dobjects: Vec<DObject> = Vec::new();
+        for &i in &self.selection {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            match d.offset(dist, side) {
+                Ok(new_d) => { new_dobjects.push(new_d); ok += 1; }
+                Err(msg)  => errs.push(format!("#{}: {}", i, msg)),
+            }
+        }
+        for nd in new_dobjects { self.doc.push(nd); }
+        self.history.push(format!(
+            "  ⇉ offset {:.3} → {} new dobject(s); {} skipped",
+            dist, ok, errs.len()));
+        for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    fn apply_lengthen(&mut self, delta: f64, near: Vec2) {
+        if self.selection.is_empty() { return; }
+        self.snapshot_doc();
+        let mut ok = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        for &i in &self.selection {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            match d.geom.lengthened(delta, near) {
+                Ok(new_geom) => {
+                    if let Some(d_mut) = self.doc.dobjects.get_mut(i) {
+                        d_mut.geom = new_geom;
+                        ok += 1;
+                    }
+                }
+                Err(msg) => errs.push(format!("#{}: {}", i, msg)),
+            }
+        }
+        self.history.push(format!(
+            "  ⟼ lengthen {:+.3} → {} ok, {} skipped",
+            delta, ok, errs.len()));
+        for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    fn apply_break(&mut self, at: Vec2) {
+        if self.selection.is_empty() { return; }
+        self.snapshot_doc();
+        // Process in reverse-index order so removals don't shift later indices.
+        let mut sel = self.selection.clone();
+        sel.sort_unstable();
+        sel.dedup();
+        let mut ok = 0usize;
+        let mut errs: Vec<String> = Vec::new();
+        let mut adds: Vec<(usize, DObject, DObject, cad_kernel::Style)> = Vec::new();
+        for &i in sel.iter().rev() {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            match d.geom.split_at(at) {
+                Ok((g1, g2)) => {
+                    adds.push((i, DObject::new(g1), DObject::new(g2), d.style));
+                    ok += 1;
+                }
+                Err(msg) => errs.push(format!("#{}: {}", i, msg)),
+            }
+        }
+        // Apply: remove original at i, push both halves with preserved style.
+        for (i, mut h1, mut h2, style) in adds {
+            if i < self.doc.dobjects.len() { self.doc.dobjects.remove(i); }
+            h1.style = style; h2.style = style;
+            self.doc.dobjects.push(h1);
+            self.doc.dobjects.push(h2);
+        }
+        self.selection.clear();
+        self.selected = None;
+        self.history.push(format!(
+            "  ✂ break: {} split, {} skipped", ok, errs.len()));
+        for e in errs.iter().take(3) { self.history.push(format!("    {}", e)); }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    fn apply_align(&mut self, s1: Vec2, s2: Vec2, t1: Vec2, t2: Vec2) {
+        if self.selection.is_empty() { return; }
+        let src_len = s1.dist(s2);
+        if src_len < EPS {
+            self.history.push("  ! align: source points coincide".into());
+            return;
+        }
+        self.snapshot_doc();
+        // Translate: s1 → t1; then rotate around t1 so (s2 - s1) aligns with (t2 - t1).
+        let v = t1 - s1;
+        let src_dir = (s2 - s1).angle();
+        let tgt_dir = (t2 - t1).angle();
+        let dtheta = (tgt_dir - src_dir).rem_euclid(std::f64::consts::TAU);
+        let dtheta = if dtheta > std::f64::consts::PI {
+            dtheta - std::f64::consts::TAU
+        } else { dtheta };
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                let translated = d.geom.translated(v);
+                d.geom = translated.rotated(t1, dtheta);
+            }
+        }
+        self.history.push(format!(
+            "  ⇲ align: {} dobject(s)  shifted ({:.2},{:.2})  rotated {:.2}° around ({:.2},{:.2})",
+            n, v.x, v.y, dtheta.to_degrees(), t1.x, t1.y));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    fn apply_stretch(&mut self, win_min: Vec2, win_max: Vec2, base: Vec2, dest: Vec2) {
+        let v = dest - base;
+        if v.len() < EPS { return; }
+        self.snapshot_doc();
+        let inside = |p: Vec2| -> bool {
+            p.x >= win_min.x && p.x <= win_max.x
+                && p.y >= win_min.y && p.y <= win_max.y
+        };
+        // Per-variant logic: move any vertex/center that lies inside the window.
+        let mut touched = 0usize;
+        for d in self.doc.dobjects.iter_mut() {
+            let new_geom = match &d.geom {
+                Geom::Line(l) => {
+                    let na = if inside(l.a) { l.a + v } else { l.a };
+                    let nb = if inside(l.b) { l.b + v } else { l.b };
+                    if na != l.a || nb != l.b { touched += 1; }
+                    Some(Geom::Line(Line { a: na, b: nb }))
+                }
+                Geom::Polyline(p) => {
+                    let mut changed = false;
+                    let new_verts: Vec<PolyVertex> = p.vertices.iter().map(|vt| {
+                        if inside(vt.pos) {
+                            changed = true;
+                            PolyVertex { pos: vt.pos + v, bulge: vt.bulge }
+                        } else { *vt }
+                    }).collect();
+                    if changed { touched += 1; }
+                    Some(Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed }))
+                }
+                // Translate as a whole iff the canonical "center" is inside.
+                Geom::Circle(c) if inside(c.center) => {
+                    touched += 1;
+                    Some(Geom::Circle(Circle { center: c.center + v, radius: c.radius }))
+                }
+                Geom::Arc(a) if inside(a.center) => {
+                    touched += 1;
+                    Some(Geom::Arc(Arc {
+                        center: a.center + v, radius: a.radius,
+                        start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+                    }))
+                }
+                Geom::Ellipse(e) if inside(e.center) => {
+                    touched += 1;
+                    Some(Geom::Ellipse(Ellipse {
+                        center: e.center + v, major: e.major, ratio: e.ratio,
+                    }))
+                }
+                Geom::EllipseArc(ea) if inside(ea.ellipse.center) => {
+                    touched += 1;
+                    Some(Geom::EllipseArc(EllipseArc {
+                        ellipse: Ellipse {
+                            center: ea.ellipse.center + v,
+                            major: ea.ellipse.major, ratio: ea.ellipse.ratio,
+                        },
+                        start_param: ea.start_param, sweep_param: ea.sweep_param,
+                    }))
+                }
+                Geom::Point(pt) if inside(pt.location) => {
+                    touched += 1;
+                    Some(Geom::Point(Point {
+                        location: pt.location + v, style: pt.style, size: pt.size,
+                    }))
+                }
+                _ => None,
+            };
+            if let Some(g) = new_geom { d.geom = g; }
+        }
+        self.history.push(format!(
+            "  ↔ stretch by ({:.2},{:.2})  touched {} dobject(s)",
+            v.x, v.y, touched));
         self.intersections.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
@@ -2839,6 +3114,26 @@ impl eframe::App for CadApp {
                 self.matchprops_state = MatchPropsState::Off;
                 self.history.push("  matchprop cancelled".into());
             }
+            if self.offset_state != OffsetState::Off {
+                self.offset_state = OffsetState::Off;
+                self.history.push("  offset cancelled".into());
+            }
+            if self.lengthen_state != LengthenState::Off {
+                self.lengthen_state = LengthenState::Off;
+                self.history.push("  lengthen cancelled".into());
+            }
+            if self.break_state != BreakState::Off {
+                self.break_state = BreakState::Off;
+                self.history.push("  break cancelled".into());
+            }
+            if self.align_state != AlignState::Off {
+                self.align_state = AlignState::Off;
+                self.history.push("  align cancelled".into());
+            }
+            if self.stretch_state != StretchState::Off {
+                self.stretch_state = StretchState::Off;
+                self.history.push("  stretch cancelled".into());
+            }
         }
 
         // Enter (when the command line is empty) finalises an in-progress
@@ -3680,6 +3975,80 @@ impl eframe::App for CadApp {
                                 self.scale_state = ScaleState::Off;
                             }
                             ScaleState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.offset_state != OffsetState::Off {
+                        if let OffsetState::WaitingForSide(d) = self.offset_state {
+                            self.apply_offset(d, click_world);
+                        }
+                        self.offset_state = OffsetState::Off;
+                        self.refocus_cmd = true;
+                    } else if self.lengthen_state != LengthenState::Off {
+                        if let LengthenState::WaitingForSide(d) = self.lengthen_state {
+                            self.apply_lengthen(d, click_world);
+                        }
+                        self.lengthen_state = LengthenState::Off;
+                        self.refocus_cmd = true;
+                    } else if self.break_state != BreakState::Off {
+                        self.apply_break(click_world);
+                        self.break_state = BreakState::Off;
+                        self.refocus_cmd = true;
+                    } else if self.align_state != AlignState::Off {
+                        match self.align_state {
+                            AlignState::WaitingForSrc1 => {
+                                self.align_state = AlignState::WaitingForSrc2(click_world);
+                                self.history.push(format!(
+                                    "    align: SRC1 = ({:.2},{:.2}) — click SOURCE point 2",
+                                    click_world.x, click_world.y));
+                            }
+                            AlignState::WaitingForSrc2(s1) => {
+                                self.align_state = AlignState::WaitingForTgt1(s1, click_world);
+                                self.history.push(
+                                    "    align: SRC2 captured — click TARGET point 1".into());
+                            }
+                            AlignState::WaitingForTgt1(s1, s2) => {
+                                self.align_state = AlignState::WaitingForTgt2(s1, s2, click_world);
+                                self.history.push(
+                                    "    align: TGT1 captured — click TARGET point 2".into());
+                            }
+                            AlignState::WaitingForTgt2(s1, s2, t1) => {
+                                self.apply_align(s1, s2, t1, click_world);
+                                self.align_state = AlignState::Off;
+                            }
+                            AlignState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.stretch_state != StretchState::Off {
+                        match self.stretch_state {
+                            StretchState::WaitingForWin1 => {
+                                self.stretch_state = StretchState::WaitingForWin2(click_world);
+                                self.history.push(format!(
+                                    "    stretch: window corner 1 = ({:.2},{:.2}) — click SECOND corner",
+                                    click_world.x, click_world.y));
+                            }
+                            StretchState::WaitingForWin2(c1) => {
+                                let wmin = Vec2 {
+                                    x: c1.x.min(click_world.x),
+                                    y: c1.y.min(click_world.y),
+                                };
+                                let wmax = Vec2 {
+                                    x: c1.x.max(click_world.x),
+                                    y: c1.y.max(click_world.y),
+                                };
+                                self.stretch_state = StretchState::WaitingForBase(wmin, wmax);
+                                self.history.push(
+                                    "    stretch: window captured — click BASE point".into());
+                            }
+                            StretchState::WaitingForBase(wmin, wmax) => {
+                                self.stretch_state = StretchState::WaitingForDest(wmin, wmax, click_world);
+                                self.history.push(
+                                    "    stretch: BASE captured — click DESTINATION".into());
+                            }
+                            StretchState::WaitingForDest(wmin, wmax, base) => {
+                                self.apply_stretch(wmin, wmax, base, click_world);
+                                self.stretch_state = StretchState::Off;
+                            }
+                            StretchState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
                     } else if self.matchprops_state != MatchPropsState::Off {
