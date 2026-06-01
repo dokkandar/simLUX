@@ -2257,67 +2257,79 @@ impl CadApp {
 
     // ---- Slice M.1 / M.2: trim / extend apply methods ----
 
-    fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) {
-        // Don't allow a cutter to trim itself.
-        if cutters.contains(&target_idx) {
-            self.history.push(format!(
-                "  ! trim: dobject #{} is in the cutting basket — skipping",
-                target_idx));
-            return;
-        }
+    /// Returns true iff the trim actually mutated the document. The
+    /// caller uses this to gate cutter-list index patching — patching
+    /// when the doc didn't change corrupts the list silently (the bug
+    /// the user caught in commit ae54eef's debug log).
+    fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
         // Snapshot ONCE per click so undo rolls back this single trim.
         self.snapshot_doc();
         let edge_mode = self.env.EdgMod;
+        // Build cutter geoms, EXCLUDING the target itself — a dobject
+        // never cuts itself (self-intersection = 0). This is what allows
+        // trimming a cutter dobject in the basket: it's still a valid
+        // target, just doesn't intersect with itself for cut math.
         let cutter_geoms: Vec<Geom> = cutters.iter()
+            .filter(|&&i| i != target_idx)
             .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
             .collect();
-        let Some(target) = self.doc.dobjects.get(target_idx) else { return; };
+        if cutter_geoms.is_empty() {
+            // No OTHER dobjects to cut against → roll back, fail.
+            if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+            self.history.push(format!(
+                "  ! trim #{}: no other cutters available (target is the only candidate)",
+                target_idx));
+            return false;
+        }
+        let Some(target) = self.doc.dobjects.get(target_idx) else {
+            if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+            return false;
+        };
         let target_style = target.style;
         match target.geom.trim_at(&cutter_geoms, pick, edge_mode) {
             Ok(pieces) => {
                 let n_pieces = pieces.len();
-                // Remove the original first, then push each surviving piece
-                // with the original's style preserved.
                 self.doc.dobjects.remove(target_idx);
                 for g in pieces {
                     let mut d = DObject::new(g);
                     d.style = target_style;
                     self.doc.push(d);
                 }
-                // Indices shift after removal; the cutter list passed in for
-                // subsequent picks references OLD indices and may now be
-                // wrong. The trim_state's cutter Vec is patched after this
-                // method returns (see canvas handler).
                 self.history.push(format!(
                     "  ✂ trim: #{} cut → {} piece(s) survive (EdgMod {})",
                     target_idx, n_pieces, if edge_mode {"ON"} else {"OFF"}));
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                true
             }
             Err(msg) => {
-                // Roll back the snapshot — nothing changed.
-                if let Some(prev) = self.undo_stack.pop() {
-                    self.doc = prev;
-                }
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
+                false
             }
         }
     }
 
-    fn apply_extend_pick(&mut self, bounds: &[usize], target_idx: usize, pick: Vec2) {
-        if bounds.contains(&target_idx) {
-            self.history.push(format!(
-                "  ! extend: dobject #{} is in the boundary basket — skipping",
-                target_idx));
-            return;
-        }
+    /// Returns true iff the extend actually mutated the document.
+    fn apply_extend_pick(&mut self, bounds: &[usize], target_idx: usize, pick: Vec2) -> bool {
         self.snapshot_doc();
         let edge_mode = self.env.EdgMod;
+        // Same self-exclusion rule as trim.
         let boundary_geoms: Vec<Geom> = bounds.iter()
+            .filter(|&&i| i != target_idx)
             .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
             .collect();
-        let Some(target) = self.doc.dobjects.get(target_idx) else { return; };
+        if boundary_geoms.is_empty() {
+            if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+            self.history.push(format!(
+                "  ! extend #{}: no other boundaries available", target_idx));
+            return false;
+        }
+        let Some(target) = self.doc.dobjects.get(target_idx) else {
+            if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+            return false;
+        };
         match target.geom.extend_to(&boundary_geoms, pick, edge_mode) {
             Ok(new_geom) => {
                 if let Some(d) = self.doc.dobjects.get_mut(target_idx) {
@@ -2329,12 +2341,12 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                true
             }
             Err(msg) => {
-                if let Some(prev) = self.undo_stack.pop() {
-                    self.doc = prev;
-                }
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! extend #{}: {}", target_idx, msg));
+                false
             }
         }
     }
@@ -4479,24 +4491,30 @@ impl eframe::App for CadApp {
                         ));
                         if let Some(tgt) = hit {
                             let n_before = self.doc.dobjects.len();
-                            self.apply_trim_pick(&cutters, tgt, click_world);
+                            let did_trim = self.apply_trim_pick(&cutters, tgt, click_world);
                             let n_after = self.doc.dobjects.len();
-                            // Trim might have failed (no intersection / etc.);
-                            // detect via doc-size delta: success removes 1 and
-                            // appends N>=0 pieces → net change is N-1.
                             let net = n_after as i64 - n_before as i64;
                             self.trim_dbg(format!(
-                                "  → apply_trim_pick result: dobjects {}→{}  (net {:+})",
-                                n_before, n_after, net));
-                            let patched: Vec<usize> = if let TrimState::PickingTargets(c) = &mut self.trim_state {
-                                c.retain(|&i| i != tgt);
-                                for c_i in c.iter_mut() {
-                                    if *c_i > tgt { *c_i -= 1; }
-                                }
-                                c.clone()
-                            } else { Vec::new() };
-                            self.trim_dbg(format!(
-                                "  → cutters patched = {:?}", patched));
+                                "  → apply_trim_pick success={}  dobjects {}→{}  (net {:+})",
+                                did_trim, n_before, n_after, net));
+                            // CRITICAL: only patch the cutter list when the
+                            // trim actually mutated the doc. Patching on
+                            // failure corrupts the list (the bug the user
+                            // caught — see commit ae54eef debug log).
+                            if did_trim {
+                                let patched: Vec<usize> = if let TrimState::PickingTargets(c) = &mut self.trim_state {
+                                    c.retain(|&i| i != tgt);
+                                    for c_i in c.iter_mut() {
+                                        if *c_i > tgt { *c_i -= 1; }
+                                    }
+                                    c.clone()
+                                } else { Vec::new() };
+                                self.trim_dbg(format!(
+                                    "  → cutters patched = {:?}", patched));
+                            } else {
+                                self.trim_dbg(
+                                    "  → cutter list UNCHANGED (trim failed; preserving cutters)".to_string());
+                            }
                         } else {
                             // Void click — log + do nothing. Session continues.
                             self.history.push(
