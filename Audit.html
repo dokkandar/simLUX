@@ -1,0 +1,659 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RUST_CAD — Audit vs LibreCAD</title>
+<style>
+:root {
+  --bg:#0f1419; --bg-elev:#161b22; --bg-tbl:#11161d;
+  --fg:#d4d4d8; --fg-dim:#8b949e; --accent:#79c0ff; --border:#30363d;
+  --ok:#3fb950; --partial:#d29922; --planned:#8b949e;
+  --deferred:#a371f7; --missing:#ff7b72;
+  --score-bar:#21262d;
+}
+* { box-sizing: border-box; }
+body {
+  background: var(--bg); color: var(--fg);
+  font: 14.5px/1.55 -apple-system, "Segoe UI", system-ui, sans-serif;
+  margin: 0; padding: 0;
+}
+.layout { display: grid; grid-template-columns: 260px 1fr; min-height: 100vh; }
+nav.toc {
+  background: var(--bg-elev); border-right: 1px solid var(--border);
+  padding: 24px 18px; position: sticky; top: 0; align-self: start;
+  height: 100vh; overflow-y: auto;
+}
+nav.toc h2 { font-size: 11px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--fg-dim); margin: 18px 0 8px; }
+nav.toc h2:first-child { margin-top: 0; }
+nav.toc a { display: block; color: var(--fg); text-decoration: none; padding: 4px 8px; border-radius: 4px; font-size: 13px; }
+nav.toc a:hover { background: rgba(255,255,255,0.06); color: var(--accent); }
+main { padding: 32px 48px 80px; max-width: 1200px; }
+
+.cover {
+  background: linear-gradient(180deg, rgba(255,123,114,0.10), transparent);
+  border: 1px solid var(--border); border-radius: 10px;
+  padding: 24px 32px; margin-bottom: 28px;
+}
+.cover h1 { margin: 0 0 6px; font-size: 26px; }
+.cover .subtitle { color: var(--fg-dim); font-size: 13px; }
+.cover p { margin-top: 12px; }
+
+.score-block {
+  display: grid; grid-template-columns: 1fr 320px; gap: 28px;
+  margin: 28px 0;
+}
+.score-headline {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px;
+  padding: 22px 26px;
+}
+.score-big {
+  font-size: 56px; font-weight: 700; color: var(--accent); line-height: 1;
+  display: flex; align-items: baseline; gap: 8px;
+}
+.score-big span.label { font-size: 14px; color: var(--fg-dim); font-weight: 400; }
+.score-byline { color: var(--fg-dim); font-size: 13px; margin-top: 8px; }
+
+.score-bars { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px; padding: 18px 22px; }
+.score-bars h4 { margin: 0 0 12px; font-size: 12px; text-transform: uppercase; letter-spacing: 1.5px; color: var(--fg-dim); }
+.score-bar-row { display: grid; grid-template-columns: 100px 1fr 40px; gap: 8px; align-items: center; margin-bottom: 8px; font-size: 12.5px; }
+.score-bar-name { color: var(--fg-dim); }
+.score-bar-track { background: var(--score-bar); border-radius: 3px; height: 10px; overflow: hidden; }
+.score-bar-fill { height: 100%; background: linear-gradient(90deg, var(--missing) 0%, var(--partial) 50%, var(--ok) 100%); }
+.score-bar-pct { color: var(--fg); text-align: right; font-family: monospace; font-size: 11.5px; }
+
+h1 { font-size: 24px; border-bottom: 1px solid var(--border); padding-bottom: 10px; margin: 48px 0 14px; }
+h2 { font-size: 19px; margin: 32px 0 10px; }
+h3 { font-size: 16px; margin: 22px 0 8px; color: var(--accent); }
+h4 { font-size: 13px; margin: 16px 0 6px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 1px; }
+a { color: var(--accent); }
+code {
+  background: rgba(110,118,129,0.18); padding: 1px 6px; border-radius: 4px;
+  font-family: "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace; font-size: 12.5px;
+}
+
+.cat-intro { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin: 12px 0 18px; }
+.cat-intro .col {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  padding: 12px 16px; font-size: 13px;
+}
+.cat-intro .col strong { color: var(--accent); }
+
+.tbl-wrap { overflow-x: auto; margin: 12px 0 20px; border: 1px solid var(--border); border-radius: 6px; }
+table { border-collapse: collapse; width: 100%; background: var(--bg-tbl); }
+th, td { padding: 8px 12px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); font-size: 13.5px; }
+th { background: var(--bg-elev); color: var(--accent); font-weight: 600; }
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(255,255,255,0.025); }
+td.status { white-space: nowrap; font-weight: 600; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.5px; }
+.s-done     { color: var(--ok); }
+.s-partial  { color: var(--partial); }
+.s-planned  { color: var(--planned); }
+.s-deferred { color: var(--deferred); }
+.s-missing  { color: var(--missing); }
+
+.legend {
+  display: flex; gap: 22px; flex-wrap: wrap;
+  background: var(--bg-elev); border: 1px solid var(--border);
+  border-radius: 6px; padding: 12px 18px; margin: 14px 0 28px;
+  font-size: 13px;
+}
+.legend .item { display: flex; align-items: center; gap: 6px; }
+
+.assessment { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.assessment .panel {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 8px;
+  padding: 18px 22px;
+}
+.assessment .panel.strengths { border-left: 3px solid var(--ok); }
+.assessment .panel.risks     { border-left: 3px solid var(--missing); }
+.assessment h3 { margin-top: 0; color: var(--fg); font-size: 17px; }
+.assessment .item { margin-bottom: 16px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }
+.assessment .item:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+.assessment .item .head { font-weight: 600; color: var(--accent); margin-bottom: 5px; font-size: 14px; }
+.assessment .item.s-risks .head { color: var(--missing); }
+.assessment .item .body { font-size: 13px; color: var(--fg); }
+
+.summary-numbers {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 14px;
+  margin: 18px 0;
+}
+.summary-numbers .stat {
+  background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  padding: 14px 16px; text-align: center;
+}
+.summary-numbers .stat .n { font-size: 26px; font-weight: 700; color: var(--accent); }
+.summary-numbers .stat .l { font-size: 11px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 1px; margin-top: 4px; }
+
+.recommendation { background: rgba(121,192,255,0.05); border-left: 3px solid var(--accent);
+  padding: 12px 18px; border-radius: 0 6px 6px 0; margin: 14px 0; }
+.recommendation strong { color: var(--accent); }
+
+.method { background: var(--bg-elev); border: 1px solid var(--border); border-radius: 6px;
+  padding: 16px 20px; font-size: 13px; color: var(--fg-dim); }
+.method p { margin: 6px 0; }
+.method strong { color: var(--fg); }
+</style>
+</head>
+<body>
+<div class="layout">
+<nav class="toc"><h2>Audit</h2><a href="#summary">Executive summary</a><a href="#method">Methodology</a><a href="#assessment">Architectural assessment</a><a href="#recommendations">Recommendations</a><h2>Categories</h2><a href="#entities">1. Entity types (Dobjects)</a><a href="#snaps">2. Object snap kinds</a><a href="#draw">3. Drafting / draw tools</a><a href="#edit">4. Edit / modify tools</a><a href="#selection">5. Selection methods</a><a href="#panels">6. Dock panels (UI)</a><a href="#files">7. File formats</a><a href="#plot">8. Print / plot</a><a href="#settings">9. Settings / SYSVARS</a></nav>
+<main>
+
+<section class="cover">
+<h1>RUST_CAD — Third-Party Audit vs LibreCAD baseline</h1>
+<div class="subtitle">
+Generated <strong>2026-06-01 13:52</strong> &nbsp;•&nbsp;
+Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
+Tests passing: <strong>91</strong> &nbsp;•&nbsp;
+Recent commits:
+</div>
+<pre style="margin-top:10px;font-size:11.5px;">c44acd3 Slice J: Editing operations (copy / rotate / scale / mirror / delete / undo)
+ec54a0a Slice I: .rsm binary format (RUST_CAD-native)
+97cf18b Slice H: cad_io crate + DXF round-trip
+2d9244c Regenerate Plan_Report.html after slices B / C / D / E
+aa092c7 Slice E (partial): DobjectPoint + DobjectPolyline</pre>
+<p>
+This document evaluates the RUST_CAD project as if reviewed by an outside
+engineer, using LibreCAD as the established 2D-CAD baseline. It is the
+project's <strong>compass</strong>: read it whenever you suspect the
+slice plan is drifting, or before adding new scope. Each category lists
+LibreCAD's feature surface, the corresponding RUST_CAD status, and notes
+on gaps. Categories are weighted; the overall score reflects rough parity.
+</p>
+<p>Audit philosophy: be honest about what isn't there. A roadmap is only
+useful when it stays attached to reality.</p>
+</section>
+
+
+<section id="summary">
+<div class="score-block">
+<div class="score-headline">
+<div class="score-big">27.9% <span class="label">weighted LibreCAD parity</span></div>
+<div class="score-byline">
+Scoring: <code>done</code> = 1.0, <code>partial</code> = 0.4, everything else = 0.
+Per-category weights reflect importance to a working CAD workflow
+(entities &amp; edit-ops heaviest; print/plot lightest). The number above
+is a directional indicator — not a benchmark.
+</div>
+</div>
+<div class="score-bars">
+<h4>Per-category</h4>
+<div class="score-bar-row"><div class="score-bar-name">entities</div><div class="score-bar-track"><div class="score-bar-fill" style="width:24%"></div></div><div class="score-bar-pct">24%</div></div><div class="score-bar-row"><div class="score-bar-name">snaps</div><div class="score-bar-track"><div class="score-bar-fill" style="width:53%"></div></div><div class="score-bar-pct">53%</div></div><div class="score-bar-row"><div class="score-bar-name">draw</div><div class="score-bar-track"><div class="score-bar-fill" style="width:38%"></div></div><div class="score-bar-pct">38%</div></div><div class="score-bar-row"><div class="score-bar-name">edit</div><div class="score-bar-track"><div class="score-bar-fill" style="width:13%"></div></div><div class="score-bar-pct">13%</div></div><div class="score-bar-row"><div class="score-bar-name">selection</div><div class="score-bar-track"><div class="score-bar-fill" style="width:54%"></div></div><div class="score-bar-pct">54%</div></div><div class="score-bar-row"><div class="score-bar-name">panels</div><div class="score-bar-track"><div class="score-bar-fill" style="width:35%"></div></div><div class="score-bar-pct">35%</div></div><div class="score-bar-row"><div class="score-bar-name">files</div><div class="score-bar-track"><div class="score-bar-fill" style="width:12%"></div></div><div class="score-bar-pct">12%</div></div><div class="score-bar-row"><div class="score-bar-name">plot</div><div class="score-bar-track"><div class="score-bar-fill" style="width:0%"></div></div><div class="score-bar-pct">0%</div></div><div class="score-bar-row"><div class="score-bar-name">settings</div><div class="score-bar-track"><div class="score-bar-fill" style="width:27%"></div></div><div class="score-bar-pct">27%</div></div>
+</div>
+</div>
+</section>
+
+<section class="legend">
+<div class="item"><span class="s-done">● done</span></div>
+<div class="item"><span class="s-partial">◐ partial</span></div>
+<div class="item"><span class="s-planned">○ planned</span></div>
+<div class="item"><span class="s-deferred">◌ deferred</span></div>
+<div class="item"><span class="s-missing">✗ missing</span></div>
+</section>
+
+
+<section id="method">
+<h1>Methodology</h1>
+<div class="method">
+<p><strong>Baseline:</strong> LibreCAD (<code>~/workspace/Librecad/LibreCAD-master/</code>),
+HSI fork branch. Feature surface surveyed across <code>src/lib/engine/</code>,
+<code>src/actions/</code>, <code>src/ui/dock_widgets/</code>, <code>src/lib/fileio/</code>.</p>
+
+<p><strong>Subject:</strong> RUST_CAD (<code>~/workspace/RUST_CAD/</code>),
+<code>main</code> branch. State as of generation timestamp. Sources of truth:
+<code>cad_kernel/src/</code> (~16 modules), <code>cad_app/src/app.rs</code>,
+<code>cad_io/src/</code>, the three reference docs at workspace root
+(<code>Variables.md</code>, <code>Dobject_DXF.md</code>, <code>Dobject_Properties.md</code>),
+and <code>ROADMAP.md</code> for declared intent.</p>
+
+<p><strong>What counts as &quot;done&quot;:</strong> the capability is in code, exercised
+by a test or wired to the UI, and behaves the way a CAD user would expect.
+&quot;Partial&quot; means a subset works or the data is stored but a consumer is
+missing. &quot;Planned&quot;, &quot;deferred&quot;, &quot;missing&quot; are non-overlapping —
+explicit roadmap intent vs deliberately out-of-scope vs not on anyone's
+list yet.</p>
+
+<p><strong>What's NOT audited:</strong> 3D modelling, BIM, parametric
+constraints, rendering quality, plug-in extensibility, Python/LISP
+scripting. RUST_CAD is a 2D drafting workbench; comparisons against 3D
+CAD or BIM tools belong in a different document.</p>
+</div>
+</section>
+
+<section id="entities">
+<h1>1. Entity types (Dobjects)</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> 19 core entity classes + 9 dimension variants. All inherit from RS_Entity; container-based composition for polylines and dimensions.</div>
+<div class="col"><strong>RUST_CAD:</strong> 7 entity types modelled as Geom enum variants inside the DObject wrapper struct (geom + style + handle). Adding a new type is a new variant — Style infrastructure is shared.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">27</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">6</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">1</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">20</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>RS_Line</code></td><td>● Line</td><td class="status s-done">● DONE</td><td>Geom::Line { a, b } — 2D today</td></tr>
+<tr><td><code>RS_Circle</code></td><td>● Circle</td><td class="status s-done">● DONE</td><td>Geom::Circle { center, radius }</td></tr>
+<tr><td><code>RS_Arc</code></td><td>● Arc</td><td class="status s-done">● DONE</td><td>Geom::Arc { center, radius, start_angle, sweep_angle }</td></tr>
+<tr><td><code>RS_Ellipse (full)</code></td><td>● Ellipse</td><td class="status s-done">● DONE</td><td>Geom::Ellipse { center, major, ratio }</td></tr>
+<tr><td><code>RS_Ellipse (arc)</code></td><td>● EllipseArc</td><td class="status s-done">● DONE</td><td>Split into separate variant for tighter algos</td></tr>
+<tr><td><code>RS_Point</code></td><td>● Point</td><td class="status s-done">● DONE</td><td>Geom::Point { location, style, size } — Slice E</td></tr>
+<tr><td><code>RS_Polyline (LW)</code></td><td>● Polyline</td><td class="status s-partial">◐ PARTIAL</td><td>Geom::Polyline — straight segments today; bulge field stored but not rendered as arc segments yet</td></tr>
+<tr><td><code>RS_Spline</code></td><td>Spline</td><td class="status s-deferred">◌ DEFERRED</td><td>NURBS — deferred indefinitely per project decision (heavy math, no concrete user need)</td></tr>
+<tr><td><code>RS_Text</code></td><td>Text (single)</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs TextStyleTable on Document first</td></tr>
+<tr><td><code>RS_MText</code></td><td>MText</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs TextStyleTable</td></tr>
+<tr><td><code>RS_Hatch</code></td><td>Hatch</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs pattern lib + boundary-path representation</td></tr>
+<tr><td><code>RS_Insert (block)</code></td><td>BlockRef</td><td class="status s-planned">○ PLANNED</td><td>Slice F — needs BlockTable on Document</td></tr>
+<tr><td><code>RS_Block (def)</code></td><td>BlockTable entry</td><td class="status s-planned">○ PLANNED</td><td>Slice F</td></tr>
+<tr><td><code>RS_Image</code></td><td>RasterImage</td><td class="status s-missing">✗ MISSING</td><td>Not in current roadmap; sketched in Dobject_Properties.md</td></tr>
+<tr><td><code>RS_Solid (2D)</code></td><td>Solid2D</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>RS_Leader</code></td><td>Leader</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>LC_MLeader</code></td><td>MLeader</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>LC_Tolerance</code></td><td>Tolerance</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>RS_ConstructionLine</code></td><td>Xline / Ray</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>LC_Hyperbola, LC_Parabola, LC_Rect</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>LibreCAD-specific extensions; not on roadmap</td></tr>
+<tr><td><code>RS_DimLinear</code></td><td>DimRotated</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs DimStyleTable on Document</td></tr>
+<tr><td><code>RS_DimAligned</code></td><td>DimAligned</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>RS_DimAngular</code></td><td>DimAngular</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>RS_DimRadial</code></td><td>DimRadial</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>RS_DimDiametric</code></td><td>DimDiameter</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>LC_DimArc</code></td><td>DimArc</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>LC_DimOrdinate</code></td><td>DimOrdinate</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+</tbody></table></div>
+</section>
+<section id="snaps">
+<h1>2. Object snap kinds</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> 10 modes (9 standard + 1 HSI-fork PER extension) as RS_SnapMode bool struct. Restrictions (Horizontal / Vertical / Orthogonal) applied as modifiers.</div>
+<div class="col"><strong>RUST_CAD:</strong> 8 kinds in cad_kernel::snap::SnapKind enum, with multi-candidate Tab cycling, mouse-priority vs object-priority activation rules, ellipse PER/TAN via multi-seed Newton (8 seeds, 30 iters).</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">15</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">8</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">0</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">7</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>SnapEndpoint</code></td><td>● END</td><td class="status s-done">● DONE</td><td>Endpoints of line / arc / ellipse arc; polyline vertices</td></tr>
+<tr><td><code>SnapMiddle</code></td><td>● MID</td><td class="status s-done">● DONE</td><td>Midpoint of line / angular midpoint of arc / parametric midpoint of ellipse arc; per-segment midpoint of polyline</td></tr>
+<tr><td><code>SnapCenter</code></td><td>● CEN</td><td class="status s-done">● DONE</td><td>Centre of circle / arc / ellipse / ellipse arc</td></tr>
+<tr><td><code>—</code></td><td>● QUA</td><td class="status s-done">● DONE</td><td>Quadrants of circles &amp; arcs, axis-end points of ellipses — RUST_CAD distinction LibreCAD lacks</td></tr>
+<tr><td><code>SnapIntersection</code></td><td>● INT</td><td class="status s-done">● DONE</td><td>Pairwise across all Geom-pair combinations (10 pair types)</td></tr>
+<tr><td><code>—</code></td><td>● PER (HSI ext)</td><td class="status s-done">● DONE</td><td>Perpendicular foot from anchor; both real and imaginary-extension feet emitted with anchor for dashed cue</td></tr>
+<tr><td><code>—</code></td><td>● TAN</td><td class="status s-done">● DONE</td><td>Tangent points from external anchor; supports ellipses via Newton</td></tr>
+<tr><td><code>SnapOnEntity</code></td><td>● NEA</td><td class="status s-done">● DONE</td><td>Nearest point on the visible curve</td></tr>
+<tr><td><code>SnapDistance</code></td><td>Dist</td><td class="status s-missing">✗ MISSING</td><td>Step along an entity by a fixed distance</td></tr>
+<tr><td><code>SnapGrid</code></td><td>Grid</td><td class="status s-missing">✗ MISSING</td><td>Snap to grid intersections (separate from grid display)</td></tr>
+<tr><td><code>SnapFree</code></td><td>Free</td><td class="status s-missing">✗ MISSING</td><td>Explicit no-snap mode (RUST_CAD: just disable all kinds)</td></tr>
+<tr><td><code>SnapAngle</code></td><td>Angle</td><td class="status s-missing">✗ MISSING</td><td>Polar tracking — `PolMod` SYSVAR catalogued in Variables.md, not wired</td></tr>
+<tr><td><code>RestrictHorizontal/Vertical/Ortho</code></td><td>Ortho restriction</td><td class="status s-missing">✗ MISSING</td><td>Modifier on top of snaps; not implemented</td></tr>
+<tr><td><code>Extension (apparent intersection)</code></td><td>AppInt</td><td class="status s-missing">✗ MISSING</td><td>DXF/AutoCAD-style apparent intersection across extended entities</td></tr>
+<tr><td><code>Parallel snap</code></td><td>PAR</td><td class="status s-missing">✗ MISSING</td><td>Snap parallel to another line</td></tr>
+</tbody></table></div>
+</section>
+<section id="draw">
+<h1>3. Drafting / draw tools</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> ~106 separate Action subclasses across line / circle / arc / ellipse / polyline / text / hatch / dim families. Each construction method is its own action.</div>
+<div class="col"><strong>RUST_CAD:</strong> 8 tools wired to the toolbar: Line, Circle, Arc (5 methods), Ellipse, EllipseArc, Point, Polyline. Construction math for all 5 arc methods (3-point, S-C-E, C-S-E, chord+radius, chord+length) is exposed via the command line.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">26</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">9</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">2</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">15</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Line 2-point</code></td><td>● Line tool</td><td class="status s-done">● DONE</td><td>Click two points</td></tr>
+<tr><td><code>Polyline multi-segment</code></td><td>● Polyline tool</td><td class="status s-done">● DONE</td><td>Click N points, Enter to finish, `close` to close</td></tr>
+<tr><td><code>Angle/orthogonal/parallel/perpendicular/tangent/bisector/freehand line</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>8 LibreCAD variants — none implemented</td></tr>
+<tr><td><code>Circle center-radius (click)</code></td><td>● Circle tool</td><td class="status s-done">● DONE</td><td>Click centre then radius point</td></tr>
+<tr><td><code>Circle 2P / 3P / TTR / TTT / inscribed</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>LibreCAD has 6 circle variants; RUST_CAD has 1</td></tr>
+<tr><td><code>Arc 3-point</code></td><td>● Arc tool method</td><td class="status s-done">● DONE</td><td>ArcMethod::ThreePoints</td></tr>
+<tr><td><code>Arc start-center-end</code></td><td>● Arc tool method</td><td class="status s-done">● DONE</td><td>ArcMethod::StartCenterEnd</td></tr>
+<tr><td><code>Arc center-start-end</code></td><td>● Arc tool method</td><td class="status s-done">● DONE</td><td>ArcMethod::CenterStartEnd</td></tr>
+<tr><td><code>Arc chord+radius</code></td><td>◐ via cmd line</td><td class="status s-partial">◐ PARTIAL</td><td>`arccr` command; not wired to toolbar</td></tr>
+<tr><td><code>Arc chord+arclength</code></td><td>◐ via cmd line</td><td class="status s-partial">◐ PARTIAL</td><td>`arccl` command; not wired to toolbar</td></tr>
+<tr><td><code>Arc 2-point+angle / +height</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>LibreCAD-only variants</td></tr>
+<tr><td><code>Ellipse</code></td><td>● Ellipse tool</td><td class="status s-done">● DONE</td><td>centre + major-end + minor-side click flow</td></tr>
+<tr><td><code>Elliptical arc</code></td><td>● EllipseArc tool</td><td class="status s-done">● DONE</td><td>5-click flow (centre, major, minor, start, end)</td></tr>
+<tr><td><code>Rectangle</code></td><td>Rect</td><td class="status s-missing">✗ MISSING</td><td>Trivial — could ship as polyline preset</td></tr>
+<tr><td><code>Polygon (regular N-gon)</code></td><td>Polygon</td><td class="status s-missing">✗ MISSING</td><td>Not on roadmap</td></tr>
+<tr><td><code>Point</code></td><td>● Point tool</td><td class="status s-done">● DONE</td><td>Slice E</td></tr>
+<tr><td><code>Spline</code></td><td>Spline tool</td><td class="status s-deferred">◌ DEFERRED</td><td>Geometry kernel deferred</td></tr>
+<tr><td><code>Text (single-line)</code></td><td>Text tool</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs TextStyleTable</td></tr>
+<tr><td><code>MText (multi-line)</code></td><td>MText tool</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
+<tr><td><code>Hatch</code></td><td>Hatch tool</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — pattern library required</td></tr>
+<tr><td><code>Image insert</code></td><td>Image</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>Block insert (Insert)</code></td><td>BlockRef</td><td class="status s-planned">○ PLANNED</td><td>Slice F</td></tr>
+<tr><td><code>Dimensions — 18 LC draw actions</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x. Today 0 of the 9 dim variants implemented</td></tr>
+<tr><td><code>GD&amp;T Feature Control Frame</code></td><td>Tolerance</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>Leader / MLeader</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
+<tr><td><code>LC Hyperbola / Parabola</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>LibreCAD extensions, not on roadmap</td></tr>
+</tbody></table></div>
+</section>
+<section id="edit">
+<h1>4. Edit / modify tools</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> ~48 modify Action classes covering transform / trim / join / polyline-segment ops / explode / order / attribute-edit. Global undo/redo transaction system.</div>
+<div class="col"><strong>RUST_CAD:</strong> 1 edit tool implemented: Move. Selection backbone is built and QueuedOp pattern lets future commands auto-enter selection mode. No undo/redo yet.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">22</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">2</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">2</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">18</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Move</code></td><td>● `move` cmd</td><td class="status s-done">● DONE</td><td>Translate selection by (end - base)</td></tr>
+<tr><td><code>Copy</code></td><td>Copy</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Duplicate</code></td><td>Duplicate</td><td class="status s-planned">○ PLANNED</td><td>Slice J — degenerate copy</td></tr>
+<tr><td><code>Rotate</code></td><td>Rotate</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Scale</code></td><td>Scale</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Mirror</code></td><td>Mirror</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Stretch</code></td><td>Stretch</td><td class="status s-planned">○ PLANNED</td><td>Slice J — moves vertices inside a window</td></tr>
+<tr><td><code>Offset (parallel)</code></td><td>Offset</td><td class="status s-planned">○ PLANNED</td><td>Slice J — geometric offset, per-Geom impl</td></tr>
+<tr><td><code>Align (3 variants)</code></td><td>Align</td><td class="status s-missing">✗ MISSING</td><td>Not on roadmap; lower priority</td></tr>
+<tr><td><code>Trim / Trim-by-amount</code></td><td>Trim</td><td class="status s-planned">○ PLANNED</td><td>Slice J — likely a large slice on its own</td></tr>
+<tr><td><code>Cut / Break</code></td><td>Break</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Divide</code></td><td>Divide</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Fillet (round)</code></td><td>Fillet</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Chamfer (bevel)</code></td><td>Chamfer</td><td class="status s-planned">○ PLANNED</td><td>Slice J</td></tr>
+<tr><td><code>Polyline segment ops (add / append / delete / change type / trim / offset)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>8 LibreCAD ops — none yet</td></tr>
+<tr><td><code>Delete</code></td><td>● `del N`</td><td class="status s-partial">◐ PARTIAL</td><td>Single-index delete via cmd line. Bulk delete on selection: missing</td></tr>
+<tr><td><code>Explode (blocks → entities)</code></td><td>Explode</td><td class="status s-missing">✗ MISSING</td><td>Depends on Slice F</td></tr>
+<tr><td><code>Explode text</code></td><td>ExplodeText</td><td class="status s-missing">✗ MISSING</td><td>Depends on text + outline conversion</td></tr>
+<tr><td><code>Attributes (pen/layer edit)</code></td><td>● Entity Info panel</td><td class="status s-done">● DONE</td><td>Slice D — per-entity layer / color / linetype / lineweight editing</td></tr>
+<tr><td><code>Array (rect / polar)</code></td><td>● Rect array</td><td class="status s-partial">◐ PARTIAL</td><td>Rect array works on a single source dobject; polar array missing</td></tr>
+<tr><td><code>Order (Z-order)</code></td><td>Order</td><td class="status s-missing">✗ MISSING</td><td>Send-to-back / bring-to-front</td></tr>
+<tr><td><code>Undo / Redo</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>No transaction system — biggest functional gap</td></tr>
+</tbody></table></div>
+</section>
+<section id="selection">
+<h1>5. Selection methods</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> 10 selection actions including window, crossing, contour, intersected, lasso, by-layer.</div>
+<div class="col"><strong>RUST_CAD:</strong> Selection backbone wired via SelectMode + QueuedOp. AutoCAD-style sub-commands during a selection session: window, crossing, single, previous (`before`), all, none, add/remove modes, Shift+click for remove.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">13</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">7</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">0</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">6</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Single entity click</code></td><td>● Single click</td><td class="status s-done">● DONE</td><td>click_select(i, shift)</td></tr>
+<tr><td><code>Window (inside) drag</code></td><td>● `inside` window</td><td class="status s-done">● DONE</td><td>L→R drag — only fully-enclosed dobjects</td></tr>
+<tr><td><code>Crossing window drag</code></td><td>● `crossing` window</td><td class="status s-done">● DONE</td><td>R→L drag — anything touching the rect</td></tr>
+<tr><td><code>All</code></td><td>● `all` cmd</td><td class="status s-done">● DONE</td><td>AutoCAD-style</td></tr>
+<tr><td><code>Invert</code></td><td>Invert</td><td class="status s-missing">✗ MISSING</td><td>Not yet</td></tr>
+<tr><td><code>Previous (`before`)</code></td><td>● `before` cmd</td><td class="status s-done">● DONE</td><td>Re-adds the last finalised selection</td></tr>
+<tr><td><code>None / deselect</code></td><td>● `none` cmd</td><td class="status s-done">● DONE</td><td>Clear selection</td></tr>
+<tr><td><code>Add / Remove mode toggles</code></td><td>● `add` / `remove` cmds</td><td class="status s-done">● DONE</td><td>AutoCAD-style during session</td></tr>
+<tr><td><code>By layer</code></td><td>By layer</td><td class="status s-missing">✗ MISSING</td><td>Not yet; trivial follow-up since LayerTable exists</td></tr>
+<tr><td><code>By block</code></td><td>By block</td><td class="status s-missing">✗ MISSING</td><td>Depends on Slice F</td></tr>
+<tr><td><code>Contour (trace edges)</code></td><td>Contour</td><td class="status s-missing">✗ MISSING</td><td>Walk connected entities</td></tr>
+<tr><td><code>Intersected (SAT)</code></td><td>Intersected</td><td class="status s-missing">✗ MISSING</td><td>True SAT polygon test</td></tr>
+<tr><td><code>Lasso (freehand)</code></td><td>Lasso</td><td class="status s-missing">✗ MISSING</td><td>Freehand outline</td></tr>
+</tbody></table></div>
+</section>
+<section id="panels">
+<h1>6. Dock panels (UI)</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> 13 core dock widgets + 10 status-bar widgets. QDockWidget pattern with custom view renderers (tree models for layers/blocks).</div>
+<div class="col"><strong>RUST_CAD:</strong> 3 dock panels (Layer, Pen palette, Entity Info) — first-pass implementations matching LibreCAD&#x27;s core read/write capability. Status bar still minimal.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">16</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">4</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">4</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">8</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Layers (grid)</code></td><td>● Layer panel</td><td class="status s-done">● DONE</td><td>Slice B — add/rename/delete, visibility/lock/freeze, active radio, color swatch</td></tr>
+<tr><td><code>Layers Tree (hierarchy)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Flat layer model only; hierarchical extension if needed later</td></tr>
+<tr><td><code>Pen Palette</code></td><td>● Pen palette</td><td class="status s-done">● DONE</td><td>Slice C — 7 default presets, apply-to-selection</td></tr>
+<tr><td><code>Entity Info / Properties</code></td><td>● Entity Info</td><td class="status s-done">● DONE</td><td>Slice D — single + multi-sel, editable layer/color/linetype/lineweight</td></tr>
+<tr><td><code>Pen Wizard</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Click-to-set-pen-by-existing-entity workflow</td></tr>
+<tr><td><code>Blocks</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice F</td></tr>
+<tr><td><code>Library (DXF browser)</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice G</td></tr>
+<tr><td><code>Command Line dock</code></td><td>● command line</td><td class="status s-partial">◐ PARTIAL</td><td>Always-listen text input wired; no separate dock widget — embedded in main area</td></tr>
+<tr><td><code>Named Views</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice G</td></tr>
+<tr><td><code>UCS List</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice G</td></tr>
+<tr><td><code>Workspaces / Layout manager</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Egui dock layout is built-in; LibreCAD-style workspace persistence not yet</td></tr>
+<tr><td><code>Debug Log (HSI fork)</code></td><td>◐ debug window</td><td class="status s-partial">◐ PARTIAL</td><td>RUST_CAD has render-mode debug + index stats; no general log viewer</td></tr>
+<tr><td><code>Status bar — coords</code></td><td>● coord display</td><td class="status s-done">● DONE</td><td>Bottom-bar widget</td></tr>
+<tr><td><code>Status bar — selection count</code></td><td>◐</td><td class="status s-partial">◐ PARTIAL</td><td>Shown in Entity Info, not as separate widget</td></tr>
+<tr><td><code>Status bar — active layer</code></td><td>◐</td><td class="status s-partial">◐ PARTIAL</td><td>Visible in Layer panel</td></tr>
+<tr><td><code>Status bar — grid / UCS / angles / rel-zero</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>All shown in LibreCAD&#x27;s status bar</td></tr>
+</tbody></table></div>
+</section>
+<section id="files">
+<h1>7. File formats</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> 5 filters registered: DXF (libdxfrw, multi-version), legacy DXF, LFF, JWW, CXF. DWG via libdxfrw (marked unsafe). No 3D / STEP.</div>
+<div class="col"><strong>RUST_CAD:</strong> 1 filter: DXF (cad_io::dxf). Round-trips currently supported entity types + LAYER + LTYPE tables. Files written by RUST_CAD open cleanly in LibreCAD. Native .rsm planned (Slice I).</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">10</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">0</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">3</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">7</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>DXF read</code></td><td>● dxf::read_dxf</td><td class="status s-partial">◐ PARTIAL</td><td>Slice H — Line/Circle/Arc/Ellipse/EllipseArc/Point/LWPolyline + LAYER + LTYPE. Untested: blocks, dim styles, xdata, complex hatches, text, splines, inserts.</td></tr>
+<tr><td><code>DXF write</code></td><td>● dxf::write_dxf</td><td class="status s-partial">◐ PARTIAL</td><td>Same surface as read; LibreCAD opens output cleanly</td></tr>
+<tr><td><code>DXF versions</code></td><td>ASCII</td><td class="status s-partial">◐ PARTIAL</td><td>Current writer emits ASCII; specific R-version tagging tentative — needs verification</td></tr>
+<tr><td><code>DWG</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Would need a libdxfrw equivalent or pure-Rust DWG reader (none mature)</td></tr>
+<tr><td><code>LFF (LibreCAD native)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Not on roadmap</td></tr>
+<tr><td><code>JWW</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Niche</td></tr>
+<tr><td><code>CXF</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Niche</td></tr>
+<tr><td><code>.rsm (native binary)</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Slice I — AutoRASM-native; format shape TBD (serde/rkyv/custom)</td></tr>
+<tr><td><code>File dialog (rfd / native)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Today: `open &lt;path&gt;` / `save &lt;path&gt;` via cmd line only</td></tr>
+<tr><td><code>3D formats (STEP / IGES)</code></td><td>—</td><td class="status s-deferred">◌ DEFERRED</td><td>Out of scope until RUST_CAD goes 3D</td></tr>
+</tbody></table></div>
+</section>
+<section id="plot">
+<h1>8. Print / plot</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> Print preview, page setup, scale-to-fit, PDF export via LC_Printing, batch dxf2pdf CLI. Per-layer plot enable.</div>
+<div class="col"><strong>RUST_CAD:</strong> Not started. Nothing on roadmap before Slice K+.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">7</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">0</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">0</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">7</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Print preview</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>No plot subsystem</td></tr>
+<tr><td><code>Page setup</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>—</td></tr>
+<tr><td><code>Scale-to-fit</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>—</td></tr>
+<tr><td><code>PDF export</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>—</td></tr>
+<tr><td><code>Multi-page</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>—</td></tr>
+<tr><td><code>Plot styles per layer</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Layer.plottable bit exists in struct; no consumer</td></tr>
+<tr><td><code>Batch CLI converter</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Future possibility once cad_io is solid</td></tr>
+</tbody></table></div>
+</section>
+<section id="settings">
+<h1>9. Settings / SYSVARS</h1>
+<div class="cat-intro">
+<div class="col"><strong>LibreCAD:</strong> RS_Settings singleton (Qt QSettings) — hierarchical key-value store. Estimated 200+ distinct keys across grid, snap, colors, UI, units, text/dim defaults.</div>
+<div class="col"><strong>RUST_CAD:</strong> UserEnv struct in cad_app/src/settings.rs — cryptic AutoCAD-style short names (SpTGSZ, GrpEnb). 209 entries catalogued in Variables.md. Persisted to ~/.config/rust_cad/user_env.txt.</div>
+</div>
+<div class="summary-numbers">
+<div class="stat"><div class="n">12</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">2</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">3</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">7</div><div class="l">○/◌/✗ pending</div></div>
+</div>
+<div class="tbl-wrap"><table>
+<thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
+<tr><td><code>Total settings exposed</code></td><td>≈ 200+</td><td class="status s-planned">—</td><td>LibreCAD</td></tr>
+<tr><td><code>Total catalogued</code></td><td>209</td><td class="status s-planned">—</td><td>Variables.md is the contract</td></tr>
+<tr><td><code>Actually wired (●)</code></td><td>≈ 7</td><td class="status s-partial">◐ PARTIAL</td><td>SpTGSZ, GrpEnb, GrClrU/S, GrpSz, plus pen panel defaults. Most ◐ Planned.</td></tr>
+<tr><td><code>Persistence</code></td><td>● user_env.txt</td><td class="status s-done">● DONE</td><td>Format: one KEY=VALUE per line, forward-compatible (unknown keys ignored)</td></tr>
+<tr><td><code>Settings UI</code></td><td>● Settings window</td><td class="status s-partial">◐ PARTIAL</td><td>Lists all UserEnv fields with cryptic name + plain-English label + live preview pane on the right</td></tr>
+<tr><td><code>Grid (spacing / snap / iso)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Grid renders; no SYSVAR-driven spacing yet</td></tr>
+<tr><td><code>Snap kinds (running osnaps)</code></td><td>● SnapSet panel</td><td class="status s-done">● DONE</td><td>Floating window; toggles persist via UserEnv</td></tr>
+<tr><td><code>Color preferences (bg / grid / snap)</code></td><td>◐</td><td class="status s-partial">◐ PARTIAL</td><td>Bg / accent colours hardcoded; some catalogued (CrsACol, IntsCol, …)</td></tr>
+<tr><td><code>Toolbar / palette visibility</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Egui auto-handles dock state; not persisted</td></tr>
+<tr><td><code>Units (mm / inch / drawing unit)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>No unit system yet</td></tr>
+<tr><td><code>Angle display format (deg / rad / DMS)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Not yet</td></tr>
+<tr><td><code>Text / dim style defaults</code></td><td>—</td><td class="status s-planned">○ PLANNED</td><td>Depends on Text/Dim slices</td></tr>
+</tbody></table></div>
+</section>
+
+<section id="assessment">
+<h1>Architectural assessment</h1>
+<div class="assessment">
+<div class="panel strengths"><h3>Strengths</h3>
+<div class="item">
+<div class="head">Pure Rust, single binary</div>
+<div class="body">No Qt baggage, no webview, no IPC. eframe + glow gives a GL context on the main thread. Cross-compiles cleanly; no system-package dependencies beyond the desktop GL stack.</div>
+</div>
+<div class="item">
+<div class="head">Property foundation is structurally right</div>
+<div class="body">DObject = geom + style + handle. Future entity types add a Geom variant; they get layer/color/linetype/lineweight/visibility for free. This is the key payoff of Slice A — it avoids per-variant retrofits down the line.</div>
+</div>
+<div class="item">
+<div class="head">Geometry math is independently testable</div>
+<div class="body">70 kernel tests + 15 cad_io tests + 2 doctests = 87 total, all passing. Snap helpers, intersection pairs, and ellipse PER/TAN/INT (multi-seed Newton) all under #[cfg(test)] coverage. cad_cli REPL lets a human pipe commands in and diff intersection output line-by-line.</div>
+</div>
+<div class="item">
+<div class="head">Spatial index built in</div>
+<div class="body">UniformGrid bucketing into all overlapping cells, auto-cell-size targeting ~10 dobjects per cell. PAIR_LIMIT cap (5M) protects against runaway intersection sweeps. Lazy rebuild on edit.</div>
+</div>
+<div class="item">
+<div class="head">DXF round-trip with LibreCAD compat verified</div>
+<div class="body">Slice H emits DXF files that LibreCAD opens cleanly. Reader handles the current 7 entity types + LAYER + LTYPE tables. Foundation for serious interop is in.</div>
+</div>
+<div class="item">
+<div class="head">Reference documents are real contracts</div>
+<div class="body">Variables.md (209 SYSVARS), Dobject_DXF.md (~310 group codes), Dobject_Properties.md (per-type fields). Three docs, plus ROADMAP.md, plus Plan_Report.html and this Audit.html. Every architectural decision has a documented home.</div>
+</div>
+</div>
+<div class="panel risks"><h3>Risks &amp; gaps</h3>
+<div class="item s-risks">
+<div class="head">No undo / redo</div>
+<div class="body">Single biggest functional gap. Every other commercial / open CAD has undo as table-stakes. Touches every edit op, every panel mutation, every import. Plan: implement at the Document level (full snapshot diff or operation log) before Slice J editing ops land — not after.</div>
+</div>
+<div class="item s-risks">
+<div class="head">No UI tests</div>
+<div class="body">egui is hard to drive headlessly. CPU renderer ByLayer resolution, selection toggles, and panel edits are verified manually. Plan: introduce snapshot tests on canvas painter output OR integration tests on the underlying CadApp methods (without instantiating the egui Context).</div>
+</div>
+<div class="item s-risks">
+<div class="head">ACI palette only covers 7 colors</div>
+<div class="body">cad_kernel/src/color.rs aci_palette() handles indices 0–9 only; 10–255 fall back to white. Real AutoCAD has all 256 mapped. Imported DXF files that use non-trivial palette indices will look wrong.</div>
+</div>
+<div class="item s-risks">
+<div class="head">GPU renderer doesn&#x27;t honour ByLayer yet</div>
+<div class="body">CPU path resolves Color::ByLayer correctly. GPU path (CircleInstance color field is u32, but populated from sel/snap/default hardcoded values). Mixed-mode (CPU lines/arcs + GPU circles) shows the gap visibly when GPU is enabled.</div>
+</div>
+<div class="item s-risks">
+<div class="head">Handle counter is process-global, not per-Document</div>
+<div class="body">Won&#x27;t round-trip cleanly when DXF files carry their own hex handles. Will need to either preserve source handles verbatim or remap on import. Decision pending — flagged in Plan_Report.html Open Questions.</div>
+</div>
+<div class="item s-risks">
+<div class="head">Most catalogued SYSVARS are not wired</div>
+<div class="body">209 entries in Variables.md — only ~7 actually drive behaviour. The Settings panel surfaces them all (so future wiring is one-line per row), but a user expecting AutoCAD parity today will hit a lot of inert toggles.</div>
+</div>
+<div class="item s-risks">
+<div class="head">DXF I/O is one-pass and shallow</div>
+<div class="body">Slice H proves the round-trip pipeline but doesn&#x27;t handle xdata, blocks, complex hatches, dim styles, text styles, splines, inserts, or proxy graphics. Real-world DXF files routinely use all of these. Treat current cad_io as a proof-of-life; harden against AutoCAD-authored files before any &#x27;open DXF&#x27; marketing claim.</div>
+</div>
+<div class="item s-risks">
+<div class="head">Polyline bulge rendering</div>
+<div class="body">PolyVertex.bulge field is stored but not interpreted as arc segments at render or snap time. Imported polylines with bulges will look like polylines of straight chords instead of arcs.</div>
+</div>
+<div class="item s-risks">
+<div class="head">No layer-tree hierarchy</div>
+<div class="body">LibreCAD has both flat and hierarchical layer panels. RUST_CAD&#x27;s LayerTable is flat. If real drawings use grouped layers, this becomes a panel limitation, not a kernel one.</div>
+</div>
+<div class="item s-risks">
+<div class="head">Print / plot not even sketched</div>
+<div class="body">Roadmap places this after .rsm and editing ops. Engineers expecting a workable CAD will note its absence — this is a &#x27;before any real adoption&#x27; category, not an optional one.</div>
+</div>
+</div>
+</div>
+</section>
+
+
+<section id="recommendations">
+<h1>Recommendations</h1>
+
+<div class="recommendation">
+<strong>1. Land Undo/Redo before any more editing ops (J).</strong>
+Doing copy/rotate/scale/mirror/trim with no undo is a CAD anti-pattern —
+users WILL ruin drawings. Plan: snapshot-based DocumentState log at first;
+move to operation-diff once it bottlenecks. This is a Slice of its own,
+sitting between H and J in the queue.
+</div>
+
+<div class="recommendation">
+<strong>2. Harden DXF I/O before claiming &quot;DXF support&quot;.</strong>
+Slice H proves the pipeline. Real-world DXF parity needs: xdata, blocks
+(blocked behind Slice F), basic text + dim styles, hatch boundary loops,
+SPLINE preservation (pass-through even if we can't render it), proxy
+entity skip. Add a regression suite of 20+ real DXF files (AutoCAD,
+LibreCAD, QCAD, BricsCAD outputs) and require round-trip diff to be
+zero or known-safe.
+</div>
+
+<div class="recommendation">
+<strong>3. Finish the ACI palette.</strong>
+Fill cad_kernel/src/color.rs::aci_palette to all 256 indices from the
+standard AutoCAD table. This is 15 minutes of work and makes imported
+DXF files look right. No reason to leave it.
+</div>
+
+<div class="recommendation">
+<strong>4. Bring the GPU path to ByLayer parity.</strong>
+CircleInstance already carries a u32 color; populate it from
+resolve_color() the same way the CPU path does. Pre-condition for any
+benchmarking comparison against LibreCAD on million-entity drawings.
+</div>
+
+<div class="recommendation">
+<strong>5. Move handle allocation to per-Document.</strong>
+Process-global counter breaks DXF round-trip the moment two files are
+open. Refactor before Block / Insert work (Slice F) starts.
+</div>
+
+<div class="recommendation">
+<strong>6. Wire the panel of catalogued SYSVARS in batches by theme.</strong>
+209 entries — wire them in themed groups (grip colors / sizes / snap radii
+first since those are visible; then editing-display flags; then save /
+backup). Each batch is 1–2 hours and visibly increases the &quot;feels like
+AutoCAD&quot; quotient.
+</div>
+
+<div class="recommendation">
+<strong>7. Don't open Slice F (Blocks) until E.text + dimensions land.</strong>
+Blocks intersect with text-heavy real drawings; landing INSERT without
+TEXT means imported blocks render with placeholders. Sequence:
+Text → MText → DimRotated → Block table.
+</div>
+
+<div class="recommendation">
+<strong>8. Treat this Audit.html as a checkpoint, not a one-off.</strong>
+Regenerate after each slice with <code>python3 build_audit.py</code>.
+The bars on the cover should move in one direction over time. If they
+plateau, the slice plan is drifting away from parity work and into
+nice-to-haves — that's a planning signal, not a comment on velocity.
+</div>
+</section>
+
+</main>
+</div>
+</body>
+</html>
