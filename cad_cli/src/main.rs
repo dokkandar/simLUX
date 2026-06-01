@@ -82,7 +82,9 @@ fn main() {
                 writeln!(out, "(open/save ignored — CLI is a math REPL, not a doc viewer)").ok();
             }
             Ok(Command::Copy) | Ok(Command::Rotate) | Ok(Command::Scale)
-            | Ok(Command::Mirror) | Ok(Command::DeleteSelected) | Ok(Command::Undo) => {
+            | Ok(Command::Mirror) | Ok(Command::DeleteSelected) | Ok(Command::Undo)
+            | Ok(Command::Redo) | Ok(Command::MatchProps) | Ok(Command::Reverse)
+            | Ok(Command::ChangeLayer) => {
                 writeln!(out, "(editing op ignored — CLI has no interactive selection)").ok();
             }
             Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }

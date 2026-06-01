@@ -60,6 +60,15 @@ pub enum Command {
     DeleteSelected,
     /// Undo the most recent editing operation.
     Undo,
+    /// Redo the most recently undone editing operation.
+    Redo,
+    /// Copy `style` (layer + color + linetype + lineweight + visibility)
+    /// from a clicked source dobject to every dobject in the selection.
+    MatchProps,
+    /// Flip direction of every selected Line / Arc / EllipseArc / Polyline.
+    Reverse,
+    /// Bulk-set every selected dobject's `style.layer` to the active layer.
+    ChangeLayer,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -118,6 +127,10 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "mirror" | "mi"   => Ok(Command::Mirror),
         "delete" | "erase" | "e" => Ok(Command::DeleteSelected),
         "undo" | "u"      => Ok(Command::Undo),
+        "redo" | "y"      => Ok(Command::Redo),
+        "matchprop" | "mp" => Ok(Command::MatchProps),
+        "reverse" | "rev" => Ok(Command::Reverse),
+        "chlayer" | "cl"  => Ok(Command::ChangeLayer),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?

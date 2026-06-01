@@ -160,6 +160,50 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 
 ---
 
+## Edit / Modify actions — extended roadmap (slices K–N)
+
+Slice J landed the core 6 (move / copy / rotate / scale / mirror / delete + undo).
+Following slices extend the editor in tiers — every action consumes the
+basket via the existing select engine (basket-first, command on top), so
+selection and editing stay orthogonal.
+
+### Slice K — Simple (this run)
+
+| # | Action | What it does | Inputs | Status |
+|---|---|---|---|---|
+| K.1 | **redo** | Re-apply the last undone op (mirror of undo) | (none) | ● Done |
+| K.2 | **matchprop** / **mp** | Copy style (layer + color + linetype + lineweight + visibility) from a clicked source to every dobject in the basket | 1 click on source | ● Done |
+| K.3 | **reverse** / **rev** | Flip direction of every selected Line / Arc / EllipseArc / Polyline | (none) | ● Done |
+| K.4 | **chlayer** / **cl** | Bulk-set basket's layer to the active layer | (none) | ● Done |
+
+### Slice L — Medium (this run)
+
+| # | Action | What it does | Inputs | Status |
+|---|---|---|---|---|
+| L.1 | **offset** / **o** | Parallel copy at distance d on side of click. Line / Circle / Arc in v1; Ellipse / Polyline politely skipped | typed distance + side click | ○ Next |
+| L.2 | **lengthen** / **len** | Delta-mode only in v1: extend length of selected Line / Arc / EllipseArc by signed delta; click side to extend | typed delta + side click | ○ Next |
+| L.3 | **break** / **br** | For each dobject in basket: project click onto the curve and split. Line → two Lines, Arc → two Arcs, Polyline → two Polylines. Circle requires 2 clicks (v2) — v1 errors gracefully | 1 click on the cut point | ○ Next |
+| L.4 | **align** | Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1 | 4 clicks | ○ Next |
+| L.5 | **stretch** | Crossing window selects which vertices move; clicked base/dest gives the delta | crossing window + 2 clicks | ○ Next |
+
+### Slice M — Complex (deferred; revisit after K+L review)
+
+| # | Action | Notes |
+|---|---|---|
+| M.1 | **trim** | Cutting edges + targets; clip to nearest intersection |
+| M.2 | **extend** | Like trim but extends toward boundary |
+| M.3 | **fillet** | Tangent arc between two curves at radius |
+| M.4 | **chamfer** | Bevel between two lines with two distances |
+| M.5 | **join** | Merge collinear lines / coincident polylines / arcs sharing center+radius |
+
+### Slice N — Strange / Exotic (deferred indefinitely)
+
+PEDIT (per-vertex polyline edit) · explode · stretch-by-grip · polar
+array · path array · group / ungroup. Each is its own slice when a real
+need surfaces.
+
+---
+
 ## Crate layout
 
 | Crate | Role |

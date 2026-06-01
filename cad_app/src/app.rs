@@ -238,6 +238,14 @@ pub struct CadApp {
     /// pre-mutation Document. `undo` pops and restores. Bounded so a
     /// long editing session doesn't grow without bound.
     undo_stack:   Vec<Document>,
+    /// Companion redo stack. `undo` pops undo_stack and pushes current
+    /// state to redo_stack. `redo` does the reverse. Any new editing op
+    /// CLEARS redo_stack (new branch — can't redo onto a different
+    /// history).
+    redo_stack:   Vec<Document>,
+
+    // ---- Slice K: matchprop click capture ----
+    matchprops_state: MatchPropsState,
 }
 
 const UNDO_STACK_CAP: usize = 64;
@@ -317,6 +325,14 @@ pub enum MirrorState {
     WaitingForB(Vec2),
 }
 
+/// State machine for matchprop — one click selects a source dobject;
+/// its `style` is then assigned to every dobject in the basket.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum MatchPropsState {
+    Off,
+    WaitingForSource,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum RenderMode {
     Cpu,
@@ -381,6 +397,8 @@ impl Default for CadApp {
             scale_state:  ScaleState::Off,
             mirror_state: MirrorState::Off,
             undo_stack:   Vec::new(),
+            redo_stack:   Vec::new(),
+            matchprops_state: MatchPropsState::Off,
         };
         // Demo layers so the Layer panel has visible content at first launch.
         let walls = s.doc.layers.add(Layer {
@@ -660,6 +678,20 @@ impl CadApp {
                 }
             }
             Ok(Command::Undo) => self.do_undo(),
+            Ok(Command::Redo) => self.do_redo(),
+            Ok(Command::MatchProps) => {
+                if self.selection.is_empty() {
+                    self.history.push(
+                        "  ! matchprop: select target dobjects first, then run matchprop, then click source".into());
+                } else {
+                    self.matchprops_state = MatchPropsState::WaitingForSource;
+                    self.history.push(format!(
+                        "  matchprop — {} dobject(s) in basket. Click SOURCE dobject (Esc cancels)",
+                        self.selection.len()));
+                }
+            }
+            Ok(Command::Reverse)     => self.apply_reverse(),
+            Ok(Command::ChangeLayer) => self.apply_chlayer(),
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
                     // No basket yet — auto-enter a selection session that
@@ -1586,11 +1618,19 @@ impl CadApp {
             self.undo_stack.remove(0);
         }
         self.undo_stack.push(self.doc.clone());
+        // A new editing op invalidates the redo branch — once you diverge
+        // from the previously-redoable history you can't return to it.
+        self.redo_stack.clear();
     }
 
     fn do_undo(&mut self) {
         match self.undo_stack.pop() {
             Some(prev) => {
+                // Stash current state on the redo stack before restoring.
+                if self.redo_stack.len() >= UNDO_STACK_CAP {
+                    self.redo_stack.remove(0);
+                }
+                self.redo_stack.push(self.doc.clone());
                 self.doc = prev;
                 self.selection.clear();
                 self.selected = None;
@@ -1598,11 +1638,112 @@ impl CadApp {
                 self.index_dirty = true;
                 self.gpu_dirty = true;
                 self.history.push(format!(
-                    "  undo applied ({} snapshot(s) left)", self.undo_stack.len()
+                    "  ↶ undo  (undo: {}  redo: {})",
+                    self.undo_stack.len(), self.redo_stack.len()
                 ));
             }
             None => self.history.push("  ! nothing to undo".into()),
         }
+    }
+
+    fn do_redo(&mut self) {
+        match self.redo_stack.pop() {
+            Some(next) => {
+                // Stash current state back on the undo stack — symmetric.
+                if self.undo_stack.len() >= UNDO_STACK_CAP {
+                    self.undo_stack.remove(0);
+                }
+                self.undo_stack.push(self.doc.clone());
+                self.doc = next;
+                self.selection.clear();
+                self.selected = None;
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history.push(format!(
+                    "  ↷ redo  (undo: {}  redo: {})",
+                    self.undo_stack.len(), self.redo_stack.len()
+                ));
+            }
+            None => self.history.push("  ! nothing to redo".into()),
+        }
+    }
+
+    // ---- Slice K: matchprop / reverse / chlayer apply methods ----
+
+    fn apply_matchprops(&mut self, source_idx: usize) {
+        let Some(source) = self.doc.dobjects.get(source_idx) else {
+            self.history.push("  ! matchprop: invalid source".into());
+            return;
+        };
+        let src_style = source.style;
+        if self.selection.is_empty() {
+            self.history.push("  ! matchprop: empty basket".into());
+            return;
+        }
+        self.snapshot_doc();
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if i == source_idx { continue; }   // self-match is a no-op
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.style = src_style;
+            }
+        }
+        self.history.push(format!(
+            "  ✓ matchprop: style from #{} applied to {} dobject(s)",
+            source_idx, n.saturating_sub(if self.selection.contains(&source_idx) {1} else {0})
+        ));
+        self.gpu_dirty = true;
+    }
+
+    fn apply_reverse(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  ! reverse: empty basket".into());
+            return;
+        }
+        self.snapshot_doc();
+        let mut flipped = 0_usize;
+        let mut noop = 0_usize;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                let direction_aware = matches!(d.geom,
+                    Geom::Line(_) | Geom::Arc(_) | Geom::EllipseArc(_) | Geom::Polyline(_));
+                if direction_aware {
+                    d.geom = d.geom.reversed();
+                    flipped += 1;
+                } else {
+                    noop += 1;
+                }
+            }
+        }
+        self.history.push(format!(
+            "  ⇋ reverse: {} flipped, {} no-op (direction-agnostic)",
+            flipped, noop
+        ));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    fn apply_chlayer(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  ! chlayer: empty basket".into());
+            return;
+        }
+        let target = self.doc.layers.active;
+        let name = self.doc.layers.get(target)
+            .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
+        self.snapshot_doc();
+        let n = self.selection.len();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.style.layer = target;
+            }
+        }
+        self.history.push(format!(
+            "  → chlayer: {} dobject(s) moved to active layer '{}'", n, name
+        ));
+        self.gpu_dirty = true;
     }
 
     /// Append translated copies of the current selection (`copy` op).
@@ -2694,6 +2835,10 @@ impl eframe::App for CadApp {
                 self.mirror_state = MirrorState::Off;
                 self.history.push("  mirror cancelled".into());
             }
+            if self.matchprops_state != MatchPropsState::Off {
+                self.matchprops_state = MatchPropsState::Off;
+                self.history.push("  matchprop cancelled".into());
+            }
         }
 
         // Enter (when the command line is empty) finalises an in-progress
@@ -3535,6 +3680,18 @@ impl eframe::App for CadApp {
                                 self.scale_state = ScaleState::Off;
                             }
                             ScaleState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.matchprops_state != MatchPropsState::Off {
+                        // matchprop is in source-pick mode — find the dobject
+                        // under the cursor and use its style.
+                        let tol_world = 10.0 / self.scale as f64;
+                        if let Some(src) = self.nearest_entity_under(world, tol_world) {
+                            self.apply_matchprops(src);
+                            self.matchprops_state = MatchPropsState::Off;
+                        } else {
+                            self.history.push(
+                                "  matchprop — no dobject under cursor (Esc to cancel)".into());
                         }
                         self.refocus_cmd = true;
                     } else if self.mirror_state != MirrorState::Off {

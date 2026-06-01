@@ -310,6 +310,64 @@ impl Geom {
         }
     }
 
+    /// Return a copy with direction flipped, where direction is defined.
+    /// - Line: swap a/b
+    /// - Arc / EllipseArc: start at the OTHER end, same sweep magnitude
+    ///   (still CCW in our convention — the swept curve is identical, just
+    ///   parameterised from the opposite endpoint)
+    /// - Polyline: reverse vertex order, flip every per-vertex bulge sign
+    ///   (bulge is signed by direction)
+    /// - Circle / Ellipse / Point: no observable direction; returns a clone
+    pub fn reversed(&self) -> Geom {
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: l.b, b: l.a }),
+            Geom::Arc(a) => {
+                let new_start = (a.start_angle + a.sweep_angle)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::Arc(Arc {
+                    center: a.center, radius: a.radius,
+                    start_angle: new_start, sweep_angle: a.sweep_angle,
+                })
+            }
+            Geom::EllipseArc(ea) => {
+                let new_start = (ea.start_param + ea.sweep_param)
+                    .rem_euclid(std::f64::consts::TAU);
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: ea.ellipse,
+                    start_param: new_start,
+                    sweep_param: ea.sweep_param,
+                })
+            }
+            Geom::Polyline(p) => {
+                // Bulge belongs to the segment FROM this vertex to the next.
+                // After reversing the vertex order, new segment `i` (verts
+                // [i] → [i+1]) corresponds to the OLD segment between
+                // (n-1-i) and (n-2-i) traversed in reverse — so its bulge
+                // is the OLD segment's bulge with sign flipped.
+                let n = p.vertices.len();
+                let mut new_verts: Vec<PolyVertex> = p.vertices.iter().rev()
+                    .map(|v| PolyVertex { pos: v.pos, bulge: 0.0 })
+                    .collect();
+                for i in 0..n {
+                    let old_seg = if p.closed {
+                        // closed has n segments; new segment i = reverse of
+                        // old segment (n-1-i) % n. bulge[k] = segment k→k+1.
+                        (n - 1 - i) % n
+                    } else {
+                        // open has n-1 segments; vertex (n-1)'s bulge slot
+                        // is unused, so skip when i+1 >= n.
+                        if i + 1 >= n { continue; }
+                        n - 2 - i
+                    };
+                    new_verts[i].bulge = -p.vertices[old_seg].bulge;
+                }
+                Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
+            }
+            // Direction-agnostic — return a deep copy.
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) => self.clone(),
+        }
+    }
+
     /// Return a copy of this geometry translated by `off`.
     pub fn translated(&self, off: Vec2) -> Geom {
         match self {
@@ -542,6 +600,48 @@ mod transform_tests {
         if let Geom::Line(l) = m {
             assert!(approx_eq(l.a.x, 3.0)); assert!(approx_eq(l.a.y, -4.0));
             assert!(approx_eq(l.b.x, 8.0)); assert!(approx_eq(l.b.y, -2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn line_reversed_swaps_endpoints() {
+        let g = Geom::Line(Line { a: Vec2::new(1.0, 2.0), b: Vec2::new(7.0, 9.0) });
+        if let Geom::Line(l) = g.reversed() {
+            assert!(approx_eq(l.a.x, 7.0)); assert!(approx_eq(l.a.y, 9.0));
+            assert!(approx_eq(l.b.x, 1.0)); assert!(approx_eq(l.b.y, 2.0));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn arc_reversed_swaps_endpoint_param() {
+        // Arc from 0° to 90°. Reversing puts start at 90° with same sweep.
+        let g = Geom::Arc(Arc {
+            center: Vec2::ZERO, radius: 5.0,
+            start_angle: 0.0,
+            sweep_angle: std::f64::consts::FRAC_PI_2,
+        });
+        if let Geom::Arc(a) = g.reversed() {
+            assert!(approx_eq(a.start_angle, std::f64::consts::FRAC_PI_2));
+            assert!(approx_eq(a.sweep_angle, std::f64::consts::FRAC_PI_2));
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn polyline_reversed_flips_vertex_order_and_bulges() {
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.2 },
+                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: -0.4 },
+                PolyVertex { pos: Vec2::new(1.0, 1.0), bulge: 0.0 },
+            ],
+            closed: false,
+        });
+        if let Geom::Polyline(p) = g.reversed() {
+            assert_eq!(p.vertices[0].pos, Vec2::new(1.0, 1.0));
+            assert_eq!(p.vertices[2].pos, Vec2::new(0.0, 0.0));
+            // bulge[0] of reversed = -original bulge[1] (shifted+sign-flipped)
+            assert!(approx_eq(p.vertices[0].bulge, 0.4));
+            assert!(approx_eq(p.vertices[1].bulge, -0.2));
         } else { panic!(); }
     }
 

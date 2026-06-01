@@ -70,6 +70,12 @@ impl DObject {
         DObject { geom: self.geom.mirrored(a, b),
                   style: self.style, handle: self.handle }
     }
+
+    /// Flip direction (Line, Arc, EllipseArc, Polyline). Style + handle preserved.
+    pub fn reversed(&self) -> DObject {
+        DObject { geom: self.geom.reversed(),
+                  style: self.style, handle: self.handle }
+    }
 }
 
 // ---- ergonomic constructors ------------------------------------------------
