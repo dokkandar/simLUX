@@ -142,16 +142,16 @@ td.status { white-space: nowrap; font-weight: 600; font-size: 11.5px; text-trans
 <section class="cover">
 <h1>RUST_CAD — Third-Party Audit vs LibreCAD baseline</h1>
 <div class="subtitle">
-Generated <strong>2026-06-01 13:56</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-01 14:19</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
 Tests passing: <strong>91</strong> &nbsp;•&nbsp;
 Recent commits:
 </div>
-<pre style="margin-top:10px;font-size:11.5px;">c5d2ad2 Add Audit.html — third-party-style parity audit vs LibreCAD
+<pre style="margin-top:10px;font-size:11.5px;">2950014 Audit.html: account for Slices I &amp; J in scoring
+c5d2ad2 Add Audit.html — third-party-style parity audit vs LibreCAD
 2d4ddb4 Regenerate Plan_Report.html after slices H / I / J
 c44acd3 Slice J: Editing operations (copy / rotate / scale / mirror / delete / undo)
-ec54a0a Slice I: .rsm binary format (RUST_CAD-native)
-97cf18b Slice H: cad_io crate + DXF round-trip</pre>
+ec54a0a Slice I: .rsm binary format (RUST_CAD-native)</pre>
 <p>
 This document evaluates the RUST_CAD project as if reviewed by an outside
 engineer, using LibreCAD as the established 2D-CAD baseline. It is the
@@ -241,19 +241,19 @@ CAD or BIM tools belong in a different document.</p>
 <tr><td><code>RS_Ellipse (arc)</code></td><td>● EllipseArc</td><td class="status s-done">● DONE</td><td>Split into separate variant for tighter algos</td></tr>
 <tr><td><code>RS_Point</code></td><td>● Point</td><td class="status s-done">● DONE</td><td>Geom::Point { location, style, size } — Slice E</td></tr>
 <tr><td><code>RS_Polyline (LW)</code></td><td>● Polyline</td><td class="status s-partial">◐ PARTIAL</td><td>Geom::Polyline — straight segments today; bulge field stored but not rendered as arc segments yet</td></tr>
-<tr><td><code>RS_Spline</code></td><td>Spline</td><td class="status s-deferred">◌ DEFERRED</td><td>NURBS — deferred indefinitely per project decision (heavy math, no concrete user need)</td></tr>
+<tr><td><code>RS_Spline</code></td><td>DobjectSpline</td><td class="status s-planned">○ PLANNED</td><td>Tier 2 in Implementation_Plan.md (#13) — Phase 9; NURBS covers parabola / hyperbola too</td></tr>
 <tr><td><code>RS_Text</code></td><td>Text (single)</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs TextStyleTable on Document first</td></tr>
 <tr><td><code>RS_MText</code></td><td>MText</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs TextStyleTable</td></tr>
 <tr><td><code>RS_Hatch</code></td><td>Hatch</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs pattern lib + boundary-path representation</td></tr>
 <tr><td><code>RS_Insert (block)</code></td><td>BlockRef</td><td class="status s-planned">○ PLANNED</td><td>Slice F — needs BlockTable on Document</td></tr>
 <tr><td><code>RS_Block (def)</code></td><td>BlockTable entry</td><td class="status s-planned">○ PLANNED</td><td>Slice F</td></tr>
-<tr><td><code>RS_Image</code></td><td>RasterImage</td><td class="status s-missing">✗ MISSING</td><td>Not in current roadmap; sketched in Dobject_Properties.md</td></tr>
-<tr><td><code>RS_Solid (2D)</code></td><td>Solid2D</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
-<tr><td><code>RS_Leader</code></td><td>Leader</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
-<tr><td><code>LC_MLeader</code></td><td>MLeader</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
-<tr><td><code>LC_Tolerance</code></td><td>Tolerance</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
-<tr><td><code>RS_ConstructionLine</code></td><td>Xline / Ray</td><td class="status s-missing">✗ MISSING</td><td>Sketched only</td></tr>
-<tr><td><code>LC_Hyperbola, LC_Parabola, LC_Rect</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>LibreCAD-specific extensions; not on roadmap</td></tr>
+<tr><td><code>RS_Image</code></td><td>DobjectRasterImage</td><td class="status s-planned">○ PLANNED</td><td>Tier 3 in Implementation_Plan.md (#21)</td></tr>
+<tr><td><code>RS_Solid (2D)</code></td><td>DobjectSolid2D</td><td class="status s-planned">○ PLANNED</td><td>Tier 3 in Implementation_Plan.md (#24)</td></tr>
+<tr><td><code>RS_Leader</code></td><td>DobjectLeader</td><td class="status s-planned">○ PLANNED</td><td>Tier 2 in Implementation_Plan.md (#20)</td></tr>
+<tr><td><code>LC_MLeader</code></td><td>DobjectMLeader</td><td class="status s-planned">○ PLANNED</td><td>Tier 2 in Implementation_Plan.md (#20)</td></tr>
+<tr><td><code>LC_Tolerance</code></td><td>DobjectTolerance</td><td class="status s-deferred">◌ DEFERRED</td><td>Extreme niche (GD&amp;T); revisit on explicit demand only</td></tr>
+<tr><td><code>RS_ConstructionLine</code></td><td>DobjectRay / DobjectXline</td><td class="status s-planned">○ PLANNED</td><td>Tier 3 in Implementation_Plan.md (#22, #23) — Phase 3 draw tools</td></tr>
+<tr><td><code>LC_Hyperbola, LC_Parabola, LC_Rect</code></td><td>—</td><td class="status s-deferred">◌ DEFERRED</td><td>Explicitly OUT OF SCOPE — DobjectSpline (Tier 2 #13) covers smooth curves; Rectangle is a Polyline preset</td></tr>
 <tr><td><code>RS_DimLinear</code></td><td>DimRotated</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x — needs DimStyleTable on Document</td></tr>
 <tr><td><code>RS_DimAligned</code></td><td>DimAligned</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
 <tr><td><code>RS_DimAngular</code></td><td>DimAngular</td><td class="status s-planned">○ PLANNED</td><td>Slice E.x</td></tr>
