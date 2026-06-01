@@ -473,6 +473,9 @@ impl Geom {
                     .filter(|&t| t > 1e-9 && t < 1.0 - 1e-9).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < 1e-9);
+                if params.is_empty() {
+                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
                 bounds.push(1.0);
@@ -493,6 +496,9 @@ impl Geom {
                     .filter(|&t| t > EPS && t < arc.sweep_angle - EPS).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                if params.is_empty() {
+                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
                 bounds.push(arc.sweep_angle);
@@ -514,6 +520,9 @@ impl Geom {
                     .filter(|&t| t > EPS && t < ea.sweep_param - EPS).collect();
                 params.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 params.dedup_by(|a, b| (*a - *b).abs() < EPS);
+                if params.is_empty() {
+                    return Err("trim: no interior cuts on target (endpoint touches don't count)");
+                }
                 let mut bounds = vec![0.0_f64];
                 bounds.extend(&params);
                 bounds.push(ea.sweep_param);

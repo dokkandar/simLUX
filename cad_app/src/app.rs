@@ -402,6 +402,12 @@ pub enum TrimState {
     Off,
     SelectingCutters,             // running a ForCuttingEdges select session
     PickingTargets(Vec<usize>),   // cutters confirmed; loop on click
+    /// "Empty Enter at cutter prompt" mode: every CURRENT dobject in the
+    /// doc is a cutter, recomputed on every click. Pieces created by
+    /// prior trims this session automatically join the cutter set. This
+    /// is the AutoCAD default and the only way "trim against everything
+    /// you see" can stay true across multiple clicks.
+    PickingTargetsAll,
 }
 
 #[derive(Clone, Debug)]
@@ -409,6 +415,9 @@ pub enum ExtendState {
     Off,
     SelectingBoundaries,
     PickingTargets(Vec<usize>),
+    /// Same "use every current dobject as a boundary" mode as
+    /// `TrimState::PickingTargetsAll`.
+    PickingTargetsAll,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -986,24 +995,33 @@ impl CadApp {
                     self.selection.len()));
             }
             SelectMode::ForCuttingEdges => {
-                let mut cutters = std::mem::take(&mut self.selection);
+                let cutters = std::mem::take(&mut self.selection);
                 // Restore the user's main selection — trim must not nuke it.
                 self.selection = std::mem::take(&mut self.pre_op_selection);
                 self.select_mode        = SelectMode::Off;
                 self.window_first       = None;
                 self.select_remove_mode = false;
-                // Empty cutter basket = use ALL dobjects as cutters
-                // (AutoCAD default; see memo
-                // `feedback_rust_cad_trim_default_all_cutters`).
+                // Empty cutter basket = "use every current dobject as a
+                // cutter, recomputed each click". This is AutoCAD's default
+                // ("press Enter to select all") AND it's the only way pieces
+                // created by THIS session's trims keep acting as cutters.
+                // See memos `feedback_rust_cad_trim_default_all_cutters` +
+                // `feedback_rust_cad_trim_breaks_into_all_segments`.
                 if cutters.is_empty() {
-                    cutters = (0..self.doc.dobjects.len()).collect();
+                    if self.doc.dobjects.is_empty() {
+                        self.history.push("  ! trim: document is empty — cancelled".into());
+                        self.trim_dbg("CUTTERS = []  (empty doc → session cancelled)");
+                        self.trim_state = TrimState::Off;
+                        return;
+                    }
                     self.history.push(format!(
-                        "  trim — no cutters picked; using ALL {} dobjects as cutters", cutters.len()));
-                }
-                if cutters.is_empty() {
-                    self.history.push("  ! trim: document is empty — cancelled".into());
-                    self.trim_dbg("CUTTERS captured = []  (empty doc → session cancelled)");
-                    self.trim_state = TrimState::Off;
+                        "  trim — no cutters picked; using ALL dobjects (dynamic) as cutters"));
+                    self.trim_dbg(format!(
+                        "CUTTERS = ALL (dynamic; doc currently has {} dobjects, recomputed each click)",
+                        self.doc.dobjects.len()));
+                    self.history.push(
+                        "  trim — every dobject is a cutter (warm orange). Click each TARGET to cut. Enter / Esc to finish.".into());
+                    self.trim_state = TrimState::PickingTargetsAll;
                     return;
                 }
                 self.trim_dbg(format!(
@@ -1015,20 +1033,26 @@ impl CadApp {
                 return;
             }
             SelectMode::ForBoundaryEdges => {
-                let mut bounds = std::mem::take(&mut self.selection);
+                let bounds = std::mem::take(&mut self.selection);
                 self.selection = std::mem::take(&mut self.pre_op_selection);
                 self.select_mode        = SelectMode::Off;
                 self.window_first       = None;
                 self.select_remove_mode = false;
                 if bounds.is_empty() {
-                    bounds = (0..self.doc.dobjects.len()).collect();
+                    if self.doc.dobjects.is_empty() {
+                        self.history.push("  ! extend: document is empty — cancelled".into());
+                        self.trim_dbg("BOUNDARIES = []  (empty doc → session cancelled)");
+                        self.extend_state = ExtendState::Off;
+                        return;
+                    }
                     self.history.push(format!(
-                        "  extend — no boundaries picked; using ALL {} dobjects as boundaries", bounds.len()));
-                }
-                if bounds.is_empty() {
-                    self.history.push("  ! extend: document is empty — cancelled".into());
-                    self.trim_dbg("BOUNDARIES captured = []  (empty doc → session cancelled)");
-                    self.extend_state = ExtendState::Off;
+                        "  extend — no boundaries picked; using ALL dobjects (dynamic) as boundaries"));
+                    self.trim_dbg(format!(
+                        "BOUNDARIES = ALL (dynamic; doc currently has {} dobjects, recomputed each click)",
+                        self.doc.dobjects.len()));
+                    self.history.push(
+                        "  extend — every dobject is a boundary (warm amber). Click each TARGET END. Enter / Esc to finish.".into());
+                    self.extend_state = ExtendState::PickingTargetsAll;
                     return;
                 }
                 self.trim_dbg(format!(
@@ -1239,8 +1263,12 @@ impl CadApp {
                     }
                     ui.label(format!("{} entries", self.trim_debug_log.len()));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let trim_active = matches!(self.trim_state, TrimState::PickingTargets(_));
-                        let extend_active = matches!(self.extend_state, ExtendState::PickingTargets(_));
+                        let trim_active = matches!(
+                            self.trim_state,
+                            TrimState::PickingTargets(_) | TrimState::PickingTargetsAll);
+                        let extend_active = matches!(
+                            self.extend_state,
+                            ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll);
                         if trim_active {
                             ui.colored_label(egui::Color32::from_rgb(255, 170, 60),
                                 "● TRIM target-pick active");
@@ -3617,11 +3645,17 @@ impl eframe::App for CadApp {
                 // here; the NEXT Enter (separate keystroke) will end
                 // the target-pick phase.
                 self.finalise_selection();
-            } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
+            } else if matches!(
+                self.trim_state,
+                TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+            {
                 self.trim_dbg("=== TRIM session END (Enter) ===");
                 self.trim_state = TrimState::Off;
                 self.history.push("  trim — session ended (Enter)".into());
-            } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
+            } else if matches!(
+                self.extend_state,
+                ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
+            {
                 self.trim_dbg("=== EXTEND session END (Enter) ===");
                 self.extend_state = ExtendState::Off;
                 self.history.push("  extend — session ended (Enter)".into());
@@ -4473,21 +4507,35 @@ impl eframe::App for CadApp {
                             ScaleState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
-                    } else if matches!(self.trim_state, TrimState::PickingTargets(_)) {
-                        let cutters = if let TrimState::PickingTargets(c) = &self.trim_state {
+                    } else if matches!(
+                        self.trim_state,
+                        TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+                    {
+                        // Resolve the effective cutter list. In "all" mode
+                        // it's recomputed from doc.dobjects every click so
+                        // pieces created by THIS session's trims keep
+                        // acting as cutters.
+                        let all_mode = matches!(self.trim_state, TrimState::PickingTargetsAll);
+                        let cutters: Vec<usize> = if all_mode {
+                            (0..self.doc.dobjects.len()).collect()
+                        } else if let TrimState::PickingTargets(c) = &self.trim_state {
                             c.clone()
                         } else { Vec::new() };
                         let tol_world = 10.0 / self.scale as f64;
                         let hit = self.nearest_entity_under(world, tol_world);
                         self.trim_dbg(format!(
-                            "TRIM target click  world={}  screen={}  hit={}  cutters={:?}",
+                            "TRIM target click  world={}  screen={}  hit={}  cutters={}",
                             Self::fmt_v(click_world),
                             format!("({:.1},{:.1})", pos.x, pos.y),
                             match hit {
                                 Some(i) => format!("#{}", i),
                                 None    => "VOID (no dobject under cursor)".into(),
                             },
-                            cutters,
+                            if all_mode {
+                                format!("ALL(dynamic, n={})", cutters.len())
+                            } else {
+                                format!("{:?}", cutters)
+                            },
                         ));
                         if let Some(tgt) = hit {
                             let n_before = self.doc.dobjects.len();
@@ -4497,11 +4545,11 @@ impl eframe::App for CadApp {
                             self.trim_dbg(format!(
                                 "  → apply_trim_pick success={}  dobjects {}→{}  (net {:+})",
                                 did_trim, n_before, n_after, net));
-                            // CRITICAL: only patch the cutter list when the
-                            // trim actually mutated the doc. Patching on
-                            // failure corrupts the list (the bug the user
-                            // caught — see commit ae54eef debug log).
-                            if did_trim {
+                            // Patch the cutter list ONLY in explicit-list
+                            // mode and ONLY when the doc actually changed.
+                            // In all-mode the next click re-derives cutters
+                            // from doc, so no patch is needed.
+                            if did_trim && !all_mode {
                                 let patched: Vec<usize> = if let TrimState::PickingTargets(c) = &mut self.trim_state {
                                     c.retain(|&i| i != tgt);
                                     for c_i in c.iter_mut() {
@@ -4511,6 +4559,9 @@ impl eframe::App for CadApp {
                                 } else { Vec::new() };
                                 self.trim_dbg(format!(
                                     "  → cutters patched = {:?}", patched));
+                            } else if all_mode {
+                                self.trim_dbg(
+                                    "  → cutters: ALL mode (next click re-derives from doc)".to_string());
                             } else {
                                 self.trim_dbg(
                                     "  → cutter list UNCHANGED (trim failed; preserving cutters)".to_string());
@@ -4521,8 +4572,14 @@ impl eframe::App for CadApp {
                                 "  trim — void click (no dobject) — session continues, click another target or press Enter".into());
                         }
                         self.refocus_cmd = true;
-                    } else if matches!(self.extend_state, ExtendState::PickingTargets(_)) {
-                        let bounds = if let ExtendState::PickingTargets(b) = &self.extend_state {
+                    } else if matches!(
+                        self.extend_state,
+                        ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
+                    {
+                        let all_bounds_mode = matches!(self.extend_state, ExtendState::PickingTargetsAll);
+                        let bounds: Vec<usize> = if all_bounds_mode {
+                            (0..self.doc.dobjects.len()).collect()
+                        } else if let ExtendState::PickingTargets(b) = &self.extend_state {
                             b.clone()
                         } else { Vec::new() };
                         let tol_world = 10.0 / self.scale as f64;
@@ -4773,13 +4830,17 @@ impl eframe::App for CadApp {
             // target-pick phase. Cutters render in warm orange so the user
             // sees what's actually intersecting. See memo
             // `feedback_rust_cad_trim_default_all_cutters`.
-            let trim_cutters: Option<&Vec<usize>> = match &self.trim_state {
-                TrimState::PickingTargets(c) => Some(c),
-                _ => None,
+            // `Some(None)` means ALL-mode (paint every visible dobject as
+            // cutter/boundary); `Some(Some(&[..]))` means explicit list.
+            let trim_cutters: Option<Option<&Vec<usize>>> = match &self.trim_state {
+                TrimState::PickingTargets(c)    => Some(Some(c)),
+                TrimState::PickingTargetsAll    => Some(None),
+                _                               => None,
             };
-            let extend_bounds: Option<&Vec<usize>> = match &self.extend_state {
-                ExtendState::PickingTargets(b) => Some(b),
-                _ => None,
+            let extend_bounds: Option<Option<&Vec<usize>>> = match &self.extend_state {
+                ExtendState::PickingTargets(b)  => Some(Some(b)),
+                ExtendState::PickingTargetsAll  => Some(None),
+                _                               => None,
             };
             let cutter_color   = egui::Color32::from_rgb(255, 170,  60); // warm orange
             let boundary_color = egui::Color32::from_rgb(255, 220,  90); // warm amber
@@ -4816,8 +4877,16 @@ impl eframe::App for CadApp {
                         // Trim/extend visualization: cutters render warm-orange,
                         // boundaries warm-amber. Solid thick lines (NOT dashed)
                         // so they're distinguishable from basket dashed-gray.
-                        let is_cutter   = trim_cutters.map_or(false, |c| c.contains(&i));
-                        let is_boundary = extend_bounds.map_or(false, |b| b.contains(&i));
+                        let is_cutter = match trim_cutters {
+                            Some(None)    => true,                 // ALL-mode
+                            Some(Some(c)) => c.contains(&i),
+                            None          => false,
+                        };
+                        let is_boundary = match extend_bounds {
+                            Some(None)    => true,
+                            Some(Some(b)) => b.contains(&i),
+                            None          => false,
+                        };
                         if is_cutter || is_boundary {
                             let col = if is_cutter { cutter_color } else { boundary_color };
                             draw_dobject(&painter, rect, self, &e.geom, col);
