@@ -157,7 +157,7 @@ These are defined in [`cad_kernel/src/geom.rs`](cad_kernel/src/geom.rs).
 Suggested Rust struct names and field shapes. All status `○`.
 Listed roughly in order of likely implementation priority.
 
-## DobjectPoint — `Point` struct (planned)
+## DobjectPoint — `Point` struct (● modeled)
 
 AutoCAD `POINT` entity — a single marker point.
 
@@ -167,7 +167,7 @@ AutoCAD `POINT` entity — a single marker point.
 | PointStyle | `style` | `u8` (0–99, PDMODE values) | Per-document setting in AutoCAD (`PDMODE` SYSVAR); per-entity here for flexibility |
 | PointSize | `size` | `f64` | PDSIZE in AutoCAD |
 
-## DobjectPolyline — `Polyline` struct (planned, LWPOLYLINE)
+## DobjectPolyline — `Polyline` struct (● modeled — straight segments only, bulges accepted but not yet rendered)
 
 2D lightweight polyline.
 

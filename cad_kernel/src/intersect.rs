@@ -37,6 +37,13 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
                 filter_by_ellipse_arc(
                     intersect_ellipse_ellipse(ea1.ellipse, ea2.ellipse), ea1),
                 ea2),
+
+        // Point / Polyline: intersection math TBD (point ∩ anything degenerates
+        // to "is the point on the curve?", polyline ∩ X needs per-segment
+        // dispatch). Return empty for now — callers don't expect INT to fire
+        // on these types until the pairs are implemented.
+        (Point(_), _) | (_, Point(_)) => Vec::new(),
+        (Polyline(_), _) | (_, Polyline(_)) => Vec::new(),
     }
 }
 

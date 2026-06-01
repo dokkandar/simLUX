@@ -347,6 +347,18 @@ fn candidate_points(
             Geom::Line(l)         => plain([l.a, l.b]),
             Geom::Arc(a)          => { let (p1, p2) = a.endpoints(); plain([p1, p2]) }
             Geom::EllipseArc(ea)  => { let (p1, p2) = ea.endpoints(); plain([p1, p2]) }
+            // Point's location IS its endpoint; useful to snap to.
+            Geom::Point(pt)       => plain([pt.location]),
+            // Polyline endpoints = first and last vertex (or all vertices when
+            // closed — every vertex is an "end" of a segment).
+            Geom::Polyline(p) => {
+                if p.vertices.is_empty() { Vec::new() }
+                else if p.closed {
+                    plain(p.vertices.iter().map(|v| v.pos).collect::<Vec<_>>())
+                } else {
+                    plain([p.vertices[0].pos, p.vertices[p.vertices.len() - 1].pos])
+                }
+            }
             Geom::Circle(_) | Geom::Ellipse(_) => Vec::new(),
         },
         SnapKind::Mid => match e {
@@ -359,7 +371,19 @@ fn candidate_points(
                 let m = ea.start_param + ea.sweep_param * 0.5;
                 plain([ea.ellipse.point_at(m)])
             }
-            Geom::Circle(_) | Geom::Ellipse(_) => Vec::new(),
+            // Polyline MID = midpoint of every segment.
+            Geom::Polyline(p) => {
+                if p.vertices.len() < 2 { return Vec::new(); }
+                let n = p.vertices.len();
+                let pairs = if p.closed { n } else { n - 1 };
+                let pts: Vec<Vec2> = (0..pairs).map(|i| {
+                    let a = p.vertices[i].pos;
+                    let b = p.vertices[(i + 1) % n].pos;
+                    (a + b) * 0.5
+                }).collect();
+                plain(pts)
+            }
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) => Vec::new(),
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -367,13 +391,14 @@ fn candidate_points(
             Geom::Circle(c)      => plain([c.center]),
             Geom::Ellipse(e)     => plain([e.center]),
             Geom::EllipseArc(ea) => plain([ea.ellipse.center]),
+            Geom::Point(_) | Geom::Polyline(_) => Vec::new(),
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -458,6 +483,26 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
                 Some(if p.dist(e1) < p.dist(e2) { e1 } else { e2 })
             }
         }
+        Geom::Point(pt) => Some(pt.location),
+        Geom::Polyline(pl) => {
+            // Project onto every segment, keep the closest foot.
+            if pl.vertices.len() < 2 { return pl.vertices.first().map(|v| v.pos); }
+            let n = pl.vertices.len();
+            let pairs = if pl.closed { n } else { n - 1 };
+            let mut best: Option<(Vec2, f64)> = None;
+            for i in 0..pairs {
+                let a = pl.vertices[i].pos;
+                let b = pl.vertices[(i + 1) % n].pos;
+                let l = Line { a, b };
+                if let Some(foot) = nearest_on_line(p, &l) {
+                    let d = p.dist(foot);
+                    if best.map_or(true, |(_, bd)| d < bd) {
+                        best = Some((foot, d));
+                    }
+                }
+            }
+            best.map(|(pt, _)| pt)
+        }
     }
 }
 
@@ -532,6 +577,21 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
         Geom::Arc(a)         => per_to_arc(from, a),
         Geom::Ellipse(e)     => per_to_ellipse(from, e),
         Geom::EllipseArc(ea) => per_to_ellipse_arc(from, ea),
+        // PER from a point to a "Point" is the point itself; conventional.
+        Geom::Point(pt)      => vec![(pt.location, None)],
+        // PER to a polyline = perpendicular foot on every segment;
+        // candidate set, cursor distance sorts which wins.
+        Geom::Polyline(p) => {
+            if p.vertices.len() < 2 { return Vec::new(); }
+            let n = p.vertices.len();
+            let pairs = if p.closed { n } else { n - 1 };
+            let mut out = Vec::new();
+            for i in 0..pairs {
+                let l = Line { a: p.vertices[i].pos, b: p.vertices[(i + 1) % n].pos };
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
     }
 }
 
@@ -623,6 +683,20 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
         }
         Geom::Ellipse(e)     => tan_to_ellipse(from, e),
         Geom::EllipseArc(ea) => tan_to_ellipse_arc(from, ea),
+        // No tangent concept for Point / Polyline straight segments —
+        // fall back to perpendicular for polyline segments (same as Line).
+        Geom::Point(pt) => vec![(pt.location, None)],
+        Geom::Polyline(p) => {
+            if p.vertices.len() < 2 { return Vec::new(); }
+            let n = p.vertices.len();
+            let pairs = if p.closed { n } else { n - 1 };
+            let mut out = Vec::new();
+            for i in 0..pairs {
+                let l = Line { a: p.vertices[i].pos, b: p.vertices[(i + 1) % n].pos };
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
     }
 }
 

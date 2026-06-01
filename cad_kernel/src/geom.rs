@@ -57,19 +57,104 @@ pub struct EllipseArc {
     pub sweep_param: f64,    // (0, 2π], positive = CCW (in parameter space)
 }
 
+/// A 2D point primitive — AutoCAD POINT entity. Has a location and a
+/// per-instance display style (PDMODE-like, 0..=99). The renderer maps
+/// the integer to a glyph (cross / X / circle-with-cross / etc.).
+#[derive(Clone, Copy, Debug)]
+pub struct Point {
+    pub location: Vec2,
+    pub style:    u8,    // PDMODE — 0 = single pixel dot, 2 = +, 3 = ×, 4 = |, …
+    pub size:     f32,   // PDSIZE — drawing units; 0.0 = use renderer default
+}
+
+/// A 2D polyline — AutoCAD LWPOLYLINE. Stores vertices with optional
+/// per-vertex `bulge` (tan of one-quarter the arc segment's included
+/// angle). Bulge = 0 means a straight segment to the next vertex; bulge
+/// != 0 means an arc segment whose mid-deviation = `chord_len * bulge / 2`.
+#[derive(Clone, Copy, Debug)]
+pub struct PolyVertex {
+    pub pos:   Vec2,
+    pub bulge: f64,
+}
+
+#[derive(Clone, Debug)]
+pub struct Polyline {
+    pub vertices: Vec<PolyVertex>,
+    pub closed:   bool,
+}
+
+impl Polyline {
+    /// AABB of all vertices (does NOT account for arc bulges beyond the
+    /// vertex positions — conservative bbox is enough for viewport culling
+    /// and the grid index. Tighter bbox is a future optimisation).
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        if self.vertices.is_empty() {
+            return (Vec2::ZERO, Vec2::ZERO);
+        }
+        let mut min = self.vertices[0].pos;
+        let mut max = min;
+        for v in &self.vertices[1..] {
+            if v.pos.x < min.x { min.x = v.pos.x; }
+            if v.pos.y < min.y { min.y = v.pos.y; }
+            if v.pos.x > max.x { max.x = v.pos.x; }
+            if v.pos.y > max.y { max.y = v.pos.y; }
+        }
+        (min, max)
+    }
+
+    /// Distance from the polyline's piecewise-linear envelope to a point.
+    /// Arc bulges are approximated as straight segments today (acceptable
+    /// for hit-test radius at typical zooms; refine when needed).
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        if self.vertices.is_empty() { return f64::INFINITY; }
+        let n = self.vertices.len();
+        let mut best = f64::INFINITY;
+        let pairs = if self.closed { n } else { n - 1 };
+        for i in 0..pairs {
+            let a = self.vertices[i].pos;
+            let b = self.vertices[(i + 1) % n].pos;
+            let d = b - a;
+            let len_sq = d.len_sq();
+            let dist = if len_sq < EPS {
+                p.dist(a)
+            } else {
+                let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
+                p.dist(a + d * t)
+            };
+            if dist < best { best = dist; }
+        }
+        best
+    }
+
+    /// Total length (sum of straight chords; arc bulges add the true arc
+    /// length on top — TODO when bulge math lands).
+    pub fn length(&self) -> f64 {
+        if self.vertices.len() < 2 { return 0.0; }
+        let n = self.vertices.len();
+        let pairs = if self.closed { n } else { n - 1 };
+        let mut sum = 0.0;
+        for i in 0..pairs {
+            sum += self.vertices[i].pos.dist(self.vertices[(i + 1) % n].pos);
+        }
+        sum
+    }
+}
+
 /// Pure geometry — the shape side of a `DObject`. Style / layer / handle
 /// live on the outer `DObject` struct (see [`crate::dobject`]).
 ///
-/// Future variants land here: Polyline, Text, MText, Hatch, BlockRef, Dim*,
+/// Future variants land here: Text, MText, Hatch, BlockRef, Dim*,
 /// Image, Wipeout, Viewport, Solid2D, Ray, Xline, Leader, MLeader, Tolerance,
 /// Table. Each addition is a new arm + a new entry in every match below.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub enum Geom {
     Line(Line),
     Circle(Circle),
     Arc(Arc),
     Ellipse(Ellipse),
     EllipseArc(EllipseArc),
+    Point(Point),
+    Polyline(Polyline),
 }
 
 impl Geom {
@@ -102,6 +187,17 @@ impl Geom {
                 start_param: ea.start_param,
                 sweep_param: ea.sweep_param,
             }),
+            Geom::Point(pt) => Geom::Point(Point {
+                location: pt.location + off,
+                style:    pt.style,
+                size:     pt.size,
+            }),
+            Geom::Polyline(p) => Geom::Polyline(Polyline {
+                vertices: p.vertices.iter()
+                    .map(|v| PolyVertex { pos: v.pos + off, bulge: v.bulge })
+                    .collect(),
+                closed:   p.closed,
+            }),
         }
     }
 
@@ -113,6 +209,8 @@ impl Geom {
             Geom::Arc(a)         => a.distance_to_point(p),
             Geom::Ellipse(e)     => e.distance_to_point(p),
             Geom::EllipseArc(ea) => ea.distance_to_point(p),
+            Geom::Point(pt)      => pt.location.dist(p),
+            Geom::Polyline(pl)   => pl.distance_to_point(p),
         }
     }
 }
@@ -173,6 +271,8 @@ impl Geom {
             ),
             Geom::Ellipse(e)     => e.bbox(),
             Geom::EllipseArc(ea) => ea.ellipse.bbox(),
+            Geom::Point(pt) => (pt.location, pt.location),
+            Geom::Polyline(pl) => pl.bbox(),
         }
     }
 }

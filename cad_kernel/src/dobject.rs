@@ -10,7 +10,7 @@
 // hits back to their storage. Pure-geometry math (intersect pairs, distance)
 // operates on `&Geom` internally; the struct exposes `.geom` for that.
 
-use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line};
+use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, Point, Polyline};
 use crate::math::Vec2;
 use crate::style::Style;
 
@@ -65,6 +65,8 @@ impl From<Circle>     for DObject { fn from(c: Circle) -> Self      { Self::new(
 impl From<Arc>        for DObject { fn from(a: Arc) -> Self         { Self::new(Geom::Arc(a)) } }
 impl From<Ellipse>    for DObject { fn from(e: Ellipse) -> Self     { Self::new(Geom::Ellipse(e)) } }
 impl From<EllipseArc> for DObject { fn from(ea: EllipseArc) -> Self { Self::new(Geom::EllipseArc(ea)) } }
+impl From<Point>      for DObject { fn from(p: Point) -> Self       { Self::new(Geom::Point(p)) } }
+impl From<Polyline>   for DObject { fn from(p: Polyline) -> Self    { Self::new(Geom::Polyline(p)) } }
 
 // ---- handle allocation -----------------------------------------------------
 //

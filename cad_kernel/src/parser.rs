@@ -68,6 +68,8 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "line"   | "l"  => parse_line(&toks[1..]),
         "circle" | "c"  => parse_circle(&toks[1..]),
         "ellipse" | "el" => parse_ellipse(&toks[1..]),
+        "point"   | "po" => parse_point(&toks[1..]),
+        "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
         "arc"    | "a"  => parse_arc(&toks[1..]),
         "arc3p"         => parse_arc_3p(&toks[1..]),
         "arcse"         => parse_arc_se(&toks[1..]),
@@ -115,6 +117,34 @@ fn parse_line(args: &[&str]) -> Result<Command, String> {
         a: parse_pt(args[0])?,
         b: parse_pt(args[1])?,
     })))
+}
+
+fn parse_point(args: &[&str]) -> Result<Command, String> {
+    if args.len() != 1 {
+        return Err("usage: point x,y".into());
+    }
+    Ok(Command::Add(Geom::Point(Point {
+        location: parse_pt(args[0])?,
+        style:    0,
+        size:     0.0,
+    })))
+}
+
+fn parse_polyline(args: &[&str]) -> Result<Command, String> {
+    // `polyline x1,y1 x2,y2 …` — straight-segment polyline; closed if the
+    // last token is the literal "close" / "closed".
+    if args.len() < 2 {
+        return Err("usage: polyline x1,y1 x2,y2 [x3,y3 …] [close]".into());
+    }
+    let (vert_args, closed) = match args.last().map(|s| s.to_ascii_lowercase()) {
+        Some(ref s) if s == "close" || s == "closed" => (&args[..args.len()-1], true),
+        _ => (args, false),
+    };
+    let mut vertices = Vec::with_capacity(vert_args.len());
+    for tok in vert_args {
+        vertices.push(PolyVertex { pos: parse_pt(tok)?, bulge: 0.0 });
+    }
+    Ok(Command::Add(Geom::Polyline(Polyline { vertices, closed })))
 }
 
 fn parse_circle(args: &[&str]) -> Result<Command, String> {

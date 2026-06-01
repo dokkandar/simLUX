@@ -39,7 +39,7 @@ pub mod snap;
 
 // Convenience re-exports
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
-pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line};
+pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, Point, PolyVertex, Polyline};
 pub use color::{aci_palette, resolve_color, Color};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
 pub use linetype::{Linetype, LinetypeTable};

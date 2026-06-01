@@ -125,5 +125,13 @@ fn describe(g: &Geom) -> String {
             ea.ellipse.center.x, ea.ellipse.center.y,
             ea.ellipse.semi_major(), ea.ellipse.ratio,
             ea.start_param.to_degrees(), ea.sweep_param.to_degrees()),
+        Geom::Point(pt) => format!(
+            "point ({:.4},{:.4}) style={} size={:.4}",
+            pt.location.x, pt.location.y, pt.style, pt.size),
+        Geom::Polyline(p) => format!(
+            "polyline {} verts{} length={:.4}",
+            p.vertices.len(),
+            if p.closed { " (closed)" } else { "" },
+            p.length()),
     }
 }

@@ -17,7 +17,7 @@ use crate::settings::UserEnv;
 const PAIR_LIMIT: usize = 5_000_000;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc }
+enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ArcMethod {
@@ -106,6 +106,10 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::EllipseArc, 2) => "ell.arc: click a point on the minor side",
         (Tool::EllipseArc, 3) => "ell.arc: click START point on the ellipse",
         (Tool::EllipseArc, _) => "ell.arc: click END point on the ellipse (CCW)    [Esc cancels]",
+        (Tool::Point, _) => "point: click to place    [Esc cancels]",
+        (Tool::Polyline, 0) => "polyline: click first vertex    [Esc cancels]",
+        (Tool::Polyline, 1) => "polyline: click next vertex; Enter finishes (open); 'c' Enter closes",
+        (Tool::Polyline, _) => "polyline: keep clicking vertices; Enter finishes (open); 'c' Enter closes",
         (Tool::Arc,    _) => arc_method.hint(n),
     }
 }
@@ -348,6 +352,20 @@ impl Default for CadApp {
             center: Vec2::new(-60.0, -30.0),
             major:  Vec2::new(25.0, 12.0),    // semi-major ≈ 27.7, rotation ≈ 25.6°
             ratio:  0.55,                     // semi-minor ≈ 15.2
+        }.into());
+        // Demo point + polyline (Slice E preview).
+        s.doc.push(Point {
+            location: Vec2::new(60.0, -40.0), style: 0, size: 0.0,
+        }.into());
+        s.doc.push(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(50.0,  40.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(70.0,  60.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(90.0,  40.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(80.0,  20.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(55.0,  25.0), bulge: 0.0 },
+            ],
+            closed: true,
         }.into());
         s.recompute();
         s.history.push("RUST_CAD math workbench — three demo dobjects loaded.".into());
@@ -1219,7 +1237,8 @@ impl CadApp {
         ui.separator();
 
         // Count by Geom variant.
-        let (mut nl, mut nc, mut na, mut ne, mut nea) = (0, 0, 0, 0, 0);
+        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl) =
+            (0, 0, 0, 0, 0, 0, 0);
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -1228,12 +1247,15 @@ impl CadApp {
                     Geom::Arc(_)        => na  += 1,
                     Geom::Ellipse(_)    => ne  += 1,
                     Geom::EllipseArc(_) => nea += 1,
+                    Geom::Point(_)      => npt += 1,
+                    Geom::Polyline(_)   => npl += 1,
                 }
             }
         }
         ui.monospace(format!(
-            "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  ellipse-arcs: {}",
-            nl, nc, na, ne, nea
+            "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}",
+            nl, nc, na, ne, nea, npt, npl
         ));
         ui.add_space(8.0);
 
@@ -1530,6 +1552,16 @@ impl CadApp {
                 self.pending.clear();
                 self.add_dobject(g, "canvas");
             }
+            (Tool::Point, 1) => {
+                let loc = self.pending[0];
+                self.pending.clear();
+                self.add_dobject(Geom::Point(Point {
+                    location: loc, style: 0, size: 0.0,
+                }), "canvas");
+            }
+            // Polyline never finalises via the click-count path — it
+            // accumulates clicks forever and finalises when the user
+            // presses Enter (see `finish_polyline`).
             (Tool::Circle, 2) => {
                 let c = self.pending[0];
                 let p = self.pending[1];
@@ -1919,6 +1951,16 @@ fn describe(g: &Geom) -> String {
             ea.start_param.to_degrees(),
             ea.sweep_param.to_degrees()
         ),
+        Geom::Point(pt) => format!(
+            "point ({:.2},{:.2}) style={} size={:.2}",
+            pt.location.x, pt.location.y, pt.style, pt.size
+        ),
+        Geom::Polyline(p) => format!(
+            "polyline {} verts{} len={:.2}",
+            p.vertices.len(),
+            if p.closed { " (closed)" } else { "" },
+            p.length()
+        ),
     }
 }
 
@@ -2003,6 +2045,23 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
             dot(c);
             dot(c + egui::vec2(-14.0, 0.0));   // start
             dot(c + egui::vec2( 14.0, 0.0));   // end
+        }
+        Tool::Point => {
+            // a small '+' glyph
+            painter.line_segment([c + egui::vec2(-9.0, 0.0), c + egui::vec2(9.0, 0.0)], pen);
+            painter.line_segment([c + egui::vec2(0.0, -9.0), c + egui::vec2(0.0, 9.0)], pen);
+            dot(c);
+        }
+        Tool::Polyline => {
+            // a 3-segment chevron-ish shape with vertex dots
+            let p1 = c + egui::vec2(-14.0,  8.0);
+            let p2 = c + egui::vec2( -4.0, -8.0);
+            let p3 = c + egui::vec2(  6.0,  6.0);
+            let p4 = c + egui::vec2( 14.0, -4.0);
+            painter.line_segment([p1, p2], pen);
+            painter.line_segment([p2, p3], pen);
+            painter.line_segment([p3, p4], pen);
+            dot(p1); dot(p2); dot(p3); dot(p4);
         }
     }
 
@@ -2290,6 +2349,32 @@ impl eframe::App for CadApp {
             self.finalise_selection();
         }
 
+        // Polyline tool: Enter (with empty cmd line) finishes the open
+        // polyline at its current vertex list. Typed "c" or "close"
+        // followed by Enter finishes with closed=true.
+        if self.tool == Tool::Polyline
+            && ctx.input(|i| i.key_pressed(egui::Key::Enter))
+        {
+            let trimmed = self.cmd.trim().to_ascii_lowercase();
+            let close = trimmed == "c" || trimmed == "close" || trimmed == "closed";
+            if trimmed.is_empty() || close {
+                if self.pending.len() >= 2 {
+                    let verts = self.pending.drain(..).map(|p| PolyVertex {
+                        pos: p, bulge: 0.0,
+                    }).collect();
+                    self.add_dobject(Geom::Polyline(Polyline {
+                        vertices: verts, closed: close,
+                    }), if close { "canvas (closed)" } else { "canvas" });
+                    if close { self.cmd.clear(); }
+                } else {
+                    self.history.push(
+                        "  ! polyline needs at least 2 vertices".into()
+                    );
+                    self.pending.clear();
+                }
+            }
+        }
+
         // ---- top toolbar ------------------------------------------------
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
             ui.add_space(4.0);
@@ -2297,10 +2382,12 @@ impl eframe::App for CadApp {
                 let prev = self.tool;
                 tool_button(ui, &mut self.tool, Tool::None,   "pointer");
                 ui.add_space(4.0);
-                tool_button(ui, &mut self.tool, Tool::Line,    "line");
-                tool_button(ui, &mut self.tool, Tool::Circle,  "circle");
+                tool_button(ui, &mut self.tool, Tool::Line,     "line");
+                tool_button(ui, &mut self.tool, Tool::Circle,   "circle");
                 tool_button(ui, &mut self.tool, Tool::Ellipse,    "ellipse");
                 tool_button(ui, &mut self.tool, Tool::EllipseArc, "ell.arc");
+                tool_button(ui, &mut self.tool, Tool::Point,    "point");
+                tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
@@ -2426,6 +2513,9 @@ impl eframe::App for CadApp {
                     Tool::Circle  => (String::from("DRAWING CIRCLE"), green),
                     Tool::Ellipse    => (String::from("DRAWING ELLIPSE"), green),
                     Tool::EllipseArc => (String::from("DRAWING ELLIPTICAL ARC"), green),
+                    Tool::Point     => (String::from("PLACING POINT"), green),
+                    Tool::Polyline  => (format!("DRAWING POLYLINE ({} verts; Enter to finish, 'c' Enter to close)",
+                        self.pending.len()), green),
                     Tool::Arc     => (format!("DRAWING ARC ({})",
                         self.arc_method.name()), green),
                 };
@@ -3943,6 +4033,12 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             let m = ea.start_param + ea.sweep_param * 0.5;
             draw(ea.ellipse.point_at(m));
         }
+        Geom::Point(pt) => {
+            draw(pt.location);
+        }
+        Geom::Polyline(p) => {
+            for v in &p.vertices { draw(v.pos); }
+        }
     }
 }
 
@@ -4040,6 +4136,31 @@ fn draw_dobject(
                 let t = ea.start_param + (i as f64 / n as f64) * ea.sweep_param;
                 pts.push(app.w2s(ea.ellipse.point_at(t), rect));
             }
+            painter.add(egui::Shape::line(pts, stroke));
+        }
+        Geom::Point(pt) => {
+            // POINT renders as a small cross-hair glyph at the location.
+            // PDMODE / PDSIZE will dispatch glyph variants when wired;
+            // today every point draws the same '+'.
+            let sp = app.w2s(pt.location, rect);
+            let s = 4.0_f32;
+            painter.line_segment(
+                [egui::pos2(sp.x - s, sp.y), egui::pos2(sp.x + s, sp.y)], stroke);
+            painter.line_segment(
+                [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
+        }
+        Geom::Polyline(p) => {
+            // Polyline = piecewise lines. Bulges deferred — straight only
+            // for now (matches the kernel's distance/bbox approximations).
+            if p.vertices.len() < 2 { return; }
+            let n = p.vertices.len();
+            let count = if p.closed { n + 1 } else { n };
+            let mut pts: Vec<egui::Pos2> = (0..count).map(|i| {
+                app.w2s(p.vertices[i % n].pos, rect)
+            }).collect();
+            // Tidy: if not closed, the +1 above never executed, but the
+            // length stayed = n. Just pass to Shape::line.
+            if !p.closed { pts.truncate(n); }
             painter.add(egui::Shape::line(pts, stroke));
         }
     }

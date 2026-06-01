@@ -9,6 +9,20 @@
 
 ## Where we are now (2026-06-01)
 
+**Slice E (Point + Polyline only): ● DONE.** `Geom` enum gains two new
+variants — `Point { location, style, size }` (AutoCAD POINT) and
+`Polyline { vertices: Vec<PolyVertex>, closed }` (LWPOLYLINE; bulge
+field on PolyVertex accepted but renderer treats every segment as
+straight today). Drafting tools wired to the toolbar (`point`,
+`pline`); polyline draws on click and finishes on Enter (`c` Enter
+closes). `From<Point>` / `From<Polyline>` impls keep ergonomic
+construction. All snap kinds extended (END snaps polyline vertices,
+MID snaps every segment midpoint, NEA/PER project onto each segment,
+Point acts as its own END snap). 70 tests still passing.
+
+Text / MText / DimRotated are deliberately deferred — they need new
+tables (TextStyleTable, DimStyleTable) which are slices of their own.
+
 **Slice D — Entity Info panel: ● DONE.** Egui dock with two modes:
 single-Dobject (full geometry breakdown + editable Layer / Visibility /
 Color / Linetype / LinetypeScale / Lineweight) and multi-selection
@@ -89,7 +103,7 @@ is in place so it inherits layer/color/linetype/lineweight for free.
 | **B. Layer panel** (UI) | ● Done | Egui dock — list/add/rename/delete/freeze/lock/visibility/active | Yes — first new panel |
 | **C. Pen palette** (UI) | ● Done | Egui dock — pen presets (color + linetype + lineweight bundles), "Apply to selection" | Yes |
 | **D. Entity Info panel** (UI) | ● Done | Read-only / partially-editable property inspector for current selection | Yes |
-| **E. New Dobject types** | ○ | `DobjectPoint` → `Polyline` → `Text` → `MText` → `DimRotated`. Each gets the full property model for free. | Yes — many new shapes |
+| **E. New Dobject types** | ◐ Partial | `DobjectPoint` ● + `DobjectPolyline` ● done. `Text` / `MText` / `DimRotated` deferred — they need `TextStyleTable` / `DimStyleTable` first (each is its own slice). | Yes — two new shapes |
 | **F. Block table + Block panel** | ○ | `BlockTable` on `Document`; INSERT references; egui Blocks dock | Yes |
 | **G. UCS / Named Views / Library Browser / Command Line panel** | ○ | Lighter dependencies, can land in any order | Yes |
 | **H. `cad_io` (DXF reader / writer)** | ○ | Round-trip LINE / CIRCLE / ARC / ELLIPSE / ELLIPSE_ARC first; then per-entity dispatchers | Yes — open .dxf files |
