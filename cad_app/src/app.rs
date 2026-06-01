@@ -1498,34 +1498,15 @@ impl CadApp {
                 }
                 ui.end_row();
 
-                // Color (cycle: ByLayer → TrueColor picker → ByLayer)
+                // Color — ACI palette is the primary picker (8-bit);
+                // TrueColor is the secondary fallback. See memo
+                // `feedback_rust_cad_color_aci_primary`.
                 ui.label("Color");
-                let color = self.doc.dobjects[idx].style.color;
-                let (r, g, b) = match color {
-                    Color::TrueColor(_) => color.rgb_bytes().unwrap_or((255, 255, 255)),
-                    Color::Aci(i)       => aci_palette(i),
-                    Color::ByLayer | Color::ByBlock =>
-                        resolve_color(color, self.doc.dobjects[idx].style.layer, &self.doc.layers),
-                };
-                let mut arr = [r, g, b];
-                let label = match color {
-                    Color::ByLayer => "ByLayer",
-                    Color::ByBlock => "ByBlock",
-                    Color::Aci(_)  => "ACI",
-                    Color::TrueColor(_) => "RGB",
-                };
-                ui.horizontal(|ui| {
-                    if ui.color_edit_button_srgb(&mut arr).changed() {
-                        self.doc.dobjects[idx].style.color =
-                            Color::rgb(arr[0], arr[1], arr[2]);
-                        self.gpu_dirty = true;
-                    }
-                    ui.small(label);
-                    if ui.small_button("ByLayer").clicked() {
-                        self.doc.dobjects[idx].style.color = Color::ByLayer;
-                        self.gpu_dirty = true;
-                    }
-                });
+                let mut col = self.doc.dobjects[idx].style.color;
+                if aci_color_picker(ui, ("info_color", idx), &mut col) {
+                    self.doc.dobjects[idx].style.color = col;
+                    self.gpu_dirty = true;
+                }
                 ui.end_row();
 
                 // Linetype (combo)
@@ -2892,6 +2873,98 @@ fn describe(g: &Geom) -> String {
 }
 
 // ---- icon tool-button -------------------------------------------------------
+
+/// Color picker UI — ACI palette as PRIMARY, TrueColor as secondary.
+/// Returns true if the value changed. See
+/// `feedback_rust_cad_color_aci_primary` memo.
+fn aci_color_picker(ui: &mut egui::Ui, id: impl std::hash::Hash, value: &mut Color) -> bool {
+    let mut changed = false;
+
+    // Current-value summary swatch + label
+    let (r, g, b) = match *value {
+        Color::Aci(i)        => aci_palette(i),
+        Color::TrueColor(_)  => value.rgb_bytes().unwrap_or((255, 255, 255)),
+        Color::ByLayer       => (180, 180, 200),
+        Color::ByBlock       => (140, 140, 160),
+    };
+    let summary = match *value {
+        Color::ByLayer       => "ByLayer".to_string(),
+        Color::ByBlock       => "ByBlock".to_string(),
+        Color::Aci(i)        => format!("ACI {}", i),
+        Color::TrueColor(v)  => format!("RGB #{:06X}", v & 0x00FFFFFF),
+    };
+
+    ui.horizontal(|ui| {
+        // Summary chip
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::hover());
+        ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
+        ui.painter().rect_stroke(rect, 2.0,
+            egui::Stroke::new(0.7, egui::Color32::from_rgb(70, 80, 95)));
+        ui.label(summary);
+    });
+
+    // ACI grid — 24 columns × ~11 rows (256 cells).
+    let cell = 14.0_f32;
+    let cols = 24;
+    egui::CollapsingHeader::new("ACI palette (8-bit)")
+        .id_salt(("aci_grid", &format!("{:?}", &id as *const _)))
+        .default_open(true)
+        .show(ui, |ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            egui::Grid::new(("aci_grid_grid", &format!("{:?}", &id as *const _)))
+                .spacing([1.0, 1.0])
+                .show(ui, |ui| {
+                    for row in 0..((256 + cols - 1) / cols) {
+                        for col in 0..cols {
+                            let i_usize = row * cols + col;
+                            if i_usize >= 256 { break; }
+                            let i = i_usize as u8;
+                            let (r, g, b) = aci_palette(i);
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(cell, cell), egui::Sense::click());
+                            ui.painter().rect_filled(rect, 1.0, egui::Color32::from_rgb(r, g, b));
+                            // Highlight current ACI selection
+                            if matches!(*value, Color::Aci(j) if j == i) {
+                                ui.painter().rect_stroke(rect, 1.0,
+                                    egui::Stroke::new(2.0, egui::Color32::WHITE));
+                            } else {
+                                ui.painter().rect_stroke(rect, 1.0,
+                                    egui::Stroke::new(0.3, egui::Color32::from_rgb(60, 70, 85)));
+                            }
+                            if resp.clicked() {
+                                *value = Color::Aci(i);
+                                changed = true;
+                            }
+                            if resp.hovered() {
+                                resp.on_hover_text(format!("ACI {}", i));
+                            }
+                        }
+                        ui.end_row();
+                    }
+                });
+        });
+
+    // Secondary controls — ByLayer / ByBlock / TrueColor fallback
+    ui.horizontal(|ui| {
+        if ui.small_button("ByLayer").clicked() {
+            *value = Color::ByLayer;
+            changed = true;
+        }
+        if ui.small_button("ByBlock").clicked() {
+            *value = Color::ByBlock;
+            changed = true;
+        }
+        // TrueColor fallback — opens egui's RGB picker; commits as TrueColor
+        let mut rgb = [r, g, b];
+        if ui.color_edit_button_srgb(&mut rgb).changed() {
+            *value = Color::rgb(rgb[0], rgb[1], rgb[2]);
+            changed = true;
+        }
+        ui.small("TrueColor…");
+    });
+
+    changed
+}
 
 fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -> bool {
     let selected = *current == this;
@@ -4336,6 +4409,18 @@ impl eframe::App for CadApp {
                         let world_r = 50.0 / self.scale as f64;
                         self.intersect_near(world, world_r);
                         self.intersect_pending_click = false;
+                    } else if self.tool == Tool::None {
+                        // Pointer-mode click — the always-on selector. Click
+                        // on a dobject adds it to the basket; Shift removes.
+                        // See `feedback_rust_cad_pointer_is_selector` memo.
+                        let shift = ctx.input(|i| i.modifiers.shift);
+                        let tol_world = 10.0 / self.scale as f64;
+                        if let Some(i) = self.nearest_entity_under(world, tol_world) {
+                            self.click_select(i, shift);
+                        }
+                        // Clicking empty space in pointer mode is a no-op (no
+                        // window-rubber-band yet — that's a Slice O thing).
+                        self.refocus_cmd = true;
                     } else if self.picking_source {
                         let tol_world = 10.0 / self.scale as f64;
                         match self.nearest_entity_under(world, tol_world) {
@@ -4460,7 +4545,18 @@ impl eframe::App for CadApp {
                             skipped += 1;
                             continue;
                         }
-                        let color = if self.selected == Some(i) || in_selection {
+                        // Basket members render as DASHED GRAY (the pointer-
+                        // mode selection look — does NOT modify style).
+                        // self.selected (array-dialog single pick) stays
+                        // yellow so it's distinguishable.
+                        if in_selection {
+                            let gray = egui::Color32::from_rgb(160, 165, 175);
+                            draw_dobject_dashed(&painter, rect, self, &e.geom,
+                                gray, 6.0, 4.0);
+                            drawn += 1;
+                            continue;
+                        }
+                        let color = if self.selected == Some(i) {
                             egui::Color32::from_rgb(255, 200, 80)
                         } else if snap_source == Some(i) {
                             egui::Color32::from_rgb(120, 240, 255)
@@ -4481,7 +4577,10 @@ impl eframe::App for CadApp {
                     // so lines/arcs are visible. Future slices add their own
                     // instance kinds.
                     let mut circles: Vec<CircleInstance> = Vec::new();
-                    let sel_col  = 0xFFC850FFu32; // yellow
+                    // GPU path: dashed gray for basket isn't available yet
+                    // (GPU dashing would need a shader change). Render solid
+                    // gray instead so basket members are still distinguishable.
+                    let sel_col  = 0xA0A5AFFFu32; // gray (basket / selected)
                     let snap_col = 0x78F0FFFFu32; // cyan
                     let def_col  = 0xAAC8E6FFu32; // light blue
                     for i in candidate_iter {
@@ -5376,6 +5475,101 @@ fn draw_dobject(
             // length stayed = n. Just pass to Shape::line.
             if !p.closed { pts.truncate(n); }
             painter.add(egui::Shape::line(pts, stroke));
+        }
+    }
+}
+
+/// Render a Dobject's geometry as a DASHED polyline (used today for the
+/// pointer-mode selection look; see `feedback_rust_cad_pointer_is_selector`).
+/// Reuses the same per-variant tessellation as `draw_dobject`, then passes
+/// the resulting polyline through `egui::Shape::dashed_line`.
+fn draw_dobject_dashed(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    g: &Geom,
+    color: egui::Color32,
+    dash: f32,
+    gap: f32,
+) {
+    let stroke = egui::Stroke::new(1.6, color);
+    let push_dashed = |pts: Vec<egui::Pos2>| {
+        for s in egui::Shape::dashed_line(&pts, stroke, dash, gap) {
+            painter.add(s);
+        }
+    };
+    match g {
+        Geom::Line(l) => {
+            push_dashed(vec![app.w2s(l.a, rect), app.w2s(l.b, rect)]);
+        }
+        Geom::Circle(c) => {
+            // Tessellate the circle into a closed polygon and dash it.
+            let r_px = (c.radius as f32 * app.scale).max(1.0);
+            let n = ((r_px * 0.7).clamp(24.0, 256.0)) as usize;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = (i as f64 / n as f64) * std::f64::consts::TAU;
+                let p = Vec2::new(
+                    c.center.x + c.radius * t.cos(),
+                    c.center.y + c.radius * t.sin(),
+                );
+                pts.push(app.w2s(p, rect));
+            }
+            push_dashed(pts);
+        }
+        Geom::Arc(a) => {
+            let r_px = (a.radius as f32 * app.scale).max(1.0);
+            let n = ((r_px * 0.5).clamp(8.0, 256.0)) as usize;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = a.start_angle + (i as f64 / n as f64) * a.sweep_angle;
+                let p = Vec2::new(
+                    a.center.x + a.radius * t.cos(),
+                    a.center.y + a.radius * t.sin(),
+                );
+                pts.push(app.w2s(p, rect));
+            }
+            push_dashed(pts);
+        }
+        Geom::Ellipse(el) => {
+            let r_px = (el.semi_major() as f32 * app.scale).max(1.0);
+            let n = ((r_px * 0.7).clamp(16.0, 512.0)) as usize;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = (i as f64 / n as f64) * std::f64::consts::TAU;
+                pts.push(app.w2s(el.point_at(t), rect));
+            }
+            push_dashed(pts);
+        }
+        Geom::EllipseArc(ea) => {
+            let r_px = (ea.ellipse.semi_major() as f32 * app.scale).max(1.0);
+            let n = ((r_px * 0.7).clamp(12.0, 512.0)) as usize;
+            let mut pts = Vec::with_capacity(n + 1);
+            for i in 0..=n {
+                let t = ea.start_param + (i as f64 / n as f64) * ea.sweep_param;
+                pts.push(app.w2s(ea.ellipse.point_at(t), rect));
+            }
+            push_dashed(pts);
+        }
+        Geom::Point(pt) => {
+            // Point glyph stays solid even when "selected" — dashing a
+            // 4-pixel cross is meaningless.
+            let sp = app.w2s(pt.location, rect);
+            let s = 4.0_f32;
+            painter.line_segment(
+                [egui::pos2(sp.x - s, sp.y), egui::pos2(sp.x + s, sp.y)], stroke);
+            painter.line_segment(
+                [egui::pos2(sp.x, sp.y - s), egui::pos2(sp.x, sp.y + s)], stroke);
+        }
+        Geom::Polyline(p) => {
+            if p.vertices.len() < 2 { return; }
+            let n = p.vertices.len();
+            let count = if p.closed { n + 1 } else { n };
+            let mut pts: Vec<egui::Pos2> = (0..count).map(|i| {
+                app.w2s(p.vertices[i % n].pos, rect)
+            }).collect();
+            if !p.closed { pts.truncate(n); }
+            push_dashed(pts);
         }
     }
 }
