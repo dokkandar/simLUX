@@ -1645,6 +1645,60 @@ impl EllipseArc {
     }
 }
 
+impl Geom {
+    /// Characteristic "grip" points the UI can render as drag handles.
+    /// v1 grip semantics: dragging any grip translates the whole dobject
+    /// by the cursor delta. Per-grip role behaviour (e.g. circle-quadrant
+    /// → change radius) is deferred to v2.
+    ///   - Line:       endpoints + midpoint
+    ///   - Arc:        endpoints + midpoint + center
+    ///   - Circle:     center + 4 quadrants
+    ///   - Ellipse:    center + 4 axis tips
+    ///   - EllipseArc: endpoints + center
+    ///   - Polyline:   every vertex
+    ///   - Point:      the point itself
+    pub fn grip_points(&self) -> Vec<Vec2> {
+        match self {
+            Geom::Line(l) => vec![l.a, l.b, (l.a + l.b) * 0.5],
+            Geom::Circle(c) => {
+                let r = c.radius;
+                vec![
+                    c.center,
+                    c.center + Vec2::new( r, 0.0),
+                    c.center + Vec2::new( 0.0,  r),
+                    c.center + Vec2::new(-r, 0.0),
+                    c.center + Vec2::new( 0.0, -r),
+                ]
+            }
+            Geom::Arc(a) => {
+                let (e1, e2) = a.endpoints();
+                let mid_t = a.start_angle + a.sweep_angle * 0.5;
+                let mid   = a.center + Vec2::new(
+                    a.radius * mid_t.cos(),
+                    a.radius * mid_t.sin(),
+                );
+                vec![e1, e2, mid, a.center]
+            }
+            Geom::Ellipse(el) => {
+                let half = std::f64::consts::FRAC_PI_2;
+                vec![
+                    el.center,
+                    el.point_at(0.0),
+                    el.point_at(half),
+                    el.point_at(std::f64::consts::PI),
+                    el.point_at(std::f64::consts::PI + half),
+                ]
+            }
+            Geom::EllipseArc(ea) => {
+                let (e1, e2) = ea.endpoints();
+                vec![e1, e2, ea.ellipse.center]
+            }
+            Geom::Polyline(p) => p.vertices.iter().map(|v| v.pos).collect(),
+            Geom::Point(p) => vec![p.location],
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Polyline segments — explode into independent Line / Arc geoms.
 //

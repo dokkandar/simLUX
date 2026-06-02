@@ -132,6 +132,10 @@ pub struct CadApp {
     /// notice shown, 2 = next Enter cancels. Resets on any state
     /// transition or any cmd input.
     empty_enter_count_in_select: u8,
+    /// Grip drag — Some(GripDrag) while the user is dragging a grip
+    /// handle of a selected dobject. v1 semantic: dragging any grip
+    /// translates the whole dobject by the cursor delta.
+    grip_drag: Option<GripDrag>,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -399,6 +403,15 @@ pub enum LengthenState { Off, WaitingForSide(f64) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
+/// Grip drag — recorded when the user presses-and-drags on a grip handle
+/// of a currently-selected dobject. v1: translate the dobject by the
+/// cursor delta from `grip_origin`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub struct GripDrag {
+    pub dobject_idx: usize,
+    pub grip_origin: Vec2,
+}
+
 /// Fillet — Slice M.3. Two-click flow: pick first object → pick second.
 /// `radius` is captured at session start so re-running `fillet` with a
 /// different value mid-flow doesn't change behaviour (sticky session).
@@ -475,6 +488,7 @@ impl Default for CadApp {
             current_prompt:     String::new(),
             last_command:       None,
             empty_enter_count_in_select: 0,
+            grip_drag: None,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -3875,6 +3889,10 @@ impl eframe::App for CadApp {
                 self.chamfer_state = ChamferState::Off;
                 self.history.push("  chamfer cancelled".into());
             }
+            if self.grip_drag.is_some() {
+                self.grip_drag = None;
+                self.history.push("  grip drag cancelled".into());
+            }
             if self.stretch_state != StretchState::Off {
                 self.stretch_state = StretchState::Off;
                 self.history.push("  stretch cancelled".into());
@@ -4797,7 +4815,62 @@ impl eframe::App for CadApp {
             // a real window-rubber-band drag isn't fired as a click.
             let drag_was_a_click = drag_stopped
                 && (in_click_only_phase || press_release_dist < 5.0);
-            let click_fired = click_now || drag_was_a_click;
+            // ---- Grip drag handling (v1: any-grip-drag translates) ---------
+            // When in pointer mode + GrpEnb + selection is non-empty, watch
+            // for a primary-button drag that starts close to one of the
+            // rendered grip squares. If hit, capture (dobject_idx, grip_pos)
+            // and suppress the normal click promotion below.
+            let pointer_mode_idle = !in_click_only_phase && self.select_mode == SelectMode::Off;
+            let mut grip_drag_consumed_click = false;
+            if pointer_mode_idle && self.env.GrpEnb {
+                let drag_started = resp.drag_started_by(egui::PointerButton::Primary);
+                if drag_started && self.grip_drag.is_none() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let cur_world = self.s2w(pos, rect);
+                        let tol = (self.env.GrpSz as f64 + 4.0) / self.scale as f64;
+                        // Scan every selected dobject's grip points.
+                        let mut targets: Vec<usize> = self.selection.clone();
+                        if let Some(s) = self.selected { targets.push(s); }
+                        targets.sort_unstable(); targets.dedup();
+                        'outer: for &idx in &targets {
+                            let Some(d) = self.doc.dobjects.get(idx) else { continue; };
+                            for gp in d.geom.grip_points() {
+                                if cur_world.dist(gp) < tol {
+                                    self.grip_drag = Some(GripDrag {
+                                        dobject_idx: idx,
+                                        grip_origin: gp,
+                                    });
+                                    break 'outer;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Commit grip drag on release.
+                if let Some(gd) = self.grip_drag {
+                    if resp.drag_stopped_by(egui::PointerButton::Primary) {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let drop_world = self.s2w(pos, rect);
+                            let delta = drop_world - gd.grip_origin;
+                            if delta.len() > 1e-9 {
+                                self.snapshot_doc();
+                                if let Some(d) = self.doc.dobjects.get_mut(gd.dobject_idx) {
+                                    d.geom = d.geom.translated(delta);
+                                }
+                                self.intersections.clear();
+                                self.index_dirty = true;
+                                self.gpu_dirty = true;
+                                self.history.push(format!(
+                                    "  ⊕ grip: #{} moved by ({:.3}, {:.3})",
+                                    gd.dobject_idx, delta.x, delta.y));
+                            }
+                        }
+                        self.grip_drag = None;
+                        grip_drag_consumed_click = true;
+                    }
+                }
+            }
+            let click_fired = (click_now || drag_was_a_click) && !grip_drag_consumed_click;
             if (click_now || drag_stopped) && self.trim_debug_open {
                 // Only log when the user has the diagnostic window open, to
                 // keep the log uncluttered.
@@ -5699,6 +5772,62 @@ impl eframe::App for CadApp {
                         egui::FontId::monospace(10.0),
                         glyph_col.gamma_multiply(0.7),
                     );
+                }
+            }
+
+            // ---- Grip handles (Issue 3) ----------------------------------
+            // Render small filled squares at each grip point of every
+            // selected dobject when in pointer mode + GrpEnb is on. v1
+            // semantic: dragging any grip translates the whole dobject.
+            if self.env.GrpEnb && !in_click_only_phase && self.select_mode == SelectMode::Off {
+                let mut grip_targets: Vec<usize> = self.selection.clone();
+                if let Some(s) = self.selected { grip_targets.push(s); }
+                grip_targets.sort_unstable(); grip_targets.dedup();
+                // Render preview translation if dragging.
+                let drag_delta: Option<Vec2> = self.grip_drag.and_then(|gd| {
+                    let cur = resp.hover_pos()?;
+                    let w   = self.s2w(cur, rect);
+                    Some(w - gd.grip_origin)
+                });
+                let gsz = self.env.GrpSz as f32;
+                let (cu_r, cu_g, cu_b) = (
+                    (self.env.GrClrU >> 16 & 0xFF) as u8,
+                    (self.env.GrClrU >>  8 & 0xFF) as u8,
+                    (self.env.GrClrU       & 0xFF) as u8,
+                );
+                let (cs_r, cs_g, cs_b) = (
+                    (self.env.GrClrS >> 16 & 0xFF) as u8,
+                    (self.env.GrClrS >>  8 & 0xFF) as u8,
+                    (self.env.GrClrS       & 0xFF) as u8,
+                );
+                let grip_col_u = egui::Color32::from_rgb(cu_r, cu_g, cu_b);
+                let grip_col_s = egui::Color32::from_rgb(cs_r, cs_g, cs_b);
+                for idx in &grip_targets {
+                    let Some(d) = self.doc.dobjects.get(*idx) else { continue; };
+                    // If this dobject is the active drag target, preview
+                    // it translated by delta.
+                    let preview_geom = if let (Some(delta), Some(gd)) = (drag_delta, self.grip_drag) {
+                        if gd.dobject_idx == *idx { Some(d.geom.translated(delta)) } else { None }
+                    } else { None };
+                    let geom_ref = preview_geom.as_ref().unwrap_or(&d.geom);
+                    // Ghost the dobject in dim white during the drag.
+                    if preview_geom.is_some() {
+                        draw_dobject(&painter, rect, self, geom_ref,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 160));
+                    }
+                    for gp in geom_ref.grip_points() {
+                        let sp = self.w2s(gp, rect);
+                        let r = egui::Rect::from_center_size(
+                            sp, egui::vec2(gsz * 2.0, gsz * 2.0));
+                        let hot = self.grip_drag
+                            .map(|gd| gd.dobject_idx == *idx
+                                 && gd.grip_origin.dist(gp) < 1e-6)
+                            .unwrap_or(false);
+                        let col = if hot { grip_col_s } else { grip_col_u };
+                        painter.rect_filled(r, 0.0, col);
+                        painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0,
+                            egui::Color32::from_rgb(20, 20, 20)));
+                    }
                 }
             }
 
