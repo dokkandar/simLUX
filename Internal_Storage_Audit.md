@@ -14,7 +14,7 @@ File: `cad_kernel/src/document.rs`
 
 ```rust
 pub struct Document {
-    pub dobjects:   Vec<DObject>,       // the drafting entities
+    pub dobjects:   Vec<DObject>,       // the drafting dobjects
     pub layers:     LayerTable,         // named layers
     pub linetypes:  LinetypeTable,      // dash patterns
     pub pens:       PenTable,           // pre-set styles a user can apply
@@ -38,7 +38,7 @@ Default state (`Document::default()`):
 
 ---
 
-## 2. The drafting entity: `DObject`
+## 2. The drafting dobject: `DObject`
 
 File: `cad_kernel/src/dobject.rs`
 
@@ -121,7 +121,7 @@ pub struct Style {
 // Aligned: ~28 bytes.
 ```
 
-Defaults match a fresh AutoCAD entity (`Style::default()`):
+Defaults for a fresh dobject (`Style::default()`):
 - `layer`          = `LayerTable::LAYER_BASE` (the built-in "LAYER B")
 - `color`          = `Color::ByLayer`
 - `linetype`       = `LinetypeTable::CONTINUOUS`
@@ -179,9 +179,9 @@ the second indirection breaks to white to avoid infinite recursion.
 
 | Source | How it's stored | Resolved at |
 |---|---|---|
-| **By Dobject** | `style.color = Color::Aci(n)` or `Color::TrueColorRef(idx)` on the entity itself. Overrides everything. | Render time. |
+| **By Dobject** | `style.color = Color::Aci(n)` or `Color::TrueColorRef(idx)` on the dobject itself. Overrides everything. | Render time. |
 | **By Block** | `style.color = Color::ByBlock`. Resolves to the BLOCK's color when inside a block reference. Falls back to ByLayer outside. **Not yet implemented** — block support is a future slice; today ByBlock is treated as ByLayer. | Render time, via block→layer→table chain. |
-| **By Group** | Not a separate concept in our model. Groups (when added) inherit from the entities they contain; group selection is a UX concept, not a color source. | N/A. |
+| **By Group** | Not a separate concept in our model. Groups (when added) inherit from the dobjects they contain; group selection is a UX concept, not a color source. | N/A. |
 | **By Layer** | `style.color = Color::ByLayer`. Resolves via `layers[style.layer].color`. The layer holds the concrete `Color::Aci(n)` or `Color::TrueColorRef(idx)`. **This is the default for new Dobjects.** | Render time. |
 
 Default on every fresh Dobject:
@@ -371,8 +371,8 @@ File: `cad_io/src/dxf.rs`. DXF is a tagged text format (one "group
 code" + value per line). The reader does **two passes**:
 
 1. Tokenise: each pair (code, value) is built into a `Vec<(i32, String)>`.
-2. Walk the pairs, dispatching on `0` (entity type marker) and
-   accumulating per-entity fields.
+2. Walk the pairs, dispatching on group code `0` (the DXF spec's
+   entity-type marker) and accumulating per-dobject fields.
 
 ### 9.1 LAYER table mapping
 
@@ -390,9 +390,9 @@ The DXF spec also defines:
   ignores 420 on LAYER. Layer truecolor support is a follow-up.
 - `430` → color book name. NOT supported.
 
-### 9.2 ENTITY common-style mapping
+### 9.2 Dobject common-style mapping
 
-Every entity reader (LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, POINT)
+Every dobject reader (LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, POINT)
 shares a Style accumulator pass:
 
 ```
@@ -407,21 +407,21 @@ DXF group  →  Field on `Style`
   60       →  visible flag (0=visible, 1=invisible)
 ```
 
-### 9.3 LINE entity
+### 9.3 LINE → Geom::Line
 
 ```
  10 / 20 / 30  →  start (X, Y, Z — Z ignored: we're 2D)
  11 / 21 / 31  →  end   (X, Y, Z — Z ignored)
 ```
 
-### 9.4 CIRCLE entity
+### 9.4 CIRCLE → Geom::Circle
 
 ```
  10 / 20  →  center (X, Y)
  40       →  radius
 ```
 
-### 9.5 ARC entity
+### 9.5 ARC → Geom::Arc
 
 ```
  10 / 20  →  center
@@ -430,7 +430,7 @@ DXF group  →  Field on `Style`
  51       →  end   angle (degrees → radians; sweep computed = end - start mod 2π)
 ```
 
-### 9.6 ELLIPSE entity
+### 9.6 ELLIPSE → Geom::Ellipse / Geom::EllipseArc
 
 ```
  10 / 20  →  center
@@ -443,7 +443,7 @@ DXF group  →  Field on `Style`
 If `41 == 0.0 && 42 ≈ 2π` → full `Geom::Ellipse`. Otherwise
 `Geom::EllipseArc`.
 
-### 9.7 LWPOLYLINE entity
+### 9.7 LWPOLYLINE → Geom::Polyline
 
 ```
  70       →  flags (bit 0 = closed)
@@ -452,7 +452,7 @@ If `41 == 0.0 && 42 ≈ 2π` → full `Geom::Ellipse`. Otherwise
  42       →  per-vertex bulge (optional; default 0 = straight)
 ```
 
-### 9.8 POINT entity
+### 9.8 POINT → Geom::Point
 
 ```
  10 / 20  →  location
@@ -462,7 +462,7 @@ If `41 == 0.0 && 42 ≈ 2π` → full `Geom::Ellipse`. Otherwise
 
 ### 9.9 What's NOT read yet
 
-- Block table (`BLOCK` / `ENDBLK` / `INSERT` entities): skipped.
+- Block table (`BLOCK` / `ENDBLK` / `INSERT` records): skipped.
 - SPLINE / NURBS: skipped (no spline support in the kernel).
 - TEXT / MTEXT: skipped.
 - DIMENSION: skipped.
@@ -527,7 +527,7 @@ In rough size-payoff order:
 3. **Per-Document handle namespace** — required before DXF handles
    can be preserved on round-trip.
 4. **Block / Group tables** — first-class containers, not just
-   selection abstractions. Memory cost: per-block ~64 B + entity
+   selection abstractions. Memory cost: per-block ~64 B + dobject
    references.
 
 None scheduled. Trigger them only when actual test data shows the

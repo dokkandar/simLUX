@@ -426,7 +426,7 @@ Use this document when:
   <li>Adding a per-Dobject property — §12 has the seven-step checklist.</li>
   <li>Estimating memory at a target dobject count — §3 and §6 have the
       cost tables.</li>
-  <li>Implementing a new DXF entity — §10 has the existing reader's
+  <li>Implementing a new DXF record type — §10 has the existing reader's
       group-code mapping pattern.</li>
   <li>Modifying RSM — §9 documents the byte-by-byte layout.</li>
   <li>Reviewing the color inheritance chain — §7 has the resolution
@@ -444,7 +444,7 @@ that holds the entire drawing.
 </p>
 
 <pre><code><span class="kw">pub struct</span> <span class="t">Document</span> {
-    <span class="kw">pub</span> dobjects:   <span class="t">Vec</span>&lt;<span class="t">DObject</span>&gt;,       <span class="c">// the drafting entities</span>
+    <span class="kw">pub</span> dobjects:   <span class="t">Vec</span>&lt;<span class="t">DObject</span>&gt;,       <span class="c">// the drafting dobjects</span>
     <span class="kw">pub</span> layers:     <span class="t">LayerTable</span>,         <span class="c">// named layers</span>
     <span class="kw">pub</span> linetypes:  <span class="t">LinetypeTable</span>,      <span class="c">// dash patterns</span>
     <span class="kw">pub</span> pens:       <span class="t">PenTable</span>,           <span class="c">// pre-set styles</span>
@@ -521,7 +521,7 @@ that holds the entire drawing.
 <h2><span class="sec">§ 3</span>DObject layout</h2>
 
 <p>
-File: <code>cad_kernel/src/dobject.rs</code>. The drafting entity that
+File: <code>cad_kernel/src/dobject.rs</code>. The drafting dobject that
 the user creates, edits, and selects.
 </p>
 
@@ -616,7 +616,7 @@ enum totals <strong>~48 bytes</strong> after tag + alignment.
 
 <p>
 File: <code>cad_kernel/src/style.rs</code>. The "common properties" every
-Dobject carries — what AutoCAD calls the entity's display attributes.
+Dobject carries — what AutoCAD calls the entity's display attributes (we call ours <em class="kw">dobjects</em>).
 </p>
 
 <pre><code><span class="kw">pub struct</span> <span class="t">Style</span> {
@@ -791,7 +791,7 @@ field, dispatched at render time.
 <tbody>
 <tr>
   <td><strong>By Dobject</strong></td>
-  <td><code>style.color = Color::Aci(n)</code> or <code>Color::TrueColorRef(idx)</code> on the entity itself. Overrides everything.</td>
+  <td><code>style.color = Color::Aci(n)</code> or <code>Color::TrueColorRef(idx)</code> on the dobject itself. Overrides everything.</td>
   <td>Render time.</td>
 </tr>
 <tr>
@@ -801,7 +801,7 @@ field, dispatched at render time.
 </tr>
 <tr>
   <td><strong>By Group</strong></td>
-  <td><em>Not a separate color source</em> in the data model. Groups (when added) inherit from the entities they contain; group selection is a UX concept, not a color source.</td>
+  <td><em>Not a separate color source</em> in the data model. Groups (when added) inherit from the dobjects they contain; group selection is a UX concept, not a color source.</td>
   <td>—</td>
 </tr>
 <tr>
@@ -811,7 +811,7 @@ field, dispatched at render time.
 </tr>
 </tbody></table>
 
-<h3>Default chain for a freshly drawn entity</h3>
+<h3>Default chain for a freshly drawn dobject</h3>
 <pre><code><span class="t">Style</span>::default()
     .color  = <span class="t">Color</span>::ByLayer
     .layer  = <span class="t">LayerTable</span>::LAYER_BASE       <span class="c">// id 0, name "LAYER B"</span>
@@ -1004,8 +1004,8 @@ passes</strong>:
   <li><strong>Tokenise:</strong> each pair (code, value) becomes
       <code>Vec&lt;(i32, String)&gt;</code>.</li>
   <li><strong>Walk:</strong> dispatch on group code <code>0</code>
-      (entity-type marker) and accumulate per-entity fields until the
-      next <code>0</code>.</li>
+      (the DXF spec's entity-type marker) and accumulate per-dobject
+      fields until the next <code>0</code>.</li>
 </ol>
 
 <h3>LAYER table mapping</h3>
@@ -1020,9 +1020,9 @@ passes</strong>:
 <tr><td class="num">430</td><td>Color book name — <strong>NOT supported</strong>.</td></tr>
 </tbody></table>
 
-<h3>ENTITY common-style mapping</h3>
+<h3>Dobject common-style mapping</h3>
 <p>
-Every entity reader (LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, POINT)
+Every dobject reader (LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, POINT)
 shares this Style accumulator pass.
 </p>
 <table>
@@ -1036,9 +1036,9 @@ shares this Style accumulator pass.
 <tr><td class="num">60</td> <td><code>visible</code> (0 = visible, 1 = invisible)</td></tr>
 </tbody></table>
 
-<h3>Per-entity geometry</h3>
+<h3>Per-dobject geometry</h3>
 <table>
-<thead><tr><th>Entity</th><th>DXF codes</th><th>Geom variant</th></tr></thead>
+<thead><tr><th>DXF record</th><th>DXF codes</th><th>Geom variant</th></tr></thead>
 <tbody>
 <tr>
   <td><strong>LINE</strong></td>
@@ -1074,7 +1074,7 @@ shares this Style accumulator pass.
 
 <h3>What's NOT read yet</h3>
 <table>
-<thead><tr><th>Entity / feature</th><th>Status</th></tr></thead>
+<thead><tr><th>DXF record / feature</th><th>Status</th></tr></thead>
 <tbody>
 <tr><td>BLOCK / ENDBLK / INSERT</td><td>Skipped — no block support yet.</td></tr>
 <tr><td>SPLINE / NURBS</td><td>Skipped — no spline kernel.</td></tr>
