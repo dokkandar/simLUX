@@ -4860,12 +4860,12 @@ impl eframe::App for CadApp {
             // ends a drag — including a "click" that egui saw as a tiny drag.
             let click_now    = resp.clicked();
             let drag_stopped = resp.drag_stopped();
-            // egui classifies press-release as `clicked()` or `drag_stopped()`
-            // depending on motion + duration. During any active editing /
-            // drafting / drawing phase, the user is placing points or
-            // picking targets — they never drag. Promote drag_stopped to a
-            // click unconditionally in those phases. See memo
-            // `feedback_rust_cad_no_drag_during_active_phase`.
+            // Unified click/drag classifier:
+            //   1. select mode is active → DRAG is the rubber-band window
+            //   2. Shift held during press → DRAG is an ad-hoc window
+            //   3. anything else → press-release is ALWAYS a click
+            // The 5-px motion heuristic is gone — egui's idea of "this was
+            // a tiny drag" doesn't get a vote.
             let press_release_dist = match (
                 ctx.input(|i| i.pointer.press_origin()),
                 resp.interact_pointer_pos(),
@@ -4873,6 +4873,8 @@ impl eframe::App for CadApp {
                 (Some(p), Some(r)) => (r - p).length(),
                 _ => 0.0,
             };
+            let shift_held = ctx.input(|i| i.modifiers.shift);
+            let in_select  = self.select_mode != SelectMode::Off;
             let in_click_only_phase =
                 self.tool != Tool::None
                 || matches!(self.trim_state,
@@ -4894,11 +4896,16 @@ impl eframe::App for CadApp {
                 || self.chamfer_state    != ChamferState::Off
                 || self.picking_source
                 || self.intersect_pending_click;
-            // When in an active phase: always promote. Otherwise (pointer
-            // mode + select-window phase), keep the distance heuristic so
-            // a real window-rubber-band drag isn't fired as a click.
-            let drag_was_a_click = drag_stopped
-                && (in_click_only_phase || press_release_dist < 5.0);
+            // Drag is the rubber-band window only when (a) we're in
+            // select mode, or (b) the user explicitly held Shift to
+            // request a window drag. Edit phases (trim/draw/move/…)
+            // keep the "always click" semantic too.
+            // Outside select mode + no Shift: drag_stopped → click.
+            // No motion threshold; the user's gesture wins.
+            let drag_intent_is_window =
+                (in_select || (shift_held && !in_click_only_phase))
+                && press_release_dist > 1.0;     // any real motion at all
+            let drag_was_a_click = drag_stopped && !drag_intent_is_window;
             // ---- Grip drag handling (v2: per-grip role semantics) -----------
             // Two ways to grab a grip in pointer mode + GrpEnb:
             //   (a) press-and-drag (release = commit)
@@ -4972,7 +4979,42 @@ impl eframe::App for CadApp {
                     }
                 }
             }
-            let click_fired = (click_now || drag_was_a_click) && !grip_drag_consumed_click;
+            // Drag-window handler: when drag_intent_is_window fires on
+            // release, capture (press, release) as the two opposite
+            // corners and apply a selection window. L→R = window (only
+            // fully-inside dobjects); R→L = crossing (anything touching).
+            // For ad-hoc Shift+drag (no select_mode), open a transient
+            // ForSelect session, apply the window, then finalise
+            // immediately so the basket persists.
+            let mut window_drag_consumed_click = false;
+            if drag_stopped && drag_intent_is_window && !grip_drag_consumed_click {
+                if let (Some(p), Some(r)) = (
+                    ctx.input(|i| i.pointer.press_origin()),
+                    resp.interact_pointer_pos(),
+                ) {
+                    let press_world   = self.s2w(p, rect);
+                    let release_world = self.s2w(r, rect);
+                    let was_off = self.select_mode == SelectMode::Off;
+                    if was_off {
+                        // Shift+drag from idle — open a one-shot ForSelect
+                        // window, apply, finalise.
+                        self.begin_selection(SelectMode::ForSelect);
+                    }
+                    self.add_window_selection(press_world, release_world, false);
+                    if was_off {
+                        self.finalise_selection();
+                    } else {
+                        // Inside select_mode: stay in the session so the
+                        // user can add more windows / clicks. window_first
+                        // would re-arm naturally on next click.
+                        self.window_first = None;
+                    }
+                    window_drag_consumed_click = true;
+                }
+            }
+            let click_fired = (click_now || drag_was_a_click)
+                && !grip_drag_consumed_click
+                && !window_drag_consumed_click;
             if (click_now || drag_stopped) && self.trim_debug_open {
                 // Only log when the user has the diagnostic window open, to
                 // keep the log uncluttered.
@@ -5944,6 +5986,31 @@ impl eframe::App for CadApp {
                         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0,
                             egui::Color32::from_rgb(20, 20, 20)));
                     }
+                }
+            }
+
+            // Live rubber-band preview while a window-drag is in progress
+            // (select mode active OR Shift held in any other phase except
+            // edit-active phases). L→R draws BLUE (window — fully-inside);
+            // R→L draws GREEN (crossing — anything touching).
+            if resp.dragged()
+                && (in_select || (shift_held && !in_click_only_phase))
+            {
+                if let (Some(p), Some(c)) = (
+                    ctx.input(|i| i.pointer.press_origin()),
+                    resp.hover_pos(),
+                ) {
+                    let r = egui::Rect::from_two_pos(p, c);
+                    let crossing = c.x < p.x;
+                    let (fill, stroke) = if crossing {
+                        (egui::Color32::from_rgba_unmultiplied(140, 220, 100, 28),
+                         egui::Color32::from_rgb(140, 220, 100))
+                    } else {
+                        (egui::Color32::from_rgba_unmultiplied(120, 170, 255, 28),
+                         egui::Color32::from_rgb(120, 170, 255))
+                    };
+                    painter.rect_filled(r, 0.0, fill);
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, stroke));
                 }
             }
 
