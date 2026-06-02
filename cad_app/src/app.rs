@@ -254,6 +254,10 @@ pub struct CadApp {
     // ---- Editing operations (Slice J) ----
     copy_state:   CopyState,
     rotate_state: RotateState,
+    /// Set by the `C` sub-command during a rotate session. When true,
+    /// applying the rotation produces COPIES of the selected dobjects
+    /// (originals untouched). Cleared when the session ends.
+    rotate_copy:  bool,
     scale_state:  ScaleState,
     mirror_state: MirrorState,
     /// Snapshot-based undo stack — every editing operation pushes the
@@ -358,15 +362,24 @@ pub enum CopyState {
     WaitingForDest(Vec2),
 }
 
-/// State machine for the interactive rotate tool:
-/// click pivot, then a reference point (the angle baseline), then the
-/// target point — sweep = atan2(target - pivot) - atan2(ref - pivot).
+/// State machine for the interactive rotate tool — AutoCAD ROTATE flow:
+///   1. WaitingForPivot                        — click the pivot.
+///   2. WaitingForAngle(pivot)                 — default: click → angle =
+///      atan2(click − pivot); OR type a number in degrees; OR type `R`
+///      to switch to reference mode; OR type `C` to toggle copy mode
+///      (rotate produces a copy instead of moving the original).
+///   3. Reference sub-states (4 clicks total): WaitingForRefSrc1 …
+///      WaitingForRefTgt2. Source angle defined by 2 clicks; target
+///      angle by 2 clicks; rotation = (tgt direction − src direction).
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum RotateState {
     Off,
     WaitingForPivot,
-    WaitingForRef(Vec2),
-    WaitingForTarget(Vec2, Vec2),   // (pivot, ref)
+    WaitingForAngle(Vec2),                                  // pivot
+    WaitingForRefSrc1(Vec2),                                // pivot
+    WaitingForRefSrc2(Vec2, Vec2),                          // pivot, src1
+    WaitingForRefTgt1(Vec2, Vec2, Vec2),                    // pivot, src1, src2
+    WaitingForRefTgt2(Vec2, Vec2, Vec2, Vec2),              // pivot, src1, src2, tgt1
 }
 
 /// State machine for the interactive scale tool — pivot + reference
@@ -542,6 +555,7 @@ impl Default for CadApp {
             info_panel_open:    true,
             copy_state:   CopyState::Off,
             rotate_state: RotateState::Off,
+            rotate_copy:  false,
             scale_state:  ScaleState::Off,
             mirror_state: MirrorState::Off,
             undo_stack:   Vec::new(),
@@ -660,6 +674,41 @@ impl CadApp {
         }
         // Any non-empty input cancels the 2-stage-Enter notice.
         self.empty_enter_count_in_select = 0;
+        // ---- Rotate sub-command intercept (AutoCAD ROTATE flow) -----
+        // During WaitingForAngle: typing a NUMBER applies that rotation
+        // (degrees, CCW positive); typing `r` switches to reference
+        // mode; typing `c` toggles copy mode for the commit.
+        if let RotateState::WaitingForAngle(pivot) = self.rotate_state {
+            let lc = trimmed.to_ascii_lowercase();
+            match lc.as_str() {
+                "r" | "ref" | "reference" => {
+                    self.rotate_state = RotateState::WaitingForRefSrc1(pivot);
+                    self.set_prompt(
+                        "rotate-R: click SOURCE point 1 (defines current direction)");
+                    return;
+                }
+                "c" | "cp" | "copy" => {
+                    self.rotate_copy = !self.rotate_copy;
+                    self.set_prompt(format!(
+                        "rotate (pivot=({:.2},{:.2})): copy {} — click to pick angle, type number, R=reference",
+                        pivot.x, pivot.y,
+                        if self.rotate_copy { "ON" } else { "off" }));
+                    return;
+                }
+                _ => {
+                    if let Ok(deg) = trimmed.parse::<f64>() {
+                        let rad = deg.to_radians();
+                        self.apply_rotate_or_copy(pivot, rad);
+                        self.rotate_state = RotateState::Off;
+                        self.rotate_copy  = false;
+                        self.clear_prompt();
+                        return;
+                    }
+                    // Not a number / sub-command: fall through to the
+                    // parser (e.g. user typed `esc` or another global).
+                }
+            }
+        }
         // ---- Selection-mode shortcut intercept ----
         //
         // While a select session is active, single-letter input is a
@@ -874,15 +923,16 @@ impl CadApp {
                 }
             }
             Ok(Command::Rotate) => {
+                self.rotate_copy = false;
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Rotate;
-                    self.history.push(
-                        "  rotate — Select dobjects, Enter to continue (Esc cancels)".into());
+                    self.set_prompt(
+                        "rotate: select dobjects, Enter to continue  [Esc=cancel]");
                 } else {
                     self.rotate_state = RotateState::WaitingForPivot;
-                    self.history.push(format!(
-                        "  rotate — {} dobject(s) selected. Click PIVOT point",
+                    self.set_prompt(format!(
+                        "rotate ({} dobject(s)): click PIVOT point  [Esc=cancel]",
                         self.selection.len()));
                 }
             }
@@ -2782,6 +2832,34 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
+    /// Dispatch the rotate session's commit step: if `rotate_copy` is on,
+    /// produce rotated COPIES (originals untouched) instead of modifying
+    /// the selection in place. AutoCAD's `C` sub-command.
+    fn apply_rotate_or_copy(&mut self, pivot: Vec2, angle: f64) {
+        if angle.abs() < EPS { return; }
+        if !self.rotate_copy {
+            self.apply_rotate(pivot, angle);
+            return;
+        }
+        self.snapshot_doc();
+        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i).map(|d| {
+                let mut copy = d.clone();
+                copy.geom = copy.geom.rotated(pivot, angle);
+                copy.handle = cad_kernel::next_handle();
+                copy
+            })
+        }).collect();
+        let n = copies.len();
+        for c in copies { self.doc.push(c); }
+        self.history.push(format!(
+            "  ⟳+ rotate-copy: {} new dobject(s) at {:.2}° around ({:.2}, {:.2})",
+            n, angle.to_degrees(), pivot.x, pivot.y));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
     /// Scale the current selection in place by `factor` around `pivot`.
     fn apply_scale(&mut self, pivot: Vec2, factor: f64) {
         if (factor - 1.0).abs() < EPS || factor.abs() < EPS { return; }
@@ -3935,6 +4013,7 @@ impl eframe::App for CadApp {
             }
             if self.rotate_state != RotateState::Off {
                 self.rotate_state = RotateState::Off;
+                self.rotate_copy  = false;
                 self.history.push("  rotate cancelled".into());
             }
             if self.scale_state != ScaleState::Off {
@@ -5099,26 +5178,46 @@ impl eframe::App for CadApp {
                     } else if self.rotate_state != RotateState::Off {
                         match self.rotate_state {
                             RotateState::WaitingForPivot => {
-                                self.rotate_state = RotateState::WaitingForRef(click_world);
-                                self.history.push(format!(
-                                    "    rotate: PIVOT = ({:.3}, {:.3}) — click REFERENCE direction",
-                                    click_world.x, click_world.y));
+                                self.rotate_state = RotateState::WaitingForAngle(click_world);
+                                self.set_prompt(format!(
+                                    "rotate (pivot=({:.2},{:.2})): click to pick angle, or type number (CCW=+), R=reference, C={}",
+                                    click_world.x, click_world.y,
+                                    if self.rotate_copy { "copy ON" } else { "copy off" }));
                             }
-                            RotateState::WaitingForRef(pivot) => {
-                                self.rotate_state = RotateState::WaitingForTarget(pivot, click_world);
-                                self.history.push(
-                                    "    rotate: REFERENCE captured — click TARGET direction".into());
-                            }
-                            RotateState::WaitingForTarget(pivot, refpt) => {
-                                let a0 = (refpt - pivot).angle();
-                                let a1 = (click_world - pivot).angle();
-                                let dtheta = (a1 - a0).rem_euclid(std::f64::consts::TAU);
-                                // Take the shorter rotation (negative if past PI)
-                                let signed = if dtheta > std::f64::consts::PI {
-                                    dtheta - std::f64::consts::TAU
-                                } else { dtheta };
-                                self.apply_rotate(pivot, signed);
+                            RotateState::WaitingForAngle(pivot) => {
+                                // Default: angle from pivot to click point.
+                                // Zero baseline = +X axis (atan2 of vector
+                                // from pivot to cursor). Positive = CCW.
+                                let signed = (click_world - pivot).angle();
+                                self.apply_rotate_or_copy(pivot, signed);
                                 self.rotate_state = RotateState::Off;
+                                self.rotate_copy = false;
+                                self.clear_prompt();
+                            }
+                            // ---- Reference sub-command (4 clicks) -------
+                            RotateState::WaitingForRefSrc1(pivot) => {
+                                self.rotate_state = RotateState::WaitingForRefSrc2(pivot, click_world);
+                                self.set_prompt("rotate-R: click SOURCE point 2 (defines current direction)");
+                            }
+                            RotateState::WaitingForRefSrc2(pivot, s1) => {
+                                self.rotate_state = RotateState::WaitingForRefTgt1(pivot, s1, click_world);
+                                self.set_prompt("rotate-R: click TARGET point 1 (defines new direction)");
+                            }
+                            RotateState::WaitingForRefTgt1(pivot, s1, s2) => {
+                                self.rotate_state = RotateState::WaitingForRefTgt2(pivot, s1, s2, click_world);
+                                self.set_prompt("rotate-R: click TARGET point 2 to apply");
+                            }
+                            RotateState::WaitingForRefTgt2(pivot, s1, s2, t1) => {
+                                let src = (s2 - s1).angle();
+                                let tgt = (click_world - t1).angle();
+                                let mut dtheta = (tgt - src).rem_euclid(std::f64::consts::TAU);
+                                if dtheta > std::f64::consts::PI {
+                                    dtheta -= std::f64::consts::TAU;
+                                }
+                                self.apply_rotate_or_copy(pivot, dtheta);
+                                self.rotate_state = RotateState::Off;
+                                self.rotate_copy = false;
+                                self.clear_prompt();
                             }
                             RotateState::Off => unreachable!(),
                         }
@@ -6012,6 +6111,67 @@ impl eframe::App for CadApp {
                     painter.rect_filled(r, 0.0, fill);
                     painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, stroke));
                 }
+            }
+
+            // ---- Rotate live preview --------------------------------------
+            // WaitingForAngle: ghost-render the selection rotated to the
+            // current cursor angle (atan2(cursor − pivot)) so the user
+            // sees the rotation form up before clicking. Also draws the
+            // pivot mark + a baseline from pivot to cursor.
+            // Reference sub-states: just show the points captured so far.
+            match self.rotate_state {
+                RotateState::WaitingForAngle(pivot) => {
+                    let pivot_s = self.w2s(pivot, rect);
+                    let mark    = egui::Color32::from_rgb(255, 200, 80);
+                    painter.circle_stroke(pivot_s, 5.0, egui::Stroke::new(1.4, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(-9.0, 0.0), pivot_s + egui::vec2(9.0, 0.0)],
+                        egui::Stroke::new(0.8, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(0.0, -9.0), pivot_s + egui::vec2(0.0, 9.0)],
+                        egui::Stroke::new(0.8, mark));
+                    if let Some(cur) = resp.hover_pos() {
+                        let cur_world = self.s2w(cur, rect);
+                        let angle = (cur_world - pivot).angle();
+                        // Baseline pivot→cursor.
+                        painter.line_segment(
+                            [pivot_s, cur],
+                            egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
+                        // Ghost of the rotated selection.
+                        let ghost = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
+                        for &i in &self.selection {
+                            let Some(d) = self.doc.dobjects.get(i) else { continue; };
+                            let g = d.geom.rotated(pivot, angle);
+                            draw_dobject(&painter, rect, self, &g, ghost);
+                        }
+                        // Angle label near cursor.
+                        let deg = angle.to_degrees();
+                        painter.text(
+                            cur + egui::vec2(12.0, -12.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("{:.1}°{}", deg, if self.rotate_copy { "  (copy)" } else { "" }),
+                            egui::FontId::monospace(12.0), mark);
+                    }
+                }
+                RotateState::WaitingForRefSrc2(_, s1)
+                | RotateState::WaitingForRefTgt1(_, s1, _)
+                | RotateState::WaitingForRefTgt2(_, s1, _, _) => {
+                    let mark = egui::Color32::from_rgb(180, 220, 120);
+                    painter.circle_filled(self.w2s(s1, rect), 3.0, mark);
+                    if let RotateState::WaitingForRefTgt1(_, _, s2)
+                         | RotateState::WaitingForRefTgt2(_, _, s2, _) = self.rotate_state {
+                        let s2s = self.w2s(s2, rect);
+                        painter.circle_filled(s2s, 3.0, mark);
+                        painter.line_segment(
+                            [self.w2s(s1, rect), s2s],
+                            egui::Stroke::new(1.0, mark));
+                    }
+                    if let RotateState::WaitingForRefTgt2(_, _, _, t1) = self.rotate_state {
+                        let mark2 = egui::Color32::from_rgb(120, 180, 255);
+                        painter.circle_filled(self.w2s(t1, rect), 3.0, mark2);
+                    }
+                }
+                _ => {}
             }
 
             // pending click points + rubber-band preview
