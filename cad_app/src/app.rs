@@ -3893,11 +3893,14 @@ impl eframe::App for CadApp {
                 self.extend_state = ExtendState::Off;
                 self.history.push("  extend cancelled".into());
             }
-            if (trim_running || extend_running) && !self.pre_op_selection.is_empty() {
-                // Restore the main selection that was stashed when the op
-                // began. (For ForCuttingEdges/ForBoundaryEdges we already
-                // restored on finalise; this catches the cancel path.)
-                self.selection = std::mem::take(&mut self.pre_op_selection);
+            if trim_running || extend_running {
+                // Esc clears EVERYTHING — including any selection that was
+                // stashed when the op began. Restoring it would resurrect
+                // dashed-gray ghosts of items the user just cancelled
+                // (bug from screenshot 2026-06-02). pre_op_selection is
+                // only restored on SUCCESSFUL finalise, never on cancel.
+                self.pre_op_selection.clear();
+                self.selection.clear();
             }
         }
 
