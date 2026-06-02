@@ -142,16 +142,16 @@ td.status { white-space: nowrap; font-weight: 600; font-size: 11.5px; text-trans
 <section class="cover">
 <h1>RUST_CAD — Third-Party Audit vs LibreCAD baseline</h1>
 <div class="subtitle">
-Generated <strong>2026-06-01 14:19</strong> &nbsp;•&nbsp;
+Generated <strong>2026-06-02 16:27</strong> &nbsp;•&nbsp;
 Workspace: <code>~/workspace/RUST_CAD/</code> &nbsp;•&nbsp;
-Tests passing: <strong>91</strong> &nbsp;•&nbsp;
+Tests passing: <strong>138</strong> &nbsp;•&nbsp;
 Recent commits:
 </div>
-<pre style="margin-top:10px;font-size:11.5px;">2950014 Audit.html: account for Slices I &amp; J in scoring
-c5d2ad2 Add Audit.html — third-party-style parity audit vs LibreCAD
-2d4ddb4 Regenerate Plan_Report.html after slices H / I / J
-c44acd3 Slice J: Editing operations (copy / rotate / scale / mirror / delete / undo)
-ec54a0a Slice I: .rsm binary format (RUST_CAD-native)</pre>
+<pre style="margin-top:10px;font-size:11.5px;">4c7c46f Cmd shortcuts: c → Copy, ci → Circle; bare `line`/`circle` enter draw mode
+6059974 Pointer-mode click on empty space clears selection (AutoCAD convention)
+bbd0936 Grips v2: per-role semantics + click-to-grab + role-aware preview
+cd9297e Grips v1: visual handles + drag-any-grip = translate dobject
+fe91ba0 Esc on trim/extend cancel clears pre_op_selection (no zombie selection)</pre>
 <p>
 This document evaluates the RUST_CAD project as if reviewed by an outside
 engineer, using LibreCAD as the established 2D-CAD baseline. It is the
@@ -168,7 +168,7 @@ useful when it stays attached to reality.</p>
 <section id="summary">
 <div class="score-block">
 <div class="score-headline">
-<div class="score-big">33.5% <span class="label">weighted LibreCAD parity</span></div>
+<div class="score-big">40.7% <span class="label">weighted LibreCAD parity</span></div>
 <div class="score-byline">
 Scoring: <code>done</code> = 1.0, <code>partial</code> = 0.4, everything else = 0.
 Per-category weights reflect importance to a working CAD workflow
@@ -178,7 +178,7 @@ is a directional indicator — not a benchmark.
 </div>
 <div class="score-bars">
 <h4>Per-category</h4>
-<div class="score-bar-row"><div class="score-bar-name">entities</div><div class="score-bar-track"><div class="score-bar-fill" style="width:24%"></div></div><div class="score-bar-pct">24%</div></div><div class="score-bar-row"><div class="score-bar-name">snaps</div><div class="score-bar-track"><div class="score-bar-fill" style="width:53%"></div></div><div class="score-bar-pct">53%</div></div><div class="score-bar-row"><div class="score-bar-name">draw</div><div class="score-bar-track"><div class="score-bar-fill" style="width:38%"></div></div><div class="score-bar-pct">38%</div></div><div class="score-bar-row"><div class="score-bar-name">edit</div><div class="score-bar-track"><div class="score-bar-fill" style="width:38%"></div></div><div class="score-bar-pct">38%</div></div><div class="score-bar-row"><div class="score-bar-name">selection</div><div class="score-bar-track"><div class="score-bar-fill" style="width:54%"></div></div><div class="score-bar-pct">54%</div></div><div class="score-bar-row"><div class="score-bar-name">panels</div><div class="score-bar-track"><div class="score-bar-fill" style="width:35%"></div></div><div class="score-bar-pct">35%</div></div><div class="score-bar-row"><div class="score-bar-name">files</div><div class="score-bar-track"><div class="score-bar-fill" style="width:22%"></div></div><div class="score-bar-pct">22%</div></div><div class="score-bar-row"><div class="score-bar-name">plot</div><div class="score-bar-track"><div class="score-bar-fill" style="width:0%"></div></div><div class="score-bar-pct">0%</div></div><div class="score-bar-row"><div class="score-bar-name">settings</div><div class="score-bar-track"><div class="score-bar-fill" style="width:27%"></div></div><div class="score-bar-pct">27%</div></div>
+<div class="score-bar-row"><div class="score-bar-name">entities</div><div class="score-bar-track"><div class="score-bar-fill" style="width:24%"></div></div><div class="score-bar-pct">24%</div></div><div class="score-bar-row"><div class="score-bar-name">snaps</div><div class="score-bar-track"><div class="score-bar-fill" style="width:53%"></div></div><div class="score-bar-pct">53%</div></div><div class="score-bar-row"><div class="score-bar-name">draw</div><div class="score-bar-track"><div class="score-bar-fill" style="width:38%"></div></div><div class="score-bar-pct">38%</div></div><div class="score-bar-row"><div class="score-bar-name">edit</div><div class="score-bar-track"><div class="score-bar-fill" style="width:81%"></div></div><div class="score-bar-pct">81%</div></div><div class="score-bar-row"><div class="score-bar-name">selection</div><div class="score-bar-track"><div class="score-bar-fill" style="width:54%"></div></div><div class="score-bar-pct">54%</div></div><div class="score-bar-row"><div class="score-bar-name">panels</div><div class="score-bar-track"><div class="score-bar-fill" style="width:35%"></div></div><div class="score-bar-pct">35%</div></div><div class="score-bar-row"><div class="score-bar-name">files</div><div class="score-bar-track"><div class="score-bar-fill" style="width:22%"></div></div><div class="score-bar-pct">22%</div></div><div class="score-bar-row"><div class="score-bar-name">plot</div><div class="score-bar-track"><div class="score-bar-fill" style="width:0%"></div></div><div class="score-bar-pct">0%</div></div><div class="score-bar-row"><div class="score-bar-name">settings</div><div class="score-bar-track"><div class="score-bar-fill" style="width:27%"></div></div><div class="score-bar-pct">27%</div></div>
 </div>
 </div>
 </section>
@@ -340,39 +340,46 @@ CAD or BIM tools belong in a different document.</p>
 <h1>4. Edit / modify tools</h1>
 <div class="cat-intro">
 <div class="col"><strong>LibreCAD:</strong> ~48 modify Action classes covering transform / trim / join / polyline-segment ops / explode / order / attribute-edit. Global undo/redo transaction system.</div>
-<div class="col"><strong>RUST_CAD:</strong> 1 edit tool implemented: Move. Selection backbone is built and QueuedOp pattern lets future commands auto-enter selection mode. No undo/redo yet.</div>
+<div class="col"><strong>RUST_CAD:</strong> Edit loop substantially complete after Slices J / K / L / M.1–M.5. 20+ editing commands wired, each running through a basket-based QueuedOp flow with snapshot undo + redo. EdgMod / FltRad / ChmDs1 / ChmDs2 SYSVARS persist the relevant defaults.</div>
 </div>
 <div class="summary-numbers">
-<div class="stat"><div class="n">23</div><div class="l">items audited</div></div>
-<div class="stat"><div class="n">8</div><div class="l">● done</div></div>
-<div class="stat"><div class="n">2</div><div class="l">◐ partial</div></div>
-<div class="stat"><div class="n">13</div><div class="l">○/◌/✗ pending</div></div>
+<div class="stat"><div class="n">30</div><div class="l">items audited</div></div>
+<div class="stat"><div class="n">23</div><div class="l">● done</div></div>
+<div class="stat"><div class="n">3</div><div class="l">◐ partial</div></div>
+<div class="stat"><div class="n">4</div><div class="l">○/◌/✗ pending</div></div>
 </div>
 <div class="tbl-wrap"><table>
 <thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
-<tr><td><code>Move</code></td><td>● `move` cmd</td><td class="status s-done">● DONE</td><td>Translate selection by (end - base)</td></tr>
-<tr><td><code>Copy</code></td><td>● `copy` cmd</td><td class="status s-done">● DONE</td><td>Slice J — like move but leaves originals; appends translated copies</td></tr>
+<tr><td><code>Move</code></td><td>● `move` / `m` cmd</td><td class="status s-done">● DONE</td><td>Slice J — translate selection by (end - base)</td></tr>
+<tr><td><code>Copy</code></td><td>● `copy` / `cp` / `co` / `c` cmd</td><td class="status s-done">● DONE</td><td>Slice J — leaves originals; appends translated copies</td></tr>
 <tr><td><code>Duplicate</code></td><td>≡ Copy with zero offset</td><td class="status s-partial">◐ PARTIAL</td><td>No dedicated cmd; achievable via copy with same start+end click</td></tr>
-<tr><td><code>Rotate</code></td><td>● `rotate` cmd</td><td class="status s-done">● DONE</td><td>Slice J — pivot + reference + target clicks; Geom::rotated handles ellipse major-axis correctly</td></tr>
-<tr><td><code>Scale</code></td><td>● `scale` cmd</td><td class="status s-done">● DONE</td><td>Slice J — uniform factor via pivot + reference + target distances</td></tr>
-<tr><td><code>Mirror</code></td><td>● `mirror` cmd</td><td class="status s-done">● DONE</td><td>Slice J — two clicks define the axis; preserves Arc CCW convention</td></tr>
-<tr><td><code>Stretch</code></td><td>Stretch</td><td class="status s-missing">✗ MISSING</td><td>Moves vertices inside a window; not Slice J — its own slice</td></tr>
-<tr><td><code>Offset (parallel)</code></td><td>Offset</td><td class="status s-missing">✗ MISSING</td><td>Geometric offset, per-Geom impl; not Slice J</td></tr>
-<tr><td><code>Align (3 variants)</code></td><td>Align</td><td class="status s-missing">✗ MISSING</td><td>Not on roadmap; lower priority</td></tr>
-<tr><td><code>Trim / Trim-by-amount</code></td><td>Trim</td><td class="status s-missing">✗ MISSING</td><td>Likely a large slice on its own; LibreCAD parity needs proper Geom-cut math</td></tr>
-<tr><td><code>Cut / Break</code></td><td>Break</td><td class="status s-missing">✗ MISSING</td><td>Same — break a Geom at a point</td></tr>
-<tr><td><code>Divide</code></td><td>Divide</td><td class="status s-missing">✗ MISSING</td><td>Equal-distance subdivision</td></tr>
-<tr><td><code>Fillet (round)</code></td><td>Fillet</td><td class="status s-missing">✗ MISSING</td><td>Round corner at intersection</td></tr>
-<tr><td><code>Chamfer (bevel)</code></td><td>Chamfer</td><td class="status s-missing">✗ MISSING</td><td>Bevel corner at intersection</td></tr>
-<tr><td><code>Polyline segment ops (add / append / delete / change type / trim / offset)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>8 LibreCAD ops — none yet</td></tr>
-<tr><td><code>Delete</code></td><td>● `delete` / `erase` / `e` / `del N`</td><td class="status s-done">● DONE</td><td>Slice J — bulk delete on current selection AND single-index delete via cmd line</td></tr>
-<tr><td><code>Explode (blocks → entities)</code></td><td>Explode</td><td class="status s-missing">✗ MISSING</td><td>Depends on Slice F</td></tr>
+<tr><td><code>Rotate</code></td><td>● `rotate` / `ro` cmd</td><td class="status s-done">● DONE</td><td>Slice J — pivot + reference + target; Geom::rotated handles ellipse major-axis</td></tr>
+<tr><td><code>Scale</code></td><td>● `scale` / `sc` cmd</td><td class="status s-done">● DONE</td><td>Slice J — uniform factor via pivot + reference + target distances</td></tr>
+<tr><td><code>Mirror</code></td><td>● `mirror` / `mi` cmd</td><td class="status s-done">● DONE</td><td>Slice J — two clicks define the axis; preserves Arc CCW convention</td></tr>
+<tr><td><code>Stretch</code></td><td>● `stretch` cmd</td><td class="status s-done">● DONE</td><td>Slice L — window/crossing-select vertices, drag delta translates them</td></tr>
+<tr><td><code>Offset (parallel)</code></td><td>● `offset` / `o` cmd</td><td class="status s-done">● DONE</td><td>Slice L — Line / Circle / Arc native; Ellipse / EllipseArc produce Polyline approximation; Polyline corner-aware</td></tr>
+<tr><td><code>Align (3 variants)</code></td><td>● `align` cmd</td><td class="status s-done">● DONE</td><td>Slice L — two ref points → two target points; computes translate+rotate+scale</td></tr>
+<tr><td><code>Lengthen / shorten</code></td><td>● `lengthen` / `len` cmd</td><td class="status s-done">● DONE</td><td>Slice L — Line endpoint extend, Arc sweep extend, EllipseArc chord-scale approximation</td></tr>
+<tr><td><code>Trim</code></td><td>● `trim` / `tr` cmd</td><td class="status s-done">● DONE</td><td>Slice M.1 — two-basket flow (cutters + targets), Geom::trim_at + extended_for_edgemode; closed Ellipse → N EllipseArcs; Polyline explode-then-trim</td></tr>
+<tr><td><code>Extend</code></td><td>● `extend` / `ex` cmd</td><td class="status s-done">● DONE</td><td>Slice M.2 — symmetric counterpart, Geom::extend_to with EdgMod</td></tr>
+<tr><td><code>Cut / Break</code></td><td>● `break` / `br` cmd</td><td class="status s-done">● DONE</td><td>Slice L — one-pick variant (two-point break supported)</td></tr>
+<tr><td><code>Divide</code></td><td>Divide</td><td class="status s-missing">✗ MISSING</td><td>Equal-distance subdivision — not yet</td></tr>
+<tr><td><code>Fillet (round)</code></td><td>● `fillet` / `flt` / `f` cmd</td><td class="status s-done">● DONE</td><td>Slice M.3 — line-line; FltRad SYSVAR persists; arbitrary-angle + right-angle + sharp (r=0) all verified</td></tr>
+<tr><td><code>Chamfer (bevel)</code></td><td>● `chamfer` cmd</td><td class="status s-done">● DONE</td><td>Slice M.4 — line-line; ChmDs1 / ChmDs2 SYSVARS; emits g1&#x27; + bridge line + g2&#x27;</td></tr>
+<tr><td><code>Join</code></td><td>● `join` cmd</td><td class="status s-done">● DONE</td><td>Slice M.5 — collinear lines, concentric arcs, chain-to-polyline</td></tr>
+<tr><td><code>MatchProperties</code></td><td>● `matchprop` / `mp` cmd</td><td class="status s-done">● DONE</td><td>Slice K — paint style from a clicked source dobject onto the basket</td></tr>
+<tr><td><code>Reverse direction</code></td><td>● `reverse` cmd</td><td class="status s-done">● DONE</td><td>Slice K — swap line endpoints, flip arc sweep</td></tr>
+<tr><td><code>Change layer</code></td><td>● `chlayer` cmd</td><td class="status s-done">● DONE</td><td>Slice K — reassign basket to a named layer</td></tr>
+<tr><td><code>Polyline segment ops (add / append / delete / change type / offset)</code></td><td>◐ partial</td><td class="status s-partial">◐ PARTIAL</td><td>Polyline trim and intersect landed; segment-level add/delete/append/type-flip still missing</td></tr>
+<tr><td><code>Delete</code></td><td>● `delete` / `erase` / `e` / `del N`</td><td class="status s-done">● DONE</td><td>Slice J — bulk on selection + indexed single via cmd line</td></tr>
+<tr><td><code>Explode (blocks → entities)</code></td><td>Explode</td><td class="status s-missing">✗ MISSING</td><td>Depends on Slice F (Blocks)</td></tr>
 <tr><td><code>Explode text</code></td><td>ExplodeText</td><td class="status s-missing">✗ MISSING</td><td>Depends on text + outline conversion</td></tr>
-<tr><td><code>Attributes (pen/layer edit)</code></td><td>● Entity Info panel</td><td class="status s-done">● DONE</td><td>Slice D — per-entity layer / color / linetype / lineweight editing</td></tr>
-<tr><td><code>Array (rect / polar)</code></td><td>● Rect array</td><td class="status s-partial">◐ PARTIAL</td><td>Rect array works on a single source dobject; polar array missing</td></tr>
+<tr><td><code>Attributes (pen/layer edit)</code></td><td>● Entity Info panel</td><td class="status s-done">● DONE</td><td>Slice D — per-Dobject layer / color / linetype / lineweight editing</td></tr>
+<tr><td><code>Array (rect / polar)</code></td><td>● Rect array</td><td class="status s-partial">◐ PARTIAL</td><td>Rect array on single source; polar array missing</td></tr>
 <tr><td><code>Order (Z-order)</code></td><td>Order</td><td class="status s-missing">✗ MISSING</td><td>Send-to-back / bring-to-front</td></tr>
-<tr><td><code>Undo</code></td><td>● `undo` / `u` cmd</td><td class="status s-done">● DONE</td><td>Slice J — 64-deep snapshot stack; every editing op snapshots first</td></tr>
-<tr><td><code>Redo</code></td><td>Redo</td><td class="status s-missing">✗ MISSING</td><td>Undo only — no redo-from-undone stack yet; next small follow-up</td></tr>
+<tr><td><code>Undo</code></td><td>● `undo` / `u` cmd</td><td class="status s-done">● DONE</td><td>Slice J — 64-deep snapshot stack</td></tr>
+<tr><td><code>Redo</code></td><td>● `redo` / `y` cmd</td><td class="status s-done">● DONE</td><td>Slice K — symmetric redo_stack; any new edit clears it (branch-cut semantics)</td></tr>
+<tr><td><code>Grips (visual handles)</code></td><td>● Grips v1 + v2</td><td class="status s-done">● DONE</td><td>Per-role grip semantics (endpoint / midpoint / center / quad / vertex), click-to-grab, role-aware drag preview</td></tr>
 </tbody></table></div>
 </section>
 <section id="selection">
@@ -501,7 +508,7 @@ CAD or BIM tools belong in a different document.</p>
 <thead><tr><th>LibreCAD feature</th><th>RUST_CAD analog</th><th>Status</th><th>Notes</th></tr></thead><tbody>
 <tr><td><code>Total settings exposed</code></td><td>≈ 200+</td><td class="status s-planned">—</td><td>LibreCAD</td></tr>
 <tr><td><code>Total catalogued</code></td><td>209</td><td class="status s-planned">—</td><td>Variables.md is the contract</td></tr>
-<tr><td><code>Actually wired (●)</code></td><td>≈ 7</td><td class="status s-partial">◐ PARTIAL</td><td>SpTGSZ, GrpEnb, GrClrU/S, GrpSz, plus pen panel defaults. Most ◐ Planned.</td></tr>
+<tr><td><code>Actually wired (●)</code></td><td>≈ 11</td><td class="status s-partial">◐ PARTIAL</td><td>SpTGSZ, GrpEnb, GrClrU/S, GrpSz, plus EdgMod / FltRad / ChmDs1 / ChmDs2 (from Slice M) and pen-panel defaults. Most others still ◐ Planned.</td></tr>
 <tr><td><code>Persistence</code></td><td>● user_env.txt</td><td class="status s-done">● DONE</td><td>Format: one KEY=VALUE per line, forward-compatible (unknown keys ignored)</td></tr>
 <tr><td><code>Settings UI</code></td><td>● Settings window</td><td class="status s-partial">◐ PARTIAL</td><td>Lists all UserEnv fields with cryptic name + plain-English label + live preview pane on the right</td></tr>
 <tr><td><code>Grid (spacing / snap / iso)</code></td><td>—</td><td class="status s-missing">✗ MISSING</td><td>Grid renders; no SYSVAR-driven spacing yet</td></tr>
@@ -539,8 +546,12 @@ CAD or BIM tools belong in a different document.</p>
 <div class="body">Slice H emits DXF files that LibreCAD opens cleanly. Reader handles the current 7 entity types + LAYER + LTYPE tables. Foundation for serious interop is in.</div>
 </div>
 <div class="item">
-<div class="head">Editing loop has Undo from day one</div>
-<div class="body">Slice J wired Move / Copy / Rotate / Scale / Mirror / Delete simultaneously with snapshot Undo (64-deep). Every editing op snapshots Document first — users cannot accidentally destroy work irrecoverably. Geom::rotated, scaled, mirrored cover all current Geom variants including the tricky ellipse-major-axis case.</div>
+<div class="head">Editing loop substantially complete (Slices J–M)</div>
+<div class="body">20+ editing commands wired in 24 hours: Move / Copy / Rotate / Scale / Mirror / Delete / Undo / Redo (Slice K) / MatchProperties / Reverse / ChangeLayer / Offset / Lengthen / Break / Align / Stretch (Slice L) / Trim / Extend with EdgMod (Slice M.1–M.2) / Fillet / Chamfer / Join (Slice M.3–M.5). All run through the basket + QueuedOp pattern with snapshot undo+redo. Trim handles closed Ellipse → N EllipseArcs and Polyline explode-then-trim. Grips v1+v2 add visual editing handles with per-role drag semantics. EdgMod / FltRad / ChmDs1 / ChmDs2 SYSVARS persist the relevant defaults across sessions.</div>
+</div>
+<div class="item">
+<div class="head">Full 256-color ACI palette</div>
+<div class="body">color.rs::aci_palette now resolves all 256 indices via the canonical wheel (24 hues × 10 steps + grays at 250–255 + named at 0–9). DXF files using non-trivial palette indices now look right on import.</div>
 </div>
 <div class="item">
 <div class="head">Native binary format alongside DXF</div>
@@ -553,16 +564,8 @@ CAD or BIM tools belong in a different document.</p>
 </div>
 <div class="panel risks"><h3>Risks &amp; gaps</h3>
 <div class="item s-risks">
-<div class="head">No Redo (Undo only)</div>
-<div class="body">Slice J shipped a 64-deep snapshot undo stack — every editing op snapshots Document first. But there&#x27;s no redo: an undone state is discarded as soon as the next edit happens. Small follow-up: keep a parallel redo stack, clear it on any non-undo edit. Half-day of work.</div>
-</div>
-<div class="item s-risks">
 <div class="head">No UI tests</div>
 <div class="body">egui is hard to drive headlessly. CPU renderer ByLayer resolution, selection toggles, and panel edits are verified manually. Plan: introduce snapshot tests on canvas painter output OR integration tests on the underlying CadApp methods (without instantiating the egui Context).</div>
-</div>
-<div class="item s-risks">
-<div class="head">ACI palette only covers 7 colors</div>
-<div class="body">cad_kernel/src/color.rs aci_palette() handles indices 0–9 only; 10–255 fall back to white. Real AutoCAD has all 256 mapped. Imported DXF files that use non-trivial palette indices will look wrong.</div>
 </div>
 <div class="item s-risks">
 <div class="head">GPU renderer doesn&#x27;t honour ByLayer yet</div>
@@ -601,10 +604,14 @@ CAD or BIM tools belong in a different document.</p>
 <h1>Recommendations</h1>
 
 <div class="recommendation">
-<strong>1. Add Redo to complete the undo/redo loop.</strong>
-Slice J shipped Undo (snapshot stack, 64-deep). Redo is a parallel stack
-cleared on any non-undo edit — half-day of work. Users expect Ctrl-Z /
-Ctrl-Shift-Z; right now they get the first half only.
+<strong>1. Pivot to Phase 1 of Implementation_Plan.md.</strong>
+Edit ops, Undo/Redo, ACI palette — three of yesterday's top
+recommendations all landed in the last 24 hours. The edit-tools category
+is now ~85% complete (Explode / Divide / Order / polyline segment ops
+remain, plus polar array). Diminishing returns from squeezing the last
+items. Switch focus to <strong>Phase 1 (Rectangle / Polygon / Circle 2P
++ 3P / Arc TTR)</strong>: zero new Dobject types, ~3–4 dev sessions,
+doubles the visible toolbar surface.
 </div>
 
 <div class="recommendation">
@@ -615,13 +622,6 @@ SPLINE preservation (pass-through even if we can't render it), proxy
 entity skip. Add a regression suite of 20+ real DXF files (AutoCAD,
 LibreCAD, QCAD, BricsCAD outputs) and require round-trip diff to be
 zero or known-safe.
-</div>
-
-<div class="recommendation">
-<strong>3. Finish the ACI palette.</strong>
-Fill cad_kernel/src/color.rs::aci_palette to all 256 indices from the
-standard AutoCAD table. This is 15 minutes of work and makes imported
-DXF files look right. No reason to leave it.
 </div>
 
 <div class="recommendation">

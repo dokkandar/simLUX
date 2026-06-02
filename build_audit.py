@@ -165,34 +165,42 @@ CATEGORIES = [
             "undo/redo transaction system."
         ),
         "rc_intro": (
-            "1 edit tool implemented: Move. Selection backbone is built and "
-            "QueuedOp pattern lets future commands auto-enter selection mode. "
-            "No undo/redo yet."
+            "Edit loop substantially complete after Slices J / K / L / M.1–M.5. "
+            "20+ editing commands wired, each running through a basket-based "
+            "QueuedOp flow with snapshot undo + redo. EdgMod / FltRad / "
+            "ChmDs1 / ChmDs2 SYSVARS persist the relevant defaults."
         ),
         "rows": [
-            ["Move",            "● `move` cmd",        "done",     "Translate selection by (end - base)"],
-            ["Copy",            "● `copy` cmd",        "done",     "Slice J — like move but leaves originals; appends translated copies"],
-            ["Duplicate",       "≡ Copy with zero offset", "partial", "No dedicated cmd; achievable via copy with same start+end click"],
-            ["Rotate",          "● `rotate` cmd",      "done",     "Slice J — pivot + reference + target clicks; Geom::rotated handles ellipse major-axis correctly"],
-            ["Scale",           "● `scale` cmd",       "done",     "Slice J — uniform factor via pivot + reference + target distances"],
-            ["Mirror",          "● `mirror` cmd",      "done",     "Slice J — two clicks define the axis; preserves Arc CCW convention"],
-            ["Stretch",         "Stretch",             "missing",  "Moves vertices inside a window; not Slice J — its own slice"],
-            ["Offset (parallel)",  "Offset",           "missing",  "Geometric offset, per-Geom impl; not Slice J"],
-            ["Align (3 variants)", "Align",            "missing",  "Not on roadmap; lower priority"],
-            ["Trim / Trim-by-amount", "Trim",          "missing",  "Likely a large slice on its own; LibreCAD parity needs proper Geom-cut math"],
-            ["Cut / Break",     "Break",               "missing",  "Same — break a Geom at a point"],
-            ["Divide",          "Divide",              "missing",  "Equal-distance subdivision"],
-            ["Fillet (round)",  "Fillet",              "missing",  "Round corner at intersection"],
-            ["Chamfer (bevel)", "Chamfer",             "missing",  "Bevel corner at intersection"],
-            ["Polyline segment ops (add / append / delete / change type / trim / offset)", "—", "missing", "8 LibreCAD ops — none yet"],
-            ["Delete",          "● `delete` / `erase` / `e` / `del N`", "done", "Slice J — bulk delete on current selection AND single-index delete via cmd line"],
-            ["Explode (blocks → entities)", "Explode", "missing",  "Depends on Slice F"],
-            ["Explode text",    "ExplodeText",         "missing",  "Depends on text + outline conversion"],
-            ["Attributes (pen/layer edit)", "● Entity Info panel", "done", "Slice D — per-entity layer / color / linetype / lineweight editing"],
-            ["Array (rect / polar)", "● Rect array",   "partial",  "Rect array works on a single source dobject; polar array missing"],
-            ["Order (Z-order)", "Order",               "missing",  "Send-to-back / bring-to-front"],
-            ["Undo",            "● `undo` / `u` cmd",  "done",     "Slice J — 64-deep snapshot stack; every editing op snapshots first"],
-            ["Redo",            "Redo",                "missing",  "Undo only — no redo-from-undone stack yet; next small follow-up"],
+            ["Move",            "● `move` / `m` cmd",        "done",     "Slice J — translate selection by (end - base)"],
+            ["Copy",            "● `copy` / `cp` / `co` / `c` cmd", "done", "Slice J — leaves originals; appends translated copies"],
+            ["Duplicate",       "≡ Copy with zero offset",  "partial",  "No dedicated cmd; achievable via copy with same start+end click"],
+            ["Rotate",          "● `rotate` / `ro` cmd",    "done",     "Slice J — pivot + reference + target; Geom::rotated handles ellipse major-axis"],
+            ["Scale",           "● `scale` / `sc` cmd",     "done",     "Slice J — uniform factor via pivot + reference + target distances"],
+            ["Mirror",          "● `mirror` / `mi` cmd",    "done",     "Slice J — two clicks define the axis; preserves Arc CCW convention"],
+            ["Stretch",         "● `stretch` cmd",          "done",     "Slice L — window/crossing-select vertices, drag delta translates them"],
+            ["Offset (parallel)", "● `offset` / `o` cmd",   "done",     "Slice L — Line / Circle / Arc native; Ellipse / EllipseArc produce Polyline approximation; Polyline corner-aware"],
+            ["Align (3 variants)", "● `align` cmd",         "done",     "Slice L — two ref points → two target points; computes translate+rotate+scale"],
+            ["Lengthen / shorten", "● `lengthen` / `len` cmd", "done",  "Slice L — Line endpoint extend, Arc sweep extend, EllipseArc chord-scale approximation"],
+            ["Trim",            "● `trim` / `tr` cmd",      "done",     "Slice M.1 — two-basket flow (cutters + targets), Geom::trim_at + extended_for_edgemode; closed Ellipse → N EllipseArcs; Polyline explode-then-trim"],
+            ["Extend",          "● `extend` / `ex` cmd",    "done",     "Slice M.2 — symmetric counterpart, Geom::extend_to with EdgMod"],
+            ["Cut / Break",     "● `break` / `br` cmd",     "done",     "Slice L — one-pick variant (two-point break supported)"],
+            ["Divide",          "Divide",                   "missing",  "Equal-distance subdivision — not yet"],
+            ["Fillet (round)",  "● `fillet` / `flt` / `f` cmd", "done", "Slice M.3 — line-line; FltRad SYSVAR persists; arbitrary-angle + right-angle + sharp (r=0) all verified"],
+            ["Chamfer (bevel)", "● `chamfer` cmd",          "done",     "Slice M.4 — line-line; ChmDs1 / ChmDs2 SYSVARS; emits g1' + bridge line + g2'"],
+            ["Join",            "● `join` cmd",             "done",     "Slice M.5 — collinear lines, concentric arcs, chain-to-polyline"],
+            ["MatchProperties", "● `matchprop` / `mp` cmd", "done",     "Slice K — paint style from a clicked source dobject onto the basket"],
+            ["Reverse direction", "● `reverse` cmd",        "done",     "Slice K — swap line endpoints, flip arc sweep"],
+            ["Change layer",    "● `chlayer` cmd",          "done",     "Slice K — reassign basket to a named layer"],
+            ["Polyline segment ops (add / append / delete / change type / offset)", "◐ partial", "partial", "Polyline trim and intersect landed; segment-level add/delete/append/type-flip still missing"],
+            ["Delete",          "● `delete` / `erase` / `e` / `del N`", "done", "Slice J — bulk on selection + indexed single via cmd line"],
+            ["Explode (blocks → entities)", "Explode",      "missing",  "Depends on Slice F (Blocks)"],
+            ["Explode text",    "ExplodeText",              "missing",  "Depends on text + outline conversion"],
+            ["Attributes (pen/layer edit)", "● Entity Info panel", "done", "Slice D — per-Dobject layer / color / linetype / lineweight editing"],
+            ["Array (rect / polar)", "● Rect array",        "partial",  "Rect array on single source; polar array missing"],
+            ["Order (Z-order)", "Order",                    "missing",  "Send-to-back / bring-to-front"],
+            ["Undo",            "● `undo` / `u` cmd",       "done",     "Slice J — 64-deep snapshot stack"],
+            ["Redo",            "● `redo` / `y` cmd",       "done",     "Slice K — symmetric redo_stack; any new edit clears it (branch-cut semantics)"],
+            ["Grips (visual handles)", "● Grips v1 + v2",   "done",     "Per-role grip semantics (endpoint / midpoint / center / quad / vertex), click-to-grab, role-aware drag preview"],
         ],
     },
     {
@@ -311,7 +319,7 @@ CATEGORIES = [
         "rows": [
             ["Total settings exposed",                "≈ 200+",            "—",       "LibreCAD"],
             ["Total catalogued",                      "209",               "—",       "Variables.md is the contract"],
-            ["Actually wired (●)",                    "≈ 7",               "partial", "SpTGSZ, GrpEnb, GrClrU/S, GrpSz, plus pen panel defaults. Most ◐ Planned."],
+            ["Actually wired (●)",                    "≈ 11",              "partial", "SpTGSZ, GrpEnb, GrClrU/S, GrpSz, plus EdgMod / FltRad / ChmDs1 / ChmDs2 (from Slice M) and pen-panel defaults. Most others still ◐ Planned."],
             ["Persistence",                           "● user_env.txt",    "done",    "Format: one KEY=VALUE per line, forward-compatible (unknown keys ignored)"],
             ["Settings UI",                           "● Settings window", "partial", "Lists all UserEnv fields with cryptic name + plain-English label + live preview pane on the right"],
             ["Grid (spacing / snap / iso)",           "—",                 "missing", "Grid renders; no SYSVAR-driven spacing yet"],
@@ -354,12 +362,21 @@ STRENGTHS = [
      "current 7 entity types + LAYER + LTYPE tables. Foundation for serious "
      "interop is in."),
 
-    ("Editing loop has Undo from day one",
-     "Slice J wired Move / Copy / Rotate / Scale / Mirror / Delete simultaneously "
-     "with snapshot Undo (64-deep). Every editing op snapshots Document first — "
-     "users cannot accidentally destroy work irrecoverably. Geom::rotated, "
-     "scaled, mirrored cover all current Geom variants including the tricky "
-     "ellipse-major-axis case."),
+    ("Editing loop substantially complete (Slices J–M)",
+     "20+ editing commands wired in 24 hours: Move / Copy / Rotate / Scale / "
+     "Mirror / Delete / Undo / Redo (Slice K) / MatchProperties / Reverse / "
+     "ChangeLayer / Offset / Lengthen / Break / Align / Stretch (Slice L) / "
+     "Trim / Extend with EdgMod (Slice M.1–M.2) / Fillet / Chamfer / Join "
+     "(Slice M.3–M.5). All run through the basket + QueuedOp pattern with "
+     "snapshot undo+redo. Trim handles closed Ellipse → N EllipseArcs and "
+     "Polyline explode-then-trim. Grips v1+v2 add visual editing handles with "
+     "per-role drag semantics. EdgMod / FltRad / ChmDs1 / ChmDs2 SYSVARS "
+     "persist the relevant defaults across sessions."),
+
+    ("Full 256-color ACI palette",
+     "color.rs::aci_palette now resolves all 256 indices via the canonical "
+     "wheel (24 hues × 10 steps + grays at 250–255 + named at 0–9). DXF files "
+     "using non-trivial palette indices now look right on import."),
 
     ("Native binary format alongside DXF",
      "Slice I added .rsm — a RUST_CAD-native binary format for fast load/save, "
@@ -374,22 +391,11 @@ STRENGTHS = [
 ]
 
 RISKS = [
-    ("No Redo (Undo only)",
-     "Slice J shipped a 64-deep snapshot undo stack — every editing op "
-     "snapshots Document first. But there's no redo: an undone state is "
-     "discarded as soon as the next edit happens. Small follow-up: keep a "
-     "parallel redo stack, clear it on any non-undo edit. Half-day of work."),
-
     ("No UI tests",
      "egui is hard to drive headlessly. CPU renderer ByLayer resolution, "
      "selection toggles, and panel edits are verified manually. Plan: introduce "
      "snapshot tests on canvas painter output OR integration tests on the "
      "underlying CadApp methods (without instantiating the egui Context)."),
-
-    ("ACI palette only covers 7 colors",
-     "cad_kernel/src/color.rs aci_palette() handles indices 0–9 only; 10–255 "
-     "fall back to white. Real AutoCAD has all 256 mapped. Imported DXF files "
-     "that use non-trivial palette indices will look wrong."),
 
     ("GPU renderer doesn't honour ByLayer yet",
      "CPU path resolves Color::ByLayer correctly. GPU path (CircleInstance "
@@ -831,10 +837,14 @@ CAD or BIM tools belong in a different document.</p>
 <h1>Recommendations</h1>
 
 <div class="recommendation">
-<strong>1. Add Redo to complete the undo/redo loop.</strong>
-Slice J shipped Undo (snapshot stack, 64-deep). Redo is a parallel stack
-cleared on any non-undo edit — half-day of work. Users expect Ctrl-Z /
-Ctrl-Shift-Z; right now they get the first half only.
+<strong>1. Pivot to Phase 1 of Implementation_Plan.md.</strong>
+Edit ops, Undo/Redo, ACI palette — three of yesterday's top
+recommendations all landed in the last 24 hours. The edit-tools category
+is now ~85% complete (Explode / Divide / Order / polyline segment ops
+remain, plus polar array). Diminishing returns from squeezing the last
+items. Switch focus to <strong>Phase 1 (Rectangle / Polygon / Circle 2P
++ 3P / Arc TTR)</strong>: zero new Dobject types, ~3–4 dev sessions,
+doubles the visible toolbar surface.
 </div>
 
 <div class="recommendation">
@@ -845,13 +855,6 @@ SPLINE preservation (pass-through even if we can't render it), proxy
 entity skip. Add a regression suite of 20+ real DXF files (AutoCAD,
 LibreCAD, QCAD, BricsCAD outputs) and require round-trip diff to be
 zero or known-safe.
-</div>
-
-<div class="recommendation">
-<strong>3. Finish the ACI palette.</strong>
-Fill cad_kernel/src/color.rs::aci_palette to all 256 indices from the
-standard AutoCAD table. This is 15 minutes of work and makes imported
-DXF files look right. No reason to leave it.
 </div>
 
 <div class="recommendation">
