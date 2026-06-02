@@ -119,6 +119,19 @@ pub struct CadApp {
     intersections: Vec<Vec2>,
     cmd:           String,
     history:       Vec<String>,
+    /// Short "what to do next" prompt for the current state, shown right
+    /// above the command input. Replaces the long placeholder hint with
+    /// a context-aware line — empty when idle. See `set_prompt`.
+    current_prompt: String,
+    /// Most recent command line the user actually ran (non-empty,
+    /// non-whitespace). Pressing Enter on an EMPTY cmd at the top-level
+    /// prompt re-runs this — AutoCAD's "repeat last command".
+    last_command:  Option<String>,
+    /// Counter for the 2-stage "Enter to cancel" pattern during a
+    /// select-mode wait with an empty basket: 0 = no Enters yet, 1 =
+    /// notice shown, 2 = next Enter cancels. Resets on any state
+    /// transition or any cmd input.
+    empty_enter_count_in_select: u8,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -457,8 +470,11 @@ impl Default for CadApp {
         let mut s = Self {
             doc:           Document::default(),
             intersections: Vec::new(),
-            cmd:           String::new(),
-            history:       Vec::new(),
+            cmd:                String::new(),
+            history:            Vec::new(),
+            current_prompt:     String::new(),
+            last_command:       None,
+            empty_enter_count_in_select: 0,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -601,8 +617,28 @@ toolbar:
 impl CadApp {
     // ---- commands & math -----------------------------------------------
 
+    /// Update the live status line shown above the cmd input. Empty
+    /// string clears it. Replaces history-pushed prompts so the user sees
+    /// only the CURRENT instruction, not a growing pile.
+    fn set_prompt<S: Into<String>>(&mut self, s: S) {
+        self.current_prompt = s.into();
+        self.empty_enter_count_in_select = 0;
+    }
+    fn clear_prompt(&mut self) {
+        self.current_prompt.clear();
+        self.empty_enter_count_in_select = 0;
+    }
+
     fn run_command(&mut self, raw: &str) {
         self.history.push(format!("> {}", raw));
+        // Remember the full raw line as the "last command" for AutoCAD-style
+        // Enter-on-empty repeat. Only persist non-empty input.
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            self.last_command = Some(trimmed.to_string());
+        }
+        // Any non-empty input cancels the 2-stage-Enter notice.
+        self.empty_enter_count_in_select = 0;
         // ---- Selection-mode shortcut intercept ----
         //
         // While a select session is active, single-letter input is a
@@ -919,58 +955,47 @@ impl CadApp {
             }
             Ok(Command::Stretch) => {
                 self.stretch_state = StretchState::WaitingForWin1;
-                self.history.push(
-                    "  stretch — Click FIRST corner of crossing window (Esc cancels)".into());
+                self.set_prompt(
+                    "stretch: click FIRST corner of crossing window  [Esc=cancel]");
             }
             Ok(Command::Trim) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
                 self.trim_dbg_session_start("TRIM");
                 self.trim_state = TrimState::SelectingCutters;
                 self.begin_selection(SelectMode::ForCuttingEdges);
-                self.history.push(
-                    "  trim — Select CUTTING edges (or press Enter NOW to use ALL dobjects as cutters). Click to add, shift-click to remove. Type w=window, c=crossing, a=all, b=before, l=last, n=none. Enter to confirm, Esc to cancel.".into());
+                self.set_prompt(
+                    "trim: pick CUTTING edges (Enter = all)  [w/c/a/b/l/n  Esc=cancel]");
             }
             Ok(Command::Extend) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
                 self.trim_dbg_session_start("EXTEND");
                 self.extend_state = ExtendState::SelectingBoundaries;
                 self.begin_selection(SelectMode::ForBoundaryEdges);
-                self.history.push(
-                    "  extend — Select BOUNDARY edges (or press Enter NOW to use ALL dobjects as boundaries). Click to add, shift-click to remove. Type w=window, c=crossing, a=all, b=before, l=last, n=none. Enter to confirm, Esc to cancel.".into());
+                self.set_prompt(
+                    "extend: pick BOUNDARY edges (Enter = all)  [w/c/a/b/l/n  Esc=cancel]");
             }
             Ok(Command::Move) => {
                 if self.selection.is_empty() {
-                    // No basket yet — auto-enter a selection session that
-                    // transitions into MOVE on Enter. User can use any
-                    // selection method (single click, window, crossing,
-                    // `before`, `all`) inside the same flow.
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Move;
-                    self.history.push(
-                        "  move — Select dobjects to move: click / window / crossing / `before` / `all`, Enter to continue (Esc cancels)".into());
+                    self.set_prompt(
+                        "move: select dobjects, Enter to continue  [Esc=cancel]");
                 } else {
-                    // Basket already populated by a prior `select` — go
-                    // straight to base / destination.
                     self.move_state = MoveState::WaitingForBase;
-                    self.history.push(format!(
-                        "  move — {} dobject(s) already selected. Click BASE point (Esc cancels)",
+                    self.set_prompt(format!(
+                        "move ({} dobject(s)): click BASE point  [Esc=cancel]",
                         self.selection.len()));
                 }
             }
             Ok(Command::Fillet(r_opt)) => {
-                // Inline `r <val>` updates the UserEnv default; `fillet`
-                // alone picks the current default. See memo
-                // `project_rust_cad_property_foundation` for env persistence.
                 if let Some(r) = r_opt {
                     self.env.FltRad = r;
                     let _ = self.env.save();
-                    self.history.push(format!(
-                        "  fillet — radius = {} (saved as FltRad)", r));
                 }
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
-                self.history.push(format!(
-                    "  fillet (r={}) — Click FIRST line on the SIDE you want to KEEP. Esc cancels.", r));
+                self.set_prompt(format!(
+                    "fillet (r={}): click FIRST line on the SIDE to KEEP  [Esc=cancel]", r));
             }
             Ok(Command::Chamfer(opt)) => {
                 if let Some((d1, d2_opt)) = opt {
@@ -978,24 +1003,20 @@ impl CadApp {
                     self.env.ChmDs1 = d1;
                     self.env.ChmDs2 = d2;
                     let _ = self.env.save();
-                    self.history.push(format!(
-                        "  chamfer — distances = ({}, {}) (saved as ChmDs1, ChmDs2)", d1, d2));
                 }
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
-                self.history.push(format!(
-                    "  chamfer (d1={}, d2={}) — Click FIRST line on the SIDE you want to KEEP. Esc cancels.", d1, d2));
+                self.set_prompt(format!(
+                    "chamfer (d1={}, d2={}): click FIRST line  [Esc=cancel]", d1, d2));
             }
             Ok(Command::Join) => {
                 if self.selection.is_empty() {
-                    // Auto-select session — like move/copy.
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Join;
-                    self.history.push(
-                        "  join — Select dobjects to merge: click / window / crossing / `all`, Enter to apply (Esc cancels)".into());
+                    self.set_prompt(
+                        "join: select dobjects to merge, Enter to apply  [Esc=cancel]");
                 } else {
-                    // Apply immediately on the already-finalised selection.
                     self.apply_join();
                 }
             }
@@ -1158,30 +1179,32 @@ impl CadApp {
             QueuedOp::None => {}
             QueuedOp::Move => {
                 self.move_state = MoveState::WaitingForBase;
-                self.history.push(format!(
-                    "  move — {} dobject(s). Click BASE point (Esc cancels)",
+                self.set_prompt(format!(
+                    "move ({} dobject(s)): click BASE point  [Esc=cancel]",
                     self.selection.len()));
             }
             QueuedOp::Copy => {
                 self.copy_state = CopyState::WaitingForBase;
-                self.history.push(format!(
-                    "  copy — {} dobject(s). Click BASE point",
+                self.set_prompt(format!(
+                    "copy ({} dobject(s)): click BASE point  [Esc=cancel]",
                     self.selection.len()));
             }
             QueuedOp::Rotate => {
                 self.rotate_state = RotateState::WaitingForPivot;
-                self.history.push(format!(
-                    "  rotate — {} dobject(s). Click PIVOT", self.selection.len()));
+                self.set_prompt(format!(
+                    "rotate ({} dobject(s)): click PIVOT  [Esc=cancel]",
+                    self.selection.len()));
             }
             QueuedOp::Scale => {
                 self.scale_state = ScaleState::WaitingForPivot;
-                self.history.push(format!(
-                    "  scale — {} dobject(s). Click PIVOT", self.selection.len()));
+                self.set_prompt(format!(
+                    "scale ({} dobject(s)): click PIVOT  [Esc=cancel]",
+                    self.selection.len()));
             }
             QueuedOp::Mirror => {
                 self.mirror_state = MirrorState::WaitingForA;
-                self.history.push(format!(
-                    "  mirror — {} dobject(s). Click FIRST axis point",
+                self.set_prompt(format!(
+                    "mirror ({} dobject(s)): click FIRST axis point  [Esc=cancel]",
                     self.selection.len()));
             }
             QueuedOp::Join => {
@@ -3797,6 +3820,10 @@ impl eframe::App for CadApp {
             self.intersect_pending_click = false;
             self.intersect_view_pending  = false;
             self.snap_override = None;
+            // Item 3: Esc clears the command line input AND any current
+            // pretext shown above it. The 2-stage-Enter counter resets too.
+            self.cmd.clear();
+            self.clear_prompt();
             if self.select_mode != SelectMode::Off {
                 self.cancel_selection();
             }
@@ -3882,29 +3909,53 @@ impl eframe::App for CadApp {
         // `feedback_rust_cad_user_terminates_sessions` — the program
         // never auto-terminates editing sessions; only the user does,
         // and a single Enter must not chain through multiple phases.
-        let enter_now = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let enter_now  = ctx.input(|i| i.key_pressed(egui::Key::Enter));
+        let space_now  = ctx.input(|i| i.key_pressed(egui::Key::Space));
         let cmd_is_empty = self.cmd.trim().is_empty();
-        if enter_now && cmd_is_empty {
+        // Item 4 — Space on a truly empty cmd line acts like Enter for the
+        // repeat-last + 2-stage cancel logic below. We let the TextEdit
+        // also see the space (harmless: cmd stays "trim-empty"), then
+        // strip any leading whitespace at the end of this block.
+        let trigger = enter_now || (space_now && cmd_is_empty);
+        if trigger && cmd_is_empty {
             if self.select_mode != SelectMode::Off {
-                // Confirming a select session (incl. trim/extend cutter
-                // basket). The transition into PickingTargets happens
-                // here; the NEXT Enter (separate keystroke) will end
-                // the target-pick phase.
-                self.finalise_selection();
+                // Item 4 — 2-stage cancel for a select-mode wait with an
+                // EMPTY basket on non-cutter/non-boundary sessions.
+                // (TRIM ForCuttingEdges and EXTEND ForBoundaryEdges keep
+                // their documented "Enter = use ALL dobjects" semantics.)
+                let basket_empty = self.selection.is_empty();
+                let is_cutter_or_bound = matches!(self.select_mode,
+                    SelectMode::ForCuttingEdges | SelectMode::ForBoundaryEdges);
+                if basket_empty && !is_cutter_or_bound {
+                    self.empty_enter_count_in_select += 1;
+                    if self.empty_enter_count_in_select == 1 {
+                        self.set_prompt(
+                            "please make a selection (Enter again to cancel)");
+                    } else {
+                        // 2nd empty Enter cancels the whole command.
+                        self.cancel_selection();
+                        self.queued_op = QueuedOp::None;
+                        self.clear_prompt();
+                    }
+                } else {
+                    // Non-empty basket OR cutter/boundary mode → finalise
+                    // (the existing behaviour, including "Enter = all").
+                    self.finalise_selection();
+                }
             } else if matches!(
                 self.trim_state,
                 TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
             {
                 self.trim_dbg("=== TRIM session END (Enter) ===");
                 self.trim_state = TrimState::Off;
-                self.history.push("  trim — session ended (Enter)".into());
+                self.clear_prompt();
             } else if matches!(
                 self.extend_state,
                 ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
             {
                 self.trim_dbg("=== EXTEND session END (Enter) ===");
                 self.extend_state = ExtendState::Off;
-                self.history.push("  extend — session ended (Enter)".into());
+                self.clear_prompt();
             } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
                 let verts = self.pending.drain(..).map(|p| PolyVertex {
                     pos: p, bulge: 0.0,
@@ -3912,7 +3963,16 @@ impl eframe::App for CadApp {
                 self.add_dobject(Geom::Polyline(Polyline {
                     vertices: verts, closed: false,
                 }), "canvas");
+            } else {
+                // Item 4 — fully idle: Enter on empty cmd repeats last cmd.
+                if let Some(last) = self.last_command.clone() {
+                    self.run_command(&last);
+                }
             }
+            // The Space that TextEdit also saw may have left a single
+            // whitespace char in self.cmd; clean it so the repeated cmd's
+            // box stays empty.
+            if space_now { self.cmd.clear(); }
         }
         // Polyline `c`/`close` then Enter — handled separately because
         // it consumes a non-empty cmd line, so it doesn't collide with
@@ -4499,23 +4559,35 @@ impl eframe::App for CadApp {
             .min_height(120.0)
             .show(ctx, |ui| {
                 ui.heading("Command");
+                // Reserve space at the bottom for: prompt line (if any) +
+                // the input row.
+                let prompt_h = if self.current_prompt.is_empty() { 0.0 } else { 18.0 };
+                let bottom_reserve = 32.0 + prompt_h;
                 egui::ScrollArea::vertical()
                     .id_salt("hist_scroll")
                     .stick_to_bottom(true)
-                    .max_height(ui.available_height() - 32.0)
+                    .max_height(ui.available_height() - bottom_reserve)
                     .show(ui, |ui| {
                         for h in &self.history {
                             ui.monospace(h);
                         }
                     });
+                // Item 1 — the only pretext shown above the input is the
+                // CURRENT prompt for the active command. Replaces the
+                // growing pile of historical prompts in the history pane.
+                if !self.current_prompt.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(255, 220, 120),
+                        &self.current_prompt,
+                    );
+                }
                 ui.horizontal(|ui| {
                     ui.label(">");
                     let btn_w = 56.0_f32;
                     let row_h = ui.spacing().interact_size.y;
                     let text_resp = ui.add_sized(
                         [(ui.available_width() - btn_w - 8.0).max(40.0), row_h],
-                        egui::TextEdit::singleline(&mut self.cmd)
-                            .hint_text("type a command (end / mid / per / line 0,0 5,0 / grips / clear / help …)"),
+                        egui::TextEdit::singleline(&mut self.cmd),
                     );
                     let run_clicked = ui.button("run").clicked();
                     // Enter is detected both via the lost-focus pattern AND
@@ -4602,8 +4674,33 @@ impl eframe::App for CadApp {
             // Collect EVERY viable snap target at the current cursor, sorted
             // by (priority, distance). The first is the default; Tab cycles
             // through the rest. Cursor motion (> 4 px) resets the cycle.
+            //
+            // Item 2 — snap is active during ANY editing/drafting/drawing
+            // phase, not just draw tools. A typed-in-cmd snap override
+            // (END / MID / PER / …) ALWAYS wins via find_all_snaps's
+            // `forced` parameter — see memo
+            // `feedback_rust_cad_inline_snap_override_supersedes`.
+            let snap_phase_active =
+                self.tool != Tool::None
+                || self.snap_override.is_some()
+                || matches!(self.trim_state,
+                    TrimState::PickingTargets(_) | TrimState::PickingTargetsAll)
+                || matches!(self.extend_state,
+                    ExtendState::PickingTargets(_) | ExtendState::PickingTargetsAll)
+                || self.move_state       != MoveState::Off
+                || self.copy_state       != CopyState::Off
+                || self.rotate_state     != RotateState::Off
+                || self.scale_state      != ScaleState::Off
+                || self.mirror_state     != MirrorState::Off
+                || self.align_state      != AlignState::Off
+                || self.stretch_state    != StretchState::Off
+                || self.offset_state     != OffsetState::Off
+                || self.lengthen_state   != LengthenState::Off
+                || self.break_state      != BreakState::Off
+                || self.fillet_state     != FilletState::Off
+                || self.chamfer_state    != ChamferState::Off;
             let snap_candidates: Vec<SnapHit> = if !self.doc.dobjects.is_empty()
-                && (self.tool != Tool::None || self.snap_override.is_some())
+                && snap_phase_active
                 && !self.picking_source && !self.intersect_pending_click
             {
                 resp.hover_pos().map(|cur| {
@@ -5234,6 +5331,22 @@ impl eframe::App for CadApp {
             };
             let cutter_color   = egui::Color32::from_rgb(255, 170,  60); // warm orange
             let boundary_color = egui::Color32::from_rgb(255, 220,  90); // warm amber
+            // Item 5 — pulse alpha for the cutter/boundary OVERLAY. Real
+            // dobject color renders normally underneath so similar-coloured
+            // neighbours stay distinguishable. The overlay pulses in/out
+            // at ~1.4 Hz (≈ 700 ms full cycle), driven by ctx.input().time.
+            // When the trim/extend session is live we request a repaint
+            // every 80 ms so the animation stays smooth without burning
+            // GPU at full vsync.
+            let cutter_or_bound_active =
+                trim_cutters.is_some() || extend_bounds.is_some();
+            if cutter_or_bound_active {
+                ctx.request_repaint_after(std::time::Duration::from_millis(80));
+            }
+            let pulse_t = ctx.input(|i| i.time);
+            // sin: -1..1  →  pulse: 0.15..0.85
+            let pulse = 0.5 + 0.35 * (pulse_t * std::f64::consts::TAU * 1.4).sin();
+            let pulse_alpha = (pulse.clamp(0.15, 0.85) * 255.0) as u8;
 
             let mut drawn   = 0usize;
             let mut skipped = 0usize;
@@ -5278,8 +5391,24 @@ impl eframe::App for CadApp {
                             None          => false,
                         };
                         if is_cutter || is_boundary {
-                            let col = if is_cutter { cutter_color } else { boundary_color };
-                            draw_dobject(&painter, rect, self, &e.geom, col);
+                            // Real dobject color FIRST (so similar-coloured
+                            // neighbours stay distinguishable; the user's
+                            // "stop turning everything yellow" complaint).
+                            let (r, g, b) = resolve_color(
+                                e.style.color, e.style.layer, &self.doc.layers,
+                            );
+                            draw_dobject(&painter, rect, self, &e.geom,
+                                egui::Color32::from_rgb(r, g, b));
+                            // Pulsing overlay on top — warm orange for
+                            // cutters, warm amber for boundaries, alpha
+                            // breathing in/out so the user sees motion
+                            // instead of a colour swap.
+                            let base = if is_cutter { cutter_color } else { boundary_color };
+                            let pulse_col = egui::Color32::from_rgba_unmultiplied(
+                                base.r(), base.g(), base.b(), pulse_alpha,
+                            );
+                            draw_dobject_thick(&painter, rect, self, &e.geom,
+                                pulse_col, 4.0);
                             drawn += 1;
                             continue;
                         }
@@ -5881,6 +6010,39 @@ impl eframe::App for CadApp {
 
             ctx.request_repaint();
         });
+
+        // Item 1 — clear the live status line when no edit phase remains
+        // active (e.g. apply_fillet ended its state). Keeps the cmd area
+        // free of stale prompts.
+        let any_edit_active =
+            self.tool != Tool::None
+            || self.select_mode != SelectMode::Off
+            || matches!(self.trim_state,
+                TrimState::SelectingCutters
+                | TrimState::PickingTargets(_)
+                | TrimState::PickingTargetsAll)
+            || matches!(self.extend_state,
+                ExtendState::SelectingBoundaries
+                | ExtendState::PickingTargets(_)
+                | ExtendState::PickingTargetsAll)
+            || self.move_state       != MoveState::Off
+            || self.copy_state       != CopyState::Off
+            || self.rotate_state     != RotateState::Off
+            || self.scale_state      != ScaleState::Off
+            || self.mirror_state     != MirrorState::Off
+            || self.align_state      != AlignState::Off
+            || self.break_state      != BreakState::Off
+            || self.lengthen_state   != LengthenState::Off
+            || self.offset_state     != OffsetState::Off
+            || self.stretch_state    != StretchState::Off
+            || self.matchprops_state != MatchPropsState::Off
+            || self.fillet_state     != FilletState::Off
+            || self.chamfer_state    != ChamferState::Off
+            || self.picking_source
+            || self.intersect_pending_click;
+        if !any_edit_active && !self.current_prompt.is_empty() {
+            self.clear_prompt();
+        }
     }
 }
 
@@ -6143,7 +6305,21 @@ fn draw_dobject(
     g: &Geom,
     color: egui::Color32,
 ) {
-    let stroke = egui::Stroke::new(1.6, color);
+    draw_dobject_thick(painter, rect, app, g, color, 1.6);
+}
+
+/// Same as `draw_dobject` with a parameterised stroke width. Used for the
+/// trim-cutter / extend-boundary pulse overlay (Item 5) which draws a
+/// thicker animated outline above the dobject's normal color.
+fn draw_dobject_thick(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    g: &Geom,
+    color: egui::Color32,
+    width: f32,
+) {
+    let stroke = egui::Stroke::new(width, color);
     match g {
         Geom::Line(l) => {
             painter.line_segment([app.w2s(l.a, rect), app.w2s(l.b, rect)], stroke);
