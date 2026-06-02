@@ -5305,14 +5305,20 @@ impl eframe::App for CadApp {
                     } else if self.tool == Tool::None {
                         // Pointer-mode click — the always-on selector. Click
                         // on a dobject adds it to the basket; Shift removes.
+                        // Click on EMPTY space deselects everything (AutoCAD
+                        // convention — gives the user a clean slate without
+                        // typing anything). Shift-click on empty preserves
+                        // the basket so missing the dobject by a few pixels
+                        // mid-shift-multi-select doesn't wipe it.
                         // See `feedback_rust_cad_pointer_is_selector` memo.
                         let shift = ctx.input(|i| i.modifiers.shift);
                         let tol_world = 10.0 / self.scale as f64;
                         if let Some(i) = self.nearest_entity_under(world, tol_world) {
                             self.click_select(i, shift);
+                        } else if !shift {
+                            self.selection.clear();
+                            self.selected = None;
                         }
-                        // Clicking empty space in pointer mode is a no-op (no
-                        // window-rubber-band yet — that's a Slice O thing).
                         self.refocus_cmd = true;
                     } else if self.picking_source {
                         let tol_world = 10.0 / self.scale as f64;
