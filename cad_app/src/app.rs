@@ -258,6 +258,9 @@ pub struct CadApp {
     /// applying the rotation produces COPIES of the selected dobjects
     /// (originals untouched). Cleared when the session ends.
     rotate_copy:  bool,
+    /// Same toggle for scale's `C` sub-command. When true, scale commits
+    /// a duplicated, scaled copy instead of mutating the selection.
+    scale_copy:   bool,
     scale_state:  ScaleState,
     mirror_state: MirrorState,
     /// Snapshot-based undo stack — every editing operation pushes the
@@ -382,14 +385,22 @@ pub enum RotateState {
     WaitingForRefTgt2(Vec2, Vec2, Vec2, Vec2),              // pivot, src1, src2, tgt1
 }
 
-/// State machine for the interactive scale tool — pivot + reference
-/// distance + target distance; factor = |target| / |ref|.
+/// State machine for the interactive scale tool — AutoCAD SCALE flow:
+///   1. WaitingForPivot                       — click the base point.
+///   2. WaitingForFactor(pivot)               — default: click → factor =
+///      |click − pivot|; OR type a number directly; OR type `R` to switch
+///      to reference mode; OR type `C` to toggle copy mode.
+///   3. Reference sub-states (3 picks): RefStart → RefEnd → NewLength.
+///      ref_d = |RefEnd − RefStart|; factor = NewLength / ref_d, where
+///      NewLength is either |click − pivot| or a typed number.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ScaleState {
     Off,
     WaitingForPivot,
-    WaitingForRef(Vec2),
-    WaitingForTarget(Vec2, f64),    // (pivot, ref_dist)
+    WaitingForFactor(Vec2),                                 // pivot
+    WaitingForRefStart(Vec2),                               // pivot
+    WaitingForRefEnd(Vec2, Vec2),                           // pivot, ref_start
+    WaitingForNewLength(Vec2, f64),                         // pivot, ref_d
 }
 
 /// State machine for the interactive mirror tool — two clicks define the axis.
@@ -556,6 +567,7 @@ impl Default for CadApp {
             copy_state:   CopyState::Off,
             rotate_state: RotateState::Off,
             rotate_copy:  false,
+            scale_copy:   false,
             scale_state:  ScaleState::Off,
             mirror_state: MirrorState::Off,
             undo_stack:   Vec::new(),
@@ -707,6 +719,48 @@ impl CadApp {
                     // Not a number / sub-command: fall through to the
                     // parser (e.g. user typed `esc` or another global).
                 }
+            }
+        }
+        // ---- Scale sub-command intercept (AutoCAD SCALE flow) ------
+        // Same shape as rotate: typed number = factor; `R` = reference;
+        // `C` = toggle copy. WaitingForNewLength also accepts a typed
+        // number as the new length (factor = new / ref_d).
+        if let ScaleState::WaitingForFactor(pivot) = self.scale_state {
+            let lc = trimmed.to_ascii_lowercase();
+            match lc.as_str() {
+                "r" | "ref" | "reference" => {
+                    self.scale_state = ScaleState::WaitingForRefStart(pivot);
+                    self.set_prompt("scale-R: click REFERENCE start (defines old length)");
+                    return;
+                }
+                "c" | "cp" | "copy" => {
+                    self.scale_copy = !self.scale_copy;
+                    self.set_prompt(format!(
+                        "scale (pivot=({:.2},{:.2})): copy {} — click for factor, type number, R=reference",
+                        pivot.x, pivot.y,
+                        if self.scale_copy { "ON" } else { "off" }));
+                    return;
+                }
+                _ => {
+                    if let Ok(factor) = trimmed.parse::<f64>() {
+                        self.apply_scale_or_copy(pivot, factor);
+                        self.scale_state = ScaleState::Off;
+                        self.scale_copy  = false;
+                        self.clear_prompt();
+                        return;
+                    }
+                }
+            }
+        }
+        if let ScaleState::WaitingForNewLength(pivot, ref_d) = self.scale_state {
+            if let Ok(new_len) = trimmed.parse::<f64>() {
+                if new_len > EPS && ref_d > EPS {
+                    self.apply_scale_or_copy(pivot, new_len / ref_d);
+                }
+                self.scale_state = ScaleState::Off;
+                self.scale_copy  = false;
+                self.clear_prompt();
+                return;
             }
         }
         // ---- Selection-mode shortcut intercept ----
@@ -937,15 +991,16 @@ impl CadApp {
                 }
             }
             Ok(Command::Scale) => {
+                self.scale_copy = false;
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Scale;
-                    self.history.push(
-                        "  scale — Select dobjects, Enter to continue (Esc cancels)".into());
+                    self.set_prompt(
+                        "scale: select dobjects, Enter to continue  [Esc=cancel]");
                 } else {
                     self.scale_state = ScaleState::WaitingForPivot;
-                    self.history.push(format!(
-                        "  scale — {} dobject(s) selected. Click PIVOT point",
+                    self.set_prompt(format!(
+                        "scale ({} dobject(s)): click PIVOT (base point)  [Esc=cancel]",
                         self.selection.len()));
                 }
             }
@@ -2879,6 +2934,33 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
+    /// Dispatch the scale session's commit step: if `scale_copy` is on,
+    /// produce scaled COPIES (originals untouched). AutoCAD `C` sub-cmd.
+    fn apply_scale_or_copy(&mut self, pivot: Vec2, factor: f64) {
+        if (factor - 1.0).abs() < EPS || factor.abs() < EPS { return; }
+        if !self.scale_copy {
+            self.apply_scale(pivot, factor);
+            return;
+        }
+        self.snapshot_doc();
+        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i).map(|d| {
+                let mut copy = d.clone();
+                copy.geom = copy.geom.scaled(pivot, factor);
+                copy.handle = cad_kernel::next_handle();
+                copy
+            })
+        }).collect();
+        let n = copies.len();
+        for c in copies { self.doc.push(c); }
+        self.history.push(format!(
+            "  ⊕+ scale-copy: {} new dobject(s) by {:.3}× around ({:.2}, {:.2})",
+            n, factor, pivot.x, pivot.y));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
     /// Mirror the current selection in place across the axis A→B.
     fn apply_mirror(&mut self, a: Vec2, b: Vec2) {
         if a.dist(b) < EPS { return; }
@@ -4018,6 +4100,7 @@ impl eframe::App for CadApp {
             }
             if self.scale_state != ScaleState::Off {
                 self.scale_state = ScaleState::Off;
+                self.scale_copy  = false;
                 self.history.push("  scale cancelled".into());
             }
             if self.mirror_state != MirrorState::Off {
@@ -5225,30 +5308,53 @@ impl eframe::App for CadApp {
                     } else if self.scale_state != ScaleState::Off {
                         match self.scale_state {
                             ScaleState::WaitingForPivot => {
-                                self.scale_state = ScaleState::WaitingForRef(click_world);
-                                self.history.push(format!(
-                                    "    scale: PIVOT = ({:.3}, {:.3}) — click REFERENCE distance",
-                                    click_world.x, click_world.y));
+                                self.scale_state = ScaleState::WaitingForFactor(click_world);
+                                self.set_prompt(format!(
+                                    "scale (pivot=({:.2},{:.2})): click for factor (= distance from pivot), type number, R=reference, C={}",
+                                    click_world.x, click_world.y,
+                                    if self.scale_copy { "copy ON" } else { "copy off" }));
                             }
-                            ScaleState::WaitingForRef(pivot) => {
-                                let d = pivot.dist(click_world);
-                                if d < EPS {
-                                    self.history.push("  ! reference too close to pivot".into());
-                                    self.scale_state = ScaleState::Off;
+                            ScaleState::WaitingForFactor(pivot) => {
+                                // Default: click distance from pivot = scale factor.
+                                let factor = pivot.dist(click_world);
+                                if factor < EPS {
+                                    self.history.push("  ! click too close to pivot — factor would be 0".into());
                                 } else {
-                                    self.scale_state = ScaleState::WaitingForTarget(pivot, d);
-                                    self.history.push(format!(
-                                        "    scale: REFERENCE d = {:.3} — click TARGET distance", d));
-                                }
-                            }
-                            ScaleState::WaitingForTarget(pivot, ref_d) => {
-                                let target_d = pivot.dist(click_world);
-                                if target_d < EPS {
-                                    self.history.push("  ! target too close to pivot".into());
-                                } else {
-                                    self.apply_scale(pivot, target_d / ref_d);
+                                    self.apply_scale_or_copy(pivot, factor);
                                 }
                                 self.scale_state = ScaleState::Off;
+                                self.scale_copy  = false;
+                                self.clear_prompt();
+                            }
+                            // ---- Reference sub-command (R) -------------
+                            ScaleState::WaitingForRefStart(pivot) => {
+                                self.scale_state = ScaleState::WaitingForRefEnd(pivot, click_world);
+                                self.set_prompt("scale-R: click REFERENCE end (defines old length)");
+                            }
+                            ScaleState::WaitingForRefEnd(pivot, ref_start) => {
+                                let ref_d = ref_start.dist(click_world);
+                                if ref_d < EPS {
+                                    self.history.push("  ! reference endpoints coincide".into());
+                                    self.scale_state = ScaleState::Off;
+                                    self.scale_copy  = false;
+                                    self.clear_prompt();
+                                } else {
+                                    self.scale_state = ScaleState::WaitingForNewLength(pivot, ref_d);
+                                    self.set_prompt(format!(
+                                        "scale-R: click for NEW length (= distance from pivot) OR type number  [ref={:.3}]",
+                                        ref_d));
+                                }
+                            }
+                            ScaleState::WaitingForNewLength(pivot, ref_d) => {
+                                let new_len = pivot.dist(click_world);
+                                if new_len < EPS {
+                                    self.history.push("  ! click too close to pivot".into());
+                                } else {
+                                    self.apply_scale_or_copy(pivot, new_len / ref_d);
+                                }
+                                self.scale_state = ScaleState::Off;
+                                self.scale_copy  = false;
+                                self.clear_prompt();
                             }
                             ScaleState::Off => unreachable!(),
                         }
@@ -6169,6 +6275,62 @@ impl eframe::App for CadApp {
                     if let RotateState::WaitingForRefTgt2(_, _, _, t1) = self.rotate_state {
                         let mark2 = egui::Color32::from_rgb(120, 180, 255);
                         painter.circle_filled(self.w2s(t1, rect), 3.0, mark2);
+                    }
+                }
+                _ => {}
+            }
+
+            // ---- Scale live preview ---------------------------------------
+            // WaitingForFactor: ghost-render the selection scaled by the
+            // current cursor distance from the pivot. Reference sub-states
+            // visualise the captured ref endpoints.
+            match self.scale_state {
+                ScaleState::WaitingForFactor(pivot) => {
+                    let pivot_s = self.w2s(pivot, rect);
+                    let mark    = egui::Color32::from_rgb(255, 200, 80);
+                    painter.circle_stroke(pivot_s, 5.0, egui::Stroke::new(1.4, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(-9.0, 0.0), pivot_s + egui::vec2(9.0, 0.0)],
+                        egui::Stroke::new(0.8, mark));
+                    painter.line_segment(
+                        [pivot_s + egui::vec2(0.0, -9.0), pivot_s + egui::vec2(0.0, 9.0)],
+                        egui::Stroke::new(0.8, mark));
+                    if let Some(cur) = resp.hover_pos() {
+                        let cur_world = self.s2w(cur, rect);
+                        let factor    = pivot.dist(cur_world);
+                        // Baseline pivot→cursor.
+                        painter.line_segment(
+                            [pivot_s, cur],
+                            egui::Stroke::new(1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
+                        // Ghost of the scaled selection.
+                        let ghost = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
+                        for &i in &self.selection {
+                            let Some(d) = self.doc.dobjects.get(i) else { continue; };
+                            let g = d.geom.scaled(pivot, factor);
+                            draw_dobject(&painter, rect, self, &g, ghost);
+                        }
+                        painter.text(
+                            cur + egui::vec2(12.0, -12.0),
+                            egui::Align2::LEFT_BOTTOM,
+                            format!("×{:.3}{}", factor,
+                                if self.scale_copy { "  (copy)" } else { "" }),
+                            egui::FontId::monospace(12.0), mark);
+                    }
+                }
+                ScaleState::WaitingForRefEnd(_, s) => {
+                    let mark = egui::Color32::from_rgb(180, 220, 120);
+                    painter.circle_filled(self.w2s(s, rect), 3.0, mark);
+                }
+                ScaleState::WaitingForNewLength(pivot, _) => {
+                    let pivot_s = self.w2s(pivot, rect);
+                    let mark    = egui::Color32::from_rgb(255, 200, 80);
+                    painter.circle_stroke(pivot_s, 5.0, egui::Stroke::new(1.4, mark));
+                    if let Some(cur) = resp.hover_pos() {
+                        painter.line_segment(
+                            [pivot_s, cur],
+                            egui::Stroke::new(1.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
                     }
                 }
                 _ => {}

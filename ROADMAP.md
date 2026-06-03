@@ -7,7 +7,36 @@
 
 ---
 
-## Where we are now (2026-06-01)
+## Where we are now (2026-06-03)
+
+**Editing roadmap COMPLETE (Slices A–M).** The entire edit/modify tier
+landed across 2026-06-01/02: Slice K (redo, matchprop, reverse,
+chlayer), Slice L (offset, lengthen, break, align — now also scales —
+stretch), and Slice M (trim, extend, fillet, chamfer, join). On top of
+the actions, 2026-06-02 added: **grips v1+v2** (visual handles, per-role
+drag semantics), the **ACI palette color picker** (8-bit AutoCAD Color
+Index as the primary picker, TrueColor secondary), the **definitive
+click/drag classifier** (select-mode/Shift → rubber-band, else always
+click), the **rotate redesign** (AutoCAD pivot → angle/R/C flow), and a
+**Color storage refactor** (TrueColor → dedup'd indexed `TrueColorTable`,
+8 B → 4 B per dobject). Default layer renamed to **"LAYER B"**.
+
+**Verification (2026-06-03 audit):** workspace builds clean (0 warnings),
+**138 tests passing** (121 cad_kernel + 15 cad_io + 2 doc), git tree
+clean. See [`Internal_Storage_Audit.md`](Internal_Storage_Audit.md) for
+the current byte-level memory/IO map — that doc supersedes the
+slice-by-slice notes below for "what the storage looks like today".
+
+**Next:** project pivots from *editing* to *new Dobject types & draw
+tools* per [`Implementation_Plan.md`](Implementation_Plan.md). The two
+candidate slices are Phase 1 quick wins (Rectangle / Polygon / Circle
+2P·3P / Arc TTR — no new Dobject types) and the Text foundation
+(`TextStyleTable` + DobjectText + DobjectMText — the critical-path gate
+that unblocks Dimensions, Blocks, and Leaders).
+
+---
+
+### Slice history (chronological — see git for detail)
 
 **Slice M.1 + M.2 — Trim / Extend: ● DONE.** Two-basket flow per the
 `feedback_rust_cad_trim_extend_selection_model` memory. New
@@ -105,10 +134,9 @@ Workspace builds clean, 70 tests pass.
 | Rename: existing `DObject` enum → `Geom` enum across the whole workspace | (149 refs swept) |
 | Renderer resolves `Color::ByLayer` + honours `style.visible` + `layer.visible/frozen` | `cad_app/src/app.rs` |
 
-**Slice B — Layer panel: ○ NEXT.** Egui dock equivalent to LibreCAD's
-`qg_layerwidget` — add / rename / delete layers, visibility / lock / freeze
-toggles, click to set active. First visible UI deliverable on top of the
-foundation.
+_(Slice B and everything after it are ● DONE — see the "Where we are
+now" block above and the slice-progression table below for current
+status.)_
 
 ---
 
@@ -199,15 +227,15 @@ selection and editing stay orthogonal.
 | L.4 | **align** | Move + rotate the basket so source pair (s1, s2) maps to target pair (t1, t2). No scale in v1 | 4 clicks | ● Done |
 | L.5 | **stretch** | Crossing window selects which vertices move; clicked base/dest gives the delta | crossing window + 2 clicks | ● Done |
 
-### Slice M — Complex (M.1 + M.2 done; M.3–M.5 queued)
+### Slice M — Complex (M.1–M.5 all ● Done)
 
 | # | Action | Spec | Status |
 |---|---|---|---|
 | M.1 | **trim** / **tr** | Two-basket flow per `feedback_rust_cad_trim_extend_selection_model` memory: prompt "Select cutting edges" → user picks via the project's existing select engine → Enter confirms cutting-edge basket → prompt "Pick targets" → click each target to trim. **`EdgMod` SYSVAR (ON/OFF)** controls infinite-extension intersections. Main editing basket stashed and restored. **No LibreCAD selection-idiom inheritance.** Wand-drag mode deferred to v2 — single-click in v1. | ● Done |
 | M.2 | **extend** / **ex** | Symmetric: boundary basket → click each target end to extend toward the nearest boundary intersection (same `EdgMod`). | ● Done |
-| M.3 | **fillet** | Tangent arc between two curves at radius | typed r + 2 clicks |
-| M.4 | **chamfer** | Bevel between two lines with two distances | typed d1, d2 + 2 line clicks |
-| M.5 | **join** | Merge collinear lines / coincident polylines / arcs sharing center+radius | (none) |
+| M.3 | **fillet** | Tangent arc between two curves at radius (typed r + 2 clicks) | ● Done |
+| M.4 | **chamfer** | Bevel between two lines with two distances (typed d1, d2 + 2 line clicks) | ● Done |
+| M.5 | **join** | Merge collinear lines / coincident polylines / arcs sharing center+radius | ● Done |
 
 ### Slice N — Strange / Exotic (deferred indefinitely)
 
