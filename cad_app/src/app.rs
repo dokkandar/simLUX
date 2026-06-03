@@ -267,6 +267,11 @@ pub struct CadApp {
     layer_rename: Option<LayerId>,
     /// Scratch buffer for the in-progress rename text.
     layer_rename_buf: String,
+    /// True on the first frame after a rename was activated — the
+    /// rename TextEdit calls `request_focus()` once to steal focus from
+    /// the always-listen command line. Cleared after the focus grab so
+    /// the user's clicks within the field aren't fighting us.
+    layer_rename_focus_pending: bool,
     /// Counter for default layer names ("Layer1", "Layer2", …).
     layer_name_counter: u32,
 
@@ -611,6 +616,7 @@ impl Default for CadApp {
             layer_panel_open:   true,
             layer_rename:       None,
             layer_rename_buf:   String::new(),
+            layer_rename_focus_pending: false,
             layer_name_counter: 0,
             pen_panel_open:     true,
             info_panel_open:    true,
@@ -1785,6 +1791,13 @@ impl CadApp {
                                     // ----- name (click to rename) ---------
                                     if self.layer_rename == Some(id) {
                                         let resp = ui.text_edit_singleline(&mut self.layer_rename_buf);
+                                        // First frame after rename activation —
+                                        // steal focus from the always-listen
+                                        // command line so keystrokes land here.
+                                        if self.layer_rename_focus_pending {
+                                            resp.request_focus();
+                                            self.layer_rename_focus_pending = false;
+                                        }
                                         if resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
                                             rename_commit = Some((id, self.layer_rename_buf.clone()));
                                         }
@@ -1799,6 +1812,7 @@ impl CadApp {
                                         let resp = ui.selectable_label(false, label);
                                         if resp.double_clicked() && id != LayerTable::LAYER_ZERO {
                                             self.layer_rename = Some(id);
+                                            self.layer_rename_focus_pending = true;
                                             self.layer_rename_buf = layer.name.clone();
                                         }
                                     }
@@ -1860,20 +1874,34 @@ impl CadApp {
     fn render_aci_picker_window(&mut self, ctx: &egui::Context) {
         let Some(target) = self.aci_pick_request else { return };
 
+        // Title — use the actual layer / dobject name so the user knows
+        // which slot they're editing without having to remember its id.
         let title = match target {
-            AciPickRequest::Layer(id)   => format!("ACI color — layer #{}", id),
-            AciPickRequest::Dobject(ix) => format!("ACI color — dobject #{}", ix),
+            AciPickRequest::Layer(id) => {
+                let name = self.doc.layers.get(id)
+                    .map(|l| l.name.clone())
+                    .unwrap_or_else(|| format!("layer #{}", id));
+                format!("ACI color — {}", name)
+            }
+            AciPickRequest::Dobject(ix) => {
+                let kind = self.doc.dobjects.get(ix)
+                    .map(|d| dobject_kind_name(&d.geom).to_string())
+                    .unwrap_or_else(|| "dobject".to_string());
+                format!("ACI color — {} #{}", kind, ix)
+            }
         };
 
         let mut open = true;
         let mut picked: Option<u8> = None;
         let mut do_save = false;
-        let mut hover_label = String::from("(hover a circle for ACI / RGB)");
+        // Reset the per-frame hover before rendering. Wheel + excluded
+        // rows write to it as the cursor moves over them.
+        self.aci_picker.hovered_aci = None;
 
         egui::Window::new(title)
             .id(egui::Id::new("aci_picker_window"))
             .open(&mut open)
-            .default_size(egui::vec2(420.0, 520.0))
+            .default_size(egui::vec2(440.0, 640.0))
             .resizable(true)
             .collapsible(true)
             .show(ctx, |ui| {
@@ -1883,7 +1911,7 @@ impl CadApp {
                         "Swap mode: ON"
                     } else { "Swap mode: OFF" };
                     if ui.selectable_label(self.aci_picker.swap_mode, swap_label)
-                        .on_hover_text("Click two circles to swap their positions.\nReleases the user's customised layout.")
+                        .on_hover_text("Click two circles to swap their positions.\nApplies only to the main wheel.")
                         .clicked()
                     {
                         self.aci_picker.swap_mode = !self.aci_picker.swap_mode;
@@ -1895,24 +1923,71 @@ impl CadApp {
                         do_save = true;
                     }
                 });
+
                 ui.separator();
 
-                // The wheel itself, centred horizontally.
+                // ---- Excluded row 1: named colors (ACI 1..=9) ----------
+                ui.label("Named colors (ACI 1–9)");
+                if let Some(aci) = self.aci_picker.excluded_row_ui(
+                    ui, crate::aci_picker::EXCLUDED_NAMED.clone())
+                {
+                    picked = Some(aci);
+                }
+                ui.add_space(4.0);
+
+                // ---- The wheel itself, centred horizontally ------------
                 ui.vertical_centered(|ui| {
-                    picked = self.aci_picker.wheel_ui(ui);
+                    if let Some(aci) = self.aci_picker.wheel_ui(ui) {
+                        picked = Some(aci);
+                    }
                 });
 
+                ui.add_space(4.0);
+                // ---- Excluded row 2: grayscale (ACI 250..=255) ---------
+                ui.label("Grays (ACI 250–255)");
+                if let Some(aci) = self.aci_picker.excluded_row_ui(
+                    ui, crate::aci_picker::EXCLUDED_GRAY.clone())
+                {
+                    picked = Some(aci);
+                }
+
                 ui.separator();
 
-                // Hover readout — mirror of the HTML reference's info panel.
-                if let Some(h) = self.aci_picker.hovered {
-                    let aci = self.aci_picker.mapping[h];
+                // ---- Manual ACI entry ----------------------------------
+                ui.horizontal(|ui| {
+                    ui.label("ACI #:");
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.aci_picker.manual_entry)
+                            .desired_width(56.0)
+                            .hint_text("0–255"),
+                    );
+                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let set   = ui.button("Set").clicked();
+                    if enter || set {
+                        match self.aci_picker.manual_entry.trim().parse::<u16>() {
+                            Ok(n) if n <= 255 => {
+                                picked = Some(n as u8);
+                                self.aci_picker.manual_entry.clear();
+                            }
+                            _ => {
+                                // Leave the (bad) input visible so the
+                                // user can correct it; no toast yet.
+                            }
+                        }
+                    }
+                });
+
+                // ---- Hover readout -------------------------------------
+                ui.add_space(2.0);
+                let hover_label = if let Some(aci) = self.aci_picker.hovered_aci {
                     let (r, g, b) = aci_palette(aci);
-                    hover_label = format!(
+                    format!(
                         "Hover: ACI {}   RGB {},{},{}   #{:02X}{:02X}{:02X}",
                         aci, r, g, b, r, g, b
-                    );
-                }
+                    )
+                } else {
+                    String::from("(hover a circle for ACI / RGB)")
+                };
                 ui.label(hover_label);
             });
 
@@ -3776,6 +3851,21 @@ fn snap_blurb(k: SnapKind) -> &'static str {
     }
 }
 
+/// Short, capitalised label for a Dobject's underlying geometry. Used
+/// in dialog/window titles where the user wants to know "what kind of
+/// dobject am I editing?" without reading a full describe() line.
+fn dobject_kind_name(g: &Geom) -> &'static str {
+    match g {
+        Geom::Line(_)       => "Line",
+        Geom::Circle(_)     => "Circle",
+        Geom::Arc(_)        => "Arc",
+        Geom::Ellipse(_)    => "Ellipse",
+        Geom::EllipseArc(_) => "EllipseArc",
+        Geom::Point(_)      => "Point",
+        Geom::Polyline(_)   => "Polyline",
+    }
+}
+
 fn describe(g: &Geom) -> String {
     match g {
         Geom::Line(l) => format!(
@@ -5399,7 +5489,14 @@ impl eframe::App for CadApp {
                     let other_focused = ctx.memory(|m| {
                         m.focused().is_some_and(|id| id != text_resp.id)
                     });
-                    if self.refocus_cmd && !other_focused {
+                    // Modal text edits elsewhere in the UI must own focus
+                    // exclusively (layer rename today; will grow as more
+                    // dialogs land). Suppress the always-listen reclaim
+                    // while any are active.
+                    let modal_textedit_active = self.layer_rename.is_some();
+                    if modal_textedit_active {
+                        self.refocus_cmd = false;
+                    } else if self.refocus_cmd && !other_focused {
                         text_resp.request_focus();
                         self.refocus_cmd = false;
                     } else if !other_focused && !text_resp.has_focus() {
