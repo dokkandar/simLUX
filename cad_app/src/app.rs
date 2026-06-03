@@ -38,6 +38,18 @@ enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PlineMode { Line, Arc }
 
+/// Per-click flow modifier inside PLINE Arc mode. Default `Normal` =
+/// tangent-continuous arc by endpoint click. `SecondPt` paths take TWO
+/// clicks (the on-arc midpoint then the endpoint) and build a 3-point
+/// arc instead. Resets to `Normal` after each arc commits, or on
+/// mode switch / Esc.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PlineArcSub {
+    Normal,
+    AwaitingSecondPt,            // user typed `s`; next click = on-arc midpoint
+    AwaitingSecondPtEnd(Vec2),   // midpoint captured; next click = endpoint
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ArcMethod {
     ThreePoints,
@@ -185,6 +197,12 @@ pub struct CadApp {
     /// Toggled inline by typing `a` (Arc) or `l` (Line) while pline is
     /// active. Each captured vertex inherits this mode's segment kind.
     pline_mode:    PlineMode,
+    /// Per-click flow inside PLINE Arc mode — `Normal` for the default
+    /// tangent-continuous arc, `AwaitingSecondPt` after the user typed
+    /// `s` (the next click captures a midpoint on the arc curve), then
+    /// `AwaitingSecondPtEnd(mid)` until the endpoint click commits a
+    /// 3-point arc. Resets to `Normal` after each arc commits.
+    pline_arc_sub: PlineArcSub,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -599,6 +617,7 @@ impl Default for CadApp {
             pending:       Vec::new(),
             pending_bulges: Vec::new(),
             pline_mode:    PlineMode::Line,
+            pline_arc_sub: PlineArcSub::Normal,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             array_open:     false,
@@ -773,15 +792,25 @@ impl CadApp {
             match lc.as_str() {
                 "a" | "arc" => {
                     self.pline_mode = PlineMode::Arc;
+                    self.pline_arc_sub = PlineArcSub::Normal;
                     self.update_pline_prompt();
                     return;
                 }
                 "l" | "line" if self.pline_mode == PlineMode::Arc => {
                     self.pline_mode = PlineMode::Line;
+                    self.pline_arc_sub = PlineArcSub::Normal;
                     self.update_pline_prompt();
                     return;
                 }
                 "u" | "undo" => {
+                    // If a Second-pt flow is mid-step, undo that sub-step
+                    // first instead of yanking a committed vertex.
+                    if self.pline_arc_sub != PlineArcSub::Normal {
+                        self.pline_arc_sub = PlineArcSub::Normal;
+                        self.history.push("  pline: cancelled Second-pt flow".into());
+                        self.update_pline_prompt();
+                        return;
+                    }
                     if let Some(last) = self.pending.pop() {
                         self.pending_bulges.pop();
                         self.history.push(format!(
@@ -793,6 +822,19 @@ impl CadApp {
                     }
                     return;
                 }
+                // Second-pt: 3-click arc (start = last vertex, second pt on
+                // arc, endpoint). Only meaningful in Arc mode and with at
+                // least one captured vertex to start the arc from.
+                "s" | "second" if self.pline_mode == PlineMode::Arc => {
+                    if self.pending.is_empty() {
+                        self.history.push(
+                            "  ! pline: need a starting vertex before Second-pt".into());
+                        return;
+                    }
+                    self.pline_arc_sub = PlineArcSub::AwaitingSecondPt;
+                    self.update_pline_prompt();
+                    return;
+                }
                 // Recognised-but-not-wired sub-options: tell the user
                 // they're known so they don't keep retyping. Wire-up
                 // lands in the Phase 2 slice.
@@ -802,7 +844,6 @@ impl CadApp {
                 | "ce" | "center"
                 | "d" | "direction"
                 | "r" | "radius"
-                | "s" | "second"
                 | "ang" | "angle" => {
                     self.history.push(format!(
                         "  pline: sub-option '{}' recognised but not yet wired (Phase 2)",
@@ -3599,12 +3640,37 @@ impl CadApp {
                 "pline ({} vert): click next  \
                 [Arc / Halfwidth / Length / Undo / Width  |  Enter=finish, 'c' Enter=close]",
                 n),
-            (PlineMode::Arc,  _) => format!(
-                "pline·ARC ({} vert): click endpoint  \
-                [Angle / CEnter / Direction / Halfwidth / Line / Radius / Second / Undo / Width  |  Enter=finish, 'c' Enter=close]",
-                n),
+            (PlineMode::Arc,  _) => match self.pline_arc_sub {
+                PlineArcSub::Normal => format!(
+                    "pline·ARC ({} vert): click endpoint  \
+                    [Angle / CEnter / Direction / Halfwidth / Line / Radius / Second / Undo / Width  |  Enter=finish, 'c' Enter=close]",
+                    n),
+                PlineArcSub::AwaitingSecondPt =>
+                    "pline·ARC·SECOND: click a point ON the arc  [U=cancel sub-flow]".to_string(),
+                PlineArcSub::AwaitingSecondPtEnd(_) =>
+                    "pline·ARC·SECOND: click ENDPOINT  [U=cancel sub-flow]".to_string(),
+            },
         };
         self.set_prompt(prompt);
+    }
+
+    /// Snap-only "phantom" DObject built from the in-progress polyline
+    /// (vertices + bulges currently in `self.pending`). Returned when
+    /// the pline tool is mid-flow with at least 2 vertices so that the
+    /// snap engine can offer END/MID/CEN/etc snaps against vertices the
+    /// user has just clicked but hasn't committed yet. NOT inserted in
+    /// `self.doc.dobjects` — it's a fresh allocation per snap frame.
+    fn pline_phantom_dobject(&self) -> Option<DObject> {
+        if self.tool != Tool::Polyline { return None; }
+        if self.pending.len() < 2 { return None; }
+        let n = self.pending.len();
+        let verts: Vec<PolyVertex> = (0..n).map(|i| {
+            let bulge = if i + 1 < n {
+                self.pending_bulges.get(i).copied().unwrap_or(0.0)
+            } else { 0.0 };
+            PolyVertex { pos: self.pending[i], bulge }
+        }).collect();
+        Some(Polyline { vertices: verts, closed: false }.into())
     }
 
     /// PLINE arc-mode helper: the exit tangent of the most recently
@@ -3657,6 +3723,7 @@ impl CadApp {
         }
         self.pending_bulges.clear();
         self.pline_mode = PlineMode::Line;
+        self.pline_arc_sub = PlineArcSub::Normal;
         verts
     }
 
@@ -4172,6 +4239,32 @@ fn snap_blurb(k: SnapKind) -> &'static str {
         SnapKind::Tan => "tangent point        (needs anchor click)",
         SnapKind::Nea => "nearest point on the curve",
     }
+}
+
+/// AutoCAD polyline bulge for a 3-point arc through (p1, p2, p3) in
+/// THAT ORDER. Returns 0.0 (straight segment) when the three points are
+/// collinear or coincident. The sign matches the polyline convention:
+/// positive bulge = arc bends to the LEFT of the chord p1→p3 (CCW).
+fn bulge_from_three_points(p1: Vec2, p2: Vec2, p3: Vec2) -> f64 {
+    use cad_kernel::arc_three_points;
+    let Some(arc) = arc_three_points(p1, p2, p3) else { return 0.0 };
+    let r = arc.radius;
+    if r < EPS { return 0.0; }
+    let center = arc.center;
+    // Angles at the center for the two endpoints + the midpoint pick.
+    let a1 = (p1 - center).angle();
+    let a3 = (p3 - center).angle();
+    let a2 = (p2 - center).angle();
+    // Try CCW direction first: (a3 - a1) mod TAU. If the swept range
+    // contains a2, the polyline travels CCW (positive bulge); else CW.
+    let ccw_sweep = (a3 - a1).rem_euclid(std::f64::consts::TAU);
+    let mid_offset = (a2 - a1).rem_euclid(std::f64::consts::TAU);
+    let signed_theta = if mid_offset <= ccw_sweep + 1e-9 {
+        ccw_sweep
+    } else {
+        -(std::f64::consts::TAU - ccw_sweep)
+    };
+    (signed_theta / 4.0).tan()
 }
 
 /// Short, capitalised label for a Dobject's underlying geometry. Used
@@ -4702,6 +4795,7 @@ impl eframe::App for CadApp {
             self.pending.clear();
             self.pending_bulges.clear();
             self.pline_mode = PlineMode::Line;
+            self.pline_arc_sub = PlineArcSub::Normal;
             self.tool = Tool::None;
             self.picking_source = false;
             self.intersect_pending_click = false;
@@ -5970,20 +6064,48 @@ impl eframe::App for CadApp {
                 || self.align_state      != AlignState::Off
                 || self.stretch_state    != StretchState::Off
                 || self.break_state      != BreakState::Off;
-            let snap_candidates: Vec<SnapHit> = if !self.doc.dobjects.is_empty()
-                && snap_phase_active
+            // Phantom dobject for the in-progress polyline so snap kinds
+            // (END / MID / CEN / …) work against vertices the user has
+            // just clicked but hasn't committed yet. Cheap — only built
+            // when the pline tool is mid-flow with at least 2 vertices.
+            let pline_phantom: Option<DObject> = self.pline_phantom_dobject();
+
+            let snap_candidates: Vec<SnapHit> = if snap_phase_active
                 && !self.picking_source && !self.intersect_pending_click
+                && (!self.doc.dobjects.is_empty() || pline_phantom.is_some())
             {
                 resp.hover_pos().map(|cur| {
                     let world = self.s2w(cur, rect);
                     let world_radius = self.env.SpTGSZ as f64 / self.scale as f64;
                     let grid = if self.index_dirty { None } else { self.index.as_ref() };
-                    find_all_snaps(
-                        world, world_radius,
-                        self.snap_enabled, self.snap_override,
-                        self.pending.last().copied(),
-                        &self.doc.dobjects, grid,
-                    )
+                    let mut hits = if self.doc.dobjects.is_empty() {
+                        Vec::new()
+                    } else {
+                        find_all_snaps(
+                            world, world_radius,
+                            self.snap_enabled, self.snap_override,
+                            self.pending.last().copied(),
+                            &self.doc.dobjects, grid,
+                        )
+                    };
+                    if let Some(ref phantom) = pline_phantom {
+                        let phantom_slice = std::slice::from_ref(phantom);
+                        let phantom_hits = find_all_snaps(
+                            world, world_radius,
+                            self.snap_enabled, self.snap_override,
+                            self.pending.last().copied(),
+                            phantom_slice, None,
+                        );
+                        hits.extend(phantom_hits);
+                        // Re-sort merged list by (priority, distance) so the
+                        // closest snap across both sources wins.
+                        hits.sort_by(|a, b| {
+                            a.kind.priority().cmp(&b.kind.priority())
+                                .then(a.point.dist(world).partial_cmp(&b.point.dist(world))
+                                    .unwrap_or(std::cmp::Ordering::Equal))
+                        });
+                    }
+                    hits
                 }).unwrap_or_default()
             } else {
                 Vec::new()
@@ -6718,19 +6840,52 @@ impl eframe::App for CadApp {
                         // pending[i+1]. In Arc sub-mode the just-clicked
                         // segment gets a tangent-continuous arc bulge;
                         // in Line sub-mode (or any other tool) it stays 0.
-                        if self.tool == Tool::Polyline && !self.pending.is_empty() {
-                            let new_bulge = if self.pline_mode == PlineMode::Arc {
-                                self.pline_arc_bulge_to(click_world)
-                            } else {
-                                0.0
-                            };
-                            self.pending_bulges.push(new_bulge);
+                        //
+                        // Second-pt flow (typed `s` in Arc mode) is
+                        // 2-stage: the first click captures an on-arc
+                        // midpoint WITHOUT committing a vertex; the
+                        // second click commits the endpoint using a
+                        // 3-point-arc bulge.
+                        let pline_handled = if self.tool == Tool::Polyline {
+                            match self.pline_arc_sub {
+                                PlineArcSub::AwaitingSecondPt => {
+                                    self.pline_arc_sub =
+                                        PlineArcSub::AwaitingSecondPtEnd(click_world);
+                                    self.history.push(format!(
+                                        "    pline·ARC second-pt: ({:.3},{:.3}) — click ENDPOINT",
+                                        click_world.x, click_world.y));
+                                    self.update_pline_prompt();
+                                    true
+                                }
+                                PlineArcSub::AwaitingSecondPtEnd(mid) => {
+                                    if let Some(&start) = self.pending.last() {
+                                        let bulge = bulge_from_three_points(
+                                            start, mid, click_world);
+                                        self.pending_bulges.push(bulge);
+                                        self.pending.push(click_world);
+                                    }
+                                    self.pline_arc_sub = PlineArcSub::Normal;
+                                    self.update_pline_prompt();
+                                    true
+                                }
+                                PlineArcSub::Normal => false,
+                            }
+                        } else { false };
+                        if !pline_handled {
+                            if self.tool == Tool::Polyline && !self.pending.is_empty() {
+                                let new_bulge = if self.pline_mode == PlineMode::Arc {
+                                    self.pline_arc_bulge_to(click_world)
+                                } else {
+                                    0.0
+                                };
+                                self.pending_bulges.push(new_bulge);
+                            }
+                            self.pending.push(click_world);
+                            if self.tool == Tool::Polyline {
+                                self.update_pline_prompt();
+                            }
+                            self.try_finalise();
                         }
-                        self.pending.push(click_world);
-                        if self.tool == Tool::Polyline {
-                            self.update_pline_prompt();
-                        }
-                        self.try_finalise();
                         // canvas click steals focus away from the command box;
                         // restore it so typing keeps working without a manual
                         // click into the field.
@@ -7469,15 +7624,38 @@ impl eframe::App for CadApp {
                             // Rubber-band from last captured to cursor.
                             // In Arc mode this is also a tessellated
                             // arc so the user sees the actual curvature
-                            // the click will commit.
+                            // the click will commit. The Second-pt
+                            // sub-flow shows two distinct shapes for
+                            // its two clicks.
                             if let Some(last) = verts.last() {
-                                if self.pline_mode == PlineMode::Arc {
-                                    let bulge = self.pline_arc_bulge_to(cw);
-                                    self.draw_pline_preview_segment(
-                                        &painter, rect, *last, cw, bulge, dash);
-                                } else {
-                                    painter.line_segment(
-                                        [self.w2s(*last, rect), cursor], dash);
+                                match (self.pline_mode, self.pline_arc_sub) {
+                                    (PlineMode::Arc, PlineArcSub::AwaitingSecondPt) => {
+                                        // Two reference lines (last→cursor and a
+                                        // dotted hint suggesting the second point
+                                        // will lie on the arc).
+                                        painter.line_segment(
+                                            [self.w2s(*last, rect), cursor], dash);
+                                        painter.circle_filled(cursor, 4.0,
+                                            preview_col.gamma_multiply(0.8));
+                                    }
+                                    (PlineMode::Arc, PlineArcSub::AwaitingSecondPtEnd(mid)) => {
+                                        // 3-point arc through (last, mid, cursor).
+                                        let mid_s = self.w2s(mid, rect);
+                                        let bulge = bulge_from_three_points(*last, mid, cw);
+                                        self.draw_pline_preview_segment(
+                                            &painter, rect, *last, cw, bulge, dash);
+                                        painter.circle_filled(mid_s, 4.0,
+                                            preview_col.gamma_multiply(0.9));
+                                    }
+                                    (PlineMode::Arc, PlineArcSub::Normal) => {
+                                        let bulge = self.pline_arc_bulge_to(cw);
+                                        self.draw_pline_preview_segment(
+                                            &painter, rect, *last, cw, bulge, dash);
+                                    }
+                                    (PlineMode::Line, _) => {
+                                        painter.line_segment(
+                                            [self.w2s(*last, rect), cursor], dash);
+                                    }
                                 }
                             }
                         }
