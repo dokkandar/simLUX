@@ -7189,19 +7189,67 @@ impl eframe::App for CadApp {
                         .or_else(|| resp.hover_pos().map(|p| self.s2w(p, rect)));
                     if let Some(cw) = cur_world {
                         let v = cw - base;
-                        // base→destination arrow
                         let base_s = self.w2s(base, rect);
                         let dest_s = self.w2s(cw, rect);
-                        painter.line_segment([base_s, dest_s],
-                            egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 200, 100)));
-                        painter.circle_filled(base_s, 4.0,
-                            egui::Color32::from_rgb(255, 200, 100));
+                        let accent = egui::Color32::from_rgb(255, 200, 100);
+                        // base BLIP + animated dashed vector to cursor
+                        draw_base_blip(&painter, base_s, accent);
+                        let time = ctx.input(|i| i.time) as f32;
+                        let phase = time * 60.0;   // marching-ants speed (px/s)
+                        draw_dashed_line(&painter, base_s, dest_s,
+                            6.0, 4.0, phase,
+                            egui::Stroke::new(1.2, accent));
                         // ghost-render the selected dobjects at +v
                         let ghost_col = egui::Color32::from_rgba_unmultiplied(255, 200, 100, 180);
                         for &i in &self.selection {
                             if let Some(d) = self.doc.dobjects.get(i) {
                                 let moved = d.geom.translated(v);
                                 draw_dobject(&painter, rect, self, &moved, ghost_col);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ---- copy tool overlay (mirrors move; greener accent so the
+            //      user can tell the two apart at a glance) --------------
+            if self.copy_state != CopyState::Off {
+                let hint_text = match self.copy_state {
+                    CopyState::WaitingForBase =>
+                        format!("COPY: click BASE point for {} dobject(s)    [Esc cancels]",
+                            self.selection.len()),
+                    CopyState::WaitingForDest(_) =>
+                        format!("COPY: click DESTINATION ({} dobject(s) being duplicated)",
+                            self.selection.len()),
+                    CopyState::Off => unreachable!(),
+                };
+                painter.text(
+                    rect.left_top() + egui::vec2(10.0, 48.0),
+                    egui::Align2::LEFT_TOP,
+                    hint_text,
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::from_rgb(150, 230, 170),
+                );
+
+                if let CopyState::WaitingForDest(base) = self.copy_state {
+                    let cur_world = snap_hit.map(|h| h.point)
+                        .or_else(|| resp.hover_pos().map(|p| self.s2w(p, rect)));
+                    if let Some(cw) = cur_world {
+                        let v = cw - base;
+                        let base_s = self.w2s(base, rect);
+                        let dest_s = self.w2s(cw, rect);
+                        let accent = egui::Color32::from_rgb(150, 230, 170);
+                        draw_base_blip(&painter, base_s, accent);
+                        let time = ctx.input(|i| i.time) as f32;
+                        let phase = time * 60.0;
+                        draw_dashed_line(&painter, base_s, dest_s,
+                            6.0, 4.0, phase,
+                            egui::Stroke::new(1.2, accent));
+                        let ghost_col = egui::Color32::from_rgba_unmultiplied(150, 230, 170, 180);
+                        for &i in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get(i) {
+                                let copied = d.geom.translated(v);
+                                draw_dobject(&painter, rect, self, &copied, ghost_col);
                             }
                         }
                     }
@@ -7413,6 +7461,25 @@ fn draw_snap_glyph(p: &egui::Painter, c: egui::Pos2, k: SnapKind, col: egui::Col
 /// Draw a dashed line a → b with the dash phase shifted by `phase` pixels so
 /// the dashes appear to drift along the line. Used for the "imaginary
 /// extension" trail of PER/TAN snaps on line dobjects.
+/// Visible "blip" marker drawn at a captured base point (move base,
+/// copy base, rotate pivot, scale pivot, …). Small filled square with
+/// a + cross through it — same vocabulary as the drafting cursor so
+/// the user reads it as "this is the locked-in point".
+///
+/// `color` is used for both fill and stroke so each command can have
+/// its own accent (move = orange, copy = green, etc.). The marker is
+/// drawn in screen-space px and doesn't scale with zoom.
+fn draw_base_blip(p: &egui::Painter, pos: egui::Pos2, color: egui::Color32) {
+    let half = 4.5_f32;        // filled square half-edge
+    let arm  = 10.0_f32;       // cross arm half-length
+    let sq = egui::Rect::from_center_size(pos, egui::vec2(half*2.0, half*2.0));
+    p.rect_filled(sq, 1.0, color);
+    p.rect_stroke(sq, 1.0, egui::Stroke::new(1.4, color));
+    let stroke = egui::Stroke::new(1.4, color);
+    p.line_segment([egui::pos2(pos.x - arm, pos.y), egui::pos2(pos.x + arm, pos.y)], stroke);
+    p.line_segment([egui::pos2(pos.x, pos.y - arm), egui::pos2(pos.x, pos.y + arm)], stroke);
+}
+
 fn draw_dashed_line(
     p: &egui::Painter,
     a: egui::Pos2, b: egui::Pos2,
