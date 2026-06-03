@@ -3629,30 +3629,6 @@ impl CadApp {
     }
 }
 
-/// Single-token commands that should also submit when the user presses Space
-/// (mimicking AutoCAD's "spacebar = enter" convention). Multi-arg commands
-/// like `line 0,0 5,0` still need Enter — Space inside them adds a real
-/// space so the arguments parse correctly.
-fn is_complete_single_token_command(cmd: &str) -> bool {
-    matches!(cmd.trim().to_ascii_lowercase().as_str(),
-        // snap-kind one-shot overrides
-        "end" | "endpoint"
-        | "mid" | "midpoint"
-        | "cen" | "center" | "centre"
-        | "qua" | "quadrant"
-        | "int" | "intersect" | "intersection"
-        | "per" | "perp" | "perpendicular"
-        | "tan" | "tangent"
-        | "nea" | "near" | "nearest"
-        // arg-less commands
-        | "clear" | "help" | "?" | "grips" | "grip"
-        | "list"  | "ls"   | "select" | "sel"
-        | "all"   | "prev" | "previous" | "before" | "none" | "deselect"
-        | "rem"   | "remove" | "addmode" | "amode"
-        | "move"  | "m"
-    )
-}
-
 /// Short one-letter badge string for the active osnap kinds, shown on the
 /// toolbar button so the user can see at a glance what's enabled.
 fn active_snap_letters(s: SnapSet) -> String {
@@ -5443,33 +5419,26 @@ impl eframe::App for CadApp {
                         && ui.input(|i| i.key_pressed(egui::Key::Enter)))
                         || (text_resp.has_focus()
                             && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    // AutoCAD-style "Space submits". The TextEdit has already
-                    // added the space char to `self.cmd` by the time we see
-                    // the key event; trim it before checking if the trimmed
-                    // string is a complete single-token command. Multi-arg
-                    // commands keep Space as a literal separator (the check
-                    // returns false for them).
+                    // AutoCAD-style "Space submits". In the cmd line — and
+                    // only in the cmd line — any non-empty input commits
+                    // when the user presses Space, exactly as Enter would.
+                    // (Other text edits like layer rename or the picker's
+                    // manual ACI box still treat Space as a literal char,
+                    // because this check is scoped to `text_resp.has_focus()`.)
+                    //
+                    // Trade-off: one-liner syntax like `line 0,0 10,10`
+                    // cannot be typed at the prompt — the first space
+                    // commits `line` and enters draw mode. The user can
+                    // still feed multi-arg commands via menu actions or
+                    // by typing each arg followed by Space at the next
+                    // prompt (the AutoCAD interaction model).
                     let space_pressed = text_resp.has_focus()
                         && ui.input(|i| i.key_pressed(egui::Key::Space));
-                    // Space submits a single-token global command (already
-                    // there) AND also any input typed during a numeric
-                    // sub-command phase (rotate angle, scale factor, scale
-                    // new-length). In those phases the user's input is
-                    // always a single token — space is a faster Enter and
-                    // shouldn't be a literal char.
-                    let in_numeric_subcmd =
-                        matches!(self.rotate_state, RotateState::WaitingForAngle(_))
-                        || matches!(self.scale_state,
-                              ScaleState::WaitingForFactor(_)
-                            | ScaleState::WaitingForNewLength(_, _));
-                    let submit_via_space = space_pressed && {
-                        let candidate = self.cmd.trim_end_matches(' ');
-                        !candidate.is_empty()
-                            && (is_complete_single_token_command(candidate)
-                                || in_numeric_subcmd)
-                    };
+                    let submit_via_space = space_pressed
+                        && !self.cmd.trim_end_matches(' ').is_empty();
                     if submit_via_space {
-                        // Strip the trailing space we just consumed.
+                        // Strip the trailing space the TextEdit already
+                        // appended to self.cmd before we got control.
                         self.cmd = self.cmd.trim_end_matches(' ').to_string();
                     }
                     if enter_pressed || run_clicked || submit_via_space {
