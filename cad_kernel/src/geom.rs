@@ -140,10 +140,95 @@ impl Polyline {
     }
 }
 
+/// Hatch pattern — the visual style applied INSIDE a hatch boundary.
+/// MVP ships `Solid` only; named patterns (ANSI31, BRICK, etc.) and
+/// user-defined parallel-line patterns (angle + spacing) land later.
+#[derive(Clone, Copy, Debug)]
+pub enum HatchPattern {
+    /// Fill the entire boundary with the dobject's solid color.
+    Solid,
+}
+
+/// An AutoCAD HATCH entity. Carries its own closed boundary as a list of
+/// vertices (last connects to first) plus a pattern descriptor. The
+/// boundary is OWNED — it is not a reference to another DObject. This
+/// is the MVP shape; once handle-stable references land the boundary
+/// can become a reference to source dobjects instead, matching DXF's
+/// own model where HATCH points at its source boundary entities.
+#[derive(Clone, Debug)]
+pub struct Hatch {
+    /// Closed polygonal boundary (implicit edge from last → first vertex).
+    /// MVP ignores per-vertex bulges, so curved hatch boundaries are
+    /// approximated by their vertex polygon for now.
+    pub boundary: Vec<Vec2>,
+    pub pattern:  HatchPattern,
+}
+
+impl Hatch {
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        if self.boundary.is_empty() {
+            return (Vec2::ZERO, Vec2::ZERO);
+        }
+        let mut min = self.boundary[0];
+        let mut max = min;
+        for v in &self.boundary[1..] {
+            if v.x < min.x { min.x = v.x; }
+            if v.y < min.y { min.y = v.y; }
+            if v.x > max.x { max.x = v.x; }
+            if v.y > max.y { max.y = v.y; }
+        }
+        (min, max)
+    }
+
+    /// Selection-distance to a point. ZERO if the point is inside the
+    /// boundary (so clicking inside the fill selects the hatch); else
+    /// distance to the nearest boundary edge.
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        if self.boundary.len() < 3 { return f64::INFINITY; }
+        if self.contains_point(p) { return 0.0; }
+        // Nearest boundary edge.
+        let n = self.boundary.len();
+        let mut best = f64::INFINITY;
+        for i in 0..n {
+            let a = self.boundary[i];
+            let b = self.boundary[(i + 1) % n];
+            let d = b - a;
+            let len_sq = d.len_sq();
+            let dist = if len_sq < EPS {
+                p.dist(a)
+            } else {
+                let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
+                p.dist(a + d * t)
+            };
+            if dist < best { best = dist; }
+        }
+        best
+    }
+
+    /// Even-odd point-in-polygon test on the closed boundary.
+    pub fn contains_point(&self, p: Vec2) -> bool {
+        let n = self.boundary.len();
+        if n < 3 { return false; }
+        let mut inside = false;
+        let mut j = n - 1;
+        for i in 0..n {
+            let pi = self.boundary[i];
+            let pj = self.boundary[j];
+            // Half-open Y test avoids double-counting horizontal edge endpoints.
+            if (pi.y > p.y) != (pj.y > p.y) {
+                let x_intersect = pi.x + (p.y - pi.y) * (pj.x - pi.x) / (pj.y - pi.y);
+                if p.x < x_intersect { inside = !inside; }
+            }
+            j = i;
+        }
+        inside
+    }
+}
+
 /// Pure geometry — the shape side of a `DObject`. Style / layer / handle
 /// live on the outer `DObject` struct (see [`crate::dobject`]).
 ///
-/// Future variants land here: Text, MText, Hatch, BlockRef, Dim*,
+/// Future variants land here: Text, MText, BlockRef, Dim*,
 /// Image, Wipeout, Viewport, Solid2D, Ray, Xline, Leader, MLeader, Tolerance,
 /// Table. Each addition is a new arm + a new entry in every match below.
 #[derive(Clone, Debug)]
@@ -155,6 +240,7 @@ pub enum Geom {
     EllipseArc(EllipseArc),
     Point(Point),
     Polyline(Polyline),
+    Hatch(Hatch),
 }
 
 impl Geom {
@@ -206,6 +292,10 @@ impl Geom {
                     .collect(),
                 closed: p.closed,
             }),
+            Geom::Hatch(h) => Geom::Hatch(Hatch {
+                boundary: h.boundary.iter().map(|p| rot(*p)).collect(),
+                pattern:  h.pattern,
+            }),
         }
     }
 
@@ -246,6 +336,10 @@ impl Geom {
                     .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge })
                     .collect(),
                 closed: p.closed,
+            }),
+            Geom::Hatch(h) => Geom::Hatch(Hatch {
+                boundary: h.boundary.iter().map(|p| sc(*p)).collect(),
+                pattern:  h.pattern,
             }),
         }
     }
@@ -306,6 +400,10 @@ impl Geom {
                     .map(|v| PolyVertex { pos: mirror(v.pos), bulge: v.bulge })
                     .collect(),
                 closed: p.closed,
+            }),
+            Geom::Hatch(h) => Geom::Hatch(Hatch {
+                boundary: h.boundary.iter().map(|p| mirror(*p)).collect(),
+                pattern:  h.pattern,
             }),
         }
     }
@@ -630,6 +728,8 @@ impl Geom {
             }
             Geom::Point(_) =>
                 Err("trim: Point has nothing to trim"),
+            Geom::Hatch(_) =>
+                Err("trim: hatch entities cannot be trimmed"),
         }
     }
 
@@ -810,6 +910,8 @@ impl Geom {
                 Err("split: closed ellipse needs TWO break points"),
             Geom::Point(_) =>
                 Err("split: cannot split a point"),
+            Geom::Hatch(_) =>
+                Err("split: hatch entities cannot be split"),
         }
     }
 
@@ -885,6 +987,8 @@ impl Geom {
                 Err("offset on polyline not implemented yet (corner math TBD)"),
             Geom::Point(_) =>
                 Err("offset on point is undefined"),
+            Geom::Hatch(_) =>
+                Err("offset on hatch is undefined (offset the boundary instead)"),
         }
     }
 
@@ -942,7 +1046,7 @@ impl Geom {
                 Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
             }
             // Direction-agnostic — return a deep copy.
-            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) => self.clone(),
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
         }
     }
 
@@ -986,6 +1090,10 @@ impl Geom {
                     .collect(),
                 closed:   p.closed,
             }),
+            Geom::Hatch(h) => Geom::Hatch(Hatch {
+                boundary: h.boundary.iter().map(|p| *p + off).collect(),
+                pattern:  h.pattern,
+            }),
         }
     }
 
@@ -999,6 +1107,7 @@ impl Geom {
             Geom::EllipseArc(ea) => ea.distance_to_point(p),
             Geom::Point(pt)      => pt.location.dist(p),
             Geom::Polyline(pl)   => pl.distance_to_point(p),
+            Geom::Hatch(h)       => h.distance_to_point(p),
         }
     }
 }
@@ -1061,6 +1170,7 @@ impl Geom {
             Geom::EllipseArc(ea) => ea.ellipse.bbox(),
             Geom::Point(pt) => (pt.location, pt.location),
             Geom::Polyline(pl) => pl.bbox(),
+            Geom::Hatch(h)  => h.bbox(),
         }
     }
 }
@@ -1727,6 +1837,10 @@ impl Geom {
                 .map(|(i, v)| (v.pos, GripRole::PolyVertex(i)))
                 .collect(),
             Geom::Point(p) => vec![(p.location, GripRole::PointLoc)],
+            // Hatch MVP exposes no grips. The boundary vertices could
+            // become PolyVertex grips later; for now editing happens by
+            // recreating the hatch from a different boundary.
+            Geom::Hatch(_) => Vec::new(),
         }
     }
 

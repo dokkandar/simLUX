@@ -54,9 +54,9 @@
 // dispatches on it.
 
 use cad_kernel::{
-    Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Layer,
-    LayerTable, Line, Lineweight, Linetype, LinetypeTable, Pen, PenTable,
-    Point, PolyVertex, Polyline, Style, Vec2,
+    Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Hatch,
+    HatchPattern, Layer, LayerTable, Line, Lineweight, Linetype, LinetypeTable,
+    Pen, PenTable, Point, PolyVertex, Polyline, Style, Vec2,
 };
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
@@ -177,7 +177,8 @@ fn write_dobjects(w: &mut Vec<u8>, ds: &[DObject], tc: &cad_kernel::TrueColorTab
 }
 
 /// Geom tag space:
-///   0=Line, 1=Circle, 2=Arc, 3=Ellipse, 4=EllipseArc, 5=Point, 6=Polyline
+///   0=Line, 1=Circle, 2=Arc, 3=Ellipse, 4=EllipseArc, 5=Point, 6=Polyline,
+///   7=Hatch (MVP — boundary vertices + pattern code; 0=Solid)
 fn write_geom(w: &mut Vec<u8>, g: &Geom) {
     match g {
         Geom::Line(l) => {
@@ -224,6 +225,17 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             for v in &p.vertices {
                 write_vec2(w, v.pos);
                 write_f64(w, v.bulge);
+            }
+        }
+        Geom::Hatch(h) => {
+            write_u8(w, 7);
+            let pattern_code: u8 = match h.pattern {
+                HatchPattern::Solid => 0,
+            };
+            write_u8(w, pattern_code);
+            write_u32(w, h.boundary.len() as u32);
+            for p in &h.boundary {
+                write_vec2(w, *p);
             }
         }
     }
@@ -417,6 +429,18 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
                 vertices.push(PolyVertex { pos: r.vec2()?, bulge: r.f64()? });
             }
             Geom::Polyline(Polyline { vertices, closed })
+        }
+        7 => {
+            let pattern = match r.u8()? {
+                0 => HatchPattern::Solid,
+                other => return Err(format!("RSM: unknown hatch pattern code {}", other)),
+            };
+            let n = r.u32()? as usize;
+            let mut boundary = Vec::with_capacity(n);
+            for _ in 0..n {
+                boundary.push(r.vec2()?);
+            }
+            Geom::Hatch(Hatch { boundary, pattern })
         }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })

@@ -68,6 +68,11 @@ pub enum Command {
     Scale,
     /// Mirror the selection across a line (two clicks define the line).
     Mirror,
+    /// Fill the closed polyline in the current selection with a solid
+    /// hatch in the active color. MVP: takes the FIRST closed polyline
+    /// from the selection (or the current single selection); other
+    /// patterns + multi-loop boundaries come later.
+    Hatch,
     /// Delete every dobject in the current selection.
     DeleteSelected,
     /// Undo the most recent editing operation.
@@ -185,6 +190,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "rotate" | "ro"   => Ok(Command::Rotate),
         "scale" | "sc"    => Ok(Command::Scale),
         "mirror" | "mi"   => Ok(Command::Mirror),
+        "hatch" | "h" | "bhatch" => Ok(Command::Hatch),
         "delete" | "erase" | "e" => Ok(Command::DeleteSelected),
         "undo" | "u"      => Ok(Command::Undo),
         "redo" | "y"      => Ok(Command::Redo),

@@ -98,6 +98,9 @@ impl From<Ellipse>    for DObject { fn from(e: Ellipse) -> Self     { Self::new(
 impl From<EllipseArc> for DObject { fn from(ea: EllipseArc) -> Self { Self::new(Geom::EllipseArc(ea)) } }
 impl From<Point>      for DObject { fn from(p: Point) -> Self       { Self::new(Geom::Point(p)) } }
 impl From<Polyline>   for DObject { fn from(p: Polyline) -> Self    { Self::new(Geom::Polyline(p)) } }
+impl From<crate::geom::Hatch> for DObject {
+    fn from(h: crate::geom::Hatch) -> Self { Self::new(Geom::Hatch(h)) }
+}
 
 // ---- handle allocation -----------------------------------------------------
 //

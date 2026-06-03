@@ -48,6 +48,11 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // Point ∩ anything: degenerates to "is the point on the curve?" —
         // not used by any tool today. Return empty until needed.
         (Point(_), _) | (_, Point(_)) => Vec::new(),
+
+        // Hatch ∩ anything: the boundary of a hatch is its own polyline
+        // dobject and intersection with that is what the user wants. The
+        // Hatch entity itself contributes no intersections.
+        (Hatch(_), _) | (_, Hatch(_)) => Vec::new(),
     }
 }
 

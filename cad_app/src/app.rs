@@ -387,6 +387,10 @@ pub enum QueuedOp {
     /// kernel's three-pass merge (collinear lines, concentric arcs, chain
     /// → polyline).
     Join,
+    /// Hatch — applied on Enter. For every closed polyline in the
+    /// finalised selection, append a Hatch dobject whose boundary copies
+    /// that polyline's vertices, filled with the active color.
+    Hatch,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -1207,6 +1211,16 @@ impl CadApp {
                         self.selection.len()));
                 }
             }
+            Ok(Command::Hatch) => {
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Hatch;
+                    self.set_prompt(
+                        "hatch: pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]");
+                } else {
+                    self.apply_hatch();
+                }
+            }
             Ok(Command::Fillet(r_opt)) => {
                 if let Some(r) = r_opt {
                     self.env.FltRad = r;
@@ -1430,8 +1444,54 @@ impl CadApp {
             QueuedOp::Join => {
                 self.apply_join();
             }
+            QueuedOp::Hatch => {
+                self.apply_hatch();
+            }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
+    }
+
+    /// MVP hatch finaliser: for every closed polyline in the current
+    /// selection, push a new Hatch dobject whose boundary copies that
+    /// polyline's vertex positions, filled with the active color.
+    /// Non-closed-polyline selections are skipped with a message.
+    /// Source polylines stay around — the hatch sits on top.
+    fn apply_hatch(&mut self) {
+        let mut added = 0_usize;
+        let mut skipped = 0_usize;
+        // Capture (boundary, source_idx) up front so we don't borrow
+        // self.doc.dobjects mutably mid-iteration.
+        let mut to_add: Vec<Vec<Vec2>> = Vec::new();
+        for &idx in &self.selection {
+            let Some(d) = self.doc.dobjects.get(idx) else { continue; };
+            match &d.geom {
+                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+                    to_add.push(p.vertices.iter().map(|v| v.pos).collect());
+                }
+                _ => skipped += 1,
+            }
+        }
+        if to_add.is_empty() {
+            self.history.push("  ! hatch: no closed polyline in selection".into());
+            return;
+        }
+        self.snapshot_doc();
+        for boundary in to_add {
+            self.doc.push(cad_kernel::Hatch {
+                boundary,
+                pattern: cad_kernel::HatchPattern::Solid,
+            }.into());
+            added += 1;
+        }
+        self.gpu_dirty = true;
+        self.index_dirty = true;
+        self.history.push(format!(
+            "  + hatch: {} solid fill(s) added{}",
+            added,
+            if skipped > 0 {
+                format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
+            } else { String::new() },
+        ));
     }
 
     /// Click on a dobject during a selection session. Plain click = ADD
@@ -2328,8 +2388,8 @@ impl CadApp {
         ui.separator();
 
         // Count by Geom variant.
-        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl) =
-            (0, 0, 0, 0, 0, 0, 0);
+        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh) =
+            (0, 0, 0, 0, 0, 0, 0, 0);
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -2340,13 +2400,14 @@ impl CadApp {
                     Geom::EllipseArc(_) => nea += 1,
                     Geom::Point(_)      => npt += 1,
                     Geom::Polyline(_)   => npl += 1,
+                    Geom::Hatch(_)      => nh  += 1,
                 }
             }
         }
         ui.monospace(format!(
             "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}",
-            nl, nc, na, ne, nea, npt, npl
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}",
+            nl, nc, na, ne, nea, npt, npl, nh
         ));
         ui.add_space(8.0);
 
@@ -2918,6 +2979,7 @@ impl CadApp {
                     Some(Geom::EllipseArc(_)) => "EllipseArc",
                     Some(Geom::Polyline(_))   => "Polyline",
                     Some(Geom::Point(_))      => "Point",
+                    Some(Geom::Hatch(_))      => "Hatch",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
@@ -3896,6 +3958,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::EllipseArc(_) => "EllipseArc",
         Geom::Point(_)      => "Point",
         Geom::Polyline(_)   => "Polyline",
+        Geom::Hatch(_)      => "Hatch",
     }
 }
 
@@ -3936,6 +3999,10 @@ fn describe(g: &Geom) -> String {
             p.vertices.len(),
             if p.closed { " (closed)" } else { "" },
             p.length()
+        ),
+        Geom::Hatch(h) => format!(
+            "hatch {} boundary verts ({:?})",
+            h.boundary.len(), h.pattern
         ),
     }
 }
@@ -7777,6 +7844,10 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
         Geom::Polyline(p) => {
             for v in &p.vertices { draw(v.pos); }
         }
+        Geom::Hatch(_) => {
+            // Hatch MVP exposes no grips — boundary vertices may become
+            // PolyVertex grips later. Nothing to draw.
+        }
     }
 }
 
@@ -7915,6 +7986,21 @@ fn draw_dobject_thick(
             if !p.closed { pts.truncate(n); }
             painter.add(egui::Shape::line(pts, stroke));
         }
+        Geom::Hatch(h) => {
+            // Solid fill via egui's closed-path tessellator (handles
+            // concave shapes too). Future patterns (parallel lines, named
+            // ANSI / ISO patterns) dispatch on `h.pattern` here.
+            if h.boundary.len() < 3 { return; }
+            let pts: Vec<egui::Pos2> = h.boundary.iter()
+                .map(|w| app.w2s(*w, rect)).collect();
+            painter.add(egui::Shape::Path(egui::epaint::PathShape {
+                points:       pts,
+                closed:       true,
+                fill:         color,
+                stroke:       egui::epaint::PathStroke::NONE,
+            }));
+            let _ = stroke;   // suppress unused-variable warning
+        }
     }
 }
 
@@ -8009,6 +8095,17 @@ fn draw_dobject_dashed(
             }).collect();
             if !p.closed { pts.truncate(n); }
             push_dashed(pts);
+        }
+        Geom::Hatch(h) => {
+            // Selection look — outline the boundary as a closed dashed
+            // polyline. We don't dash the fill itself (too noisy at small
+            // sizes); the boundary outline is enough to read "selected".
+            if h.boundary.len() < 3 { return; }
+            let n = h.boundary.len();
+            let mut pts: Vec<egui::Pos2> = (0..=n).map(|i| {
+                app.w2s(h.boundary[i % n], rect)
+            }).collect();
+            push_dashed(std::mem::take(&mut pts));
         }
     }
 }

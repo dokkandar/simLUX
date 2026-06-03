@@ -359,7 +359,7 @@ fn candidate_points(
                     plain([p.vertices[0].pos, p.vertices[p.vertices.len() - 1].pos])
                 }
             }
-            Geom::Circle(_) | Geom::Ellipse(_) => Vec::new(),
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Hatch(_) => Vec::new(),
         },
         SnapKind::Mid => match e {
             Geom::Line(l) => plain([(l.a + l.b) * 0.5]),
@@ -383,7 +383,7 @@ fn candidate_points(
                 }).collect();
                 plain(pts)
             }
-            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) => Vec::new(),
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => Vec::new(),
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -391,14 +391,14 @@ fn candidate_points(
             Geom::Circle(c)      => plain([c.center]),
             Geom::Ellipse(e)     => plain([e.center]),
             Geom::EllipseArc(ea) => plain([ea.ellipse.center]),
-            Geom::Point(_) | Geom::Polyline(_) => Vec::new(),
+            Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) => Vec::new(),
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -503,6 +503,9 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
             }
             best.map(|(pt, _)| pt)
         }
+        // Hatch boundary edges are the snap target via the boundary's own
+        // polyline dobject. The Hatch entity itself has no curve to snap to.
+        Geom::Hatch(_) => None,
     }
 }
 
@@ -592,6 +595,8 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
             }
             out
         }
+        // Snap to the hatch's boundary via its own polyline dobject instead.
+        Geom::Hatch(_) => Vec::new(),
     }
 }
 
@@ -697,6 +702,8 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
             }
             out
         }
+        // TAN to a hatch isn't defined — use the boundary polyline directly.
+        Geom::Hatch(_) => Vec::new(),
     }
 }
 

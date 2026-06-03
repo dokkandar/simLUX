@@ -528,6 +528,11 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
                 }
             }
         }
+        // DXF HATCH is a substantial entity with pattern, seed point,
+        // boundary edge data, and seed loop topology. MVP does NOT
+        // export hatches yet — skip silently so a round-trip with a
+        // hatch in the doc just drops the hatch but otherwise succeeds.
+        Geom::Hatch(_) => {}
     }
 }
 
