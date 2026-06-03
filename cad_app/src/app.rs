@@ -136,6 +136,13 @@ pub struct CadApp {
     /// handle of a selected dobject. v1 semantic: dragging any grip
     /// translates the whole dobject by the cursor delta.
     grip_drag: Option<GripDrag>,
+    /// Open/closed state for each dockable Window panel. Default true
+    /// for the most-used panels. Toggled from the Tools menu.
+    cmd_window_open:     bool,
+    layers_window_open:  bool,
+    pens_window_open:    bool,
+    info_window_open:    bool,
+    dobjects_window_open: bool,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -519,6 +526,11 @@ impl Default for CadApp {
             last_command:       None,
             empty_enter_count_in_select: 0,
             grip_drag: None,
+            cmd_window_open:     true,
+            layers_window_open:  true,
+            pens_window_open:    false,
+            info_window_open:    false,
+            dobjects_window_open: false,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -1561,11 +1573,15 @@ impl CadApp {
     }
 
     fn render_layer_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("layers")
+        let mut open = self.layers_window_open;
+        egui::Window::new(format!("Layers ({})", self.doc.layers.len()))
+            .open(&mut open)
+            .default_pos(egui::pos2(10.0, 70.0))
+            .default_size(egui::vec2(320.0, 480.0))
             .min_width(240.0)
-            .default_width(280.0)
+            .resizable(true)
+            .collapsible(true)
             .show(ctx, |ui| {
-                ui.heading(format!("Layers ({})", self.doc.layers.len()));
                 ui.separator();
 
                 // ---- toolbar row: add + rename + delete -----------------
@@ -1770,6 +1786,7 @@ impl CadApp {
                     self.layer_rename_buf.clear();
                 }
             });
+        self.layers_window_open = open;
     }
 
     // ===================================================================
@@ -1783,11 +1800,15 @@ impl CadApp {
     // shortcut for setting multiple style fields together.
 
     fn render_pen_palette(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("pens")
+        let mut open = self.pens_window_open;
+        egui::Window::new(format!("Pens ({})", self.doc.pens.len()))
+            .open(&mut open)
+            .default_pos(egui::pos2(340.0, 70.0))
+            .default_size(egui::vec2(280.0, 420.0))
             .min_width(220.0)
-            .default_width(260.0)
+            .resizable(true)
+            .collapsible(true)
             .show(ctx, |ui| {
-                ui.heading(format!("Pens ({})", self.doc.pens.len()));
                 ui.separator();
 
                 if self.selection.is_empty() {
@@ -1873,6 +1894,7 @@ impl CadApp {
                     }
                 }
             });
+        self.pens_window_open = open;
     }
 
     // ===================================================================
@@ -1887,11 +1909,15 @@ impl CadApp {
     //      bulk-edit layer / visibility / color.
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
-        egui::SidePanel::left("info")
+        let mut open = self.info_window_open;
+        egui::Window::new("Info / Properties")
+            .open(&mut open)
+            .default_pos(egui::pos2(640.0, 70.0))
+            .default_size(egui::vec2(300.0, 520.0))
             .min_width(240.0)
-            .default_width(280.0)
+            .resizable(true)
+            .collapsible(true)
             .show(ctx, |ui| {
-                ui.heading("Entity Info");
                 ui.separator();
 
                 // Decide which mode we're in.
@@ -1919,6 +1945,7 @@ impl CadApp {
                     }
                 }
             });
+        self.info_window_open = open;
     }
 
     fn render_info_single(&mut self, ui: &mut egui::Ui, idx: usize) {
@@ -4418,6 +4445,14 @@ impl eframe::App for CadApp {
                     }
                 });
                 ui.menu_button("Tools", |ui| {
+                    ui.label(egui::RichText::new("Palettes").small().color(
+                        egui::Color32::from_rgb(150, 165, 185)));
+                    ui.checkbox(&mut self.cmd_window_open,      "Command palette");
+                    ui.checkbox(&mut self.layers_window_open,   "Layers");
+                    ui.checkbox(&mut self.pens_window_open,     "Pens");
+                    ui.checkbox(&mut self.info_window_open,     "Info / Properties");
+                    ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
+                    ui.separator();
                     if ui.button("Snap window").clicked() {
                         self.snap_window_open = !self.snap_window_open;
                         ui.close_menu();
@@ -4954,9 +4989,18 @@ impl eframe::App for CadApp {
             self.render_trim_debug_window(ctx);
         }
 
-        // ---- right panel: dobjects + intersection list ------------------
-        egui::SidePanel::right("dobjects").min_width(280.0).show(ctx, |ui| {
-            ui.heading(format!("DObjects ({})", self.doc.dobjects.len()));
+        // ---- DObjects palette — floating Window -------------------------
+        let mut dobjects_open = self.dobjects_window_open;
+        let dobjects_count = self.doc.dobjects.len();
+        egui::Window::new(format!("DObjects ({})", dobjects_count))
+            .open(&mut dobjects_open)
+            .default_pos(egui::pos2(
+                ctx.screen_rect().right() - 320.0, 70.0))
+            .default_size(egui::vec2(300.0, 520.0))
+            .min_width(220.0)
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
             if self.picking_source {
                 ui.colored_label(
                     egui::Color32::from_rgb(255, 220, 100),
@@ -5004,6 +5048,7 @@ impl eframe::App for CadApp {
                 }
             });
         });
+        self.dobjects_window_open = dobjects_open;
 
         // ---- UI.1: STATUS BAR (very bottom) -----------------------------
         // Declared BEFORE the cmd panel so it sits at the absolute bottom
@@ -5110,13 +5155,23 @@ impl eframe::App for CadApp {
                 });
             });
 
-        // ---- bottom: command input + history ----------------------------
-        egui::TopBottomPanel::bottom("cmd")
-            .resizable(true)
-            .default_height(180.0)
+        // ---- Cmd palette — floating Window (AutoCAD-style) -------------
+        // History + prompt + input combined in one draggable, resizable
+        // window. Default position: lower-left of the screen.
+        let cmd_default_pos = {
+            let r = ctx.screen_rect();
+            egui::pos2(r.left() + 360.0, r.bottom() - 220.0)
+        };
+        let mut cmd_open = self.cmd_window_open;
+        egui::Window::new("Command")
+            .open(&mut cmd_open)
+            .default_pos(cmd_default_pos)
+            .default_size(egui::vec2(720.0, 180.0))
+            .min_width(360.0)
             .min_height(120.0)
+            .resizable(true)
+            .collapsible(true)
             .show(ctx, |ui| {
-                ui.heading("Command");
                 // Reserve space at the bottom for: prompt line (if any) +
                 // the input row.
                 let prompt_h = if self.current_prompt.is_empty() { 0.0 } else { 18.0 };
@@ -5209,6 +5264,7 @@ impl eframe::App for CadApp {
                     }
                 });
             });
+        self.cmd_window_open = cmd_open;
 
         // ---- central panel: canvas --------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
