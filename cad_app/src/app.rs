@@ -7135,6 +7135,28 @@ impl eframe::App for CadApp {
                             painter.circle_stroke(self.w2s(*c, rect), r_px, dash);
                             painter.line_segment([self.w2s(*c, rect), cursor], hint);
                         }
+                        // Polyline live preview — show every captured
+                        // segment (solid hint) PLUS a rubber-band dashed
+                        // segment from the last vertex to the cursor.
+                        // Bug fix: previously nothing was drawn between
+                        // clicks, so it looked like only dots existed.
+                        // Each captured vertex gets a small filled dot
+                        // so the user can see where they've already clicked.
+                        (Tool::Polyline, verts) if !verts.is_empty() => {
+                            for w in verts.iter() {
+                                painter.circle_filled(self.w2s(*w, rect), 3.0, preview_col);
+                            }
+                            for pair in verts.windows(2) {
+                                painter.line_segment(
+                                    [self.w2s(pair[0], rect), self.w2s(pair[1], rect)],
+                                    egui::Stroke::new(1.0, preview_col.gamma_multiply(0.7)));
+                            }
+                            // rubber-band from last captured to cursor
+                            if let Some(last) = verts.last() {
+                                painter.line_segment(
+                                    [self.w2s(*last, rect), cursor], dash);
+                            }
+                        }
                         // Ellipse 3-click flow.
                         // Stage 1 (pending=[centre]): rubber-band line from
                         // centre to cursor — defines the major axis.
