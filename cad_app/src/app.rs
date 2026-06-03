@@ -5637,6 +5637,26 @@ impl eframe::App for CadApp {
                 (in_select || (shift_held && !in_click_only_phase))
                 && press_release_dist > 1.0;     // any real motion at all
             let drag_was_a_click = drag_stopped && !drag_intent_is_window;
+
+            // ---- Drafting-mode PRESS-fires-click override ---------------
+            //
+            // Where the gesture has no drag semantic (every drawing tool
+            // + every point-pick edit phase), register the click at PRESS
+            // time instead of release. Same affordance as the AutoCAD
+            // pickbox: pressing AT a point captures THAT point, even if
+            // the cursor drifts a few pixels between press and release.
+            // Drag-meaningful gestures (select-mode rubber-band, Shift-
+            // drag window, grip drag) stay on release — they need both
+            // endpoints. Visual cue: the square+cross drafting cursor
+            // is drawn iff in_click_only_phase.
+            let press_now = in_click_only_phase
+                && ctx.input(|i| i.pointer.primary_pressed())
+                && resp.contains_pointer();
+            let click_now = if in_click_only_phase { press_now } else { click_now };
+            // In drafting mode the press fired the click; suppress the
+            // release-time drag-promoted click so we don't double-fire
+            // when egui later reports a tiny accidental drag_stopped.
+            let drag_was_a_click = drag_was_a_click && !in_click_only_phase;
             // ---- Grip drag handling (v2: per-grip role semantics) -----------
             // Two ways to grab a grip in pointer mode + GrpEnb:
             //   (a) press-and-drag (release = commit)
@@ -7244,6 +7264,32 @@ impl eframe::App for CadApp {
                     } else {
                         painter.rect_stroke(r, 0.0, egui::Stroke::new(1.2, edge));
                     }
+                }
+            }
+
+            // ---- Drafting cursor overlay --------------------------------
+            //
+            // While drafting mode is active (drawing tool OR any
+            // point-pick edit phase), draw a square (the "pickbox") with
+            // a cross through it at the hover position. Same visual cue
+            // AutoCAD uses to tell the user "I'm in command, click to
+            // place a point". This is also when press-fires-click is in
+            // effect — see the click pipeline override above. Drawn
+            // last so it sits on top of dobjects and previews.
+            if in_click_only_phase {
+                if let Some(p) = resp.hover_pos() {
+                    let half  = 7.0_f32;     // pickbox half-edge in px
+                    let arm   = 14.0_f32;    // crosshair arm half-length
+                    let col   = egui::Color32::from_rgb(235, 235, 245);
+                    let stroke= egui::Stroke::new(1.0, col);
+                    // square
+                    let sq = egui::Rect::from_center_size(p, egui::vec2(half*2.0, half*2.0));
+                    painter.rect_stroke(sq, 0.0, stroke);
+                    // cross arms (extend a bit past the square edges)
+                    painter.line_segment(
+                        [egui::pos2(p.x - arm, p.y), egui::pos2(p.x + arm, p.y)], stroke);
+                    painter.line_segment(
+                        [egui::pos2(p.x, p.y - arm), egui::pos2(p.x, p.y + arm)], stroke);
                 }
             }
 
