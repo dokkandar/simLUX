@@ -1,3 +1,4 @@
+mod aci_picker;
 mod app;
 mod gpu;
 mod settings;

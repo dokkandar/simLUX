@@ -16,6 +16,19 @@ use crate::settings::UserEnv;
 // 5 million pairs is roughly half a second on this CPU.
 const PAIR_LIMIT: usize = 5_000_000;
 
+/// Where the user's customised ACI-wheel permutation lives. Sits next to
+/// the other project-root files (Audit.html, Variables.md, etc.) so the
+/// arrangement travels with the codebase, not a per-user config dir.
+fn aci_mapping_path() -> std::path::PathBuf {
+    // CARGO_MANIFEST_DIR resolves to `<repo>/cad_app/` at compile time;
+    // step one level up to reach the workspace root where the other
+    // top-level project artefacts live.
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest_dir.parent()
+        .map(|p| p.join("aci_mapping.json"))
+        .unwrap_or_else(|| std::path::PathBuf::from("aci_mapping.json"))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
 
@@ -143,6 +156,13 @@ pub struct CadApp {
     pens_window_open:    bool,
     info_window_open:    bool,
     dobjects_window_open: bool,
+    /// ACI polar-wheel picker — shared state for the floating picker
+    /// window. The same window serves every call site; `pick_request`
+    /// names who asked for the pick so the chosen ACI flows back to
+    /// the right slot. See `aci_picker.rs` and the user's reference
+    /// HTML at `~/workspace/RUST_CAD/ACI_Picker_UI.html`.
+    aci_picker:           crate::aci_picker::AciPickerState,
+    aci_pick_request:     Option<AciPickRequest>,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -515,6 +535,16 @@ pub enum RenderMode {
     Gpu,
 }
 
+/// Who asked the floating ACI picker for a color, so the chosen ACI flows
+/// back to the right slot when the user clicks a circle in the wheel.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AciPickRequest {
+    /// Picker is editing a layer's color.
+    Layer(LayerId),
+    /// Picker is editing a dobject's color (Info palette dobject edit).
+    Dobject(usize),
+}
+
 impl Default for CadApp {
     fn default() -> Self {
         let mut s = Self {
@@ -531,6 +561,12 @@ impl Default for CadApp {
             pens_window_open:    false,
             info_window_open:    false,
             dobjects_window_open: false,
+            aci_picker:          {
+                let mut p = crate::aci_picker::AciPickerState::default();
+                p.try_load_mapping(&aci_mapping_path());
+                p
+            },
+            aci_pick_request:    None,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -1654,6 +1690,10 @@ impl CadApp {
                 // because the layer loop holds &mut self.doc.layers. Capture
                 // (layer_id, packed_rgb) here; intern + assign after the loop.
                 let mut color_change: Vec<(LayerId, u32)> = Vec::new();
+                // Pick-button captures the layer id the user clicked; the
+                // window-open assignment runs after the loop to stay clear
+                // of the &mut self borrow chain.
+                let mut pick_layer_color: Option<LayerId> = None;
                 let n = self.doc.layers.len();
 
                 egui::ScrollArea::vertical()
@@ -1720,13 +1760,26 @@ impl CadApp {
                                     }
 
                                     // ----- color swatch -------------------
-                                    let mut arr = [rgb.0, rgb.1, rgb.2];
-                                    if ui.color_edit_button_srgb(&mut arr).changed() {
-                                        let packed =
-                                            ((arr[0] as u32) << 16)
-                                          | ((arr[1] as u32) << 8)
-                                          | (arr[2] as u32);
-                                        color_change.push((id, packed));
+                                    // Clickable swatch — opens the polar ACI
+                                    // picker window for this layer. ACI is
+                                    // the primary picker (see memo
+                                    // `feedback_rust_cad_color_aci_primary`).
+                                    let (swatch_rect, swatch_resp) = ui.allocate_exact_size(
+                                        egui::vec2(22.0, 18.0), egui::Sense::click(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        swatch_rect, 2.0,
+                                        egui::Color32::from_rgb(rgb.0, rgb.1, rgb.2),
+                                    );
+                                    ui.painter().rect_stroke(
+                                        swatch_rect, 2.0,
+                                        egui::Stroke::new(0.7, egui::Color32::from_rgb(70, 80, 95)),
+                                    );
+                                    if swatch_resp
+                                        .on_hover_text("Click to pick an ACI color")
+                                        .clicked()
+                                    {
+                                        pick_layer_color = Some(id);
                                     }
 
                                     // ----- name (click to rename) ---------
@@ -1785,8 +1838,118 @@ impl CadApp {
                     self.layer_rename = None;
                     self.layer_rename_buf.clear();
                 }
+                if let Some(id) = pick_layer_color {
+                    self.aci_pick_request = Some(AciPickRequest::Layer(id));
+                }
             });
         self.layers_window_open = open;
+    }
+
+    // ===================================================================
+    // Floating ACI color picker — the polar AutoRasm wheel.
+    // ===================================================================
+    //
+    // One shared window serves every call site. The active request
+    // (`aci_pick_request`) names who asked; when the user clicks a slot
+    // in pick mode, the resulting ACI is written back to that target
+    // and the window closes. Swap mode lets the user tune the wheel
+    // arrangement; "Save mapping" persists the permutation to
+    // `~/workspace/RUST_CAD/aci_mapping.json`.
+    //
+    // Spec: ~/workspace/RUST_CAD/ACI_Picker_UI.html
+    fn render_aci_picker_window(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.aci_pick_request else { return };
+
+        let title = match target {
+            AciPickRequest::Layer(id)   => format!("ACI color — layer #{}", id),
+            AciPickRequest::Dobject(ix) => format!("ACI color — dobject #{}", ix),
+        };
+
+        let mut open = true;
+        let mut picked: Option<u8> = None;
+        let mut do_save = false;
+        let mut hover_label = String::from("(hover a circle for ACI / RGB)");
+
+        egui::Window::new(title)
+            .id(egui::Id::new("aci_picker_window"))
+            .open(&mut open)
+            .default_size(egui::vec2(420.0, 520.0))
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                // Top control row — swap / reset / save.
+                ui.horizontal(|ui| {
+                    let swap_label = if self.aci_picker.swap_mode {
+                        "Swap mode: ON"
+                    } else { "Swap mode: OFF" };
+                    if ui.selectable_label(self.aci_picker.swap_mode, swap_label)
+                        .on_hover_text("Click two circles to swap their positions.\nReleases the user's customised layout.")
+                        .clicked()
+                    {
+                        self.aci_picker.swap_mode = !self.aci_picker.swap_mode;
+                    }
+                    if ui.button("Reset layout").clicked() {
+                        self.aci_picker.reset_to_default();
+                    }
+                    if ui.button("Save mapping").clicked() {
+                        do_save = true;
+                    }
+                });
+                ui.separator();
+
+                // The wheel itself, centred horizontally.
+                ui.vertical_centered(|ui| {
+                    picked = self.aci_picker.wheel_ui(ui);
+                });
+
+                ui.separator();
+
+                // Hover readout — mirror of the HTML reference's info panel.
+                if let Some(h) = self.aci_picker.hovered {
+                    let aci = self.aci_picker.mapping[h];
+                    let (r, g, b) = aci_palette(aci);
+                    hover_label = format!(
+                        "Hover: ACI {}   RGB {},{},{}   #{:02X}{:02X}{:02X}",
+                        aci, r, g, b, r, g, b
+                    );
+                }
+                ui.label(hover_label);
+            });
+
+        // Apply the pick to whoever asked.
+        if let Some(aci) = picked {
+            match target {
+                AciPickRequest::Layer(id) => {
+                    if let Some(l) = self.doc.layers.get_mut(id) {
+                        l.color = Color::Aci(aci);
+                    }
+                    self.gpu_dirty = true;
+                }
+                AciPickRequest::Dobject(ix) => {
+                    if let Some(d) = self.doc.dobjects.get_mut(ix) {
+                        d.style.color = Color::Aci(aci);
+                    }
+                    self.gpu_dirty = true;
+                }
+            }
+            self.aci_pick_request = None;
+        }
+
+        if do_save {
+            match self.aci_picker.save_mapping(&aci_mapping_path()) {
+                Ok(()) => self.history.push(format!(
+                    "  ACI mapping saved → {}", aci_mapping_path().display()
+                )),
+                Err(e) => self.history.push(format!(
+                    "  ! ACI mapping save failed: {}", e
+                )),
+            }
+        }
+
+        if !open {
+            // User dismissed the window — abandon the pending request.
+            self.aci_pick_request = None;
+        }
     }
 
     // ===================================================================
@@ -2006,10 +2169,14 @@ impl CadApp {
                 // `feedback_rust_cad_color_aci_primary`.
                 ui.label("Color");
                 let mut col = self.doc.dobjects[idx].style.color;
+                let mut wants_pick = false;
                 if aci_color_picker(ui, ("info_color", idx), &mut col,
-                                    &mut self.doc.truecolors) {
+                                    &mut self.doc.truecolors, &mut wants_pick) {
                     self.doc.dobjects[idx].style.color = col;
                     self.gpu_dirty = true;
+                }
+                if wants_pick {
+                    self.aci_pick_request = Some(AciPickRequest::Dobject(idx));
                 }
                 ui.end_row();
 
@@ -3657,11 +3824,16 @@ fn describe(g: &Geom) -> String {
 /// `feedback_rust_cad_color_aci_primary` memo. TrueColor values are
 /// interned via the document's `TrueColorTable` (see Color storage
 /// refactor memo); the picker takes a &mut TrueColorTable for that.
+///
+/// Clicking the "Pick ACI…" button sets `*wants_pick = true`; the caller
+/// then opens the shared polar-wheel window (see `render_aci_picker_window`
+/// + the ACI picker UI reference at `~/workspace/RUST_CAD/ACI_Picker_UI.html`).
 fn aci_color_picker(
     ui: &mut egui::Ui,
-    id: impl std::hash::Hash,
+    _id: impl std::hash::Hash,
     value: &mut Color,
     truecolors: &mut TrueColorTable,
+    wants_pick: &mut bool,
 ) -> bool {
     let mut changed = false;
 
@@ -3688,54 +3860,21 @@ fn aci_color_picker(
     };
 
     ui.horizontal(|ui| {
-        // Summary chip
-        let (rect, _) = ui.allocate_exact_size(egui::vec2(22.0, 18.0), egui::Sense::hover());
+        // Clickable summary chip — same affordance as the layer panel
+        // swatch: click to open the polar ACI picker.
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(22.0, 18.0), egui::Sense::click());
         ui.painter().rect_filled(rect, 2.0, egui::Color32::from_rgb(r, g, b));
         ui.painter().rect_stroke(rect, 2.0,
             egui::Stroke::new(0.7, egui::Color32::from_rgb(70, 80, 95)));
+        if resp.on_hover_text("Click to pick an ACI color").clicked() {
+            *wants_pick = true;
+        }
         ui.label(summary);
+        if ui.small_button("Pick ACI…").clicked() {
+            *wants_pick = true;
+        }
     });
-
-    // ACI grid — 24 columns × ~11 rows (256 cells).
-    let cell = 14.0_f32;
-    let cols = 24;
-    egui::CollapsingHeader::new("ACI palette (8-bit)")
-        .id_salt(("aci_grid", &format!("{:?}", &id as *const _)))
-        .default_open(true)
-        .show(ui, |ui| {
-            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
-            egui::Grid::new(("aci_grid_grid", &format!("{:?}", &id as *const _)))
-                .spacing([1.0, 1.0])
-                .show(ui, |ui| {
-                    for row in 0..((256 + cols - 1) / cols) {
-                        for col in 0..cols {
-                            let i_usize = row * cols + col;
-                            if i_usize >= 256 { break; }
-                            let i = i_usize as u8;
-                            let (r, g, b) = aci_palette(i);
-                            let (rect, resp) = ui.allocate_exact_size(
-                                egui::vec2(cell, cell), egui::Sense::click());
-                            ui.painter().rect_filled(rect, 1.0, egui::Color32::from_rgb(r, g, b));
-                            // Highlight current ACI selection
-                            if matches!(*value, Color::Aci(j) if j == i) {
-                                ui.painter().rect_stroke(rect, 1.0,
-                                    egui::Stroke::new(2.0, egui::Color32::WHITE));
-                            } else {
-                                ui.painter().rect_stroke(rect, 1.0,
-                                    egui::Stroke::new(0.3, egui::Color32::from_rgb(60, 70, 85)));
-                            }
-                            if resp.clicked() {
-                                *value = Color::Aci(i);
-                                changed = true;
-                            }
-                            if resp.hovered() {
-                                resp.on_hover_text(format!("ACI {}", i));
-                            }
-                        }
-                        ui.end_row();
-                    }
-                });
-        });
 
     // Secondary controls — ByLayer / ByBlock / TrueColor fallback
     ui.horizontal(|ui| {
@@ -4988,6 +5127,10 @@ impl eframe::App for CadApp {
         if self.trim_debug_open {
             self.render_trim_debug_window(ctx);
         }
+
+        // ---- floating: ACI color picker (polar wheel) ------------------
+        // Renders only when a call site has set `aci_pick_request`.
+        self.render_aci_picker_window(ctx);
 
         // ---- DObjects palette — floating Window -------------------------
         let mut dobjects_open = self.dobjects_window_open;
