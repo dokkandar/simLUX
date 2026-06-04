@@ -392,6 +392,13 @@ pub struct CadApp {
     /// the Trim Debug window, copies the log, pastes to repro reports.
     trim_debug_log:  Vec<String>,
     trim_debug_open: bool,
+    /// Hatch debug log — same shape as `trim_debug_log`. Records every
+    /// state transition in the hatch flow (dialog open/buttons, pattern
+    /// changes, pick-point search results, apply_hatch params, resolve
+    /// loop counts, render kicks). Logged only when the window is open
+    /// so the Vec doesn't grow forever in normal use.
+    hatch_debug_log:  Vec<String>,
+    hatch_debug_open: bool,
     /// Frame counter for log timestamping — gives ordering even when
     /// multiple clicks happen close in wall-clock time.
     trim_debug_frame: u64,
@@ -713,6 +720,8 @@ impl Default for CadApp {
             pre_op_selection: Vec::new(),
             trim_debug_log:  Vec::new(),
             trim_debug_open: false,
+            hatch_debug_log:  Vec::new(),
+            hatch_debug_open: false,
             trim_debug_frame: 0,
         };
         // Demo layers so the Layer panel has visible content at first
@@ -1357,6 +1366,9 @@ impl CadApp {
                 }
             }
             Ok(Command::Hatch { pattern, scale, angle_deg }) => {
+                self.hatch_dbg(format!(
+                    "Command::Hatch parsed — pattern={:?}, scale={}, angle={}",
+                    pattern, scale, angle_deg));
                 // No args → open the attributes dialog so the user
                 // picks pattern + scale + angle with a live preview
                 // BEFORE picking the boundary. With args, run directly
@@ -1365,19 +1377,29 @@ impl CadApp {
                     && angle_deg.abs() < 1e-9
                 {
                     self.hatch_dialog_open = true;
+                    self.hatch_dbg(
+                        "  no args → opened Choose Hatch Attributes dialog".to_string());
                     self.set_prompt(
                         "hatch: pick pattern + scale + angle in the dialog, then click OK");
                     return;
                 }
                 self.pending_hatch_pattern = (pattern.clone(), scale, angle_deg);
+                self.hatch_dbg(format!(
+                    "  pending_hatch_pattern = ({:?}, {}, {})",
+                    pattern, scale, angle_deg));
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Hatch;
                     let style = pattern.as_deref().unwrap_or("SOLID");
+                    self.hatch_dbg(format!(
+                        "  empty selection → ForSelect + QueuedOp::Hatch ({})", style));
                     self.set_prompt(format!(
                         "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
                         style));
                 } else {
+                    self.hatch_dbg(format!(
+                        "  selection has {} dobject(s) → applying immediately",
+                        self.selection.len()));
                     self.apply_hatch();
                 }
             }
@@ -1874,22 +1896,44 @@ impl CadApp {
     /// message. Multi-loop selection = one hatch with islands; single
     /// loop = solid disc.
     fn apply_hatch(&mut self) {
+        self.hatch_dbg(format!(
+            "apply_hatch() entry — selection.len() = {}, idx = {:?}",
+            self.selection.len(), self.selection));
         let mut handles: Vec<cad_kernel::Handle> = Vec::new();
         let mut skipped = 0_usize;
+        // Capture per-idx decisions first WITHOUT borrowing self mutably,
+        // then push the log lines + handles after — avoids the
+        // hatch_dbg-vs-self.selection borrow conflict.
+        let mut decisions: Vec<(usize, &'static str, Option<u64>, Option<usize>)> = Vec::new();
         for &idx in &self.selection {
             let Some(d) = self.doc.dobjects.get(idx) else { continue; };
+            let kind = dobject_kind_name(&d.geom);
             match &d.geom {
                 Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    handles.push(d.handle);
+                    decisions.push((idx, kind, Some(d.handle), Some(p.vertices.len())));
                 }
                 Geom::Circle(_) | Geom::Ellipse(_) => {
-                    handles.push(d.handle);
+                    decisions.push((idx, kind, Some(d.handle), None));
                 }
-                _ => skipped += 1,
+                _ => decisions.push((idx, kind, None, None)),
+            }
+        }
+        for (idx, kind, h_opt, verts_opt) in decisions {
+            if let Some(h) = h_opt {
+                handles.push(h);
+                match verts_opt {
+                    Some(nv) => self.hatch_dbg(format!(
+                        "  accept #{} ({}, closed, {} verts)", idx, kind, nv)),
+                    None => self.hatch_dbg(format!("  accept #{} ({})", idx, kind)),
+                }
+            } else {
+                skipped += 1;
+                self.hatch_dbg(format!("  skip   #{} ({}) — not a closed boundary", idx, kind));
             }
         }
         if handles.is_empty() {
-            self.history.push("  ! hatch: no closed polyline in selection".into());
+            self.hatch_dbg("  → 0 boundaries accepted; aborting".to_string());
+            self.history.push("  ! hatch: no closed boundary in selection".into());
             return;
         }
         self.snapshot_doc();
@@ -1912,6 +1956,9 @@ impl CadApp {
             cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
             cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
         };
+        self.hatch_dbg(format!(
+            "  pushing Hatch dobject: pattern={}, scale={:.3}, angle={:.2}, {} boundary handle(s)",
+            pattern_label, pat_scale, pat_angle, loop_count));
         self.doc.push(cad_kernel::Hatch {
             boundary_handles: handles,
             pattern,
@@ -2200,14 +2247,12 @@ impl CadApp {
         // X close button → dismiss (no commit, no follow-up state).
         if !open {
             self.hatch_dialog_open = false;
+            self.hatch_dbg("dialog dismissed via X close".to_string());
             self.clear_prompt();
             return;
         }
         if clicked_dobjects || clicked_pick_point {
             self.hatch_dialog_open = false;
-            // Stash the chosen settings — both follow-up paths flow
-            // through the same `apply_hatch` finaliser that reads
-            // them.
             let pattern = if self.hatch_dialog_solid {
                 None
             } else {
@@ -2219,7 +2264,13 @@ impl CadApp {
                 self.hatch_dialog_angle,
             );
             let style = pattern.as_deref().unwrap_or("SOLID").to_string();
+            self.hatch_dbg(format!(
+                "dialog committed: pattern={}, scale={:.3}, angle={:.2}",
+                style, self.hatch_dialog_scale, self.hatch_dialog_angle));
             if clicked_dobjects {
+                self.hatch_dbg(format!(
+                    "  Dobject/s button — selection.len() = {}",
+                    self.selection.len()));
                 if self.selection.is_empty() {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Hatch;
@@ -2230,10 +2281,9 @@ impl CadApp {
                     self.apply_hatch();
                 }
             } else {
-                // Pick-point — arm the canvas-click handler; clear
-                // any pending selection mode so the click isn't
-                // routed into a basket.
                 self.hatch_pick_point_armed = true;
+                self.hatch_dbg(
+                    "  Pick Point button — armed canvas click".to_string());
                 self.set_prompt(format!(
                     "hatch ({}): click inside a closed region  [Esc=cancel]",
                     style));
@@ -2296,6 +2346,126 @@ impl CadApp {
                     });
             });
         self.trim_debug_open = open;
+    }
+
+    /// Hatch debug window — same shape as the trim debug log. Records
+    /// every state transition in the hatch flow so the user can pin
+    /// down where the hatch is "falling": dialog open / pattern +
+    /// scale + angle changes / Dobjects vs Pick Point button / canvas
+    /// click consumed for pick-point / smallest-containing search
+    /// candidates + winner / apply_hatch params / resolved loops /
+    /// render line counts. Toggle via Tools menu.
+    fn render_hatch_debug_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.hatch_debug_open;
+        let mut do_dump_state = false;
+        egui::Window::new("Hatch Debug Log")
+            .open(&mut open)
+            .default_width(720.0)
+            .default_height(420.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
+                        let text = self.hatch_debug_log.join("\n");
+                        ui.ctx().copy_text(text);
+                        self.history.push("  hatch debug log → clipboard".into());
+                    }
+                    if ui.button("🗑 Clear").clicked() {
+                        self.hatch_debug_log.clear();
+                    }
+                    if ui.button("📸 Dump Hatch State")
+                        .on_hover_text("Append a snapshot of every Hatch dobject in the doc (boundary handles, resolved loop vertex counts, pattern). Press anytime; no per-frame flood.")
+                        .clicked()
+                    {
+                        do_dump_state = true;
+                    }
+                    ui.label(format!("{} entries", self.hatch_debug_log.len()));
+                    // Live status — what's the hatch flow doing right now?
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if self.hatch_dialog_open {
+                            ui.colored_label(egui::Color32::from_rgb(120, 220, 255),
+                                "● dialog open");
+                        } else if self.hatch_pick_point_armed {
+                            ui.colored_label(egui::Color32::from_rgb(255, 200, 120),
+                                "● pick-point armed");
+                        } else if matches!(self.queued_op, QueuedOp::Hatch) {
+                            ui.colored_label(egui::Color32::from_rgb(255, 220, 90),
+                                "● awaiting boundary selection");
+                        } else {
+                            ui.colored_label(egui::Color32::from_rgb(140, 140, 150),
+                                "○ idle");
+                        }
+                    });
+                });
+                ui.separator();
+                // Real-time hatch attrs readout — always visible at the
+                // top of the log so the user can SEE the pattern/scale/
+                // angle that the next `apply_hatch` will use.
+                let (pat, sc, ang) = &self.pending_hatch_pattern;
+                ui.monospace(format!(
+                    "pending: pattern={:<12} scale={:<6.3} angle={:>6.2}°    \
+                     dialog(solid={}, name={:?}, scale={:.3}, angle={:.2})",
+                    pat.as_deref().unwrap_or("(SOLID)"), sc, ang,
+                    self.hatch_dialog_solid, self.hatch_dialog_name,
+                    self.hatch_dialog_scale, self.hatch_dialog_angle));
+                ui.separator();
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false; 2])
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        if self.hatch_debug_log.is_empty() {
+                            ui.colored_label(egui::Color32::from_rgb(140, 140, 150),
+                                "(empty — run `hatch` to start logging)");
+                        }
+                        for line in &self.hatch_debug_log {
+                            ui.monospace(line);
+                        }
+                    });
+            });
+        self.hatch_debug_open = open;
+        if do_dump_state {
+            self.dump_hatch_state();
+        }
+    }
+
+    /// Append a one-shot snapshot of every Hatch dobject in the doc
+    /// to the debug log. Triggered by the debug window's button. Lists
+    /// boundary handle indices + resolved loop vertex counts so the
+    /// user can see if "the hatch entity exists but has no rendered
+    /// fill" is a render bug or a boundary-resolve bug.
+    fn dump_hatch_state(&mut self) {
+        let mut entries: Vec<(usize, String)> = Vec::new();
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            if let Geom::Hatch(h) = &d.geom {
+                let pat = match &h.pattern {
+                    cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
+                    cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } =>
+                        format!("{} scale={:.3} angle={:.2}", name, scale, angle_deg),
+                };
+                let resolved = self.resolve_hatch_loops(h);
+                let loops_desc: Vec<String> = resolved.iter()
+                    .map(|l| format!("{}v", l.len()))
+                    .collect();
+                let handle_indices: Vec<String> = h.boundary_handles.iter()
+                    .map(|hh| {
+                        self.doc.index_of_handle(*hh)
+                            .map(|ix| format!("#{}", ix))
+                            .unwrap_or_else(|| format!("(missing handle {:#x})", hh))
+                    })
+                    .collect();
+                entries.push((i, format!(
+                    "hatch #{} pattern=[{}] boundary_handles=[{}] resolved_loops=[{}]",
+                    i, pat, handle_indices.join(", "), loops_desc.join(", "))));
+            }
+        }
+        if entries.is_empty() {
+            self.hatch_dbg("dump: no hatch dobjects in the doc".to_string());
+        } else {
+            self.hatch_dbg(format!("dump: {} hatch dobject(s):", entries.len()));
+            for (_, e) in entries {
+                self.hatch_dbg(format!("  {}", e));
+            }
+        }
     }
 
     fn render_layer_panel(&mut self, ctx: &egui::Context) {
@@ -3519,6 +3689,21 @@ impl CadApp {
             self.trim_debug_log.drain(..200);
         }
         self.trim_debug_log.push(format!(
+            "[{:>5}] {}", self.trim_debug_frame, msg.into()
+        ));
+    }
+
+    /// Append a Hatch Debug Log entry. Cheap no-op when the window is
+    /// closed so wide instrumentation doesn't waste memory in normal
+    /// use. Per-frame counter prefix mirrors trim_dbg so cross-log
+    /// timing matches.
+    fn hatch_dbg<S: Into<String>>(&mut self, msg: S) {
+        if !self.hatch_debug_open { return; }
+        const CAP: usize = 1000;
+        if self.hatch_debug_log.len() >= CAP {
+            self.hatch_debug_log.drain(..200);
+        }
+        self.hatch_debug_log.push(format!(
             "[{:>5}] {}", self.trim_debug_frame, msg.into()
         ));
     }
@@ -6069,6 +6254,14 @@ impl eframe::App for CadApp {
                 {
                     self.trim_debug_open = !self.trim_debug_open;
                 }
+                // Hatch Debug window toggle — sibling to Trim Debug.
+                let hdbg_label = if self.hatch_debug_open { "hatch dbg ▾" } else { "hatch dbg ▸" };
+                if ui.button(hdbg_label)
+                    .on_hover_text("Hatch Debug — log dialog + pick-point + apply + render at every state transition")
+                    .clicked()
+                {
+                    self.hatch_debug_open = !self.hatch_debug_open;
+                }
                 ui.add_space(20.0);
                 ui.label("intersect:");
                 // View-mode: intersect only dobjects visible in the current viewport.
@@ -6477,6 +6670,11 @@ impl eframe::App for CadApp {
         // Modal-ish (resizable=false, collapsible=false), opens when
         // bare `hatch` is typed; closes on OK / Cancel / X.
         self.render_hatch_dialog(ctx);
+
+        // ---- floating: Hatch Debug Log (instrumentation) ---------------
+        if self.hatch_debug_open {
+            self.render_hatch_debug_window(ctx);
+        }
 
         // ---- DObjects palette — floating Window -------------------------
         let mut dobjects_open = self.dobjects_window_open;
@@ -7199,14 +7397,27 @@ impl eframe::App for CadApp {
                     if self.hatch_pick_point_armed {
                         self.hatch_pick_point_armed = false;
                         self.clear_prompt();
+                        self.hatch_dbg(format!(
+                            "pick-point click at world ({:.3}, {:.3})",
+                            world.x, world.y));
                         match self.find_smallest_containing_closed(world) {
                             Some(handle_idx) => {
+                                let kind = self.doc.dobjects.get(handle_idx)
+                                    .map(|d| dobject_kind_name(&d.geom))
+                                    .unwrap_or("?");
+                                self.hatch_dbg(format!(
+                                    "  → smallest containing dobject #{} ({})",
+                                    handle_idx, kind));
                                 self.selection = vec![handle_idx];
                                 self.apply_hatch();
                                 self.selection.clear();
                             }
-                            None => self.history.push(
-                                "  ! hatch pick-point: no closed dobject contains the click".into()),
+                            None => {
+                                self.hatch_dbg(
+                                    "  → no closed dobject contains the click".to_string());
+                                self.history.push(
+                                    "  ! hatch pick-point: no closed dobject contains the click".into());
+                            }
                         }
                         return;
                     }
