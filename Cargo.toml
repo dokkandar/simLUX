@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members  = ["cad_kernel", "cad_snap", "cad_app", "cad_cli", "cad_io"]
+members  = ["cad_kernel", "cad_snap", "cad_app", "cad_cli", "cad_io", "cad_nurbs"]
 
 [profile.release]
 lto           = true

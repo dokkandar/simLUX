@@ -232,6 +232,13 @@ name = "cad_kernel"
 version = "0.1.0"
 
 [[package]]
+name = "cad_nurbs"
+version = "0.1.0"
+dependencies = [
+ "cad_kernel",
+]
+
+[[package]]
 name = "cad_snap"
 version = "0.1.0"
 dependencies = [
