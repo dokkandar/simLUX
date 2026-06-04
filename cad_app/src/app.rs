@@ -2401,6 +2401,33 @@ impl CadApp {
                 "      hit{}: t={:.3} at ({:.3},{:.3}) seg#{} src=#{} a={:?} b={:?}",
                 k, t, hp.x, hp.y, sidx, src, (pa.x, pa.y), (pb.x, pb.y)));
         }
+        // Per-hit trace attempts — same logic trace_boundary_at uses
+        // internally, but with diagnostic output for each starting
+        // hit so we can see exactly which junctions dead-end the walk
+        // and which produce loops not containing the seed.
+        let adj = crate::hatch_trace::build_adjacency(&segs, &endpoints, cluster_pos.len());
+        for (k, &(_, sidx, _)) in hits.iter().enumerate() {
+            let (a_id, b_id) = endpoints[sidx];
+            let pa = cluster_pos[a_id];
+            let pb = cluster_pos[b_id];
+            let start_cluster = if pa.y < pb.y { a_id } else { b_id };
+            match crate::hatch_trace::trace_loop(
+                sidx, start_cluster, &segs, &endpoints, &adj, &cluster_pos)
+            {
+                Some(loop_verts) => {
+                    let n = loop_verts.len();
+                    let inside = point_in_polygon(seed, loop_verts.clone());
+                    self.hatch_dbg(format!(
+                        "      attempt{}: trace_loop OK — {} verts, contains seed: {}",
+                        k, n, inside));
+                }
+                None => {
+                    self.hatch_dbg(format!(
+                        "      attempt{}: trace_loop DEAD-END (best=None at some junction OR exceeded MAX_TRACE_STEPS)",
+                        k));
+                }
+            }
+        }
         let tb = match crate::hatch_trace::trace_boundary_at(&self.doc, seed) {
             Some(tb) => tb,
             None => {
