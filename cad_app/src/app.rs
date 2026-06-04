@@ -1895,6 +1895,56 @@ impl CadApp {
         out
     }
 
+    /// After cheap path picks an OUTER, auto-detect any other closed
+    /// dobjects whose bbox is fully inside the outer's bbox AND whose
+    /// boundary samples are all inside the outer's polygon — those are
+    /// islands. Matches AutoCAD BPOLY's "scan for nested shapes" pass.
+    /// Used only by the cheap path; the trace path discovers islands
+    /// via its own ray-cast analysis.
+    fn collect_islands_inside(&self, outer_idx: usize, seed: Vec2) -> Vec<usize> {
+        let Some(outer_d) = self.doc.dobjects.get(outer_idx) else { return Vec::new(); };
+        let outer_polygon = closed_dobject_polygon(&outer_d.geom);
+        if outer_polygon.len() < 3 { return Vec::new(); }
+        let (omin, omax) = outer_d.geom.bbox();
+        let mut islands = Vec::new();
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            if i == outer_idx { continue; }
+            if !d.style.visible { continue; }
+            // Must be a self-closed boundary type
+            let is_candidate = match &d.geom {
+                Geom::Polyline(p) => p.closed && p.vertices.len() >= 3,
+                Geom::Circle(_) | Geom::Ellipse(_) => true,
+                _ => false,
+            };
+            if !is_candidate { continue; }
+            // bbox-inside test (cheap reject) — must be FULLY inside outer's bbox
+            let (bmin, bmax) = d.geom.bbox();
+            if !(bmin.x >= omin.x - 1e-9 && bmin.y >= omin.y - 1e-9
+                 && bmax.x <= omax.x + 1e-9 && bmax.y <= omax.y + 1e-9) { continue; }
+            let cand_poly = closed_dobject_polygon(&d.geom);
+            if cand_poly.len() < 3 { continue; }
+            // If candidate contains the seed it's NOT an island — that
+            // would have made it the outer instead (smaller bbox area).
+            if point_in_polygon(seed, cand_poly.clone()) { continue; }
+            // Sample test: every k-th vertex of candidate must be inside
+            // outer's polygon. Five evenly-spaced samples is enough to
+            // catch the common "small circle inside big circle" case
+            // without paying full polygon-in-polygon containment.
+            let n = cand_poly.len();
+            let samples = [
+                cand_poly[0],
+                cand_poly[n / 5],
+                cand_poly[(2 * n) / 5],
+                cand_poly[(3 * n) / 5],
+                cand_poly[(4 * n) / 5],
+            ];
+            if samples.iter().all(|p| point_in_polygon(*p, outer_polygon.clone())) {
+                islands.push(i);
+            }
+        }
+        islands
+    }
+
     fn find_smallest_containing_closed(&self, world: Vec2) -> Option<usize> {
         let mut best: Option<(usize, f64)> = None;
         for (i, d) in self.doc.dobjects.iter().enumerate() {
@@ -2097,9 +2147,22 @@ impl CadApp {
             let kind = self.doc.dobjects.get(idx)
                 .map(|d| dobject_kind_name(&d.geom))
                 .unwrap_or("?");
-            self.hatch_dbg(format!(
-                "  → CHEAP PATH chose smallest containing dobject #{} ({})", idx, kind));
-            self.selection = vec![idx];
+            // AutoCAD BPOLY also auto-adds any closed dobjects sitting
+            // ENTIRELY INSIDE the chosen outer as islands — the user
+            // doesn't have to pre-select them. Without this the cheap
+            // path produces a "fill through everything" hatch when the
+            // outer contains nested shapes.
+            let islands = self.collect_islands_inside(idx, seed);
+            if !islands.is_empty() {
+                self.hatch_dbg(format!(
+                    "  → CHEAP PATH chose outer #{} ({}) + auto-detected {} island(s): {:?}",
+                    idx, kind, islands.len(), islands));
+            } else {
+                self.hatch_dbg(format!(
+                    "  → CHEAP PATH chose smallest containing dobject #{} ({}), 0 auto-islands",
+                    idx, kind));
+            }
+            self.selection = std::iter::once(idx).chain(islands).collect();
             self.apply_hatch();
             self.selection.clear();
             return true;
@@ -5421,6 +5484,34 @@ fn tessellate_circle_loop(centre: Vec2, radius: f64, n: usize) -> Vec<Vec2> {
     out
 }
 
+/// Tessellate any single closed geometry to a vertex loop in world
+/// coords. Mirrors what `App::resolve_hatch_loops` does for one
+/// boundary, but on raw geometry rather than via handle resolution —
+/// used by the cheap-path island detector to PIP-test other dobjects'
+/// boundaries against a chosen outer.
+///
+/// Returns an empty Vec for non-closed geometries (Line / Arc / open
+/// Polyline / Spline / Point / Hatch); the caller is expected to
+/// filter for closed candidates upstream, this is just a safety net.
+fn closed_dobject_polygon(g: &Geom) -> Vec<Vec2> {
+    match g {
+        Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+            let mut v: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
+            v.push(p.vertices[0].pos);
+            let n = p.vertices.len();
+            for k in 0..n {
+                let a = p.vertices[k].pos;
+                let b = p.vertices[(k + 1) % n].pos;
+                append_arc_world_samples(a, b, p.vertices[k].bulge, &mut v);
+            }
+            v
+        }
+        Geom::Circle(c)  => tessellate_circle_loop(c.center, c.radius, 64),
+        Geom::Ellipse(e) => tessellate_ellipse_loop(e, 64),
+        _ => Vec::new(),
+    }
+}
+
 /// Tessellate an Ellipse to an N-vertex closed loop using the kernel's
 /// own `point_at`. Same density rationale as circles.
 fn tessellate_ellipse_loop(e: &Ellipse, n: usize) -> Vec<Vec2> {
@@ -6529,6 +6620,16 @@ impl eframe::App for CadApp {
                 tool_button(ui, &mut self.tool, Tool::Point,    "point");
                 tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
                 tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
+                // Hatch is a one-shot command (not a persistent draw
+                // tool), so it's a plain button — clicking it opens
+                // the same Choose Hatch Attributes dialog as the
+                // `hatch` cmd-line word.
+                if ui.button("⧱ hatch")
+                    .on_hover_text("Hatch — opens the pattern dialog; pick boundaries or click inside a closed region")
+                    .clicked()
+                {
+                    self.run_command("hatch");
+                }
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
