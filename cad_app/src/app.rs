@@ -8198,13 +8198,17 @@ impl eframe::App for CadApp {
                     // Non-circle dobjects still go through CPU (mixed rendering)
                     // so lines/arcs are visible. Future slices add their own
                     // instance kinds.
+                    //
+                    // Color resolution must MATCH the CPU branch: each
+                    // dobject's own style.color (resolved through
+                    // ByLayer / ByBlock / Aci / TrueColorRef) wins
+                    // unless the dobject is selected (yellow) or the
+                    // current snap source (cyan). The earlier GPU code
+                    // hardcoded three flat colors and ignored every
+                    // per-dobject color — fixed below.
                     let mut circles: Vec<CircleInstance> = Vec::new();
-                    // GPU path: dashed gray for basket isn't available yet
-                    // (GPU dashing would need a shader change). Render solid
-                    // gray instead so basket members are still distinguishable.
-                    let sel_col  = 0xA0A5AFFFu32; // gray (basket / selected)
-                    let snap_col = 0x78F0FFFFu32; // cyan
-                    let def_col  = 0xAAC8E6FFu32; // light blue
+                    let snap_col = egui::Color32::from_rgb(120, 240, 255);
+                    let sel_col  = egui::Color32::from_rgb(255, 200, 80);
                     for i in candidate_iter {
                         let e = &self.doc.dobjects[i];
                         let (emin, emax) = e.bbox();
@@ -8213,34 +8217,39 @@ impl eframe::App for CadApp {
                             continue;
                         }
                         let in_selection = self.selection.contains(&i);
+                        let color = if self.selected == Some(i) || in_selection {
+                            sel_col
+                        } else if snap_source == Some(i) {
+                            snap_col
+                        } else {
+                            let (r, g, b) = resolve_color(
+                                e.style.color, e.style.layer,
+                                &self.doc.layers, &self.doc.truecolors);
+                            egui::Color32::from_rgb(r, g, b)
+                        };
                         match &e.geom {
                             Geom::Circle(c) => {
-                                let color = if self.selected == Some(i) || in_selection { sel_col }
-                                    else if snap_source == Some(i) { snap_col }
-                                    else { def_col };
+                                // Pack ARGB → 0xRRGGBBAA u32 for the
+                                // instance buffer (vertex attrib uses
+                                // unpack4x8unorm in shader = LE RGBA).
+                                let packed: u32 =
+                                      ((color.r() as u32) << 24)
+                                    | ((color.g() as u32) << 16)
+                                    | ((color.b() as u32) <<  8)
+                                    |  (color.a() as u32);
                                 circles.push(CircleInstance {
                                     x: c.center.x as f32,
                                     y: c.center.y as f32,
                                     r: c.radius as f32,
-                                    color,
+                                    color: packed,
                                 });
                                 drawn += 1;
                             }
                             _ => {
-                                // line / arc / polyline / ellipse /
-                                // spline / hatch: still CPU. Hatch
-                                // needs Document access to resolve
-                                // boundary handles — same short-
-                                // circuit as the CPU branch. Without
-                                // this, hatches don't render in GPU
-                                // mode at all.
-                                let color = if self.selected == Some(i) || in_selection {
-                                    egui::Color32::from_rgb(255, 200, 80)
-                                } else if snap_source == Some(i) {
-                                    egui::Color32::from_rgb(120, 240, 255)
-                                } else {
-                                    egui::Color32::from_rgb(170, 200, 230)
-                                };
+                                // Hatch needs Document access to
+                                // resolve boundary handles — short-
+                                // circuit before draw_dobject which is
+                                // a no-op for Hatch.
                                 if let Geom::Hatch(h) = &e.geom {
                                     self.render_hatch_fill(&painter, rect, h, color);
                                 } else {
