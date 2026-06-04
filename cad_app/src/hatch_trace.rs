@@ -238,7 +238,7 @@ pub fn build_adjacency(
 /// where `pt = p.a + t*(p.b - p.a) = q.a + u*(q.b - q.a)` and both
 /// `t, u ∈ [0, 1]`. Returns `None` for parallel segments or for
 /// intersections lying outside either segment's parameter range.
-fn seg_seg_intersect_params(p: &TessSeg, q: &TessSeg) -> Option<(f64, f64, Vec2)> {
+pub fn seg_seg_intersect_params(p: &TessSeg, q: &TessSeg) -> Option<(f64, f64, Vec2)> {
     let r = p.b - p.a;
     let s = q.b - q.a;
     let rxs = r.x * s.y - r.y * s.x;

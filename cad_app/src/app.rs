@@ -1881,6 +1881,41 @@ impl CadApp {
         out
     }
 
+    /// True if the dobject at `outer_idx` has its boundary crossed by
+    /// any other visible dobject — which means the cheap path's "hatch
+    /// the whole outer + auto islands" answer is WRONG for partial
+    /// overlaps. In that case we route to the trace path so the
+    /// planar-subdivision face containing the seed gets hatched
+    /// instead of the whole outer.
+    ///
+    /// Detection reuses the trace path's tessellator + seg-seg
+    /// intersection helper — same primitive that v2c splits on, just
+    /// asked as a yes/no question without actually splitting.
+    fn outer_has_crossings_with_others(&self, outer_idx: usize) -> bool {
+        let segs = crate::hatch_trace::tessellate_doc(&self.doc);
+        let outer_segs: Vec<usize> = segs.iter().enumerate()
+            .filter(|(_, s)| s.src == outer_idx)
+            .map(|(i, _)| i)
+            .collect();
+        if outer_segs.is_empty() { return false; }
+        for &i in &outer_segs {
+            for other in segs.iter() {
+                if other.src == outer_idx { continue; }
+                // Match split_at_intersections' tolerance — endpoint
+                // touches don't count, only interior crossings do.
+                if let Some((ti, tj, _)) = crate::hatch_trace::seg_seg_intersect_params(
+                    &segs[i], other)
+                {
+                    if ti > 1e-6 && ti < 1.0 - 1e-6
+                       && tj > 1e-6 && tj < 1.0 - 1e-6 {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Verdict-per-dobject log for the island scan: shows, for each
     /// other dobject in the doc, why it was or wasn't accepted as an
     /// island inside `outer_idx`. Returns lines for the caller to push
@@ -2271,14 +2306,24 @@ impl CadApp {
         // Routing rule:
         //  * 0 closed candidates contain the seed → trace path (the
         //    boundary is formed by open primitives chained together).
-        //  * Exactly 1 closed candidate contains the seed → cheap path
-        //    (single self-closed boundary + auto-islands inside).
-        //  * 2+ closed candidates contain the seed → PARTIAL OVERLAP →
-        //    trace path with intersection-splitting so the actual
-        //    visible region (lens, common area, …) gets hatched
-        //    instead of one source's whole boundary.
+        //  * Exactly 1 candidate AND no other dobject crosses its
+        //    boundary → cheap path (single self-closed boundary +
+        //    auto-islands inside).
+        //  * Exactly 1 candidate BUT its boundary is crossed by some
+        //    other dobject → trace path (the planar subdivision has
+        //    sub-faces inside the outer; the cheap path would
+        //    incorrectly hatch the whole outer).
+        //  * 2+ candidates contain the seed → trace path.
         let multiple = cheap_candidates.len() > 1;
-        if !multiple {
+        let single_outer_crossed = !multiple
+            && cheap_candidates.len() == 1
+            && self.outer_has_crossings_with_others(cheap_candidates[0].0);
+        if single_outer_crossed {
+            self.hatch_dbg(format!(
+                "  --- single outer #{} has crossings with other dobjects → deferring to trace path ---",
+                cheap_candidates[0].0));
+        }
+        if !multiple && !single_outer_crossed {
             if let Some(idx) = self.find_smallest_containing_closed(seed) {
                 let kind = self.doc.dobjects.get(idx)
                     .map(|d| dobject_kind_name(&d.geom))
@@ -2307,11 +2352,12 @@ impl CadApp {
                 self.selection.clear();
                 return true;
             }
-        } else {
+        } else if multiple {
             self.hatch_dbg(format!(
                 "  --- {} candidates contain seed → PARTIAL OVERLAP, deferring to trace path ---",
                 cheap_candidates.len()));
         }
+        // (the single_outer_crossed log was emitted above before the branch)
         // Full trace path — handles arbitrary chains AND partial overlaps
         // (intersection-splitting inside trace_boundary_at).
         self.hatch_dbg("  --- TRACE PATH engaged ---");
