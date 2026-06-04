@@ -1978,6 +1978,11 @@ impl CadApp {
                 format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
             } else { String::new() },
         ));
+        // Auto-dump after each apply so the log captures bbox + line-
+        // count diagnostics for the new hatch without making the user
+        // press the button. Only logs when the debug window is open
+        // (no-op otherwise via hatch_dbg).
+        self.dump_hatch_state();
     }
 
     /// Click on a dobject during a selection session. Plain click = ADD
@@ -2440,7 +2445,7 @@ impl CadApp {
     /// user can see if "the hatch entity exists but has no rendered
     /// fill" is a render bug or a boundary-resolve bug.
     fn dump_hatch_state(&mut self) {
-        let mut entries: Vec<(usize, String)> = Vec::new();
+        let mut entries: Vec<String> = Vec::new();
         for (i, d) in self.doc.dobjects.iter().enumerate() {
             if let Geom::Hatch(h) = &d.geom {
                 let pat = match &h.pattern {
@@ -2449,9 +2454,6 @@ impl CadApp {
                         format!("{} scale={:.3} angle={:.2}", name, scale, angle_deg),
                 };
                 let resolved = self.resolve_hatch_loops(h);
-                let loops_desc: Vec<String> = resolved.iter()
-                    .map(|l| format!("{}v", l.len()))
-                    .collect();
                 let handle_indices: Vec<String> = h.boundary_handles.iter()
                     .map(|hh| {
                         self.doc.index_of_handle(*hh)
@@ -2459,16 +2461,64 @@ impl CadApp {
                             .unwrap_or_else(|| format!("(missing handle {:#x})", hh))
                     })
                     .collect();
-                entries.push((i, format!(
-                    "hatch #{} pattern=[{}] boundary_handles=[{}] resolved_loops=[{}]",
-                    i, pat, handle_indices.join(", "), loops_desc.join(", "))));
+                // Per-loop bbox + line-count estimate. This catches the
+                // most common pattern-doesn't-show bug: pattern spacing
+                // is larger than the loop, so 0 lines cross the boundary
+                // and the fill looks blank. The diagnostic tells the
+                // user "raise the scale".
+                let mut loops_desc: Vec<String> = Vec::new();
+                let mut union_min = Vec2::new(f64::INFINITY, f64::INFINITY);
+                let mut union_max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+                for l in &resolved {
+                    let mut lmin = Vec2::new(f64::INFINITY, f64::INFINITY);
+                    let mut lmax = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for v in l {
+                        if v.x < lmin.x { lmin.x = v.x; }
+                        if v.y < lmin.y { lmin.y = v.y; }
+                        if v.x > lmax.x { lmax.x = v.x; }
+                        if v.y > lmax.y { lmax.y = v.y; }
+                        if v.x < union_min.x { union_min.x = v.x; }
+                        if v.y < union_min.y { union_min.y = v.y; }
+                        if v.x > union_max.x { union_max.x = v.x; }
+                        if v.y > union_max.y { union_max.y = v.y; }
+                    }
+                    let w = lmax.x - lmin.x;
+                    let hh = lmax.y - lmin.y;
+                    loops_desc.push(format!(
+                        "{}v bbox={:.2}x{:.2}", l.len(), w, hh));
+                }
+                // Estimate line count for each family in the pattern at
+                // the dobject's current scale + angle.
+                let mut line_estimate = String::new();
+                if let cad_kernel::HatchPattern::Pattern { name, scale, .. } = &h.pattern {
+                    if union_max.x.is_finite() {
+                        let diag = ((union_max.x - union_min.x).powi(2)
+                                  + (union_max.y - union_min.y).powi(2)).sqrt();
+                        let fams = cad_kernel::patterns::lookup(name);
+                        let counts: Vec<String> = fams.iter().map(|f| {
+                            let s = f.spacing * scale.abs().max(1e-9);
+                            let n = (diag / s).ceil() as i64;
+                            format!("{}({} lines @ spacing {:.3})",
+                                (f.angle.to_degrees() as i32 % 360), n, s)
+                        }).collect();
+                        line_estimate = format!("  estimated families: [{}]",
+                            counts.join(", "));
+                        if counts.iter().any(|c| c.contains("(0 lines")) {
+                            line_estimate.push_str("  ⚠ ZERO LINES — raise scale or pick a finer pattern");
+                        }
+                    }
+                }
+                entries.push(format!(
+                    "hatch #{} pattern=[{}] boundary_handles=[{}] resolved_loops=[{}]{}",
+                    i, pat, handle_indices.join(", "), loops_desc.join(", "),
+                    line_estimate));
             }
         }
         if entries.is_empty() {
             self.hatch_dbg("dump: no hatch dobjects in the doc".to_string());
         } else {
             self.hatch_dbg(format!("dump: {} hatch dobject(s):", entries.len()));
-            for (_, e) in entries {
+            for e in entries {
                 self.hatch_dbg(format!("  {}", e));
             }
         }
@@ -8177,7 +8227,13 @@ impl eframe::App for CadApp {
                                 drawn += 1;
                             }
                             _ => {
-                                // line / arc: still CPU
+                                // line / arc / polyline / ellipse /
+                                // spline / hatch: still CPU. Hatch
+                                // needs Document access to resolve
+                                // boundary handles — same short-
+                                // circuit as the CPU branch. Without
+                                // this, hatches don't render in GPU
+                                // mode at all.
                                 let color = if self.selected == Some(i) || in_selection {
                                     egui::Color32::from_rgb(255, 200, 80)
                                 } else if snap_source == Some(i) {
@@ -8185,7 +8241,11 @@ impl eframe::App for CadApp {
                                 } else {
                                     egui::Color32::from_rgb(170, 200, 230)
                                 };
-                                draw_dobject(&painter, rect, self, &e.geom, color);
+                                if let Geom::Hatch(h) = &e.geom {
+                                    self.render_hatch_fill(&painter, rect, h, color);
+                                } else {
+                                    draw_dobject(&painter, rect, self, &e.geom, color);
+                                }
                                 drawn += 1;
                             }
                         }
