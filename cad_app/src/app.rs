@@ -1654,17 +1654,8 @@ impl CadApp {
             // arcs would need boundary-traversal (chain into a loop);
             // queued for the pick-point slice.
             let loop_verts: Option<Vec<Vec2>> = match &d.geom {
-                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    let mut v: Vec<Vec2> = Vec::with_capacity(p.vertices.len() + 1);
-                    v.push(p.vertices[0].pos);
-                    let n = p.vertices.len();
-                    for i in 0..n {
-                        let a = p.vertices[i].pos;
-                        let b = p.vertices[(i + 1) % n].pos;
-                        let bulge = p.vertices[i].bulge;
-                        append_arc_world_samples(a, b, bulge, &mut v);
-                    }
-                    Some(v)
+                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
+                    Some(closed_dobject_polygon(&d.geom))
                 }
                 Geom::Circle(c) => {
                     Some(tessellate_circle_loop(c.center, c.radius, 64))
@@ -1865,15 +1856,10 @@ impl CadApp {
         let mut out = Vec::new();
         for (i, d) in self.doc.dobjects.iter().enumerate() {
             let contains = match &d.geom {
-                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    let mut verts: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
-                    let n = p.vertices.len();
-                    verts.push(p.vertices[0].pos);
-                    for k in 0..n {
-                        let a = p.vertices[k].pos;
-                        let b = p.vertices[(k + 1) % n].pos;
-                        append_arc_world_samples(a, b, p.vertices[k].bulge, &mut verts);
-                    }
+                // Treat polylines with coincident endpoints as closed too
+                // (the "drew it as a loop but forgot to type c Enter" case).
+                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
+                    let verts = closed_dobject_polygon(&d.geom);
                     point_in_polygon(world, verts)
                 }
                 Geom::Circle(c) => (world - c.center).len() < c.radius,
@@ -1895,6 +1881,80 @@ impl CadApp {
         out
     }
 
+    /// Verdict-per-dobject log for the island scan: shows, for each
+    /// other dobject in the doc, why it was or wasn't accepted as an
+    /// island inside `outer_idx`. Returns lines for the caller to push
+    /// into `hatch_dbg`. The actual island list is built by
+    /// `collect_islands_inside` — this is pure instrumentation.
+    fn dbg_island_scan_verdicts(&self, outer_idx: usize, seed: Vec2) -> Vec<String> {
+        let mut out = Vec::new();
+        let Some(outer_d) = self.doc.dobjects.get(outer_idx) else { return out; };
+        let outer_polygon = closed_dobject_polygon(&outer_d.geom);
+        if outer_polygon.len() < 3 {
+            out.push(format!("    outer #{} has no polygon — cannot scan", outer_idx));
+            return out;
+        }
+        let (omin, omax) = outer_d.geom.bbox();
+        for (i, d) in self.doc.dobjects.iter().enumerate() {
+            if i == outer_idx { continue; }
+            let kind = dobject_kind_name(&d.geom);
+            if !d.style.visible {
+                out.push(format!("    #{:02} {} — skip (hidden)", i, kind));
+                continue;
+            }
+            let is_closed_type = match &d.geom {
+                Geom::Polyline(p) => polyline_is_effectively_closed(p),
+                Geom::Circle(_) | Geom::Ellipse(_) => true,
+                _ => false,
+            };
+            if !is_closed_type {
+                out.push(format!("    #{:02} {} — skip (not a closed boundary type)", i, kind));
+                continue;
+            }
+            let (bmin, bmax) = d.geom.bbox();
+            let bbox_inside = bmin.x >= omin.x - 1e-9 && bmin.y >= omin.y - 1e-9
+                            && bmax.x <= omax.x + 1e-9 && bmax.y <= omax.y + 1e-9;
+            if !bbox_inside {
+                out.push(format!(
+                    "    #{:02} {} — skip (bbox ({:.2},{:.2})→({:.2},{:.2}) NOT fully inside outer bbox)",
+                    i, kind, bmin.x, bmin.y, bmax.x, bmax.y));
+                continue;
+            }
+            let cand_poly = closed_dobject_polygon(&d.geom);
+            if cand_poly.len() < 3 {
+                out.push(format!("    #{:02} {} — skip (degenerate polygon)", i, kind));
+                continue;
+            }
+            if point_in_polygon(seed, cand_poly.clone()) {
+                out.push(format!(
+                    "    #{:02} {} — skip (CONTAINS SEED — would be outer, not island)",
+                    i, kind));
+                continue;
+            }
+            let n = cand_poly.len();
+            let samples = [
+                cand_poly[0],
+                cand_poly[n / 5],
+                cand_poly[(2 * n) / 5],
+                cand_poly[(3 * n) / 5],
+                cand_poly[(4 * n) / 5],
+            ];
+            let inside_count = samples.iter()
+                .filter(|p| point_in_polygon(**p, outer_polygon.clone()))
+                .count();
+            if inside_count == samples.len() {
+                out.push(format!(
+                    "    #{:02} {} — ISLAND ACCEPTED (bbox inside, {}/{} boundary samples inside outer, seed-not-inside)",
+                    i, kind, inside_count, samples.len()));
+            } else {
+                out.push(format!(
+                    "    #{:02} {} — skip (only {}/{} boundary samples inside outer — partial overlap, not nested)",
+                    i, kind, inside_count, samples.len()));
+            }
+        }
+        out
+    }
+
     /// After cheap path picks an OUTER, auto-detect any other closed
     /// dobjects whose bbox is fully inside the outer's bbox AND whose
     /// boundary samples are all inside the outer's polygon — those are
@@ -1910,9 +1970,10 @@ impl CadApp {
         for (i, d) in self.doc.dobjects.iter().enumerate() {
             if i == outer_idx { continue; }
             if !d.style.visible { continue; }
-            // Must be a self-closed boundary type
+            // Must be a self-closed boundary type. Effectively-closed
+            // open polylines (endpoint gap < ε) are accepted too.
             let is_candidate = match &d.geom {
-                Geom::Polyline(p) => p.closed && p.vertices.len() >= 3,
+                Geom::Polyline(p) => polyline_is_effectively_closed(p),
                 Geom::Circle(_) | Geom::Ellipse(_) => true,
                 _ => false,
             };
@@ -1949,20 +2010,11 @@ impl CadApp {
         let mut best: Option<(usize, f64)> = None;
         for (i, d) in self.doc.dobjects.iter().enumerate() {
             let contains = match &d.geom {
-                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-                    // Tessellate bulges first so the PIP polygon matches
-                    // what the user sees (and what resolve_hatch_loops
-                    // would use). Without this, clicks inside a bulge
-                    // crescent report "outside" — render and hit-test
-                    // disagree on the shape.
-                    let mut verts: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
-                    let n = p.vertices.len();
-                    verts.push(p.vertices[0].pos);
-                    for k in 0..n {
-                        let a = p.vertices[k].pos;
-                        let b = p.vertices[(k + 1) % n].pos;
-                        append_arc_world_samples(a, b, p.vertices[k].bulge, &mut verts);
-                    }
+                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
+                    // Use the same tessellated polygon the renderer
+                    // would resolve, so PIP and render agree on the
+                    // shape (bulges + effective-closure both honoured).
+                    let verts = closed_dobject_polygon(&d.geom);
                     point_in_polygon(world, verts)
                 }
                 Geom::Circle(c) => {
@@ -2029,7 +2081,7 @@ impl CadApp {
             let Some(d) = self.doc.dobjects.get(idx) else { continue; };
             let kind = dobject_kind_name(&d.geom);
             match &d.geom {
-                Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
+                Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
                     decisions.push((idx, kind, Some(d.handle), Some(p.vertices.len())));
                 }
                 Geom::Circle(_) | Geom::Ellipse(_) => {
@@ -2121,16 +2173,89 @@ impl CadApp {
             "  --- doc snapshot at pick-point click ({:.3},{:.3}) ---",
             seed.x, seed.y));
         let doc_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
-            .map(|(i, d)| format!(
-                "    #{:02} [{}] {}", i,
-                if d.style.visible { "vis" } else { "hid" },
-                describe_verbose(&d.geom)))
+            .map(|(i, d)| {
+                let (bmin, bmax) = d.geom.bbox();
+                let closed_tag = match &d.geom {
+                    Geom::Polyline(p) => {
+                        if p.closed { " [closed]".to_string() }
+                        else if polyline_is_effectively_closed(p) {
+                            " [closed-by-gap]".to_string()
+                        }
+                        else { " [open]".to_string() }
+                    }
+                    Geom::Circle(_) | Geom::Ellipse(_) => " [closed]".to_string(),
+                    _ => String::new(),
+                };
+                format!(
+                    "    #{:02} [{}] bbox=({:.2},{:.2})→({:.2},{:.2}){} {}",
+                    i,
+                    if d.style.visible { "vis" } else { "hid" },
+                    bmin.x, bmin.y, bmax.x, bmax.y,
+                    closed_tag,
+                    describe_verbose(&d.geom))
+            })
             .collect();
         for line in doc_lines {
             self.hatch_dbg(line);
         }
         // Cheap path first: hits the typical "click inside one closed
         // shape" workflow without paying for the trace.
+        // Per-dobject verdict log so the user can see exactly WHY each
+        // dobject was accepted / rejected as a candidate. The actual
+        // decision still comes from collect_closed_containing — this
+        // is pure instrumentation.
+        self.hatch_dbg("  --- cheap-path verdict per dobject ---");
+        let verdict_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
+            .map(|(i, d)| {
+                let kind = dobject_kind_name(&d.geom);
+                match &d.geom {
+                    Geom::Polyline(p) => {
+                        if !polyline_is_effectively_closed(p) {
+                            format!("    #{:02} {} — SKIP (open polyline, gap≥{:.0e})",
+                                i, kind, POLYLINE_EFFECTIVELY_CLOSED_EPS)
+                        } else {
+                            let verts = closed_dobject_polygon(&d.geom);
+                            if point_in_polygon(seed, verts) {
+                                let (bmin, bmax) = d.geom.bbox();
+                                let area = (bmax.x - bmin.x).abs() * (bmax.y - bmin.y).abs();
+                                format!("    #{:02} {} — CANDIDATE (contains seed, bbox area {:.3})",
+                                    i, kind, area)
+                            } else {
+                                format!("    #{:02} {} — skip (closed but does NOT contain seed)", i, kind)
+                            }
+                        }
+                    }
+                    Geom::Circle(c) => {
+                        let dist = (seed - c.center).len();
+                        if dist < c.radius {
+                            let area = (2.0 * c.radius).powi(2);
+                            format!("    #{:02} {} — CANDIDATE (contains seed, dist {:.3} < r {:.3}, bbox area {:.3})",
+                                i, kind, dist, c.radius, area)
+                        } else {
+                            format!("    #{:02} {} — skip (seed dist {:.3} ≥ r {:.3})",
+                                i, kind, dist, c.radius)
+                        }
+                    }
+                    Geom::Ellipse(e) => {
+                        let dvec = seed - e.center;
+                        let a = e.semi_major().max(1e-12);
+                        let b = e.semi_minor().max(1e-12);
+                        let u = dvec.dot(e.u_hat()) / a;
+                        let v = dvec.dot(e.v_hat()) / b;
+                        let val = u * u + v * v;
+                        if val < 1.0 {
+                            format!("    #{:02} {} — CANDIDATE (contains seed, u²+v²={:.3} < 1)",
+                                i, kind, val)
+                        } else {
+                            format!("    #{:02} {} — skip (u²+v²={:.3} ≥ 1)", i, kind, val)
+                        }
+                    }
+                    _ => format!("    #{:02} {} — SKIP (not a self-closed boundary type)", i, kind),
+                }
+            }).collect();
+        for line in verdict_lines {
+            self.hatch_dbg(line);
+        }
         let cheap_candidates = self.collect_closed_containing(seed);
         if !cheap_candidates.is_empty() {
             self.hatch_dbg(format!(
@@ -2152,6 +2277,12 @@ impl CadApp {
             // doesn't have to pre-select them. Without this the cheap
             // path produces a "fill through everything" hatch when the
             // outer contains nested shapes.
+            self.hatch_dbg(format!(
+                "  --- island scan inside outer #{} ---", idx));
+            let scan_lines = self.dbg_island_scan_verdicts(idx, seed);
+            for line in scan_lines {
+                self.hatch_dbg(line);
+            }
             let islands = self.collect_islands_inside(idx, seed);
             if !islands.is_empty() {
                 self.hatch_dbg(format!(
@@ -5484,24 +5615,60 @@ fn tessellate_circle_loop(centre: Vec2, radius: f64, n: usize) -> Vec<Vec2> {
     out
 }
 
+/// Tolerance for treating a polyline's first/last vertices as
+/// coincident — i.e. the polyline is geometrically a loop even if its
+/// `closed` flag is still false. The debug log surfaces this case with
+/// "endpoint gap = … ← visually closed but `closed=false`".
+const POLYLINE_EFFECTIVELY_CLOSED_EPS: f64 = 1e-3;
+
+/// True if `p` should be treated as a closed loop for hatch purposes:
+/// either its `closed` flag is set, OR its first and last vertices
+/// coincide within `POLYLINE_EFFECTIVELY_CLOSED_EPS`. Polylines with
+/// fewer than 3 vertices can't form a loop.
+fn polyline_is_effectively_closed(p: &Polyline) -> bool {
+    if p.vertices.len() < 3 { return false; }
+    if p.closed { return true; }
+    let first = p.vertices.first().map(|v| v.pos);
+    let last  = p.vertices.last().map(|v| v.pos);
+    match (first, last) {
+        (Some(a), Some(b)) =>
+            (a - b).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS,
+        _ => false,
+    }
+}
+
 /// Tessellate any single closed geometry to a vertex loop in world
 /// coords. Mirrors what `App::resolve_hatch_loops` does for one
 /// boundary, but on raw geometry rather than via handle resolution —
 /// used by the cheap-path island detector to PIP-test other dobjects'
 /// boundaries against a chosen outer.
 ///
-/// Returns an empty Vec for non-closed geometries (Line / Arc / open
-/// Polyline / Spline / Point / Hatch); the caller is expected to
-/// filter for closed candidates upstream, this is just a safety net.
+/// Open polylines whose endpoints meet within
+/// `POLYLINE_EFFECTIVELY_CLOSED_EPS` are also accepted — this is the
+/// "drew it as a closed loop but forgot to type `c` Enter" case the
+/// user's polyline #6 surfaced. The duplicated last vertex (if any)
+/// is dropped so the polygon doesn't double-count its starting edge.
+///
+/// Returns an empty Vec for everything else (Line / Arc / open
+/// Polyline with separated endpoints / Spline / Point / Hatch).
 fn closed_dobject_polygon(g: &Geom) -> Vec<Vec2> {
     match g {
-        Geom::Polyline(p) if p.closed && p.vertices.len() >= 3 => {
-            let mut v: Vec<Vec2> = Vec::with_capacity(p.vertices.len() * 4);
-            v.push(p.vertices[0].pos);
+        Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
             let n = p.vertices.len();
-            for k in 0..n {
+            // Treat the polyline as if `closed=true`. If the last
+            // vertex duplicates the first (the v06=(x,y) ≡ v00 case
+            // from polyline #6 in the user log), drop it so the
+            // implied closing edge isn't drawn twice.
+            let effective_n = if !p.closed {
+                let f = p.vertices[0].pos;
+                let l = p.vertices[n - 1].pos;
+                if (f - l).len() < POLYLINE_EFFECTIVELY_CLOSED_EPS { n - 1 } else { n }
+            } else { n };
+            let mut v: Vec<Vec2> = Vec::with_capacity(effective_n * 4);
+            v.push(p.vertices[0].pos);
+            for k in 0..effective_n {
                 let a = p.vertices[k].pos;
-                let b = p.vertices[(k + 1) % n].pos;
+                let b = p.vertices[(k + 1) % effective_n].pos;
                 append_arc_world_samples(a, b, p.vertices[k].bulge, &mut v);
             }
             v
