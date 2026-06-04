@@ -234,6 +234,86 @@ pub fn build_adjacency(
     adj
 }
 
+/// Segment-segment intersection in parametric form. Returns `(t, u, pt)`
+/// where `pt = p.a + t*(p.b - p.a) = q.a + u*(q.b - q.a)` and both
+/// `t, u ∈ [0, 1]`. Returns `None` for parallel segments or for
+/// intersections lying outside either segment's parameter range.
+fn seg_seg_intersect_params(p: &TessSeg, q: &TessSeg) -> Option<(f64, f64, Vec2)> {
+    let r = p.b - p.a;
+    let s = q.b - q.a;
+    let rxs = r.x * s.y - r.y * s.x;
+    if rxs.abs() < 1e-12 { return None; }   // parallel
+    let qp = q.a - p.a;
+    let t = (qp.x * s.y - qp.y * s.x) / rxs;
+    let u = (qp.x * r.y - qp.y * r.x) / rxs;
+    if !(0.0..=1.0).contains(&t) || !(0.0..=1.0).contains(&u) { return None; }
+    Some((t, u, p.a + r * t))
+}
+
+/// Pairwise intersection splitting pass — the missing primitive that
+/// makes the trace path work for partial overlaps.
+///
+/// Walks every segment pair where the two segments come from DIFFERENT
+/// source dobjects (same-source pairs already share endpoints at chain
+/// joints — no split needed there). For each crossing that lies
+/// strictly in the interior of BOTH segments, both segments get a new
+/// vertex inserted at the crossing point and are split into two
+/// fragments.
+///
+/// After this pass, the endpoint-clustering step naturally treats every
+/// crossing as a graph node, and the CCW trace walks through the
+/// planar subdivision correctly — partial overlaps trace the
+/// intersection region instead of either source dobject's whole
+/// boundary.
+///
+/// Complexity: O(N²) over segments, with each pair being a fast 2D
+/// cross-product check. At 200 segs (typical interactive drawing)
+/// that's 20k checks → sub-millisecond. Spatial-index acceleration
+/// is a future optimisation if profiling demands it.
+pub fn split_at_intersections(segs: &[TessSeg]) -> Vec<TessSeg> {
+    let n = segs.len();
+    if n < 2 { return segs.to_vec(); }
+    // For each segment i, accumulate (t_along_i, intersection_point)
+    // pairs at every interior crossing. We process them at the end by
+    // sorting by t and emitting consecutive fragments.
+    let mut cuts: Vec<Vec<(f64, Vec2)>> = vec![Vec::new(); n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if segs[i].src == segs[j].src { continue; }
+            let Some((ti, tj, pt)) = seg_seg_intersect_params(&segs[i], &segs[j]) else { continue; };
+            // Endpoint-touching intersections are already handled by
+            // cluster_endpoints; only interior crossings need a split.
+            if ti > 1e-6 && ti < 1.0 - 1e-6 {
+                cuts[i].push((ti, pt));
+            }
+            if tj > 1e-6 && tj < 1.0 - 1e-6 {
+                cuts[j].push((tj, pt));
+            }
+        }
+    }
+    let mut out: Vec<TessSeg> = Vec::with_capacity(n);
+    for (i, s) in segs.iter().enumerate() {
+        if cuts[i].is_empty() {
+            out.push(*s);
+            continue;
+        }
+        cuts[i].sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut prev = s.a;
+        for (_, pt) in &cuts[i] {
+            // Skip near-duplicate splits (two intersections at almost
+            // the same point — would create a zero-length fragment).
+            if (*pt - prev).len() < 1e-7 { continue; }
+            out.push(TessSeg { a: prev, b: *pt, src: s.src });
+            prev = *pt;
+        }
+        // Tail fragment — only emit if non-degenerate.
+        if (s.b - prev).len() > 1e-7 {
+            out.push(TessSeg { a: prev, b: s.b, src: s.src });
+        }
+    }
+    out
+}
+
 /// Cast a +X horizontal ray from `seed` against every segment. Returns
 /// `(t, seg_idx, hit_pos)` sorted by `t`, with `t > 0` (strictly east of
 /// the seed). Horizontal segments are ignored — they lie ALONG the ray
@@ -292,21 +372,29 @@ pub fn trace_loop(
         if next_cluster == start_cluster {
             return Some(verts);
         }
-        // Direction we ARRIVED at next_cluster, then reverse it — the
-        // "looking back" direction. The CCW turn from that to each
-        // outgoing edge's direction tells us how sharp a left turn it
-        // would be. Smallest positive CCW turn = sharpest left =
-        // boundary of the face on our LEFT.
+        // At each junction, the CCW turn from "arrive_back" to each
+        // outgoing edge tells us how far around (CCW) we'd rotate to
+        // face that edge. To bound the face on our LEFT (the face that
+        // contains the seed, which is what we want to hatch), we pick
+        // the LARGEST valid CCW turn — that's the sharpest LEFT turn
+        // = stay hugging the left face's boundary. Picking smallest
+        // CCW would bound the RIGHT face instead.
+        //
+        // We start the walk with the seed on our LEFT (the +X ray hits
+        // the east boundary of the seed's region; we begin walking
+        // from the south endpoint, putting the west — and the seed —
+        // on our left), so LEFT-face = seed's face = the region to
+        // hatch.
         let in_dir = (cluster_pos[next_cluster] - cluster_pos[cur_cluster]).angle();
         let arrive_back = (in_dir + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU);
         let mut best: Option<(usize, f64)> = None;
         for &(sidx, _other, out_dir) in &adj[next_cluster] {
             if sidx == cur_seg { continue; }
             let turn = (out_dir - arrive_back).rem_euclid(std::f64::consts::TAU);
-            // Reject zero (would mean a coincident reverse edge, which
-            // is the back-edge anyway).
-            if turn < 1e-9 { continue; }
-            if best.map_or(true, |(_, t)| turn < t) {
+            // Reject ~0 and ~2π (coincident reverse / back-edge — would
+            // turn around and walk back the way we came).
+            if turn < 1e-6 || turn > std::f64::consts::TAU - 1e-6 { continue; }
+            if best.map_or(true, |(_, t)| turn > t) {
                 best = Some((sidx, turn));
             }
         }
@@ -389,8 +477,14 @@ pub struct TracedBoundary {
 /// Full BPOLY pipeline. Returns `None` if no closed boundary surrounds
 /// the seed, or if every trace attempt failed.
 pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
-    let segs = tessellate_doc(doc);
-    if segs.is_empty() { return None; }
+    let raw = tessellate_doc(doc);
+    if raw.is_empty() { return None; }
+    // Split every segment at every crossing with a segment from a
+    // DIFFERENT source dobject — this is what makes partial overlaps
+    // ("lens between two circles", "click in the common region of
+    // three overlapping shapes") trace the actual visible region
+    // rather than a single source's whole boundary.
+    let segs = split_at_intersections(&raw);
     let (endpoints, cluster_pos) = cluster_endpoints(&segs);
     let n_clusters = cluster_pos.len();
     let adj = build_adjacency(&segs, &endpoints, n_clusters);
@@ -541,5 +635,90 @@ mod tests {
             Line { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0) }.into(),
         ]);
         assert!(trace_boundary_at(&doc, Vec2::new(5.0, 100.0)).is_none());
+    }
+
+    /// The partial-overlap case the user's log surfaced: two circles
+    /// overlap forming a lens. Click in the lens. The trace should
+    /// find a region SMALLER than either circle alone — proof that
+    /// the split-at-intersections pass is doing its job.
+    #[test]
+    fn lens_between_two_overlapping_circles() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(0.0, 0.0), radius: 10.0 }.into(),
+            Circle { center: Vec2::new(8.0, 0.0), radius: 10.0 }.into(),
+        ]);
+        // Seed in the lens (between the two centres, on the x-axis
+        // both circles cover this point)
+        let tb = trace_boundary_at(&doc, Vec2::new(4.0, 0.0))
+            .expect("must trace the lens region between two overlapping circles");
+        let area = polygon_signed_area(&tb.outer).abs();
+        let single_circle_area = std::f64::consts::PI * 100.0;
+        // The lens is strictly smaller than either single circle.
+        assert!(area > 0.0 && area < single_circle_area,
+            "lens area {} should be > 0 and < single-circle area {}",
+            area, single_circle_area);
+    }
+
+    /// Three overlapping circles with a common region in the middle.
+    /// Click in the common region — trace must walk a boundary made of
+    /// THREE different circles' arc fragments, only possible after
+    /// pairwise intersection splitting.
+    #[test]
+    fn common_region_of_three_overlapping_circles() {
+        let doc = doc_from(vec![
+            Circle { center: Vec2::new(-3.0, -2.0), radius: 6.0 }.into(),
+            Circle { center: Vec2::new( 3.0, -2.0), radius: 6.0 }.into(),
+            Circle { center: Vec2::new( 0.0,  3.0), radius: 6.0 }.into(),
+        ]);
+        // Seed at the centroid — inside all three circles
+        let tb = trace_boundary_at(&doc, Vec2::new(0.0, 0.0))
+            .expect("must trace the 3-circle common region");
+        let area = polygon_signed_area(&tb.outer).abs();
+        let single_circle_area = std::f64::consts::PI * 36.0;
+        assert!(area > 0.0 && area < single_circle_area * 0.5,
+            "common-region area {} should be < half of one circle's area {}",
+            area, single_circle_area);
+    }
+
+    /// Splitting a single seg by itself is a no-op.
+    #[test]
+    fn split_at_intersections_noop_when_no_crossings() {
+        let segs = vec![
+            TessSeg { a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0), src: 0 },
+            TessSeg { a: Vec2::new(0.0, 5.0), b: Vec2::new(10.0, 5.0), src: 0 },
+        ];
+        let out = split_at_intersections(&segs);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// Two perpendicular segments crossing at their midpoints split
+    /// each one in half — 2 input segs → 4 output segs.
+    #[test]
+    fn split_at_intersections_basic_cross() {
+        let segs = vec![
+            TessSeg { a: Vec2::new(-5.0, 0.0), b: Vec2::new(5.0, 0.0),  src: 0 },
+            TessSeg { a: Vec2::new(0.0, -5.0), b: Vec2::new(0.0, 5.0),  src: 1 },
+        ];
+        let out = split_at_intersections(&segs);
+        assert_eq!(out.len(), 4, "expected 4 sub-segments, got {}", out.len());
+        // All sub-segments touch the origin
+        let near_origin = out.iter().filter(|s|
+            (s.a - Vec2::new(0.0, 0.0)).len() < 1e-9
+            || (s.b - Vec2::new(0.0, 0.0)).len() < 1e-9
+        ).count();
+        assert_eq!(near_origin, 4, "every fragment should touch the cross point");
+    }
+
+    /// Same-source crossings are NOT split (a self-intersecting open
+    /// polyline's tessellation fragments shouldn't generate spurious
+    /// splits at the self-intersection — that's a degenerate input).
+    #[test]
+    fn split_at_intersections_skips_same_source() {
+        let segs = vec![
+            TessSeg { a: Vec2::new(-5.0, 0.0), b: Vec2::new(5.0, 0.0),  src: 0 },
+            TessSeg { a: Vec2::new(0.0, -5.0), b: Vec2::new(0.0, 5.0),  src: 0 },
+        ];
+        let out = split_at_intersections(&segs);
+        assert_eq!(out.len(), 2, "same-source segs should NOT be split");
     }
 }

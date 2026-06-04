@@ -2268,47 +2268,64 @@ impl CadApp {
         } else {
             self.hatch_dbg("  --- cheap-path: 0 self-closed dobjects contain the click ---");
         }
-        if let Some(idx) = self.find_smallest_containing_closed(seed) {
-            let kind = self.doc.dobjects.get(idx)
-                .map(|d| dobject_kind_name(&d.geom))
-                .unwrap_or("?");
-            // AutoCAD BPOLY also auto-adds any closed dobjects sitting
-            // ENTIRELY INSIDE the chosen outer as islands — the user
-            // doesn't have to pre-select them. Without this the cheap
-            // path produces a "fill through everything" hatch when the
-            // outer contains nested shapes.
+        // Routing rule:
+        //  * 0 closed candidates contain the seed → trace path (the
+        //    boundary is formed by open primitives chained together).
+        //  * Exactly 1 closed candidate contains the seed → cheap path
+        //    (single self-closed boundary + auto-islands inside).
+        //  * 2+ closed candidates contain the seed → PARTIAL OVERLAP →
+        //    trace path with intersection-splitting so the actual
+        //    visible region (lens, common area, …) gets hatched
+        //    instead of one source's whole boundary.
+        let multiple = cheap_candidates.len() > 1;
+        if !multiple {
+            if let Some(idx) = self.find_smallest_containing_closed(seed) {
+                let kind = self.doc.dobjects.get(idx)
+                    .map(|d| dobject_kind_name(&d.geom))
+                    .unwrap_or("?");
+                // AutoCAD BPOLY also auto-adds any closed dobjects sitting
+                // ENTIRELY INSIDE the chosen outer as islands — the user
+                // doesn't have to pre-select them.
+                self.hatch_dbg(format!(
+                    "  --- island scan inside outer #{} ---", idx));
+                let scan_lines = self.dbg_island_scan_verdicts(idx, seed);
+                for line in scan_lines {
+                    self.hatch_dbg(line);
+                }
+                let islands = self.collect_islands_inside(idx, seed);
+                if !islands.is_empty() {
+                    self.hatch_dbg(format!(
+                        "  → CHEAP PATH chose outer #{} ({}) + auto-detected {} island(s): {:?}",
+                        idx, kind, islands.len(), islands));
+                } else {
+                    self.hatch_dbg(format!(
+                        "  → CHEAP PATH chose smallest containing dobject #{} ({}), 0 auto-islands",
+                        idx, kind));
+                }
+                self.selection = std::iter::once(idx).chain(islands).collect();
+                self.apply_hatch();
+                self.selection.clear();
+                return true;
+            }
+        } else {
             self.hatch_dbg(format!(
-                "  --- island scan inside outer #{} ---", idx));
-            let scan_lines = self.dbg_island_scan_verdicts(idx, seed);
-            for line in scan_lines {
-                self.hatch_dbg(line);
-            }
-            let islands = self.collect_islands_inside(idx, seed);
-            if !islands.is_empty() {
-                self.hatch_dbg(format!(
-                    "  → CHEAP PATH chose outer #{} ({}) + auto-detected {} island(s): {:?}",
-                    idx, kind, islands.len(), islands));
-            } else {
-                self.hatch_dbg(format!(
-                    "  → CHEAP PATH chose smallest containing dobject #{} ({}), 0 auto-islands",
-                    idx, kind));
-            }
-            self.selection = std::iter::once(idx).chain(islands).collect();
-            self.apply_hatch();
-            self.selection.clear();
-            return true;
+                "  --- {} candidates contain seed → PARTIAL OVERLAP, deferring to trace path ---",
+                cheap_candidates.len()));
         }
-        // Full trace path — handles arbitrary chains.
+        // Full trace path — handles arbitrary chains AND partial overlaps
+        // (intersection-splitting inside trace_boundary_at).
         self.hatch_dbg("  --- TRACE PATH engaged ---");
         // Run a manual instrumentation pass first so the user can see
         // segment / cluster / ray-hit counts before the actual trace.
-        let segs = crate::hatch_trace::tessellate_doc(&self.doc);
+        let raw_segs = crate::hatch_trace::tessellate_doc(&self.doc);
+        let segs = crate::hatch_trace::split_at_intersections(&raw_segs);
         let (endpoints, cluster_pos) =
             crate::hatch_trace::cluster_endpoints(&segs);
         let hits = crate::hatch_trace::ray_cast_horiz(seed, &segs);
         self.hatch_dbg(format!(
-            "    tessellated {} segs, {} clusters, ray cast found {} hit(s) east of seed",
-            segs.len(), cluster_pos.len(), hits.len()));
+            "    tessellated {} segs → split into {} segs (+{}), {} clusters, ray cast found {} hit(s) east of seed",
+            raw_segs.len(), segs.len(), segs.len() - raw_segs.len(),
+            cluster_pos.len(), hits.len()));
         for (k, (t, sidx, hp)) in hits.iter().enumerate() {
             let (a_id, b_id) = endpoints[*sidx];
             let pa = cluster_pos[a_id];
