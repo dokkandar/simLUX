@@ -1366,6 +1366,12 @@ impl CadApp {
                 }
             }
             Ok(Command::Hatch { pattern, scale, angle_deg }) => {
+                // Auto-open the Hatch Debug window so the user sees the
+                // live log without having to hunt for the toolbar
+                // toggle. Mirrors the trim/extend pattern. Does NOT
+                // clear prior entries — accumulating context is useful
+                // when comparing successive `hatch` runs.
+                self.hatch_dbg_session_start();
                 self.hatch_dbg(format!(
                     "Command::Hatch parsed — pattern={:?}, scale={}, angle={}",
                     pattern, scale, angle_deg));
@@ -3706,6 +3712,17 @@ impl CadApp {
         self.hatch_debug_log.push(format!(
             "[{:>5}] {}", self.trim_debug_frame, msg.into()
         ));
+    }
+
+    /// Auto-open the Hatch Debug window at the start of a fresh `hatch`
+    /// command and stamp a session-start marker. Mirrors
+    /// `trim_dbg_session_start`. Does NOT clear the prior log — the
+    /// user can hit 🗑 Clear themselves if they want a fresh slate.
+    fn hatch_dbg_session_start(&mut self) {
+        self.hatch_debug_open = true;
+        self.hatch_dbg(format!(
+            "=== HATCH session START ===  doc.dobjects.len() = {}, selection.len() = {}",
+            self.doc.dobjects.len(), self.selection.len()));
     }
 
     /// Wipe + open the debug log at the start of a fresh trim/extend
