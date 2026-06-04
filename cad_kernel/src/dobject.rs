@@ -101,6 +101,9 @@ impl From<Polyline>   for DObject { fn from(p: Polyline) -> Self    { Self::new(
 impl From<crate::geom::Hatch> for DObject {
     fn from(h: crate::geom::Hatch) -> Self { Self::new(Geom::Hatch(h)) }
 }
+impl From<crate::geom::Spline> for DObject {
+    fn from(s: crate::geom::Spline) -> Self { Self::new(Geom::Spline(s)) }
+}
 
 // ---- handle allocation -----------------------------------------------------
 //

@@ -359,6 +359,15 @@ fn candidate_points(
                     plain([p.vertices[0].pos, p.vertices[p.vertices.len() - 1].pos])
                 }
             }
+            // Spline endpoints = first and last control point (clamped
+            // curves interpolate their endpoint control points exactly).
+            Geom::Spline(s) => {
+                if s.control_points.is_empty() { Vec::new() }
+                else {
+                    plain([s.control_points[0],
+                           s.control_points[s.control_points.len() - 1]])
+                }
+            }
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Hatch(_) => Vec::new(),
         },
         SnapKind::Mid => match e {
@@ -383,7 +392,7 @@ fn candidate_points(
                 }).collect();
                 plain(pts)
             }
-            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => Vec::new(),
+            Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -391,14 +400,14 @@ fn candidate_points(
             Geom::Circle(c)      => plain([c.center]),
             Geom::Ellipse(e)     => plain([e.center]),
             Geom::EllipseArc(ea) => plain([ea.ellipse.center]),
-            Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) => Vec::new(),
+            Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -506,6 +515,30 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
         // Hatch boundary edges are the snap target via the boundary's own
         // polyline dobject. The Hatch entity itself has no curve to snap to.
         Geom::Hatch(_) => None,
+        // Spline NEA = nearest point on a tessellation of the curve.
+        // Good enough at typical zooms; an iterative parameter-space
+        // projection (Newton on |C(u) - p|) would give sub-pixel
+        // precision when we need it.
+        Geom::Spline(s) => {
+            let samples = s.tessellate(64);
+            if samples.is_empty() { return None; }
+            let mut best: Option<(Vec2, f64)> = None;
+            for w in samples.windows(2) {
+                let a = w[0]; let b = w[1];
+                let d = b - a;
+                let len_sq = d.len_sq();
+                let foot = if len_sq < EPS { a }
+                    else {
+                        let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
+                        a + d * t
+                    };
+                let dist = p.dist(foot);
+                if best.map_or(true, |(_, bd)| dist < bd) {
+                    best = Some((foot, dist));
+                }
+            }
+            best.map(|(pt, _)| pt)
+        }
     }
 }
 
@@ -597,6 +630,20 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
         }
         // Snap to the hatch's boundary via its own polyline dobject instead.
         Geom::Hatch(_) => Vec::new(),
+        // Spline PER: per-segment perpendicular foot on a 64-sample
+        // tessellation. Like the polyline branch above — good enough
+        // for typical pickbox sizes; per_to_line filters by segment
+        // bounds via its anchor.
+        Geom::Spline(s) => {
+            let samples = s.tessellate(64);
+            if samples.len() < 2 { return Vec::new(); }
+            let mut out = Vec::new();
+            for w in samples.windows(2) {
+                let l = Line { a: w[0], b: w[1] };
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
     }
 }
 
@@ -704,6 +751,19 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
         }
         // TAN to a hatch isn't defined — use the boundary polyline directly.
         Geom::Hatch(_) => Vec::new(),
+        // TAN to a spline: same polyline fallback (per-segment
+        // perpendicular foot). True NURBS tangent solver lands when
+        // someone needs it.
+        Geom::Spline(s) => {
+            let samples = s.tessellate(64);
+            if samples.len() < 2 { return Vec::new(); }
+            let mut out = Vec::new();
+            for w in samples.windows(2) {
+                let l = Line { a: w[0], b: w[1] };
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
     }
 }
 

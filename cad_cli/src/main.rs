@@ -150,5 +150,8 @@ fn describe(g: &Geom) -> String {
         Geom::Hatch(h) => format!(
             "hatch ({} boundary loops, {:?})",
             h.boundary_handles.len(), h.pattern),
+        Geom::Spline(s) => format!(
+            "spline (degree {}, {} control points)",
+            s.degree, s.control_points.len()),
     }
 }

@@ -533,6 +533,10 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
         // export hatches yet — skip silently so a round-trip with a
         // hatch in the doc just drops the hatch but otherwise succeeds.
         Geom::Hatch(_) => {}
+        // DXF SPLINE entity needs: flags / degree / knots / weights /
+        // control points / fit points / fit tolerance. v1 doesn't
+        // export it yet — skip silently. Round-trip in RSM works.
+        Geom::Spline(_) => {}
     }
 }
 

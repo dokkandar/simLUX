@@ -18,7 +18,17 @@
 // quarter-circle of radius 1 — proves the rational path against a
 // shape that B-splines alone (degree-2 polynomial) can only approximate.
 
-use cad_kernel::Vec2;
+/// Minimal 2D point used throughout the NURBS math. Defined locally so
+/// the crate stays free of workspace-internal dependencies — that lets
+/// `cad_kernel` take `cad_nurbs` as a dep (for `Geom::Spline`) without
+/// a circular reference. Convert to/from `cad_kernel::Vec2` at the
+/// call site (both are plain {x, y} structs).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Vec2 { pub x: f64, pub y: f64 }
+
+impl Vec2 {
+    pub const fn new(x: f64, y: f64) -> Self { Self { x, y } }
+}
 
 // ============================================================================
 //   Knot vector

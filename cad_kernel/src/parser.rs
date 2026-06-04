@@ -136,6 +136,7 @@ pub enum ToolKind {
     EllipseArc,
     Point,
     Polyline,
+    Spline,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -158,6 +159,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "ellipse" | "el" => parse_ellipse(&toks[1..]),
         "point"   | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
+        "spline"   | "spl"          => Ok(Command::SetTool(ToolKind::Spline)),
         "arc"    | "a"  => parse_arc(&toks[1..]),
         "arc3p"         => parse_arc_3p(&toks[1..]),
         "arcse"         => parse_arc_se(&toks[1..]),

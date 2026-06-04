@@ -193,6 +193,108 @@ impl Hatch {
     }
 }
 
+/// 2D NURBS spline. Carries everything `cad_nurbs::NurbsCurve` needs to
+/// reproduce the curve: degree, control points, per-control-point
+/// weights. The knot vector is implicit (clamped/open uniform —
+/// derived from degree + control-point count) for v1; user-supplied
+/// knot vectors land when the kernel exposes more sophisticated
+/// curve-fitting paths.
+///
+/// All weights equal to 1.0 reduces to a plain B-spline (non-rational).
+/// Distinct weights enable EXACT conics — circles, ellipses, parabolas —
+/// that polynomial B-splines can only approximate.
+///
+/// Bbox is the convex hull's bbox (i.e. the control points' bbox),
+/// which is a valid superset of the curve since a NURBS lies entirely
+/// inside its control polygon's convex hull. Transforms apply
+/// element-wise to control points — that's the whole point of the
+/// representation.
+#[derive(Clone, Debug)]
+pub struct Spline {
+    pub degree:         usize,
+    pub control_points: Vec<Vec2>,
+    /// One weight per control point. Must satisfy
+    /// `weights.len() == control_points.len()` and each weight > 0.
+    /// Use `Spline::new_bspline` to build a non-rational (all-1)
+    /// variant without constructing the weight vector by hand.
+    pub weights:        Vec<f64>,
+}
+
+impl Spline {
+    /// Build a rational NURBS spline. Panics if weight count mismatches
+    /// control-point count or if the curve is degenerate
+    /// (control_points <= degree).
+    pub fn new(degree: usize, control_points: Vec<Vec2>, weights: Vec<f64>) -> Self {
+        assert_eq!(weights.len(), control_points.len(),
+            "Spline: weights count must match control_points count");
+        assert!(control_points.len() > degree,
+            "Spline: need more control points than degree");
+        Self { degree, control_points, weights }
+    }
+
+    /// Non-rational B-spline (all weights = 1.0). Same constraints as
+    /// `new`.
+    pub fn new_bspline(degree: usize, control_points: Vec<Vec2>) -> Self {
+        let n = control_points.len();
+        Self::new(degree, control_points, vec![1.0; n])
+    }
+
+    /// Bounding box of the control polygon (= valid superset of the
+    /// curve's bbox by the convex-hull property). Tighter bbox would
+    /// need sample-based bounds; deferred until a profiler asks for it.
+    pub fn bbox(&self) -> (Vec2, Vec2) {
+        if self.control_points.is_empty() {
+            return (Vec2::ZERO, Vec2::ZERO);
+        }
+        let mut min = self.control_points[0];
+        let mut max = min;
+        for v in &self.control_points[1..] {
+            if v.x < min.x { min.x = v.x; }
+            if v.y < min.y { min.y = v.y; }
+            if v.x > max.x { max.x = v.x; }
+            if v.y > max.y { max.y = v.y; }
+        }
+        (min, max)
+    }
+
+    /// Tessellate the curve to `n_samples` evenly-spaced points across
+    /// its parameter domain. Convenience wrapper around the cad_nurbs
+    /// rational evaluator — converts to/from the kernel's Vec2 type at
+    /// the boundary.
+    pub fn tessellate(&self, n_samples: usize) -> Vec<Vec2> {
+        use cad_nurbs::{NurbsCurve, Vec2 as NV};
+        let ctrls: Vec<NV> = self.control_points.iter()
+            .map(|v| NV::new(v.x, v.y)).collect();
+        let curve = NurbsCurve::new_clamped(self.degree, ctrls, self.weights.clone());
+        curve.tessellate(n_samples).into_iter()
+            .map(|p| Vec2::new(p.x, p.y))
+            .collect()
+    }
+
+    /// Distance from the visible curve to a point. Uses a 64-sample
+    /// tessellation then per-segment distance — accurate enough for
+    /// pickbox hit-testing at typical zoom levels. Refine to a
+    /// projection iteration when sub-pixel accuracy is needed.
+    pub fn distance_to_point(&self, p: Vec2) -> f64 {
+        let samples = self.tessellate(64);
+        if samples.len() < 2 { return f64::INFINITY; }
+        let mut best = f64::INFINITY;
+        for w in samples.windows(2) {
+            let a = w[0]; let b = w[1];
+            let d = b - a;
+            let len_sq = d.len_sq();
+            let dist = if len_sq < EPS {
+                p.dist(a)
+            } else {
+                let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
+                p.dist(a + d * t)
+            };
+            if dist < best { best = dist; }
+        }
+        best
+    }
+}
+
 /// Pure geometry — the shape side of a `DObject`. Style / layer / handle
 /// live on the outer `DObject` struct (see [`crate::dobject`]).
 ///
@@ -209,6 +311,7 @@ pub enum Geom {
     Point(Point),
     Polyline(Polyline),
     Hatch(Hatch),
+    Spline(Spline),
 }
 
 impl Geom {
@@ -266,6 +369,16 @@ impl Geom {
             // its boundary too (or do that automatically at the app
             // level — TODO follow-up).
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            // Splines transform their control points — the curve
+            // follows because NURBS evaluation is linear in control
+            // points (Σ N_i(u) * P_i / Σ N_i(u) * w_i; rotating each
+            // P_i rotates the whole curve by the same R). Weights
+            // and degree are invariant.
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree:         s.degree,
+                control_points: s.control_points.iter().map(|p| rot(*p)).collect(),
+                weights:        s.weights.clone(),
+            }),
         }
     }
 
@@ -309,6 +422,11 @@ impl Geom {
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree:         s.degree,
+                control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
+                weights:        s.weights.clone(),
+            }),
         }
     }
 
@@ -371,6 +489,11 @@ impl Geom {
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree:         s.degree,
+                control_points: s.control_points.iter().map(|p| mirror(*p)).collect(),
+                weights:        s.weights.clone(),
+            }),
         }
     }
 
@@ -696,6 +819,8 @@ impl Geom {
                 Err("trim: Point has nothing to trim"),
             Geom::Hatch(_) =>
                 Err("trim: hatch entities cannot be trimmed"),
+            Geom::Spline(_) =>
+                Err("trim: spline entities cannot be trimmed in v1 (knot insertion + split + reparametrise pending)"),
         }
     }
 
@@ -878,6 +1003,8 @@ impl Geom {
                 Err("split: cannot split a point"),
             Geom::Hatch(_) =>
                 Err("split: hatch entities cannot be split"),
+            Geom::Spline(_) =>
+                Err("split: spline entities cannot be split in v1 (knot insertion pending)"),
         }
     }
 
@@ -955,6 +1082,8 @@ impl Geom {
                 Err("offset on point is undefined"),
             Geom::Hatch(_) =>
                 Err("offset on hatch is undefined (offset the boundary instead)"),
+            Geom::Spline(_) =>
+                Err("offset on spline not implemented yet (true offset of a NURBS isn't a NURBS — needs sampling + refit)"),
         }
     }
 
@@ -1012,6 +1141,16 @@ impl Geom {
                 Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
             }
             // Direction-agnostic — return a deep copy.
+            // Spline: reversing a NURBS curve = reverse control points
+            //         + reverse weights + reverse knot vector. Since
+            //         we use an implicit clamped/open uniform knot
+            //         vector that's symmetric, reversing control
+            //         points + weights is enough.
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree:         s.degree,
+                control_points: s.control_points.iter().rev().copied().collect(),
+                weights:        s.weights.iter().rev().copied().collect(),
+            }),
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
         }
     }
@@ -1058,6 +1197,11 @@ impl Geom {
             }),
             // No-op for the same reason as `rotated`.
             Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            Geom::Spline(s) => Geom::Spline(Spline {
+                degree:         s.degree,
+                control_points: s.control_points.iter().map(|p| *p + off).collect(),
+                weights:        s.weights.clone(),
+            }),
         }
     }
 
@@ -1072,6 +1216,7 @@ impl Geom {
             Geom::Point(pt)      => pt.location.dist(p),
             Geom::Polyline(pl)   => pl.distance_to_point(p),
             Geom::Hatch(h)       => h.distance_to_point(p),
+            Geom::Spline(s)      => s.distance_to_point(p),
         }
     }
 }
@@ -1135,6 +1280,7 @@ impl Geom {
             Geom::Point(pt) => (pt.location, pt.location),
             Geom::Polyline(pl) => pl.bbox(),
             Geom::Hatch(h)  => h.bbox(),
+            Geom::Spline(s) => s.bbox(),
         }
     }
 }
@@ -1742,6 +1888,10 @@ pub enum GripRole {
     EllipseArcCenter,
     PolyVertex(usize),
     PointLoc,
+    /// Control point of a NURBS spline at the given index. Dragging
+    /// reshapes the curve via control-point edit (the dragged point
+    /// stays put; the curve bends towards it).
+    SplineCtrlPt(usize),
 }
 
 impl Geom {
@@ -1805,6 +1955,13 @@ impl Geom {
             // become PolyVertex grips later; for now editing happens by
             // recreating the hatch from a different boundary.
             Geom::Hatch(_) => Vec::new(),
+            // Spline grips = every control point. Dragging one
+            // reshapes the curve locally (NURBS basis support is
+            // narrow — drag at index i only affects a span of degree+1
+            // segments around i).
+            Geom::Spline(s) => s.control_points.iter().enumerate()
+                .map(|(i, p)| (*p, GripRole::SplineCtrlPt(i)))
+                .collect(),
         }
     }
 
@@ -1957,6 +2114,16 @@ impl Geom {
                 let mut new_verts = p.vertices.clone();
                 if let Some(v) = new_verts.get_mut(i) { v.pos = new_pos; }
                 Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed })
+            }
+            // ---- Spline (control-point edit) ---------------------------
+            (Geom::Spline(s), GripRole::SplineCtrlPt(i)) => {
+                let mut new_ctrls = s.control_points.clone();
+                if let Some(c) = new_ctrls.get_mut(i) { *c = new_pos; }
+                Geom::Spline(Spline {
+                    degree:         s.degree,
+                    control_points: new_ctrls,
+                    weights:        s.weights.clone(),
+                })
             }
             // ---- Point -------------------------------------------------
             (Geom::Point(p), GripRole::PointLoc) =>

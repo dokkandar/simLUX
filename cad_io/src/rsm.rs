@@ -56,7 +56,7 @@
 use cad_kernel::{
     Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Hatch,
     HatchPattern, Layer, LayerTable, Line, Lineweight, Linetype, LinetypeTable,
-    Pen, PenTable, Point, PolyVertex, Polyline, Style, Vec2,
+    Pen, PenTable, Point, PolyVertex, Polyline, Spline, Style, Vec2,
 };
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
@@ -178,7 +178,8 @@ fn write_dobjects(w: &mut Vec<u8>, ds: &[DObject], tc: &cad_kernel::TrueColorTab
 
 /// Geom tag space:
 ///   0=Line, 1=Circle, 2=Arc, 3=Ellipse, 4=EllipseArc, 5=Point, 6=Polyline,
-///   7=Hatch (MVP — boundary vertices + pattern code; 0=Solid)
+///   7=Hatch (MVP — boundary handles + pattern code; 0=Solid)
+///   8=Spline (NURBS — degree + control points + weights)
 fn write_geom(w: &mut Vec<u8>, g: &Geom) {
     match g {
         Geom::Line(l) => {
@@ -240,6 +241,18 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             write_u32(w, h.boundary_handles.len() as u32);
             for handle in &h.boundary_handles {
                 write_u64(w, *handle);
+            }
+        }
+        Geom::Spline(s) => {
+            write_u8(w, 8);
+            write_u8(w, s.degree as u8);
+            write_u32(w, s.control_points.len() as u32);
+            for p in &s.control_points {
+                write_vec2(w, *p);
+            }
+            // weights.len() == control_points.len() by Spline invariant.
+            for wt in &s.weights {
+                write_f64(w, *wt);
             }
         }
     }
@@ -445,6 +458,15 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
                 boundary_handles.push(r.u64()?);
             }
             Geom::Hatch(Hatch { boundary_handles, pattern })
+        }
+        8 => {
+            let degree = r.u8()? as usize;
+            let n = r.u32()? as usize;
+            let mut control_points = Vec::with_capacity(n);
+            for _ in 0..n { control_points.push(r.vec2()?); }
+            let mut weights = Vec::with_capacity(n);
+            for _ in 0..n { weights.push(r.f64()?); }
+            Geom::Spline(Spline { degree, control_points, weights })
         }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })

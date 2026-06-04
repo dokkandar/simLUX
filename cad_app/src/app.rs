@@ -30,7 +30,7 @@ fn aci_mapping_path() -> std::path::PathBuf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline }
+enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline }
 
 /// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
 /// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
@@ -141,6 +141,10 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::Polyline, 0) => "polyline: click first vertex    [Esc cancels]",
         (Tool::Polyline, 1) => "polyline: click next vertex; Enter finishes (open); 'c' Enter closes",
         (Tool::Polyline, _) => "polyline: keep clicking vertices; Enter finishes (open); 'c' Enter closes",
+        (Tool::Spline,   0) => "spline: click first control point    [Esc cancels]",
+        (Tool::Spline,   1) => "spline: click next control point",
+        (Tool::Spline,   2) => "spline: click next control point (Enter finishes after ≥3 ctrls)",
+        (Tool::Spline,   _) => "spline: keep clicking control points; Enter finishes (open)",
         (Tool::Arc,    _) => arc_method.hint(n),
     }
 }
@@ -1012,6 +1016,7 @@ impl CadApp {
                     ToolKind::EllipseArc => Tool::EllipseArc,
                     ToolKind::Point      => Tool::Point,
                     ToolKind::Polyline   => Tool::Polyline,
+                    ToolKind::Spline     => Tool::Spline,
                 };
                 self.pending.clear();
                 self.set_prompt(current_hint(self.tool, self.arc_method, 0));
@@ -2589,8 +2594,8 @@ impl CadApp {
         ui.separator();
 
         // Count by Geom variant.
-        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh) =
-            (0, 0, 0, 0, 0, 0, 0, 0);
+        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh, mut nsp) =
+            (0, 0, 0, 0, 0, 0, 0, 0, 0);
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -2602,13 +2607,14 @@ impl CadApp {
                     Geom::Point(_)      => npt += 1,
                     Geom::Polyline(_)   => npl += 1,
                     Geom::Hatch(_)      => nh  += 1,
+                    Geom::Spline(_)     => nsp += 1,
                 }
             }
         }
         ui.monospace(format!(
             "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}",
-            nl, nc, na, ne, nea, npt, npl, nh
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}",
+            nl, nc, na, ne, nea, npt, npl, nh, nsp
         ));
         ui.add_space(8.0);
 
@@ -3181,6 +3187,7 @@ impl CadApp {
                     Some(Geom::Polyline(_))   => "Polyline",
                     Some(Geom::Point(_))      => "Point",
                     Some(Geom::Hatch(_))      => "Hatch",
+                    Some(Geom::Spline(_))     => "Spline",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
@@ -3908,7 +3915,7 @@ impl CadApp {
         if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
         // Polyline / Line / Arc draw tools: the last captured point is
         // the ortho anchor for the next click.
-        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc) {
+        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc) {
             if let Some(p) = self.pending.last().copied() { return Some(p); }
         }
         None
@@ -4491,6 +4498,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Point(_)      => "Point",
         Geom::Polyline(_)   => "Polyline",
         Geom::Hatch(_)      => "Hatch",
+        Geom::Spline(_)     => "Spline",
     }
 }
 
@@ -4535,6 +4543,12 @@ fn describe(g: &Geom) -> String {
         Geom::Hatch(h) => format!(
             "hatch {} boundary loop(s) ({:?})",
             h.boundary_handles.len(), h.pattern
+        ),
+        Geom::Spline(s) => format!(
+            "spline degree={} {} ctrl pts{}",
+            s.degree, s.control_points.len(),
+            if s.weights.iter().all(|w| (*w - 1.0).abs() < 1e-9) { "" }
+            else { " (rational)" }
         ),
     }
 }
@@ -4719,6 +4733,40 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
             painter.line_segment([p1, p2], pen);
             painter.line_segment([p2, p3], pen);
             painter.line_segment([p3, p4], pen);
+            dot(p1); dot(p2); dot(p3); dot(p4);
+        }
+        Tool::Spline => {
+            // Smooth S-curve sampled from a cubic NURBS through 4
+            // control points (rendered AS the icon — eats its own
+            // dogfood). The 4 control dots show where the user clicks
+            // when drafting; the curve shows the result. Hint pens
+            // sketch the control polygon underneath so the icon also
+            // teaches the data model at a glance.
+            let p1 = c + egui::vec2(-14.0,  8.0);
+            let p2 = c + egui::vec2( -5.0, -10.0);
+            let p3 = c + egui::vec2(  5.0,  10.0);
+            let p4 = c + egui::vec2( 14.0, -8.0);
+            // Faint chord polygon (the "control polygon")
+            let hint = egui::Stroke::new(0.6, egui::Color32::from_rgba_unmultiplied(
+                icon_col.r(), icon_col.g(), icon_col.b(), 90));
+            painter.line_segment([p1, p2], hint);
+            painter.line_segment([p2, p3], hint);
+            painter.line_segment([p3, p4], hint);
+            // The curve itself — a cubic Bézier sample is close enough
+            // visually to a degree-3 clamped uniform NURBS through 4
+            // control points (which IS a single Bézier in this case).
+            let mut prev = p1;
+            for i in 1..=24 {
+                let t = i as f32 / 24.0;
+                let u = 1.0 - t;
+                let pt = egui::pos2(
+                    u*u*u*p1.x + 3.0*u*u*t*p2.x + 3.0*u*t*t*p3.x + t*t*t*p4.x,
+                    u*u*u*p1.y + 3.0*u*u*t*p2.y + 3.0*u*t*t*p3.y + t*t*t*p4.y,
+                );
+                painter.line_segment([prev, pt], pen);
+                prev = pt;
+            }
+            // Control-point dots
             dot(p1); dot(p2); dot(p3); dot(p4);
         }
     }
@@ -5162,6 +5210,18 @@ impl eframe::App for CadApp {
                 self.add_dobject(Geom::Polyline(Polyline {
                     vertices: verts, closed: false,
                 }), "canvas");
+            } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
+                // SPLINE commit — degree-3 (cubic) clamped/open uniform
+                // NURBS through the captured control points, all
+                // weights = 1.0 (non-rational B-spline). Cubic is the
+                // CAD default; smaller pending counts get a lower
+                // effective degree to keep the curve well-formed.
+                let n = self.pending.len();
+                let degree = 3.min(n - 1);
+                let ctrls: Vec<Vec2> = self.pending.drain(..).collect();
+                self.pending_bulges.clear();
+                let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
+                self.add_dobject(Geom::Spline(spline), "canvas");
             } else {
                 // Item 4 — fully idle: Enter on empty cmd repeats last cmd.
                 if let Some(last) = self.last_command.clone() {
@@ -5378,6 +5438,7 @@ impl eframe::App for CadApp {
                 tool_button(ui, &mut self.tool, Tool::EllipseArc, "ell.arc");
                 tool_button(ui, &mut self.tool, Tool::Point,    "point");
                 tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
+                tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
@@ -5513,6 +5574,8 @@ impl eframe::App for CadApp {
                     Tool::EllipseArc => (String::from("DRAWING ELLIPTICAL ARC"), green),
                     Tool::Point     => (String::from("PLACING POINT"), green),
                     Tool::Polyline  => (format!("DRAWING POLYLINE ({} verts; Enter to finish, 'c' Enter to close)",
+                        self.pending.len()), green),
+                    Tool::Spline    => (format!("DRAWING SPLINE ({} ctrl pts; Enter finishes after \u{2265}3)",
                         self.pending.len()), green),
                     Tool::Arc     => (format!("DRAWING ARC ({})",
                         self.arc_method.name()), green),
@@ -7878,6 +7941,51 @@ impl eframe::App for CadApp {
                                 }
                             }
                         }
+                        // Spline live preview — control-polygon hint
+                        // (thin chord lines between successive captured
+                        // control points) PLUS the actual NURBS curve
+                        // sampled through pending + cursor as the live
+                        // next control point. Cubic by default (degree
+                        // 3); lower degrees fall in until the user has
+                        // ≥ 4 control points.
+                        (Tool::Spline, verts) if !verts.is_empty() => {
+                            // Captured control points as small dots.
+                            for w in verts.iter() {
+                                painter.circle_filled(self.w2s(*w, rect), 3.0, preview_col);
+                            }
+                            // Faint control polygon.
+                            let hint_pen = egui::Stroke::new(
+                                0.7, preview_col.gamma_multiply(0.4));
+                            for pair in verts.windows(2) {
+                                painter.line_segment(
+                                    [self.w2s(pair[0], rect), self.w2s(pair[1], rect)],
+                                    hint_pen);
+                            }
+                            // Last captured → cursor (control-polygon
+                            // continuation, hinting where the next
+                            // ctrl lands).
+                            if let Some(last) = verts.last() {
+                                painter.line_segment(
+                                    [self.w2s(*last, rect), cursor], hint_pen);
+                            }
+                            // The CURVE — build a transient Spline
+                            // including the cursor as the live next
+                            // control point, tessellate, draw dashed.
+                            let mut ctrls: Vec<Vec2> = verts.to_vec();
+                            ctrls.push(cw);
+                            if ctrls.len() >= 2 {
+                                let degree = 3.min(ctrls.len() - 1);
+                                let s = cad_kernel::Spline::new_bspline(degree, ctrls);
+                                let n = (s.bbox().1 - s.bbox().0).len() as f32 * self.scale;
+                                let n = (n * 0.5).clamp(32.0, 256.0) as usize;
+                                let samples = s.tessellate(n);
+                                if samples.len() >= 2 {
+                                    let pts: Vec<egui::Pos2> = samples.iter()
+                                        .map(|w| self.w2s(*w, rect)).collect();
+                                    painter.add(egui::Shape::line(pts, dash));
+                                }
+                            }
+                        }
                         // Ellipse 3-click flow.
                         // Stage 1 (pending=[centre]): rubber-band line from
                         // centre to cursor — defines the major axis.
@@ -8502,6 +8610,12 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             // Hatch MVP exposes no grips — boundary vertices may become
             // PolyVertex grips later. Nothing to draw.
         }
+        Geom::Spline(s) => {
+            // Spline grips = every control point. Dragging one
+            // reshapes the curve locally (see GripRole::SplineCtrlPt
+            // in the kernel).
+            for p in &s.control_points { draw(*p); }
+        }
     }
 }
 
@@ -8643,6 +8757,20 @@ fn draw_dobject_thick(
             // bug, so silently drop instead of crashing.
             let _ = (color, stroke);
         }
+        Geom::Spline(s) => {
+            // NURBS → screen polyline. Density scales with on-screen
+            // size of the control polygon; pickbox-precision at most
+            // typical zooms. Refine when someone zooms in past the
+            // chord error of a 64-sample tessellation.
+            let (min, max) = s.bbox();
+            let bbox_diag_px = ((max - min).len() as f32) * app.scale;
+            let n = (bbox_diag_px * 0.5).clamp(32.0, 512.0) as usize;
+            let samples = s.tessellate(n);
+            if samples.len() < 2 { return; }
+            let pts: Vec<egui::Pos2> = samples.iter()
+                .map(|w| app.w2s(*w, rect)).collect();
+            painter.add(egui::Shape::line(pts, stroke));
+        }
     }
 }
 
@@ -8742,6 +8870,18 @@ fn draw_dobject_dashed(
             // outline when selected — and editing happens on the
             // boundary, not on the hatch itself. Hatch dashed-overlay
             // is a no-op until we have a selectable-hatch UI flow.
+        }
+        Geom::Spline(s) => {
+            // Selection highlight — same tessellation as the solid
+            // render, dashed.
+            let (min, max) = s.bbox();
+            let bbox_diag_px = ((max - min).len() as f32) * app.scale;
+            let n = (bbox_diag_px * 0.5).clamp(32.0, 512.0) as usize;
+            let samples = s.tessellate(n);
+            if samples.len() < 2 { return; }
+            let pts: Vec<egui::Pos2> = samples.iter()
+                .map(|w| app.w2s(*w, rect)).collect();
+            push_dashed(pts);
         }
     }
 }

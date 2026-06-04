@@ -53,6 +53,12 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // dobject and intersection with that is what the user wants. The
         // Hatch entity itself contributes no intersections.
         (Hatch(_), _) | (_, Hatch(_)) => Vec::new(),
+
+        // Spline ∩ anything: not implemented yet — NURBS curve
+        // intersection is a non-trivial numerical problem (typically
+        // Bézier-subdivision + Newton refinement). Return empty for
+        // v1; trim/extend against splines is also gated upstream.
+        (Spline(_), _) | (_, Spline(_)) => Vec::new(),
     }
 }
 
