@@ -8107,6 +8107,33 @@ impl eframe::App for CadApp {
                             skipped += 1;
                             continue;
                         }
+                        // ---- Hatch short-circuit (BEFORE viewport /
+                        // micro-cull / state-branches). Hatch's bbox is a
+                        // (0,0) placeholder (the kernel can't resolve
+                        // boundary handles to a real bbox), so the
+                        // viewport-bbox cull and the bbox_px micro-cull
+                        // below would both wrongly drop it. The selection-
+                        // dashed and trim-pulse branches also call
+                        // render functions that stub Hatch as a no-op.
+                        // Dispatch directly to render_hatch_fill here so
+                        // none of that matters.
+                        if let Geom::Hatch(h) = &e.geom {
+                            let color = if self.selected == Some(i)
+                                || self.selection.contains(&i)
+                            {
+                                egui::Color32::from_rgb(255, 200, 80)
+                            } else if snap_source == Some(i) {
+                                egui::Color32::from_rgb(120, 240, 255)
+                            } else {
+                                let (r, g, b) = resolve_color(
+                                    e.style.color, e.style.layer,
+                                    &self.doc.layers, &self.doc.truecolors);
+                                egui::Color32::from_rgb(r, g, b)
+                            };
+                            self.render_hatch_fill(&painter, rect, h, color);
+                            drawn += 1;
+                            continue;
+                        }
                         let (emin, emax) = e.bbox();
                         if emax.x < v_min.x || emin.x > v_max.x
                         || emax.y < v_min.y || emin.y > v_max.y {

@@ -24,6 +24,12 @@ pub struct UniformGrid {
     pub cols:      usize,
     pub rows:      usize,
     cells: Vec<Vec<u32>>,  // row-major, cells[row * cols + col]
+    /// Indices of dobjects whose `Geom::is_view_independent_bbox()`
+    /// returned true (Hatch today). They're NOT bucketed into cells
+    /// because their bbox is a degenerate placeholder; instead they
+    /// get appended to every query result so the render path always
+    /// has a chance to draw them.
+    view_independent: Vec<u32>,
 }
 
 impl UniformGrid {
@@ -33,6 +39,7 @@ impl UniformGrid {
             origin:    Vec2::ZERO,
             cols: 0, rows: 0,
             cells: Vec::new(),
+            view_independent: Vec::new(),
         }
     }
 
@@ -41,15 +48,33 @@ impl UniformGrid {
         assert!(cell_size > 0.0, "cell_size must be positive");
         if dobjects.is_empty() { return Self::empty(); }
 
-        // overall world bbox
+        // overall world bbox — only over dobjects whose bbox is
+        // view-meaningful. View-independent bboxes (e.g. Hatch's
+        // placeholder (0,0)) would otherwise distort the grid origin
+        // and force absurd cell counts.
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for e in dobjects {
+        let mut view_independent: Vec<u32> = Vec::new();
+        for (i, e) in dobjects.iter().enumerate() {
+            if e.geom.is_view_independent_bbox() {
+                view_independent.push(i as u32);
+                continue;
+            }
             let (emin, emax) = e.bbox();
             if emin.x < min.x { min.x = emin.x; }
             if emin.y < min.y { min.y = emin.y; }
             if emax.x > max.x { max.x = emax.x; }
             if emax.y > max.y { max.y = emax.y; }
+        }
+        // If EVERY dobject is view-independent, there's no spatial grid
+        // to build — return an empty grid that still carries the
+        // global list, so query_bbox keeps returning the hatches.
+        if !min.x.is_finite() {
+            return Self {
+                cell_size, origin: Vec2::ZERO, cols: 0, rows: 0,
+                cells: Vec::new(),
+                view_independent,
+            };
         }
 
         let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
@@ -57,6 +82,9 @@ impl UniformGrid {
         let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
 
         for (i, e) in dobjects.iter().enumerate() {
+            if e.geom.is_view_independent_bbox() {
+                continue;   // already in view_independent
+            }
             let (emin, emax) = e.bbox();
             let xmin = (((emin.x - min.x) / cell_size).floor() as isize).max(0) as usize;
             let xmax = (((emax.x - min.x) / cell_size).floor() as isize).max(0) as usize;
@@ -72,7 +100,7 @@ impl UniformGrid {
             }
         }
 
-        Self { cell_size, origin: min, cols, rows, cells }
+        Self { cell_size, origin: min, cols, rows, cells, view_independent }
     }
 
     /// Pick a cell size that targets `target_per_cell` dobjects per cell, on
@@ -81,16 +109,20 @@ impl UniformGrid {
         if dobjects.is_empty() { return 1.0; }
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut count_real: usize = 0;
         for e in dobjects {
+            if e.geom.is_view_independent_bbox() { continue; }
+            count_real += 1;
             let (emin, emax) = e.bbox();
             if emin.x < min.x { min.x = emin.x; }
             if emin.y < min.y { min.y = emin.y; }
             if emax.x > max.x { max.x = emax.x; }
             if emax.y > max.y { max.y = emax.y; }
         }
+        if count_real == 0 { return 1.0; }
         let w = (max.x - min.x).max(1.0);
         let h = (max.y - min.y).max(1.0);
-        let by_density = (w * h * target_per_cell / dobjects.len() as f64).sqrt();
+        let by_density = (w * h * target_per_cell / count_real as f64).sqrt();
         by_density.max(0.001).min(1.0e6)
     }
 
@@ -98,7 +130,12 @@ impl UniformGrid {
     /// Deduplicated. DObjects were bucketed by bbox so callers may still need
     /// a tighter test for exact-overlap semantics.
     pub fn query_bbox(&self, q_min: Vec2, q_max: Vec2) -> Vec<u32> {
-        if self.cells.is_empty() { return Vec::new(); }
+        // Even an empty cell grid must still return the view-independent
+        // dobjects (Hatch etc.) — their bbox is a placeholder, so a
+        // bbox-overlap test would always miss them.
+        if self.cells.is_empty() {
+            return self.view_independent.clone();
+        }
         let cs = self.cell_size;
         let to_cell = |v: f64, axis_origin: f64| -> isize {
             ((v - axis_origin) / cs).floor() as isize
@@ -107,7 +144,9 @@ impl UniformGrid {
         let xmax = (to_cell(q_max.x, self.origin.x).max(0) as usize).min(self.cols - 1);
         let ymin = to_cell(q_min.y, self.origin.y).max(0) as usize;
         let ymax = (to_cell(q_max.y, self.origin.y).max(0) as usize).min(self.rows - 1);
-        if xmin > xmax || ymin > ymax { return Vec::new(); }
+        if xmin > xmax || ymin > ymax {
+            return self.view_independent.clone();
+        }
 
         // HashSet for dedup. Result is typically small (hundreds to low
         // thousands); HashSet's per-insert cost dominates only if we hit the
@@ -120,6 +159,10 @@ impl UniformGrid {
                     out.insert(idx);
                 }
             }
+        }
+        // Append view-independent always-include set.
+        for &idx in &self.view_independent {
+            out.insert(idx);
         }
         out.into_iter().collect()
     }

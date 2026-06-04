@@ -1302,6 +1302,26 @@ impl Geom {
             Geom::Spline(s) => s.bbox(),
         }
     }
+
+    /// True iff this dobject's bbox is NOT a reliable view-culling key.
+    ///
+    /// Hatches reference their boundary by handle, so the kernel can't
+    /// compute the bbox without the Document. Bbox returns (0, 0) as a
+    /// placeholder — which means a spatial-index bbox-query may filter
+    /// the hatch out unless the camera happens to include the origin.
+    ///
+    /// Spatial indexes (e.g. `UniformGrid`) MUST treat
+    /// view-independent dobjects as ALWAYS in the candidate set, so
+    /// the resolved-by-handle render path still gets a chance to draw
+    /// them. App-level renderers MUST short-circuit them BEFORE
+    /// viewport-bbox culls.
+    ///
+    /// Future variants (Region, BlockRef, Xref) that store references
+    /// rather than vertices will override this the same way Hatch
+    /// does today.
+    pub fn is_view_independent_bbox(&self) -> bool {
+        matches!(self, Geom::Hatch(_))
+    }
 }
 
 // ---- Ellipse / EllipseArc geometry ----------------------------------------
