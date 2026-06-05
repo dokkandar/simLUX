@@ -501,6 +501,12 @@ pub enum QueuedOp {
     /// finalised selection, append a Hatch dobject whose boundary copies
     /// that polyline's vertices, filled with the active color.
     Hatch,
+    /// Array — applied on Enter. The finalised selection becomes the
+    /// SOURCES for the array generation; the array dialog re-shows
+    /// itself and the user adjusts rows/cols/dx/dy then clicks
+    /// Generate. Multi-source: every grid cell instantiates a copy of
+    /// every dobject in the selection (offset by cell position).
+    Array,
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -1734,6 +1740,17 @@ impl CadApp {
             }
             QueuedOp::Hatch => {
                 self.apply_hatch();
+            }
+            QueuedOp::Array => {
+                // Selection basket now holds the array source(s). Re-show
+                // the array dialog so the user can set rows/cols/dx/dy
+                // and click Generate. We don't drain the basket — the
+                // dialog uses `self.selection` directly.
+                self.array_open = true;
+                self.clear_prompt();
+                self.history.push(format!(
+                    "  array: {} source dobject(s) picked — set rows/cols and Generate",
+                    self.selection.len()));
             }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
@@ -5556,40 +5573,42 @@ impl CadApp {
     // ---- array generator -----------------------------------------------
 
     fn generate_array(&mut self) {
-        let Some(src) = self.selected else {
-            self.history.push("  ! select an dobject first (click it in the right panel)".into());
-            return;
-        };
-        if src >= self.doc.dobjects.len() {
-            self.history.push("  ! invalid selection".into());
+        // Multi-source: iterate `self.selection` (the standard basket).
+        // Every grid cell instantiates a copy of every source, offset
+        // by that cell's (c·dx, r·dy). The cell at (0, 0) is the
+        // source itself — skipped so we don't duplicate the originals.
+        let sources: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        if sources.is_empty() {
+            self.history.push("  ! array: no sources selected".into());
             return;
         }
-        let source = self.doc.dobjects[src].clone();
         let cols = self.array_cols.max(1);
         let rows = self.array_rows.max(1);
         let dx   = self.array_dx;
         let dy   = self.array_dy;
-        let copies = cols * rows;
+        let cells = cols * rows;
+        let new_dobjects = cells.saturating_sub(1) * sources.len();
 
-        // pre-reserve to avoid repeated allocs
-        self.doc.dobjects.reserve(copies - 1);
+        self.doc.dobjects.reserve(new_dobjects);
         for r in 0..rows {
             for c in 0..cols {
-                if r == 0 && c == 0 { continue; }   // skip the source itself
+                if r == 0 && c == 0 { continue; }   // skip the source cell
                 let off = Vec2::new(c as f64 * dx, r as f64 * dy);
-                self.doc.dobjects.push(source.translated(off));
+                for s in &sources {
+                    self.doc.dobjects.push(s.translated(off));
+                }
             }
         }
         let new_total = self.doc.dobjects.len();
         self.intersections.clear();
-        self.index_dirty = true;        // bulk add — invalidate the index
-        self.gpu_dirty   = true;        // upload-on-next-render
+        self.index_dirty = true;
+        self.gpu_dirty   = true;
         self.history.push(format!(
-            "  + array: {} cols × {} rows = {} copies → {} dobjects. (press an ∩ button to query)",
-            cols, rows, copies - 1, new_total,
+            "  + array: {} cells × {} source(s) = {} new → {} total dobjects",
+            cells, sources.len(), new_dobjects, new_total,
         ));
-        // Immediately rebuild the spatial index so render culling kicks in on
-        // the very next frame instead of waiting for the user's first ∩ press.
         self.ensure_index();
     }
 }
@@ -7669,94 +7688,60 @@ impl eframe::App for CadApp {
         }
 
         // ---- array dialog --------------------------------------------------
-        // Two states:
-        //  - picking_source = true  → dialog HIDDEN, small banner shown, waiting
-        //                              for the user to click an dobject in the right
-        //                              panel; the click leaves pick-mode and the
-        //                              dialog reappears.
-        //  - picking_source = false → full dialog shown.
-        if self.array_open {
-            if self.picking_source {
-                // Banner — small, doesn't obscure the right panel.
-                // Three completion paths: click an dobject on the
-                // canvas (uses nearest_entity_under), click an dobject
-                // row in the DObjects panel, OR press OK to accept
-                // whatever `self.selected` already holds (useful when
-                // the user has already picked something via canvas
-                // earlier and just wants to reuse it).
-                let current_desc = self.selected
-                    .and_then(|i| self.doc.dobjects.get(i))
-                    .map(|d| describe(&d.geom));
-                let mut do_ok     = false;
-                let mut do_cancel = false;
-                egui::Window::new("Pick array source")
-                    .resizable(false)
-                    .collapsible(false)
-                    .show(ctx, |ui| {
-                        ui.set_min_width(320.0);
-                        ui.colored_label(
-                            egui::Color32::from_rgb(255, 220, 100),
-                            "→ Click an dobject on the canvas, or pick a row in the DObjects panel.",
-                        );
-                        ui.label("Once a source is picked the array dialog returns.");
-                        ui.separator();
-                        match &current_desc {
-                            Some(d) => {
-                                ui.horizontal(|ui| {
-                                    ui.label("current source:");
-                                    ui.monospace(format!("#{} {}",
-                                        self.selected.unwrap(), d));
-                                });
-                            }
-                            None => {
-                                ui.colored_label(
-                                    egui::Color32::from_rgb(255, 140, 140),
-                                    "(no source picked yet — OK is disabled)");
-                            }
-                        }
-                        ui.horizontal(|ui| {
-                            if ui.add_enabled(self.selected.is_some(),
-                                              egui::Button::new("OK"))
-                                .on_hover_text("Accept the currently-selected dobject as the array source")
-                                .clicked()
-                            {
-                                do_ok = true;
-                            }
-                            if ui.button("Cancel pick").clicked() {
-                                do_cancel = true;
-                            }
-                        });
-                    });
-                if do_ok || do_cancel {
-                    self.picking_source = false;
-                }
-            } else {
+        // The dialog uses the STANDARD selection-basket flow for picking
+        // sources: "Select sources ↓" begins a SelectMode::ForSelect
+        // session with QueuedOp::Array. The array dialog HIDES during
+        // that session (`self.select_mode != SelectMode::Off` is the
+        // gate); user clicks dobjects (basket grows, dashed-gray
+        // rendering), presses Enter; QueuedOp::Array's finalise handler
+        // re-shows this dialog. Multi-source: every source goes into
+        // every grid cell.
+        let in_array_pick = self.array_open
+            && self.queued_op == QueuedOp::Array
+            && self.select_mode != SelectMode::Off;
+        if self.array_open && !in_array_pick {
+            {
                 let mut do_generate = false;
                 let mut close_it    = false;
                 let mut start_pick  = false;
-                let selected_desc = self.selected.and_then(|i| self.doc.dobjects.get(i))
-                    .map(|d| describe(&d.geom));
+                let sources: Vec<(usize, String)> = self.selection.iter()
+                    .filter_map(|&i| self.doc.dobjects.get(i)
+                        .map(|d| (i, describe(&d.geom))))
+                    .collect();
                 egui::Window::new("Rectangular Array")
                     .resizable(false)
                     .collapsible(false)
                     .show(ctx, |ui| {
-                        ui.set_min_width(340.0);
-                        ui.label("Duplicates the selected dobject into a grid.");
+                        ui.set_min_width(360.0);
+                        ui.label("Duplicates the selected dobject(s) into a grid.");
                         ui.separator();
 
-                        // Source row: "Select source" button + current selection display
+                        // Source row: "Select sources" button + count + first-source preview
                         ui.horizontal(|ui| {
-                            if ui.button("Select source ↓").clicked() {
+                            if ui.button("Select sources ↓")
+                                .on_hover_text("Begin a selection session — click dobjects, Enter to finish")
+                                .clicked()
+                            {
                                 start_pick = true;
                             }
-                            match &selected_desc {
-                                Some(d) => { ui.monospace(format!("#{} {}",
-                                    self.selected.unwrap(), d)); }
-                                None    => { ui.colored_label(
+                            if sources.is_empty() {
+                                ui.colored_label(
                                     egui::Color32::from_rgb(255, 140, 140),
-                                    "no source selected"); }
+                                    "no sources selected");
+                            } else {
+                                ui.label(format!("{} source(s):", sources.len()));
                             }
                         });
+                        if !sources.is_empty() {
+                            egui::ScrollArea::vertical()
+                                .id_salt("array_sources")
+                                .max_height(80.0)
+                                .show(ui, |ui| {
+                                    for (i, d) in &sources {
+                                        ui.monospace(format!("  #{} {}", i, d));
+                                    }
+                                });
+                        }
                         ui.separator();
 
                         ui.horizontal(|ui| {
@@ -7773,11 +7758,12 @@ impl eframe::App for CadApp {
                             ui.label("    dy");
                             ui.add(egui::DragValue::new(&mut self.array_dy).speed(1.0));
                         });
-                        let total = self.array_cols * self.array_rows;
-                        let total_after = self.doc.dobjects.len() + total.saturating_sub(1);
+                        let cells = self.array_cols * self.array_rows;
+                        let new_dobjects = cells.saturating_sub(1) * sources.len().max(1);
+                        let total_after = self.doc.dobjects.len() + new_dobjects;
                         ui.label(format!(
-                            "{} copies → {} dobjects total after generation",
-                            total - 1, total_after
+                            "{} cell(s) × {} source(s) = {} new dobjects → {} total",
+                            cells, sources.len(), new_dobjects, total_after
                         ));
                         if total_after > 1500 {
                             ui.colored_label(
@@ -7793,7 +7779,7 @@ impl eframe::App for CadApp {
                         }
                         ui.separator();
                         ui.horizontal(|ui| {
-                            if ui.add_enabled(self.selected.is_some(),
+                            if ui.add_enabled(!sources.is_empty(),
                                               egui::Button::new("Generate")).clicked() {
                                 do_generate = true;
                             }
@@ -7802,7 +7788,17 @@ impl eframe::App for CadApp {
                             }
                         });
                     });
-                if start_pick  { self.picking_source = true; }
+                if start_pick {
+                    // Begin a fresh selection session for picking
+                    // sources. The basket may already hold whatever
+                    // the user selected before opening the dialog —
+                    // we DON'T clear it, so prior selections carry
+                    // over (user can shift-click to remove).
+                    self.queued_op = QueuedOp::Array;
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.set_prompt(
+                        "array: pick source dobject(s), Enter to finish  [Esc=cancel]".to_string());
+                }
                 if do_generate { self.generate_array(); }
                 if close_it    { self.array_open = false; }
             }
