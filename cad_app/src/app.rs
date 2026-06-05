@@ -180,9 +180,23 @@ pub struct CadApp {
     /// per-cull skip counters. Surfaced in the "Screen Stats" floating
     /// window so the user can verify the renderer's view of the doc.
     last_render_stats: RenderStats,
+    /// APX (approximate / draft display) mode currently active. While
+    /// true, every visible dobject renders as a single dot at its
+    /// gravity point (per `env.LodAnc`) instead of full geometry —
+    /// one instanced GPU draw call for the entire scene, FPS recovers
+    /// from single-digit to 60+ on million-dobject drawings. Toggled
+    /// by the [APX] badge in the status bar. The underlying data is
+    /// unchanged; only the visual is approximate. Selection hit-
+    /// testing still uses the real geometry.
+    lod_active: bool,
     /// Whether the "Screen Stats" window is currently visible. Toggle
     /// via Tools menu.
     screen_stats_open: bool,
+    /// Previous-frame value of `screen_stats_open`. Lets render code
+    /// detect the false→true edge (window reopened via menu) and
+    /// clear any stale dock-pos so the window appears at its default
+    /// position instead of getting stuck behind a panel.
+    screen_stats_was_open: bool,
     /// Background worker for hatch trace. `None` when no trace is in
     /// flight. While `Some`, every frame `poll_hatch_worker` tries to
     /// receive the result; on receipt the loops are materialised as
@@ -214,7 +228,38 @@ pub struct CadApp {
     /// via `current_pos(...)` so the snap "sticks". Dragging the
     /// Window away further than the threshold removes the entry, so
     /// the snap is reversible.
-    docked_window_pos: HashMap<&'static str, egui::Pos2>,
+    ///
+    /// Stores both the snapped position AND the edge the window is
+    /// docked to. Edge drives sizing: docked to TOP/BOTTOM forces the
+    /// window to span the full screen width (it becomes a horizontal
+    /// strip); docked to LEFT/RIGHT forces full screen height
+    /// (vertical strip). Corner docks pin position but leave size
+    /// content-driven.
+    docked_window_pos: HashMap<&'static str, DockState>,
+    /// Accumulated hold-time on each docked window's title bar. Once
+    /// it reaches `DOCK_UNDOCK_HOLD_SEC` (~200 ms), the dock state is
+    /// cleared and the window goes back to free positioning so the
+    /// user can drag it elsewhere. Reset to zero whenever the button
+    /// is released. Per-window so two windows being held simultaneously
+    /// don't share a clock.
+    dock_undock_hold: HashMap<&'static str, f32>,
+    /// IDs of windows that the user is currently dragging. Used by
+    /// `process_dock_after_show` to evaluate snap-to-edge ONLY at the
+    /// end of a drag (drag-release transition). Without this gate,
+    /// snap would fire on any idle frame where the window happens to
+    /// sit near a screen edge — which auto-docks freshly-opened
+    /// windows on appear, before the user has even touched them.
+    dock_dragging: std::collections::HashSet<&'static str>,
+    /// Screen-space rect of the canvas (central panel) from the last
+    /// frame. Docking uses this — NOT `ctx.screen_rect()` — so docked
+    /// strips align with the canvas area instead of overlapping the
+    /// menubar / toolbar / status bar. Captured inside the
+    /// CentralPanel show closure, read by `apply_dock_pos` /
+    /// `process_dock_after_show` which run earlier in the same frame
+    /// (so they actually read the PREVIOUS frame's rect — fine, since
+    /// the canvas rect only changes when the user resizes the app
+    /// window).
+    canvas_screen_rect: Option<egui::Rect>,
     /// Open/closed state for each dockable Window panel. Default true
     /// for the most-used panels. Toggled from the Tools menu.
     cmd_window_open:     bool,
@@ -668,6 +713,23 @@ pub enum RenderMode {
     Gpu,
 }
 
+/// Which screen edge (if any) a floating Window is docked against.
+/// Drives the size behavior in `apply_dock_pos`:
+///   * Top/Bottom → full-width strip, content-fit height
+///   * Left/Right → full-height strip, content-fit width
+///   * Corners    → pinned position only, size content-fit
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DockEdge {
+    Top, Bottom, Left, Right,
+    TopLeft, TopRight, BottomLeft, BottomRight,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct DockState {
+    pub pos:  egui::Pos2,
+    pub edge: DockEdge,
+}
+
 /// Snapshot of what the render loop did this frame. Surfaced in the
 /// "Screen Stats" floating window so the user can see at a glance how
 /// many dobjects exist, how many are in the viewport, and how many
@@ -773,10 +835,15 @@ impl Default for CadApp {
             empty_enter_count_in_select: 0,
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
+            lod_active:          false,
             screen_stats_open:   true,
+            screen_stats_was_open: true,
             hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
+            dock_undock_hold:    HashMap::new(),
+            dock_dragging:       std::collections::HashSet::new(),
+            canvas_screen_rect:  None,
             cmd_window_open:     true,
             layers_window_open:  true,
             pens_window_open:    false,
@@ -2472,18 +2539,33 @@ impl CadApp {
         // been set to cancel the previous worker. Replace with new.
         let cancel = StdArc::new(AtomicBool::new(false));
         self.op_cancel = cancel.clone();
-        // Clone the Document for the worker — read-only on its side,
-        // so a snapshot is safe even if the user keeps editing on the
-        // main thread. Document::clone is O(N) over dobjects; for
-        // 1M dobjects this is the dominant up-front cost (will likely
-        // need optimisation when we get there).
-        let doc_snapshot = self.doc.clone();
+        // Snapshot only the scoped dobjects (~tens to a few thousand),
+        // not the whole Document. At 9M dobjects, `self.doc.clone()`
+        // is ~1 GB of memcpy — multi-second freeze per pick-point click.
+        // The worker's tessellation only ever touches `scope`, so the
+        // dobjects outside scope are dead weight in the snapshot.
+        //
+        // The new doc carries the small ancillary tables (layers,
+        // linetypes, pens, truecolors) verbatim — they're cheap and
+        // the worker may resolve colors / styles through them.
+        // `scope_for_thread` is remapped to `[0..scoped_n)` since the
+        // dobjects are now at fresh contiguous indices in the snapshot.
+        let mut doc_snapshot = cad_kernel::Document::default();
+        doc_snapshot.layers     = self.doc.layers.clone();
+        doc_snapshot.linetypes  = self.doc.linetypes.clone();
+        doc_snapshot.pens       = self.doc.pens.clone();
+        doc_snapshot.truecolors = self.doc.truecolors.clone();
+        doc_snapshot.dobjects   = scope.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            .collect();
+        let scoped_n = doc_snapshot.dobjects.len();
         let cancel_for_thread = cancel.clone();
         let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
-        // Move the viewport scope into the worker — restricts tessellation
-        // to dobjects whose bbox overlaps the viewport bbox. CRITICAL for
-        // 400k+ dobject docs.
-        let scope_for_thread = scope.clone();
+        // The worker's scope is now the full range of the snapshot
+        // (every dobject in the snapshot WAS in the original scope).
+        // No remapping needed downstream — poll_hatch_worker only
+        // consumes the trace's vertex loops, not the src indices.
+        let scope_for_thread: Vec<usize> = (0..scoped_n).collect();
         thread::spawn(move || {
             let mut log: Vec<String> = Vec::new();
             log.push(format!(
@@ -2683,6 +2765,13 @@ impl CadApp {
         // makes this O(visible cells) instead of O(N). Fallback to
         // full doc only when the index is stale or no frame has
         // rendered yet.
+        //
+        // CRITICAL: rebuild the index FIRST if it's dirty. Otherwise
+        // viewport_scope() falls back to full-doc range, which defeats
+        // the whole point of scoping. This bug bit on the 2nd click in
+        // a multi-pick session — the 1st hatch's `index_dirty = true`
+        // turned the 2nd click into a full-doc scan.
+        let _ = self.ensure_index();
         let view_scope: Vec<usize> = self.viewport_scope()
             .unwrap_or_else(|| (0..self.doc.dobjects.len()).collect());
         let total = self.doc.dobjects.len();
@@ -3000,19 +3089,38 @@ impl CadApp {
     /// Width within which a floating Window's edge is treated as "close
     /// enough to dock". Same value the user asked for.
     const DOCK_THRESHOLD_PX: f32 = 50.0;
+    /// Minimum width docked top/bottom strips will use. Prevents the
+    /// window from shrinking below this when the user resizes it
+    /// after docking.
+    const DOCK_STRIP_MIN_WIDTH:  f32 = 320.0;
+    /// Minimum height docked left/right strips will use.
+    const DOCK_STRIP_MIN_HEIGHT: f32 = 200.0;
+    /// Hold the title bar this long (seconds) to release a docked
+    /// window. Long enough that an accidental click doesn't undock,
+    /// short enough that a deliberate "I want to move this" feels
+    /// instant.
+    const DOCK_UNDOCK_HOLD_SEC: f32 = 0.20;
 
-    /// If `id` has a snapped position stored, attach `current_pos` to
-    /// the Window so it renders there. Reversible — when the user
-    /// drags away further than the threshold, `process_dock_after_show`
-    /// removes the entry and the Window goes back to free positioning.
+    /// If `id` has a docked state stored, pin its position AND constrain
+    /// its size based on which edge it's docked to:
+    ///   * Top/Bottom → forces `min_width = screen_width` so the
+    ///     window becomes a horizontal strip spanning the screen.
+    ///   * Left/Right → forces `min_height = screen_height` for a
+    ///     vertical strip.
+    ///   * Corners    → pinned position only; size stays content-fit.
+    /// Reversible — when the user drags away further than the
+    /// threshold, `process_dock_after_show` removes the entry and the
+    /// Window goes back to free positioning + sizing.
     fn apply_dock_pos<'a>(
         &self,
-        id: &'static str,
-        mut window: egui::Window<'a>,
+        _id: &'static str,
+        _ctx: &egui::Context,
+        window: egui::Window<'a>,
     ) -> egui::Window<'a> {
-        if let Some(p) = self.docked_window_pos.get(id) {
-            window = window.current_pos(*p);
-        }
+        // Auto-docking + auto-resize disabled per user request — was
+        // wasting time on edge cases. Windows are now plain floating:
+        // user moves and resizes manually. Will be redone in a dedicated
+        // dock-system pass later.
         window
     }
 
@@ -3026,33 +3134,12 @@ impl CadApp {
         ctx: &egui::Context,
         resp: Option<egui::InnerResponse<R>>,
     ) {
-        let Some(r) = resp else { return; };
-        let rect = r.response.rect;
-        let screen = ctx.screen_rect();
-        let th = Self::DOCK_THRESHOLD_PX;
-        let mut p = rect.min;
-        let mut snapped = false;
-        // Horizontal edges
-        if rect.min.x >= screen.min.x && (rect.min.x - screen.min.x) < th {
-            p.x = screen.min.x;
-            snapped = true;
-        } else if rect.max.x <= screen.max.x && (screen.max.x - rect.max.x) < th {
-            p.x = screen.max.x - rect.width();
-            snapped = true;
-        }
-        // Vertical edges
-        if rect.min.y >= screen.min.y && (rect.min.y - screen.min.y) < th {
-            p.y = screen.min.y;
-            snapped = true;
-        } else if rect.max.y <= screen.max.y && (screen.max.y - rect.max.y) < th {
-            p.y = screen.max.y - rect.height();
-            snapped = true;
-        }
-        if snapped {
-            self.docked_window_pos.insert(id, p);
-        } else {
-            self.docked_window_pos.remove(id);
-        }
+        // Auto-snap disabled per user request. Was triggering false
+        // positives (windows docking to top on first appear, all
+        // windows piling up at the top, etc.). Will be redesigned in
+        // a dedicated dock-system pass later. For now: leave windows
+        // free-floating — user manages position/size manually.
+        let _ = (id, ctx, resp);
     }
 
     fn render_hatch_dialog(&mut self, ctx: &egui::Context) {
@@ -3262,7 +3349,7 @@ impl CadApp {
             .default_width(640.0)
             .default_height(400.0)
             .resizable(true);
-        let win = self.apply_dock_pos("Trim Debug Log", win);
+        let win = self.apply_dock_pos("Trim Debug Log", ctx, win);
         let resp = win.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
@@ -3326,7 +3413,7 @@ impl CadApp {
             .default_width(720.0)
             .default_height(420.0)
             .resizable(true);
-        let win = self.apply_dock_pos("Hatch Debug Log", win);
+        let win = self.apply_dock_pos("Hatch Debug Log", ctx, win);
         let resp = win.show(ctx, |ui| {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy Log").on_hover_text("Copy the whole log to the clipboard").clicked() {
@@ -3486,6 +3573,14 @@ impl CadApp {
     /// Tools menu; open by default because that's the whole point —
     /// the user wanted to SEE this info.
     fn render_screen_stats_window(&mut self, ctx: &egui::Context) {
+        // Detect false→true edge: user just reopened the window via
+        // menu. Clear any stale snap-dock so the window appears at its
+        // default_pos instead of getting stuck at an old snap position
+        // (which can be off-screen or behind a panel after a resize).
+        if self.screen_stats_open && !self.screen_stats_was_open {
+            self.docked_window_pos.remove("Screen Stats");
+        }
+        self.screen_stats_was_open = self.screen_stats_open;
         if !self.screen_stats_open { return; }
         let mut open = self.screen_stats_open;
         let stats = self.last_render_stats.clone();
@@ -3496,7 +3591,7 @@ impl CadApp {
             .default_size(egui::vec2(280.0, 220.0))
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Screen Stats", win);
+        let win = self.apply_dock_pos("Screen Stats", ctx, win);
         let resp = win.show(ctx, |ui| {
             ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.0));
             let cull_ratio = if stats.total > 0 {
@@ -3588,7 +3683,7 @@ impl CadApp {
             .min_width(240.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Layers", win);
+        let win = self.apply_dock_pos("Layers", ctx, win);
         let resp = win.show(ctx, |ui| {
                 ui.separator();
 
@@ -4013,7 +4108,7 @@ impl CadApp {
             .min_width(220.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Pens", win);
+        let win = self.apply_dock_pos("Pens", ctx, win);
         let resp = win.show(ctx, |ui| {
                 ui.separator();
 
@@ -4124,7 +4219,7 @@ impl CadApp {
             .min_width(240.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Info / Properties", win);
+        let win = self.apply_dock_pos("Info / Properties", ctx, win);
         let resp = win.show(ctx, |ui| {
                 ui.separator();
 
@@ -6636,6 +6731,41 @@ fn aci_color_picker(
     changed
 }
 
+/// Text-only toolbar button styled to match `tool_button`'s color scheme
+/// and height so the toolbar reads as one consistent strip. Used for the
+/// panel-toggle buttons (snap, grips, settings, layers, pens, info, array)
+/// that don't have a drafted icon.
+///
+/// `active` highlights the button in the same blue as a selected drafting
+/// tool — visual cue that the corresponding panel is open / feature is on.
+fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
+    // Allocate space matching tool_button height (52 px) but text-width
+    // sized so the label decides the width.
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(12.0),
+        egui::Color32::from_rgb(225, 235, 245),
+    );
+    let pad_x = 10.0;
+    let size = egui::vec2((galley.size().x + pad_x * 2.0).max(56.0), 52.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if active {
+        egui::Color32::from_rgb(60, 110, 175)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::from_rgb(28, 34, 42)
+    };
+    painter.rect(
+        rect, 5.0, bg,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)),
+    );
+    let text_pos = rect.center() - egui::vec2(galley.size().x * 0.5, galley.size().y * 0.5);
+    painter.galley(text_pos, galley, egui::Color32::from_rgb(225, 235, 245));
+    resp.clicked()
+}
+
 fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -> bool {
     let selected = *current == this;
     let (resp, painter) =
@@ -7122,6 +7252,7 @@ impl eframe::App for CadApp {
             };
         }
 
+
         // global drafting-mode toggles (AutoCAD F-keys). Fire on key-press
         // anywhere — they're modeless and don't interfere with text input
         // since F-keys aren't typeable characters. Each one persists via
@@ -7510,16 +7641,9 @@ impl eframe::App for CadApp {
                     ui.checkbox(&mut self.pens_window_open,     "Pens");
                     ui.checkbox(&mut self.info_window_open,     "Info / Properties");
                     ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
-                    ui.checkbox(&mut self.screen_stats_open,    "Screen Stats")
-                        .on_hover_text(
-                            "Renderer's view of the doc: total / in viewport / drawn / skipped");
                     ui.separator();
                     if ui.button("Snap window").clicked() {
                         self.snap_window_open = !self.snap_window_open;
-                        ui.close_menu();
-                    }
-                    if ui.button("Trim Debug Log").clicked() {
-                        self.trim_debug_open = !self.trim_debug_open;
                         ui.close_menu();
                     }
                     if ui.button("Toggle Grips").clicked() {
@@ -7527,6 +7651,64 @@ impl eframe::App for CadApp {
                         let _ = self.env.save();
                         ui.close_menu();
                     }
+                    ui.separator();
+                    // ---- Debug tools submenu --------------------------
+                    // All diagnostic / development toggles live here in
+                    // one place. Adding new debug instruments? Put the
+                    // toggle here, not on the toolbar.
+                    ui.menu_button("Debug tools", |ui| {
+                        ui.checkbox(&mut self.screen_stats_open, "Screen Stats")
+                            .on_hover_text(
+                                "Renderer's view of the doc: total / in viewport / drawn / skipped");
+                        ui.checkbox(&mut self.debug_open, "Render mode (CPU/GPU + APX)")
+                            .on_hover_text("CPU/GPU toggle, APX (draft display), render stats");
+                        ui.checkbox(&mut self.trim_debug_open, "Trim Debug Log")
+                            .on_hover_text("Log every click + state transition during trim/extend");
+                        ui.checkbox(&mut self.hatch_debug_open, "Hatch Debug Log")
+                            .on_hover_text("Log dialog + pick-point + apply + render for hatch");
+                        ui.separator();
+                        // Spatial index — rebuild + status
+                        let idx_label = if self.index_dirty || self.index.is_none() {
+                            "Rebuild spatial index ⟲"
+                        } else {
+                            "Spatial index ✓ (fresh)"
+                        };
+                        if ui.button(idx_label).clicked() {
+                            self.ensure_index();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        // Intersection visualizer (diagnostic — shows ∩
+                        // points so the user can verify a query).
+                        ui.label(egui::RichText::new("Intersect visualizer").small().color(
+                            egui::Color32::from_rgb(150, 165, 185)));
+                        if ui.button("∩ view (whole viewport)").clicked() {
+                            self.intersect_view_pending = true;
+                            ui.close_menu();
+                        }
+                        let click_lbl = if self.intersect_pending_click {
+                            "∩ click — waiting for click…"
+                        } else {
+                            "∩ click — arm for next click"
+                        };
+                        if ui.button(click_lbl).clicked() {
+                            self.intersect_pending_click = !self.intersect_pending_click;
+                            ui.close_menu();
+                        }
+                        if ui.button("Clear ∩ overlay").clicked() {
+                            self.intersections.clear();
+                            self.last_intersect_label.clear();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        // Destructive — moved to Debug tools because it
+                        // wipes the entire document with no confirmation.
+                        if ui.button("Clear all dobjects (DESTRUCTIVE)").clicked() {
+                            self.clear_all();
+                            self.history.push("  cleared".into());
+                            ui.close_menu();
+                        }
+                    });
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Command help").clicked() {
@@ -7583,113 +7765,36 @@ impl eframe::App for CadApp {
                     self.pending.clear();
                 }
                 ui.add_space(20.0);
-                if ui.button("clear all").clicked() {
-                    self.clear_all();
-                    self.history.push("  cleared".into());
+                // ---- User-facing panel toggles ---------------------------
+                // Styled to match the drafting tool buttons (same height,
+                // same color scheme) so the toolbar reads as one strip.
+                // Debug-only buttons moved to Tools → Debug tools menu.
+                if panel_button(ui, "array…", self.array_open) {
+                    self.array_open = !self.array_open;
                 }
-                if ui.button("array…").clicked() {
-                    self.array_open = true;
-                }
-                // Spatial index rebuild button (auto-runs on first ∩ if dirty).
-                let idx_label = if self.index_dirty || self.index.is_none() {
-                    "rebuild idx ⟲"
-                } else {
-                    "idx ✓"
-                };
-                if ui.button(idx_label).clicked() {
-                    self.ensure_index();
-                }
-                if ui.button("debug…").on_hover_text("CPU/GPU toggle + render stats").clicked() {
-                    self.debug_open = !self.debug_open;
-                }
-                // OSNAP settings (floating window) + a quick on/off badge
-                // showing which kinds are currently active.
-                let snap_btn = format!(
-                    "snap… ({})",
-                    active_snap_letters(self.snap_enabled),
-                );
-                if ui.button(snap_btn)
-                    .on_hover_text("object snap settings — END, MID, CEN, INT, PER, TAN, NEA")
-                    .clicked()
-                {
+                // OSNAP settings (floating window) + active-snaps badge.
+                let snap_btn = format!("snap…\n{}", active_snap_letters(self.snap_enabled));
+                if panel_button(ui, &snap_btn, self.snap_window_open) {
                     self.snap_window_open = !self.snap_window_open;
                 }
-                // GRIPS toggle (also: typing `grips` on the command line, or
-                // the GrpEnb checkbox in the settings window).
-                let grips_btn = if self.env.GrpEnb { "grips: ON" } else { "grips: off" };
-                if ui.button(grips_btn)
-                    .on_hover_text("GrpEnb — show grip handles on the selected dobject")
-                    .clicked()
-                {
+                // GRIPS toggle (also: cmd `grips`, or GrpEnb in settings).
+                let grips_btn = if self.env.GrpEnb { "grips\nON" } else { "grips\noff" };
+                if panel_button(ui, grips_btn, self.env.GrpEnb) {
                     self.env.GrpEnb = !self.env.GrpEnb;
                 }
-                // Settings window
-                if ui.button("settings…")
-                    .on_hover_text("User-Environment Settings (UserEnv)")
-                    .clicked()
-                {
+                if panel_button(ui, "settings…", self.settings_open) {
                     self.settings_open = !self.settings_open;
                 }
-                // Layer panel toggle
-                let layer_btn = if self.layer_panel_open { "layers ▾" } else { "layers ▸" };
-                if ui.button(layer_btn)
-                    .on_hover_text("Layer panel — add / rename / delete / visibility / lock / freeze")
-                    .clicked()
-                {
+                if panel_button(ui, "layers", self.layer_panel_open) {
                     self.layer_panel_open = !self.layer_panel_open;
                 }
-                // Pen palette toggle
-                let pen_btn = if self.pen_panel_open { "pens ▾" } else { "pens ▸" };
-                if ui.button(pen_btn)
-                    .on_hover_text("Pen palette — preset (color + linetype + lineweight) bundles; click to apply to selection")
-                    .clicked()
-                {
+                if panel_button(ui, "pens", self.pen_panel_open) {
                     self.pen_panel_open = !self.pen_panel_open;
                 }
-                // Entity Info panel toggle
-                let info_btn = if self.info_panel_open { "info ▾" } else { "info ▸" };
-                if ui.button(info_btn)
-                    .on_hover_text("Entity Info — properties of current selection (read + edit layer/color/visibility)")
-                    .clicked()
-                {
+                if panel_button(ui, "info", self.info_panel_open) {
                     self.info_panel_open = !self.info_panel_open;
                 }
-                // Trim Debug window toggle
-                let tdbg_label = if self.trim_debug_open { "trim dbg ▾" } else { "trim dbg ▸" };
-                if ui.button(tdbg_label)
-                    .on_hover_text("Trim Debug — log every click + state transition; Copy Log button writes to clipboard")
-                    .clicked()
-                {
-                    self.trim_debug_open = !self.trim_debug_open;
-                }
-                // Hatch Debug window toggle — sibling to Trim Debug.
-                let hdbg_label = if self.hatch_debug_open { "hatch dbg ▾" } else { "hatch dbg ▸" };
-                if ui.button(hdbg_label)
-                    .on_hover_text("Hatch Debug — log dialog + pick-point + apply + render at every state transition")
-                    .clicked()
-                {
-                    self.hatch_debug_open = !self.hatch_debug_open;
-                }
                 ui.add_space(20.0);
-                ui.label("intersect:");
-                // View-mode: intersect only dobjects visible in the current viewport.
-                // The action is deferred to the canvas closure (which is where the
-                // viewport rect actually becomes known); we just set a flag here.
-                if ui.button("∩ view").clicked() {
-                    self.intersect_view_pending = true;
-                }
-                // Click-mode: arm a one-shot, the next canvas click computes
-                // intersections in a 50-pixel radius around the click point.
-                let click_btn_text = if self.intersect_pending_click {
-                    "∩ click (waiting…)"
-                } else { "∩ click" };
-                if ui.button(click_btn_text).clicked() {
-                    self.intersect_pending_click = !self.intersect_pending_click;
-                }
-                if ui.button("clear ∩").clicked() {
-                    self.intersections.clear();
-                    self.last_intersect_label.clear();
-                }
                 if !self.last_intersect_label.is_empty() {
                     ui.colored_label(
                         egui::Color32::from_rgb(180, 200, 220),
@@ -7728,12 +7833,15 @@ impl eframe::App for CadApp {
             let circle_count = self.doc.dobjects.iter()
                 .filter(|d| matches!(d.geom, Geom::Circle(_))).count();
             let fps = self.fps_smooth;
-            egui::Window::new("DEBUG — render mode")
+            let win = egui::Window::new("DEBUG — render mode")
                 .open(&mut keep)
                 .resizable(true)
                 .default_width(310.0)
-                .default_pos(egui::pos2(20.0, 130.0))
-                .show(ctx, |ui| {
+                .min_width(280.0)
+                .min_height(180.0)
+                .default_pos(egui::pos2(20.0, 130.0));
+            let win = self.apply_dock_pos("DEBUG — render mode", ctx, win);
+            let resp = win.show(ctx, |ui| {
                     ui.label(egui::RichText::new("Render mode")
                         .monospace().strong());
                     ui.horizontal(|ui| {
@@ -7745,6 +7853,41 @@ impl eframe::App for CadApp {
                             RenderMode::Gpu, "GPU (instanced circles + CPU lines/arcs)");
                     });
                     ui.separator();
+                    // ---- APX (draft display) toggle ------------------
+                    // Sits alongside the CPU/GPU choice because it's
+                    // the same axis of trade-off: fidelity vs speed.
+                    // When ON, every visible dobject collapses to a
+                    // single dot at its bbox center — one instanced
+                    // GPU draw call for the whole scene, FPS recovers
+                    // from single-digit to 60+ on million-dobject
+                    // drawings. Toggle off when you need to see real
+                    // geometry. Click + drag, snap, pick, move, copy
+                    // still work — only the visual is approximate.
+                    ui.label(egui::RichText::new("APX (draft display)")
+                        .monospace().strong());
+                    let mut apx = self.lod_active;
+                    let apx_label = if apx {
+                        "● APX ON  — geometry shown as dots"
+                    } else {
+                        "○ APX OFF — full geometry"
+                    };
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new(apx_label).monospace()
+                    ).fill(if apx {
+                        egui::Color32::from_rgb(80, 50, 20)
+                    } else {
+                        egui::Color32::from_rgb(40, 45, 55)
+                    })).clicked() {
+                        apx = !apx;
+                    }
+                    if apx != self.lod_active {
+                        self.lod_active = apx;
+                        self.history.push(format!(
+                            "  APX → {} (manual)",
+                            if self.lod_active { "ON (geometry shown as dots)" }
+                            else { "OFF (full geometry)" }));
+                    }
+                    ui.separator();
                     ui.monospace(format!("FPS         {:>6.1}", fps));
                     ui.monospace(format!("dobjects    {:>6}", dobject_count));
                     ui.monospace(format!("  circles   {:>6}", circle_count));
@@ -7754,8 +7897,10 @@ impl eframe::App for CadApp {
                     ui.label(egui::RichText::new("Notes").small());
                     ui.small("• GPU path: one PaintCallback, one glDrawArraysInstanced");
                     ui.small("• GPU renders Circles only this slice; Lines/Arcs stay CPU");
-                    ui.small("• Switch back to CPU any time for comparison");
+                    ui.small("• APX: ALL types render as dots — works even in CPU mode");
+                    ui.small("• Selection / snap / hit-test always use real geometry");
                 });
+            self.process_dock_after_show("DEBUG — render mode", ctx, resp);
             if !keep { self.debug_open = false; }
             if self.render_mode != mode_before {
                 self.history.push(format!(
@@ -8116,7 +8261,7 @@ impl eframe::App for CadApp {
             .min_width(220.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("DObjects", win);
+        let win = self.apply_dock_pos("DObjects", ctx, win);
         let resp = win.show(ctx, |ui| {
             if self.picking_source {
                 ui.colored_label(
@@ -8236,6 +8381,48 @@ impl eframe::App for CadApp {
                                 self.scale, self.scale)
                         ).monospace().small().color(egui::Color32::from_rgb(150, 165, 185)));
                         ui.separator();
+                        // ---- Render-perf badges: [APX] [GPU/CPU] -----
+                        // Both are user-toggled, no auto-switch. APX
+                        // collapses every visible dobject to a single
+                        // dot (one instanced GPU draw call — fast even
+                        // at 3M+ dobjects). GPU swaps the renderer to
+                        // the instanced-circle path (circles fast,
+                        // other primitives still CPU).
+                        let perf_badge = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| {
+                            let col = if on {
+                                egui::Color32::from_rgb(255, 200, 80)   // warm amber when active
+                            } else {
+                                egui::Color32::from_rgb(80, 90, 105)
+                            };
+                            let resp = ui.add(egui::Label::new(
+                                egui::RichText::new(label).monospace().small().strong().color(col)
+                            ).sense(egui::Sense::click()));
+                            resp.on_hover_text(tip).clicked()
+                        };
+                        let gpu_on = self.render_mode == RenderMode::Gpu;
+                        if perf_badge(ui, "GPU", gpu_on,
+                            "Renderer: GPU (instanced circles) vs CPU (egui painter). \
+                             GPU is much faster for circle-heavy scenes; other primitives \
+                             still go through CPU regardless.")
+                        {
+                            self.render_mode = if gpu_on { RenderMode::Cpu } else { RenderMode::Gpu };
+                            self.gpu_dirty = true;
+                            self.history.push(format!(
+                                "  render mode → {:?} (manual)", self.render_mode));
+                        }
+                        if perf_badge(ui, "APX", self.lod_active,
+                            "Approximate display: every visible dobject becomes a single \
+                             dot at its bbox center. One GPU draw call for the whole scene — \
+                             FPS recovers from single-digit to 60+ on million-dobject drawings. \
+                             Selection / snap / hit-testing still use the real geometry.")
+                        {
+                            self.lod_active = !self.lod_active;
+                            self.history.push(format!(
+                                "  APX → {} (manual)",
+                                if self.lod_active { "ON (geometry shown as dots)" }
+                                else { "OFF (full geometry)" }));
+                        }
+                        ui.separator();
                         // EdgMod toggle
                         let mut em = self.env.EdgMod;
                         if ui.checkbox(&mut em, "EdgMod").changed() {
@@ -8321,7 +8508,7 @@ impl eframe::App for CadApp {
             .min_height(120.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Command", win);
+        let win = self.apply_dock_pos("Command", ctx, win);
         let resp = win.show(ctx, |ui| {
                 // Reserve space at the bottom for: prompt line (if any) +
                 // the input row.
@@ -8424,6 +8611,10 @@ impl eframe::App for CadApp {
             let (resp, painter) =
                 ui.allocate_painter(avail, egui::Sense::click_and_drag());
             let rect = resp.rect;
+            // Stash the canvas rect for the dock helpers — they need
+            // the canvas area (below toolbar, above status bar) not
+            // the full window rect.
+            self.canvas_screen_rect = Some(rect);
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
 
@@ -9246,15 +9437,33 @@ impl eframe::App for CadApp {
                     } else if self.select_mode != SelectMode::Off {
                         let shift = ctx.input(|i| i.modifiers.shift);
                         let tol_world = 10.0 / self.scale as f64;
-                        if let Some(i) = self.nearest_entity_under(world, tol_world) {
+                        // If the user explicitly typed `w` or `c`, their
+                        // intent is unambiguous: this click starts a
+                        // window-selection rectangle, not a single-dobject
+                        // pick. Skip the nearest-entity heuristic — at high
+                        // zoom-out the 10-px tol almost always hits SOMETHING
+                        // and would steal the click. The armed flag survives
+                        // here and gets consumed by add_window_selection on
+                        // the second corner click.
+                        let armed_window = self.armed_window_inside.is_some();
+                        let hit = if armed_window {
+                            None
+                        } else {
+                            self.nearest_entity_under(world, tol_world)
+                        };
+                        if let Some(i) = hit {
                             self.click_select(i, shift);
                             self.window_first = None;   // any half-started window is dropped
                         } else if let Some(first) = self.window_first.take() {
                             self.add_window_selection(first, world, shift);
                         } else {
                             self.window_first = Some(world);
-                            self.history.push(
-                                "    window: click opposite corner (L→R inside, R→L crossing — hold Shift to subtract)".into());
+                            let hint = match self.armed_window_inside {
+                                Some(true)  => "    window (armed INSIDE): click OPPOSITE corner".to_string(),
+                                Some(false) => "    window (armed CROSSING): click OPPOSITE corner".to_string(),
+                                None        => "    window: click opposite corner (L→R inside, R→L crossing — hold Shift to subtract)".to_string(),
+                            };
+                            self.history.push(hint);
                         }
                         self.refocus_cmd = true;
                     } else if self.intersect_pending_click {
@@ -9435,9 +9644,16 @@ impl eframe::App for CadApp {
             // (O(visible cells)); otherwise fall back to O(N) iteration. The
             // index loop is dramatically faster at 1M+ dobjects.
             //
+            // Rebuild the index FIRST if dirty — otherwise every move /
+            // copy / array invalidates it and the renderer wastes a frame
+            // iterating all N. One rebuild pays for itself in milliseconds
+            // when N reaches the millions (≈100 ms rebuild vs ≈100 ms per
+            // frame of full-N iteration, every frame, forever).
+            //
             // Collected into a Vec so we can both COUNT the candidates
             // (= `in_viewport` in the screen-stats panel) and iterate
             // them twice (CPU vs GPU branches consume the same set).
+            let _ = self.ensure_index();
             let candidates: Vec<usize> =
                 if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
                     g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize).collect()
@@ -9445,6 +9661,9 @@ impl eframe::App for CadApp {
                     (0..self.doc.dobjects.len()).collect()
                 };
             let in_viewport = candidates.len();
+            // Render mode (CPU/GPU) and APX (dots) are user-toggled via
+            // the status-bar badges. No auto-switch — the user decides
+            // when to trade fidelity for speed.
             let candidate_iter: Box<dyn Iterator<Item = usize>> =
                 Box::new(candidates.into_iter());
 
@@ -9491,7 +9710,92 @@ impl eframe::App for CadApp {
             let mut drawn   = 0usize;
             let mut skipped = 0usize;
             let mut gpu_circles_count = 0usize;
-            match self.render_mode {
+
+            // === APX (draft display) render branch ===
+            // When `lod_active`, every visible dobject becomes a single
+            // dot at its gravity point. Dots are pushed into the GPU
+            // instanced-circle pipeline as tiny world-radius circles —
+            // one draw call for the entire scene, FPS recovers from
+            // single-digit to 60+. The full-geometry render_mode match
+            // below is skipped entirely while APX is active.
+            //
+            // Hit-testing, snap, and selection still use the underlying
+            // bbox / geometry — only the visual is approximate.
+            if self.lod_active {
+                let mut dots: Vec<CircleInstance> = Vec::new();
+                // Screen-target dot radius → world radius for this frame.
+                // 1.5 px is small enough not to clutter at typical zooms
+                // but visible as a clear dot.
+                let dot_world_r = (1.5_f64 / (self.scale as f64).max(1e-9)) as f32;
+                for i in candidate_iter {
+                    let e = &self.doc.dobjects[i];
+                    if !e.style.visible || !self.doc.layers.renders(e.style.layer) {
+                        skipped += 1;
+                        continue;
+                    }
+                    let (emin, emax) = e.bbox();
+                    if emax.x < v_min.x || emin.x > v_max.x
+                    || emax.y < v_min.y || emin.y > v_max.y {
+                        continue;
+                    }
+                    // Anchor strategy. Only 0 (bbox center) implemented
+                    // this slice; 1 (primitive center) and 2 (first
+                    // vertex) fall back to bbox center.
+                    let anchor = match self.env.LodAnc {
+                        _ => Vec2::new((emin.x + emax.x) * 0.5,
+                                       (emin.y + emax.y) * 0.5),
+                    };
+                    // Selection / snap highlight wins over per-dobject
+                    // color so the user can still pick out selected items.
+                    let in_selection = self.selection.contains(&i);
+                    let color = if self.selected == Some(i) || in_selection {
+                        egui::Color32::from_rgb(255, 200, 80)
+                    } else if snap_source == Some(i) {
+                        egui::Color32::from_rgb(120, 240, 255)
+                    } else {
+                        let (r, g, b) = resolve_color(
+                            e.style.color, e.style.layer,
+                            &self.doc.layers, &self.doc.truecolors);
+                        egui::Color32::from_rgb(r, g, b)
+                    };
+                    let packed: u32 =
+                          ((color.r() as u32) << 24)
+                        | ((color.g() as u32) << 16)
+                        | ((color.b() as u32) <<  8)
+                        |  (color.a() as u32);
+                    dots.push(CircleInstance {
+                        x: anchor.x as f32,
+                        y: anchor.y as f32,
+                        r: dot_world_r,
+                        color: packed,
+                    });
+                    drawn += 1;
+                }
+                gpu_circles_count = dots.len();
+                if !dots.is_empty() {
+                    let view = view_matrix(
+                        rect.width(), rect.height(),
+                        self.scale,
+                        self.world_offset.x, self.world_offset.y,
+                    );
+                    let renderer = self.gpu_renderer.clone();
+                    let cb = egui::PaintCallback {
+                        rect,
+                        callback: StdArc::new(
+                            egui_glow::CallbackFn::new(
+                                move |_info, gl_painter| {
+                                    let gl = gl_painter.gl();
+                                    let mut r = renderer.lock().unwrap();
+                                    r.ensure_init(gl);
+                                    r.upload_and_render(gl, &dots, &view);
+                                },
+                            ),
+                        ),
+                    };
+                    painter.add(egui::Shape::Callback(cb));
+                }
+                self.gpu_dirty = false;
+            } else { match self.render_mode {
                 RenderMode::Cpu => {
                     for i in candidate_iter {
                         let e = &self.doc.dobjects[i];
@@ -9708,7 +10012,7 @@ impl eframe::App for CadApp {
                     }
                     self.gpu_dirty = false;
                 }
-            }
+            } } // close `match self.render_mode` and outer `else` from APX branch
             // Grip handles on the selected dobject (drawn on top of the
             // geometry, under the snap marker / rubber band).
             if self.env.GrpEnb {
@@ -9722,9 +10026,13 @@ impl eframe::App for CadApp {
             // HUD: FPS + drawn/skipped/total + index status + render mode.
             let idx_state = if self.index.is_some() && !self.index_dirty { "idx ✓" }
                             else { "idx stale" };
-            let mode_str = match self.render_mode {
-                RenderMode::Cpu => format!("CPU"),
-                RenderMode::Gpu => format!("GPU ({} circles instanced)", gpu_circles_count),
+            let mode_str = if self.lod_active {
+                format!("APX ({} dots instanced)", gpu_circles_count)
+            } else {
+                match self.render_mode {
+                    RenderMode::Cpu => format!("CPU"),
+                    RenderMode::Gpu => format!("GPU ({} circles instanced)", gpu_circles_count),
+                }
             };
             painter.text(
                 rect.right_top() + egui::vec2(-8.0, 8.0),

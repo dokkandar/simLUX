@@ -116,6 +116,15 @@ pub struct UserEnv {
     /// pure horizontal or vertical move. F8 toggles.
     pub OrtEnb: bool,
 
+    // ---- APX (approximate / draft display) ----
+    /// Dot-anchor strategy when rendering in APX (user-toggled draft
+    /// mode). 0 = bbox center (default, simple/uniform). 1 = primitive
+    /// center (Circle.center, Line midpoint, Polyline centroid — TBD
+    /// per type). 2 = first vertex of the dobject. The APX mode
+    /// itself is toggled by a button in the status bar — no auto-
+    /// trigger; user-controlled.
+    pub LodAnc: u8,
+
     // ---- external references ----
     /// External-reference demand-loading mode.
     /// 0 = off, 1 = on, 2 = on with copy (work on a temp duplicate).
@@ -155,6 +164,7 @@ impl Default for UserEnv {
             GrdSnp: false,
             GrdSpc: 10.0,
             OrtEnb: false,
+            LodAnc: 0,
             XrLdMd: 2,
             XrTmpP: String::new(),
         }
@@ -228,6 +238,7 @@ impl UserEnv {
         push_bool(&mut s, "GrdSnp", self.GrdSnp);
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
         push_bool(&mut s, "OrtEnb", self.OrtEnb);
+        push_u8(&mut s, "LodAnc", self.LodAnc);
         push_u8(&mut s, "XrLdMd", self.XrLdMd);
         push_str(&mut s, "XrTmpP", &self.XrTmpP);
         fs::write(&path, s)
@@ -280,6 +291,7 @@ impl UserEnv {
             "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
             "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
+            "LodAnc" => if let Ok(v) = val.parse() { self.LodAnc = v; }
             "XrLdMd" => if let Ok(v) = val.parse() { self.XrLdMd = v; }
             "XrTmpP" => self.XrTmpP = val.to_string(),
             _ => {}     // unknown — forward-compatible
