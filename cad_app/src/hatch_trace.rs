@@ -138,6 +138,31 @@ pub fn tessellate_doc_cancellable(doc: &Document, cancel: &AtomicBool) -> Vec<Te
     out
 }
 
+/// Viewport-scoped + cancellable. Only tessellates the dobjects whose
+/// indices are in `scope` (typically a spatial-index query result for
+/// the visible world bbox). For a 400k-dobject doc with ~50 visible,
+/// this is ~10000x cheaper than tessellating everything.
+///
+/// The check loop runs over `scope` instead of `doc.dobjects` so the
+/// cost is bounded by `scope.len()`, not `doc.dobjects.len()`.
+pub fn tessellate_doc_in_view_cancellable(
+    doc:    &Document,
+    scope:  &[usize],
+    cancel: &AtomicBool,
+) -> Vec<TessSeg> {
+    let mut out = Vec::new();
+    for (k, &i) in scope.iter().enumerate() {
+        if k & (CANCEL_CHECK_STRIDE - 1) == 0 && cancelled(cancel) {
+            return out;
+        }
+        let Some(d) = doc.dobjects.get(i) else { continue };
+        if !d.style.visible { continue; }
+        if matches!(d.geom, Geom::Hatch(_) | Geom::Point(_)) { continue; }
+        tessellate_one(d, i, &mut out);
+    }
+    out
+}
+
 fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
     match &d.geom {
         Geom::Line(l) => {
@@ -567,13 +592,53 @@ pub struct TracedBoundary {
 /// the seed, or if every trace attempt failed.
 pub fn trace_boundary_at(doc: &Document, seed: Vec2) -> Option<TracedBoundary> {
     let raw = tessellate_doc(doc);
+    trace_boundary_from_raw(raw, seed)
+}
+
+/// Viewport-scoped variant — tessellates ONLY dobjects whose indices
+/// are in `scope` (typically a spatial-index query result for the
+/// visible world bbox). At 400k+ dobjects with ~50 visible, this
+/// makes the trace tractable; without it the trace tessellates all
+/// 400k and the worker thread runs effectively forever.
+pub fn trace_boundary_at_in_view(
+    doc:   &Document,
+    scope: &[usize],
+    seed:  Vec2,
+) -> Option<TracedBoundary> {
+    let never = never_cancelled();
+    let raw = tessellate_doc_in_view_cancellable(doc, scope, &never);
+    trace_boundary_from_raw(raw, seed)
+}
+
+/// Cancellable variant of `trace_boundary_at_in_view`. Used by the
+/// async worker thread — checks the cancel flag between phases so
+/// the user's Esc actually fires mid-op.
+pub fn trace_boundary_at_in_view_cancellable(
+    doc:    &Document,
+    scope:  &[usize],
+    seed:   Vec2,
+    cancel: &AtomicBool,
+) -> Option<TracedBoundary> {
+    let raw = tessellate_doc_in_view_cancellable(doc, scope, cancel);
+    if cancelled(cancel) { return None; }
+    let segs = split_at_intersections_cancellable(&raw, cancel);
+    if cancelled(cancel) { return None; }
+    trace_boundary_from_segs(segs, seed)
+}
+
+/// Shared trace pipeline given the raw segment soup. Used by both the
+/// full-doc and viewport-scoped entry points.
+fn trace_boundary_from_raw(raw: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoundary> {
     if raw.is_empty() { return None; }
-    // Split every segment at every crossing with a segment from a
-    // DIFFERENT source dobject — this is what makes partial overlaps
-    // ("lens between two circles", "click in the common region of
-    // three overlapping shapes") trace the actual visible region
-    // rather than a single source's whole boundary.
     let segs = split_at_intersections(&raw);
+    trace_boundary_from_segs(segs, seed)
+}
+
+/// Shared trace pipeline given POST-SPLIT segments. Caller is
+/// responsible for any cancel checks during the upstream phases.
+fn trace_boundary_from_segs(segs: Vec<TessSeg>, seed: Vec2) -> Option<TracedBoundary> {
+    if segs.is_empty() { return None; }
+    // (no further split — segs are already split)
     let (endpoints, cluster_pos) = cluster_endpoints(&segs);
     let n_clusters = cluster_pos.len();
     let adj = build_adjacency(&segs, &endpoints, n_clusters);

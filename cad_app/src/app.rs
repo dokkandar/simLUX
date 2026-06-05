@@ -2012,8 +2012,25 @@ impl CadApp {
     /// label — useful for the hatch-debug log so the user can see every
     /// candidate the cheap path considered, not just the winner.
     fn collect_closed_containing(&self, world: Vec2) -> Vec<(usize, f64, &'static str)> {
+        self.collect_closed_containing_scoped(world, None)
+    }
+
+    /// Scoped variant — when `scope` is `Some`, only iterates those
+    /// indices (typically the viewport_scope set). Lets hatch avoid
+    /// scanning all 400k+ dobjects when only ~50 are near the click.
+    fn collect_closed_containing_scoped(
+        &self,
+        world: Vec2,
+        scope: Option<&[usize]>,
+    ) -> Vec<(usize, f64, &'static str)> {
         let mut out = Vec::new();
-        for (i, d) in self.doc.dobjects.iter().enumerate() {
+        let iter: Box<dyn Iterator<Item = (usize, &DObject)>> = match scope {
+            Some(s) => Box::new(s.iter().filter_map(|&i| {
+                self.doc.dobjects.get(i).map(|d| (i, d))
+            })),
+            None => Box::new(self.doc.dobjects.iter().enumerate()),
+        };
+        for (i, d) in iter {
             let contains = match &d.geom {
                 // Treat polylines with coincident endpoints as closed too
                 // (the "drew it as a loop but forgot to type c Enter" case).
@@ -2038,6 +2055,30 @@ impl CadApp {
             out.push((i, area, dobject_kind_name(&d.geom)));
         }
         out
+    }
+
+    /// Indices of dobjects whose bbox overlaps the current viewport
+    /// world-bbox (`last_visible`). Uses the spatial index when it's
+    /// fresh — O(visible cells), typically a few dozen entries — and
+    /// falls back to the full N range when the index is stale or
+    /// missing. Returns `None` only when no viewport has ever been
+    /// rendered (first frame).
+    ///
+    /// THIS IS THE FIX for the 400k-dobjects perf glitch: every hatch
+    /// helper (cheap-path candidate scan, island scan, verbose dump,
+    /// trace tessellation) now restricts its iteration to this set
+    /// instead of the full document. A click in a 100-dobject
+    /// neighbourhood of a 400k-dobject drawing iterates ~100, not 400k.
+    fn viewport_scope(&self) -> Option<Vec<usize>> {
+        let (vmin, vmax) = self.last_visible?;
+        let scope: Vec<usize> = if let (Some(g), false) =
+            (self.index.as_ref(), self.index_dirty)
+        {
+            g.query_bbox(vmin, vmax).into_iter().map(|u| u as usize).collect()
+        } else {
+            (0..self.doc.dobjects.len()).collect()
+        };
+        Some(scope)
     }
 
     /// True if the dobject at `outer_idx` has its boundary crossed by
@@ -2156,12 +2197,28 @@ impl CadApp {
     /// Used only by the cheap path; the trace path discovers islands
     /// via its own ray-cast analysis.
     fn collect_islands_inside(&self, outer_idx: usize, seed: Vec2) -> Vec<usize> {
+        self.collect_islands_inside_scoped(outer_idx, seed, None)
+    }
+
+    /// Scoped variant — see `collect_closed_containing_scoped`.
+    fn collect_islands_inside_scoped(
+        &self,
+        outer_idx: usize,
+        seed: Vec2,
+        scope: Option<&[usize]>,
+    ) -> Vec<usize> {
         let Some(outer_d) = self.doc.dobjects.get(outer_idx) else { return Vec::new(); };
         let outer_polygon = closed_dobject_polygon(&outer_d.geom);
         if outer_polygon.len() < 3 { return Vec::new(); }
         let (omin, omax) = outer_d.geom.bbox();
         let mut islands = Vec::new();
-        for (i, d) in self.doc.dobjects.iter().enumerate() {
+        let iter: Box<dyn Iterator<Item = (usize, &DObject)>> = match scope {
+            Some(s) => Box::new(s.iter().filter_map(|&i| {
+                self.doc.dobjects.get(i).map(|d| (i, d))
+            })),
+            None => Box::new(self.doc.dobjects.iter().enumerate()),
+        };
+        for (i, d) in iter {
             if i == outer_idx { continue; }
             if !d.style.visible { continue; }
             // Must be a self-closed boundary type. Effectively-closed
@@ -2201,8 +2258,23 @@ impl CadApp {
     }
 
     fn find_smallest_containing_closed(&self, world: Vec2) -> Option<usize> {
+        self.find_smallest_containing_closed_scoped(world, None)
+    }
+
+    /// Scoped variant — see `collect_closed_containing_scoped`.
+    fn find_smallest_containing_closed_scoped(
+        &self,
+        world: Vec2,
+        scope: Option<&[usize]>,
+    ) -> Option<usize> {
         let mut best: Option<(usize, f64)> = None;
-        for (i, d) in self.doc.dobjects.iter().enumerate() {
+        let iter: Box<dyn Iterator<Item = (usize, &DObject)>> = match scope {
+            Some(s) => Box::new(s.iter().filter_map(|&i| {
+                self.doc.dobjects.get(i).map(|d| (i, d))
+            })),
+            None => Box::new(self.doc.dobjects.iter().enumerate()),
+        };
+        for (i, d) in iter {
             let contains = match &d.geom {
                 Geom::Polyline(p) if polyline_is_effectively_closed(p) => {
                     // Use the same tessellated polygon the renderer
@@ -2367,6 +2439,12 @@ impl CadApp {
     /// new). The previous worker's result is silently discarded — its
     /// receiver gets dropped.
     fn spawn_hatch_worker(&mut self, seed: Vec2) {
+        let scope = self.viewport_scope()
+            .unwrap_or_else(|| (0..self.doc.dobjects.len()).collect());
+        self.spawn_hatch_worker_scoped(seed, scope);
+    }
+
+    fn spawn_hatch_worker_scoped(&mut self, seed: Vec2, scope: Vec<usize>) {
         // If a worker is already running, cancel it. The old thread
         // will exit at its next cancel-check; its send will fail
         // harmlessly because we drop the receiver here.
@@ -2402,27 +2480,19 @@ impl CadApp {
         let doc_snapshot = self.doc.clone();
         let cancel_for_thread = cancel.clone();
         let (tx, rx) = mpsc::channel::<HatchWorkerResult>();
+        // Move the viewport scope into the worker — restricts tessellation
+        // to dobjects whose bbox overlaps the viewport bbox. CRITICAL for
+        // 400k+ dobject docs.
+        let scope_for_thread = scope.clone();
         thread::spawn(move || {
             let mut log: Vec<String> = Vec::new();
             log.push(format!(
-                "  worker started: seed=({:.3},{:.3}), {} dobjects",
-                seed.x, seed.y, doc_snapshot.dobjects.len()));
-            let raw = crate::hatch_trace::tessellate_doc_cancellable(
-                &doc_snapshot, &cancel_for_thread);
-            if cancel_for_thread.load(Ordering::Relaxed) {
-                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
-                return;
-            }
-            let segs = crate::hatch_trace::split_at_intersections_cancellable(
-                &raw, &cancel_for_thread);
-            if cancel_for_thread.load(Ordering::Relaxed) {
-                let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
-                return;
-            }
-            log.push(format!(
-                "  worker: tessellated {} → split into {} segs (+{})",
-                raw.len(), segs.len(), segs.len() - raw.len()));
-            let tb = crate::hatch_trace::trace_boundary_at(&doc_snapshot, seed);
+                "  worker started: seed=({:.3},{:.3}), {} dobjects in viewport scope ({} total)",
+                seed.x, seed.y, scope_for_thread.len(), doc_snapshot.dobjects.len()));
+            // Single end-to-end call — tessellates only viewport dobjects,
+            // splits at intersections, traces. Cancellable between phases.
+            let tb = crate::hatch_trace::trace_boundary_at_in_view_cancellable(
+                &doc_snapshot, &scope_for_thread, seed, &cancel_for_thread);
             if cancel_for_thread.load(Ordering::Relaxed) {
                 let _ = tx.send(HatchWorkerResult::Cancelled { log_lines: log });
                 return;
@@ -2480,6 +2550,30 @@ impl CadApp {
         match result {
             HatchWorkerResult::Success { loops, log_lines } => {
                 for line in log_lines { self.hatch_dbg(line); }
+                // Off-screen warning: if the traced outer loop extends
+                // beyond the current viewport bbox, the user can't see
+                // the full hatch. Tell them.
+                if let (Some((vmin, vmax)), Some(outer)) =
+                    (self.last_visible, loops.first())
+                {
+                    let mut omin = Vec2::new(f64::INFINITY, f64::INFINITY);
+                    let mut omax = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+                    for v in outer {
+                        if v.x < omin.x { omin.x = v.x; }
+                        if v.y < omin.y { omin.y = v.y; }
+                        if v.x > omax.x { omax.x = v.x; }
+                        if v.y > omax.y { omax.y = v.y; }
+                    }
+                    let outside = omin.x < vmin.x || omin.y < vmin.y
+                               || omax.x > vmax.x || omax.y > vmax.y;
+                    if outside {
+                        self.history.push(
+                            "  ⚠ traced hatch boundary extends off-screen — zoom out to see the full region"
+                            .into());
+                        self.hatch_dbg(
+                            "  worker: outer bbox extends beyond viewport — zoom out to see full hatch");
+                    }
+                }
                 self.snapshot_doc();
                 let mut handles: Vec<cad_kernel::Handle> = Vec::new();
                 for loop_verts in loops {
@@ -2582,15 +2676,34 @@ impl CadApp {
     }
 
     fn apply_pick_point_hatch(&mut self, seed: Vec2) -> bool {
+        // === Viewport scope ===
+        // Restrict EVERY hatch operation to the dobjects whose bbox
+        // overlaps the current viewport — at 400k+ dobjects, iterating
+        // the full doc per click is unworkable. The spatial index
+        // makes this O(visible cells) instead of O(N). Fallback to
+        // full doc only when the index is stale or no frame has
+        // rendered yet.
+        let view_scope: Vec<usize> = self.viewport_scope()
+            .unwrap_or_else(|| (0..self.doc.dobjects.len()).collect());
+        let total = self.doc.dobjects.len();
+        let in_view = view_scope.len();
+        self.hatch_dbg(format!(
+            "  --- viewport scope: {} of {} dobjects in view ({:.1}%) — iterating scope only ---",
+            in_view, total, 100.0 * in_view as f32 / total.max(1) as f32));
+
         // Verbose dump: every dobject + every coordinate the trace
         // pipeline will see this click. Lets the user verify "is this
         // polyline actually closed?", "do these line endpoints really
         // meet?" without guessing. Skipped when the debug window is
         // closed (`hatch_dbg` is a no-op then).
+        // ONLY in-view dobjects are dumped — out-of-view ones can't
+        // affect the hatch in the visible region.
         self.hatch_dbg(format!(
             "  --- doc snapshot at pick-point click ({:.3},{:.3})  zoom={:.2} px/world  world_per_px={:.4} ---",
             seed.x, seed.y, self.scale, 1.0 / (self.scale as f64).max(1e-9)));
-        let doc_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
+        let doc_lines: Vec<String> = view_scope.iter().filter_map(|&i| {
+                self.doc.dobjects.get(i).map(|d| (i, d))
+            })
             .map(|(i, d)| {
                 let (bmin, bmax) = d.geom.bbox();
                 let closed_tag = match &d.geom {
@@ -2622,8 +2735,10 @@ impl CadApp {
         // dobject was accepted / rejected as a candidate. The actual
         // decision still comes from collect_closed_containing — this
         // is pure instrumentation.
-        self.hatch_dbg("  --- cheap-path verdict per dobject ---");
-        let verdict_lines: Vec<String> = self.doc.dobjects.iter().enumerate()
+        self.hatch_dbg("  --- cheap-path verdict per dobject (viewport only) ---");
+        let verdict_lines: Vec<String> = view_scope.iter().filter_map(|&i| {
+                self.doc.dobjects.get(i).map(|d| (i, d))
+            })
             .map(|(i, d)| {
                 let kind = dobject_kind_name(&d.geom);
                 match &d.geom {
@@ -2674,7 +2789,7 @@ impl CadApp {
         for line in verdict_lines {
             self.hatch_dbg(line);
         }
-        let cheap_candidates = self.collect_closed_containing(seed);
+        let cheap_candidates = self.collect_closed_containing_scoped(seed, Some(&view_scope));
         if !cheap_candidates.is_empty() {
             self.hatch_dbg(format!(
                 "  --- cheap-path candidates ({} found, picked smallest by bbox area) ---",
@@ -2707,20 +2822,20 @@ impl CadApp {
                 cheap_candidates[0].0));
         }
         if !multiple && !single_outer_crossed {
-            if let Some(idx) = self.find_smallest_containing_closed(seed) {
+            if let Some(idx) = self.find_smallest_containing_closed_scoped(seed, Some(&view_scope)) {
                 let kind = self.doc.dobjects.get(idx)
                     .map(|d| dobject_kind_name(&d.geom))
                     .unwrap_or("?");
                 // AutoCAD BPOLY also auto-adds any closed dobjects sitting
                 // ENTIRELY INSIDE the chosen outer as islands — the user
-                // doesn't have to pre-select them.
+                // doesn't have to pre-select them. Scoped to viewport.
                 self.hatch_dbg(format!(
-                    "  --- island scan inside outer #{} ---", idx));
+                    "  --- island scan inside outer #{} (viewport only) ---", idx));
                 let scan_lines = self.dbg_island_scan_verdicts(idx, seed);
                 for line in scan_lines {
                     self.hatch_dbg(line);
                 }
-                let islands = self.collect_islands_inside(idx, seed);
+                let islands = self.collect_islands_inside_scoped(idx, seed, Some(&view_scope));
                 if !islands.is_empty() {
                     self.hatch_dbg(format!(
                         "  → CHEAP PATH chose outer #{} ({}) + auto-detected {} island(s): {:?}",
