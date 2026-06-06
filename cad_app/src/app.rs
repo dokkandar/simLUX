@@ -9509,18 +9509,26 @@ impl eframe::App for CadApp {
             let in_select  = self.select_mode != SelectMode::Off;
             // Track press time so the classifier below can enforce a
             // hold-threshold before treating a drag as a window. See
-            // feedback_rust_cad_universal_selection_model. Cleared on
-            // release.
+            // feedback_rust_cad_universal_selection_model.
+            //
+            // Order is critical: capture the elapsed-hold reading from
+            // the OLD press_time BEFORE the release event clears it.
+            // Previous version cleared on release first, so on the
+            // same frame as `drag_stopped()` fires, press_held_secs
+            // read zero and the gate failed — entire drag-window
+            // gestures were silently discarded as fast clicks. Now we
+            // compute the gate, classify, THEN update press_time.
             let now = ctx.input(|i| i.time);
+            let hold_thresh_secs = (self.env.SelDmTm as f64) / 1000.0;
+            let press_held_secs = self.press_time.map(|t0| now - t0).unwrap_or(0.0);
+            let hold_threshold_passed = press_held_secs >= hold_thresh_secs;
+            // Now update press_time for next frame.
             if ctx.input(|i| i.pointer.primary_pressed()) && resp.contains_pointer() {
                 self.press_time = Some(now);
             }
             if ctx.input(|i| i.pointer.primary_released()) {
                 self.press_time = None;
             }
-            let hold_thresh_secs = (self.env.SelDmTm as f64) / 1000.0;
-            let press_held_secs = self.press_time.map(|t0| now - t0).unwrap_or(0.0);
-            let hold_threshold_passed = press_held_secs >= hold_thresh_secs;
             let in_click_only_phase =
                 self.tool != Tool::None
                 || matches!(self.trim_state,
