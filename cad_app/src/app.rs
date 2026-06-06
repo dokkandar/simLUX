@@ -473,6 +473,17 @@ pub struct CadApp {
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
+    /// AutoCAD offset Erase mode (transient — resets per command).
+    /// When true, the source dobject is deleted right after the offset
+    /// completes. Toggle with `e`.
+    offset_erase: bool,
+    /// AutoCAD offset Layer mode: false = Current layer (default),
+    /// true = Source layer. Toggle with `l` cycling.
+    offset_layer_src: bool,
+    /// Count of successful offsets since the last `Off`. Used by the
+    /// in-command `u` undo to know whether anything is on the
+    /// per-offset stack to pop (prevents popping prior unrelated state).
+    offset_applied_count: u32,
     lengthen_state: LengthenState,
     break_state:    BreakState,
     align_state:    AlignState,
@@ -649,8 +660,23 @@ pub enum MatchPropsState {
 }
 
 /// State machines for the Slice-L click-driven actions.
+///
+/// AutoCAD-style multi-phase offset command. The flow:
+///   Off → (user types `offset`) → WaitingForObject(mode)
+///       click object → WaitingForSide(mode, src_idx)
+///       click side / through-point → apply, back to WaitingForObject
+///       Enter or Esc → Off
+/// `mode` carries either an explicit distance or "Through" semantics.
+/// Type `t`/`e`/`l`/`u`/<number> at any waiting prompt to swap modes
+/// or change distance; see the run_command intercept.
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub enum OffsetState   { Off, WaitingForSide(f64) }
+pub enum OffsetMode { Distance(f64), Through }
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum OffsetState {
+    Off,
+    WaitingForObject(OffsetMode),
+    WaitingForSide(OffsetMode, usize),
+}
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LengthenState { Off, WaitingForSide(f64) }
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -947,6 +973,9 @@ impl Default for CadApp {
             redo_stack:   Vec::new(),
             matchprops_state: MatchPropsState::Off,
             offset_state:   OffsetState::Off,
+            offset_erase:        false,
+            offset_layer_src:    false,
+            offset_applied_count: 0,
             lengthen_state: LengthenState::Off,
             break_state:    BreakState::Off,
             align_state:    AlignState::Off,
@@ -1294,6 +1323,81 @@ impl CadApp {
                     self.set_prompt(format!(
                         "chamfer: enter `<a>` or `<a> <b>` (current {}, {})  [Esc=cancel]",
                         self.env.ChmDs1, self.env.ChmDs2));
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        // ---- Offset sub-command intercept ------------------------------
+        // Sub-options recognized while offset is active:
+        //   t / through         → switch to Through-point mode
+        //   e / erase           → toggle Erase-source mode
+        //   l / layer           → cycle Current ↔ Source layer
+        //   u / undo            → undo the last in-command offset
+        //   <number>            → set distance + switch back to Distance mode
+        // All only fire while offset_state != Off.
+        if self.offset_state != OffsetState::Off {
+            let lc = trimmed.to_ascii_lowercase();
+            let mut toks = lc.split_ascii_whitespace();
+            match toks.next() {
+                Some("t") | Some("through") => {
+                    self.offset_state = OffsetState::WaitingForObject(OffsetMode::Through);
+                    self.history.push("  offset: mode → THROUGH (next click after object = through-point)".into());
+                    self.refresh_offset_prompt();
+                    return;
+                }
+                Some("e") | Some("erase") => {
+                    self.offset_erase = !self.offset_erase;
+                    self.history.push(format!(
+                        "  offset: erase source → {}",
+                        if self.offset_erase {"ON (originals deleted)"} else {"OFF"}));
+                    self.refresh_offset_prompt();
+                    return;
+                }
+                Some("l") | Some("layer") => {
+                    self.offset_layer_src = !self.offset_layer_src;
+                    self.history.push(format!(
+                        "  offset: result layer → {}",
+                        if self.offset_layer_src {"SOURCE"} else {"CURRENT"}));
+                    self.refresh_offset_prompt();
+                    return;
+                }
+                Some("u") | Some("undo") => {
+                    if self.offset_applied_count == 0 {
+                        self.history.push("  ! offset: nothing to undo in this command".into());
+                    } else if let Some(prev) = self.undo_stack.pop() {
+                        self.doc = prev;
+                        self.offset_applied_count -= 1;
+                        self.intersections.clear();
+                        self.index_dirty = true;
+                        self.gpu_dirty = true;
+                        self.history.push("  offset: ↺ last offset undone".into());
+                        // Return to "Select object" with whatever mode
+                        // was current — don't change the distance.
+                        let mode = match self.offset_state {
+                            OffsetState::WaitingForObject(m)   => m,
+                            OffsetState::WaitingForSide(m, _)  => m,
+                            OffsetState::Off => OffsetMode::Distance(self.env.OfsDis),
+                        };
+                        self.offset_state = OffsetState::WaitingForObject(mode);
+                        self.refresh_offset_prompt();
+                    } else {
+                        self.history.push("  ! offset: undo stack empty".into());
+                    }
+                    return;
+                }
+                Some(num) if num.parse::<f64>().is_ok() => {
+                    let v: f64 = num.parse().unwrap();
+                    if v.abs() < 1e-12 {
+                        self.history.push("  ! offset: distance must be non-zero".into());
+                        return;
+                    }
+                    self.env.OfsDis = v;
+                    let _ = self.env.save();
+                    self.offset_state = OffsetState::WaitingForObject(OffsetMode::Distance(v));
+                    self.history.push(format!("  offset: distance → {}", v));
+                    self.refresh_offset_prompt();
                     return;
                 }
                 _ => {}
@@ -1718,29 +1822,26 @@ impl CadApp {
             Ok(Command::Reverse)     => self.apply_reverse(),
             Ok(Command::ChangeLayer) => self.apply_chlayer(),
             Ok(Command::Offset(d_opt)) => {
-                // Resolve None to the persistent default (env.OfsDis).
-                // When the user supplied a distance explicitly, persist
-                // it so the next bare `offset` reuses it. Matches the
-                // AutoCAD OFFSETDIST behavior.
-                let d = match d_opt {
-                    Some(v) => {
-                        if (self.env.OfsDis - v).abs() > 1e-12 {
-                            self.env.OfsDis = v;
-                            let _ = self.env.save();
-                        }
-                        v
+                // AutoCAD-style flow:
+                //   offset            → enter with persisted distance
+                //                       (env.OfsDis); user picks objects
+                //                       one-at-a-time inside the command
+                //   offset <d>        → set + persist distance, same flow
+                // Sub-options (t/e/l/u) handled in the run_command
+                // intercept above. Esc / Enter at WaitingForObject exits.
+                if let Some(v) = d_opt {
+                    if (self.env.OfsDis - v).abs() > 1e-12 {
+                        self.env.OfsDis = v;
+                        let _ = self.env.save();
                     }
-                    None => self.env.OfsDis,
-                };
-                if self.selection.is_empty() {
-                    self.history.push(format!(
-                        "  ! offset (d={:.3}): empty basket — `select` first", d));
-                } else {
-                    self.offset_state = OffsetState::WaitingForSide(d);
-                    self.history.push(format!(
-                        "  offset — distance {:.3}; {} in basket. Click SIDE to offset toward (Esc cancels)",
-                        d, self.selection.len()));
                 }
+                let d = self.env.OfsDis;
+                // Transient command-scoped flags start clean each invocation.
+                self.offset_erase        = false;
+                self.offset_layer_src    = false;
+                self.offset_applied_count = 0;
+                self.offset_state = OffsetState::WaitingForObject(OffsetMode::Distance(d));
+                self.refresh_offset_prompt();
             }
             Ok(Command::Lengthen(d)) => {
                 if self.selection.is_empty() {
@@ -4920,6 +5021,100 @@ impl CadApp {
 
     // ---- Slice L apply methods ----
 
+    /// Refresh the offset prompt with the current mode (Distance/Through),
+    /// erase + layer mode flags, and applied count. Called after every
+    /// sub-option toggle or phase transition so the visible prompt is
+    /// always current.
+    fn refresh_offset_prompt(&mut self) {
+        let mode_str = match self.offset_state {
+            OffsetState::Off => return,
+            OffsetState::WaitingForObject(m) | OffsetState::WaitingForSide(m, _) => match m {
+                OffsetMode::Distance(d) => format!("d={}", d),
+                OffsetMode::Through => "THROUGH".to_string(),
+            },
+        };
+        let phase = match self.offset_state {
+            OffsetState::WaitingForObject(_) => "select object to offset",
+            OffsetState::WaitingForSide(OffsetMode::Through, _) => "click THROUGH-point",
+            OffsetState::WaitingForSide(_, _) => "click SIDE",
+            OffsetState::Off => return,
+        };
+        let badges = format!(
+            "{}{}{}",
+            mode_str,
+            if self.offset_erase     { ", erase" } else { "" },
+            if self.offset_layer_src { ", lyr=src" } else { "" },
+        );
+        self.set_prompt(format!(
+            "offset ({}): {}  [t=through, e=erase, l=layer, u=undo, Esc]",
+            badges, phase));
+    }
+
+    /// Apply a single offset of one source dobject by one side/through
+    /// click. Honors the current mode (Distance or Through), the
+    /// erase flag (delete source after), and the layer flag (Current
+    /// vs Source layer for the result). Pushes the result and bumps
+    /// the in-command undo counter.
+    fn apply_offset_single(&mut self, mode: OffsetMode, src_idx: usize, click: Vec2) {
+        let Some(src) = self.doc.dobjects.get(src_idx) else { return; };
+        let src_clone = src.clone();
+        // Resolve distance + side hint based on mode.
+        let (dist, side_hint) = match mode {
+            OffsetMode::Distance(d) => (d, click),
+            OffsetMode::Through => {
+                let d = distance_world_to_geom(&src_clone.geom, click);
+                if !d.is_finite() || d.abs() < 1e-9 {
+                    self.history.push(
+                        "  ! offset (through): point is on the source dobject — skipped".into());
+                    return;
+                }
+                (d, click)
+            }
+        };
+        self.snapshot_doc();
+        match src_clone.offset(dist, side_hint) {
+            Ok(mut new_d) => {
+                // Layer flag: Current (default) — keep new_d's layer
+                // as whatever the kernel set (which is typically
+                // src_clone's). Source — explicitly copy src style
+                // (layer + color + linetype). When the kernel preserves
+                // source style by default we just override layer for
+                // "Current" mode.
+                if self.offset_layer_src {
+                    new_d.style.layer = src_clone.style.layer;
+                } else {
+                    new_d.style.layer = self.doc.layers.active;
+                }
+                let new_idx = self.doc.push(new_d);
+                self.offset_applied_count += 1;
+                if self.offset_erase {
+                    // Delete the source. The new dobject was just
+                    // pushed at new_idx; deleting src_idx shifts new_idx
+                    // down by 1 if new_idx > src_idx — bookkeeping for
+                    // the log only.
+                    if src_idx < self.doc.dobjects.len() {
+                        self.doc.dobjects.remove(src_idx);
+                    }
+                    let final_idx = if new_idx > src_idx { new_idx - 1 } else { new_idx };
+                    self.history.push(format!(
+                        "  ⇉ offset {:.4} → #{} (source #{} erased)",
+                        dist, final_idx, src_idx));
+                } else {
+                    self.history.push(format!(
+                        "  ⇉ offset {:.4} → #{} (source #{} kept)",
+                        dist, new_idx, src_idx));
+                }
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! offset: {}", msg));
+            }
+        }
+    }
+
     fn apply_offset(&mut self, dist: f64, side: Vec2) {
         if self.selection.is_empty() { return; }
         self.snapshot_doc();
@@ -7602,6 +7797,9 @@ impl eframe::App for CadApp {
             }
             if self.offset_state != OffsetState::Off {
                 self.offset_state = OffsetState::Off;
+                self.offset_erase = false;
+                self.offset_layer_src = false;
+                self.offset_applied_count = 0;
                 self.history.push("  offset cancelled".into());
             }
             if self.lengthen_state != LengthenState::Off {
@@ -7747,6 +7945,19 @@ impl eframe::App for CadApp {
                 self.pending_bulges.clear();
                 let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
                 self.add_dobject(Geom::Spline(spline), "canvas");
+            } else if matches!(self.offset_state, OffsetState::WaitingForObject(_)) {
+                // Offset's loop exit: Enter at "Select object" returns
+                // to Off. Matches AutoCAD's `Select object to offset
+                // or [Exit/Undo] <Exit>:` default-Enter-is-Exit.
+                self.offset_state = OffsetState::Off;
+                self.offset_erase = false;
+                self.offset_layer_src = false;
+                let n = self.offset_applied_count;
+                self.offset_applied_count = 0;
+                self.clear_prompt();
+                self.history.push(format!(
+                    "  offset: exit ({} offset{} applied)",
+                    n, if n == 1 { "" } else { "s" }));
             } else {
                 // Item 4 — fully idle: Enter on empty cmd repeats last cmd.
                 if let Some(last) = self.last_command.clone() {
@@ -9599,10 +9810,36 @@ impl eframe::App for CadApp {
                         }
                         self.refocus_cmd = true;
                     } else if self.offset_state != OffsetState::Off {
-                        if let OffsetState::WaitingForSide(d) = self.offset_state {
-                            self.apply_offset(d, click_world);
+                        let tol_world = 10.0 / self.scale as f64;
+                        let hit = self.nearest_entity_under(world, tol_world);
+                        match self.offset_state {
+                            OffsetState::WaitingForObject(mode) => {
+                                if let Some(idx) = hit {
+                                    self.offset_state = OffsetState::WaitingForSide(mode, idx);
+                                    let msg = match mode {
+                                        OffsetMode::Distance(d) => format!(
+                                            "  offset: source = #{} — click SIDE to offset toward (d={})", idx, d),
+                                        OffsetMode::Through => format!(
+                                            "  offset: source = #{} — click THROUGH-point", idx),
+                                    };
+                                    self.history.push(msg);
+                                    self.refresh_offset_prompt();
+                                } else {
+                                    self.history.push("  offset — click ON a dobject; missed".into());
+                                }
+                            }
+                            OffsetState::WaitingForSide(mode, src_idx) => {
+                                self.apply_offset_single(mode, src_idx, click_world);
+                                // Loop back to "Select object" — AutoCAD-style.
+                                let next_mode = match mode {
+                                    OffsetMode::Through => OffsetMode::Through,
+                                    OffsetMode::Distance(_) => OffsetMode::Distance(self.env.OfsDis),
+                                };
+                                self.offset_state = OffsetState::WaitingForObject(next_mode);
+                                self.refresh_offset_prompt();
+                            }
+                            OffsetState::Off => unreachable!(),
                         }
-                        self.offset_state = OffsetState::Off;
                         self.refocus_cmd = true;
                     } else if self.lengthen_state != LengthenState::Off {
                         if let LengthenState::WaitingForSide(d) = self.lengthen_state {
@@ -10022,8 +10259,13 @@ impl eframe::App for CadApp {
             // arrived.
             let cutter_or_bound_active =
                 trim_cutters.is_some() || extend_bounds.is_some();
+            let fillet_or_chamfer_picked = matches!(
+                self.fillet_state,  FilletState::WaitingForSecond(..))
+                || matches!(self.chamfer_state, ChamferState::WaitingForSecond(..));
             let pulse_animation_active =
-                cutter_or_bound_active || !self.selection.is_empty();
+                cutter_or_bound_active
+                || !self.selection.is_empty()
+                || fillet_or_chamfer_picked;
             if pulse_animation_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
@@ -10209,18 +10451,23 @@ impl eframe::App for CadApp {
                             drawn += 1;
                             continue;
                         }
-                        // Basket members: render the real dobject (its
-                        // resolved color) first, THEN overlay an
-                        // animated dashed pulse on top. Mirrors the
-                        // trim/extend method — same pulse_alpha
-                        // breathing rate, just dashed instead of
-                        // thick-solid.
+                        // Basket members + fillet/chamfer first-pick:
+                        // render the real dobject (its resolved color)
+                        // first, THEN overlay an animated dashed pulse
+                        // on top. Mirrors the trim/extend method —
+                        // same pulse_alpha breathing rate, just dashed
+                        // instead of thick-solid.
                         //
                         // Color, width, dash/gap and pulse range are
-                        // hardcoded for now; planned SYSVARs are
-                        // listed in Variables.md (SelDshClr / SelDshW
-                        // / SelDshL / SelDshG / SelPlsMin / SelPlsMax).
-                        if in_selection {
+                        // hardcoded for now; planned SYSVARs listed in
+                        // Variables.md.
+                        let is_fillet_first = matches!(
+                            self.fillet_state,
+                            FilletState::WaitingForSecond(_, fi, _) if fi == i);
+                        let is_chamfer_first = matches!(
+                            self.chamfer_state,
+                            ChamferState::WaitingForSecond(_, _, ci, _) if ci == i);
+                        if in_selection || is_fillet_first || is_chamfer_first {
                             let (r, g, b) = resolve_color(
                                 e.style.color, e.style.layer, &self.doc.layers,
                                 &self.doc.truecolors);
@@ -11637,6 +11884,30 @@ fn draw_polyline_full_ellipse(
         pts.push(app.w2s(el.point_at(t), rect));
     }
     painter.add(egui::Shape::line(pts, stroke));
+}
+
+/// Unsigned perpendicular distance from a world-space point `p` to the
+/// given geometry. Used by Offset's Through-point mode to compute the
+/// distance the new parallel copy should be from the source. Returns
+/// `f64::NAN` for geometry types we don't support (caller should treat
+/// NaN as failure).
+fn distance_world_to_geom(g: &Geom, p: Vec2) -> f64 {
+    match g {
+        Geom::Line(l) => {
+            let d = l.b - l.a;
+            let len_sq = d.len_sq();
+            if len_sq < 1e-12 { return f64::NAN; }
+            // Perpendicular distance from point to infinite line.
+            ((p - l.a).cross(d)).abs() / len_sq.sqrt()
+        }
+        Geom::Circle(c)  => ((p - c.center).len() - c.radius).abs(),
+        Geom::Arc(a)     => ((p - a.center).len() - a.radius).abs(),
+        // For Polyline/Spline/Ellipse: pick the closest segment of the
+        // bbox/centerline as a rough proxy. Better than NAN; user can
+        // refine later. (Real perpendicular-to-curve distance is a
+        // separate kernel job.)
+        _ => f64::NAN,
+    }
 }
 
 fn draw_dobject(
