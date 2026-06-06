@@ -3036,12 +3036,17 @@ impl CadApp {
     fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool) {
         let bbox_min = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
         let bbox_max = Vec2::new(p1.x.max(p2.x), p1.y.max(p2.y));
-        // If the user explicitly armed window/crossing via typed `w` /
-        // `c`, that mode wins; otherwise fall back to drag direction.
+        // === Hard rule (feedback_rust_cad_universal_selection_model) ===
+        // Typed `w` / `c` ALWAYS beats drag direction. The .take() is
+        // critical — the override is consumed by the first completing
+        // window so it doesn't carry over to the next gesture. Do NOT
+        // reorder this match without re-reading the memo: any future
+        // "smart direction detection" must still fall under the
+        // Some(_) arms, not over them.
         let crossing = match self.armed_window_inside.take() {
             Some(true)  => false,            // armed window → inside-only
             Some(false) => true,             // armed crossing
-            None        => p2.x < p1.x,      // direction-default
+            None        => p2.x < p1.x,      // direction-default (R→L = crossing)
         };
         let want_remove = shift ^ self.select_remove_mode;
 
