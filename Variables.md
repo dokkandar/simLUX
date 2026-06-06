@@ -311,6 +311,13 @@ without rebuilding.
 | `ExtDshL` | Extension‑dash length (px) | `7.0` | `app.rs` |
 | `ExtGapL` | Extension‑dash gap (px) | `4.0` | `app.rs` |
 | `WinDshSpd` | Selection‑window dash drift speed | `40.0` | `app.rs select overlay` |
+| `SelDshClr` | Selection-basket dashed overlay colour | `0xB4D2E6` (rgb 180,210,230) | `app.rs in_selection branch` |
+| `SelDshW`   | Selection-basket dashed overlay stroke width (px) | `1.6` | `app.rs draw_dobject_dashed` |
+| `SelDshL`   | Selection-basket dash length (px) | `6.0` | `app.rs in_selection branch` |
+| `SelDshG`   | Selection-basket dash gap (px) | `4.0` | `app.rs in_selection branch` |
+| `SelPlsMin` | Selection-basket pulse alpha min (0.0–1.0) | `0.15` | `app.rs pulse_alpha` (shared with trim/extend) |
+| `SelPlsMax` | Selection-basket pulse alpha max (0.0–1.0) | `0.85` | `app.rs pulse_alpha` (shared with trim/extend) |
+| `SelPlsHz`  | Selection-basket pulse frequency (cycles/sec) | `1.4` | `app.rs pulse` (shared with trim/extend) |
 | `HitTolPx` | Hit-test tolerance in pixels (overlaps `PkBxSz`) | `10.0` | `app.rs nearest_entity_under` |
 | `IntRad` | `∩ click` search radius in pixels | `50.0` | `app.rs intersect_pending_click` |
 | `PairLim` | Maximum candidate pair count before ∩ refuses | `5_000_000` | `app.rs PAIR_LIMIT` |

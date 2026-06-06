@@ -10014,9 +10014,17 @@ impl eframe::App for CadApp {
             // When the trim/extend session is live we request a repaint
             // every 80 ms so the animation stays smooth without burning
             // GPU at full vsync.
+            // Keep the pulse animation refreshing whenever there's
+            // anything pulsing: trim cutters, extend boundaries, OR a
+            // non-empty selection basket (the dashed overlay shares
+            // the same pulse). Without this the basket would freeze
+            // at whatever phase it was in when the last user input
+            // arrived.
             let cutter_or_bound_active =
                 trim_cutters.is_some() || extend_bounds.is_some();
-            if cutter_or_bound_active {
+            let pulse_animation_active =
+                cutter_or_bound_active || !self.selection.is_empty();
+            if pulse_animation_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
             let pulse_t = ctx.input(|i| i.time);
@@ -10201,14 +10209,31 @@ impl eframe::App for CadApp {
                             drawn += 1;
                             continue;
                         }
-                        // Basket members render as DASHED GRAY (the pointer-
-                        // mode selection look — does NOT modify style).
-                        // self.selected (array-dialog single pick) stays
-                        // yellow so it's distinguishable.
+                        // Basket members: render the real dobject (its
+                        // resolved color) first, THEN overlay an
+                        // animated dashed pulse on top. Mirrors the
+                        // trim/extend method — same pulse_alpha
+                        // breathing rate, just dashed instead of
+                        // thick-solid.
+                        //
+                        // Color, width, dash/gap and pulse range are
+                        // hardcoded for now; planned SYSVARs are
+                        // listed in Variables.md (SelDshClr / SelDshW
+                        // / SelDshL / SelDshG / SelPlsMin / SelPlsMax).
                         if in_selection {
-                            let gray = egui::Color32::from_rgb(160, 165, 175);
+                            let (r, g, b) = resolve_color(
+                                e.style.color, e.style.layer, &self.doc.layers,
+                                &self.doc.truecolors);
+                            draw_dobject(&painter, rect, self, &e.geom,
+                                egui::Color32::from_rgb(r, g, b));
+                            // Pulsing dashed overlay — gray-cyan reads
+                            // distinctly against both light and dark
+                            // dobject colors.
+                            let base = egui::Color32::from_rgb(180, 210, 230);
+                            let pulse_col = egui::Color32::from_rgba_unmultiplied(
+                                base.r(), base.g(), base.b(), pulse_alpha);
                             draw_dobject_dashed(&painter, rect, self, &e.geom,
-                                gray, 6.0, 4.0);
+                                pulse_col, 6.0, 4.0);
                             drawn += 1;
                             continue;
                         }
