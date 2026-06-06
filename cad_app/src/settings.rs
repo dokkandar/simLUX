@@ -130,10 +130,16 @@ pub struct UserEnv {
     // ---- UCS indicator (origin marker) ----
     /// User Coordinate System indicator on/off (AutoCAD `UCSICON`).
     /// When true, the canvas renders a small origin marker (red dot
-    /// + X / Y axis arrows). If world (0,0) is inside the visible
-    /// canvas, the marker anchors there. Otherwise it pins to the
-    /// bottom-left corner of the canvas as a reference legend.
+    /// + X / Y axis arrows). See `UcsMod` for placement behaviour.
     pub UcsIcn: bool,
+    /// UCS icon placement mode:
+    ///   0 = bottom-left corner ALWAYS (default, simplest legend)
+    ///   1 = anchor at world (0,0) when visible, else fall back to
+    ///       the corner (AutoCAD's `UCSICON ORigin` behaviour)
+    /// Change via the settings panel — most users want the corner
+    /// pin, but precision-drafting workflows benefit from seeing the
+    /// origin live in the drawing.
+    pub UcsMod: u8,
     /// Path to a PNG/SVG used as the user's avatar on the X-axis of
     /// the UCS icon. Empty string → fall back to the "User logo"
     /// placeholder rectangle. Persisted across sessions so the user
@@ -202,6 +208,7 @@ impl Default for UserEnv {
             GrdSpc: 10.0,
             OrtEnb: false,
             UcsIcn: true,
+            UcsMod: 0,                  // corner by default
             UcsAvP: String::new(),
             SelDmTm: 250,
             LodAnc: 0,
@@ -282,6 +289,7 @@ impl UserEnv {
         push_bool(&mut s, "OrtEnb", self.OrtEnb);
         let push_u16_dec = |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
         push_bool(&mut s, "UcsIcn", self.UcsIcn);
+        push_u8(&mut s, "UcsMod", self.UcsMod);
         push_str(&mut s, "UcsAvP", &self.UcsAvP);
         push_u16_dec(&mut s, "SelDmTm", self.SelDmTm);
         push_u8(&mut s, "LodAnc", self.LodAnc);
@@ -340,6 +348,7 @@ impl UserEnv {
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
             "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
             "UcsIcn" => if let Some(v) = parse_bool(val) { self.UcsIcn = v; }
+            "UcsMod" => if let Ok(v) = val.parse() { self.UcsMod = v; }
             "UcsAvP" => self.UcsAvP = val.to_string(),
             "SelDmTm" => if let Ok(v) = val.parse() { self.SelDmTm = v; }
             "LodAnc" => if let Ok(v) = val.parse() { self.LodAnc = v; }

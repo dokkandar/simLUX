@@ -12363,15 +12363,17 @@ fn parse_dist_tokens(raw: &str) -> Vec<f64> {
 /// Toggled by `env.UcsIcn`. Future: `env.UcsAvP` will replace the
 /// placeholder box with a user-supplied avatar image.
 fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
-    // Anchor: world origin in screen space — clamped to a padded
-    // sub-rect of the canvas so the icon never overlaps the very edge.
+    // Anchor depends on env.UcsMod:
+    //   0 = corner ALWAYS (default — simplest legend)
+    //   1 = AtOrigin when world (0,0) is inside a padded canvas,
+    //       else fall back to corner (AutoCAD UCSICON ORigin mode)
     let pad = 50.0;
     let safe = egui::Rect::from_min_max(
         rect.min + egui::vec2(pad, pad),
         rect.max - egui::vec2(pad, pad),
     );
     let origin_world_screen = app.w2s(Vec2::ZERO, rect);
-    let at_origin = safe.contains(origin_world_screen);
+    let at_origin = app.env.UcsMod == 1 && safe.contains(origin_world_screen);
     let anchor = if at_origin {
         origin_world_screen
     } else {
@@ -12448,10 +12450,11 @@ fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
         egui::Color32::from_rgb(80, 80, 80),
     );
 
-    // When pinned at the corner (origin off-screen), append a small
-    // delta-from-origin hint so the user knows the marker is a
-    // reference, not the actual position of (0,0).
-    if !at_origin {
+    // Only in AtOrigin mode and only when the origin is actually
+    // off-screen → show the delta hint, so the user knows the corner
+    // pin is a fallback. In Corner-always mode, the icon IS the
+    // reference legend; no apology needed.
+    if app.env.UcsMod == 1 && !at_origin {
         let dx = origin_world_screen.x - anchor.x;
         let dy = origin_world_screen.y - anchor.y;
         painter.text(
