@@ -473,6 +473,7 @@ pub struct CadApp {
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
+    dist_state:     DistState,
     /// AutoCAD offset Erase mode (transient — resets per command).
     /// When true, the source dobject is deleted right after the offset
     /// completes. Toggle with `e`.
@@ -679,6 +680,11 @@ pub enum OffsetState {
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LengthenState { Off, WaitingForSide(f64) }
+
+/// DIST measurement: click two points, get distance / dx / dy / angle
+/// printed to the history. Pure inspection — never mutates the doc.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum DistState { Off, WaitingForP1, WaitingForP2(Vec2) }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum BreakState    { Off, WaitingForPoint }
 
@@ -973,6 +979,7 @@ impl Default for CadApp {
             redo_stack:   Vec::new(),
             matchprops_state: MatchPropsState::Off,
             offset_state:   OffsetState::Off,
+            dist_state:     DistState::Off,
             offset_erase:        false,
             offset_layer_src:    false,
             offset_applied_count: 0,
@@ -1613,11 +1620,27 @@ impl CadApp {
                 ));
             }
             Ok(Command::List) => {
-                self.begin_selection(SelectMode::ForList);
-                self.history.push(
-                    "  list — Select dobjects: click to add/toggle, click empty corners for window (L→R inside, R→L crossing), Enter when done (Esc cancels)".into());
-                self.history.push(
-                    "         Sub-commands: all | before (re-select last) | none | remove | addmode".into());
+                // If something is already selected, dump it immediately
+                // without re-entering select mode. Matches AutoCAD's
+                // pickfirst semantics: `list` on a non-empty basket
+                // just lists. Empty basket → enter select-for-list.
+                if !self.selection.is_empty() {
+                    let sel = self.selection.clone();
+                    self.history.push(format!(
+                        "  list — {} dobject(s) currently selected:", sel.len()));
+                    for &i in &sel {
+                        if let Some(d) = self.doc.dobjects.get(i) {
+                            self.history.push(format!(
+                                "      #{:>5}  {}", i, describe(&d.geom)));
+                        }
+                    }
+                } else {
+                    self.begin_selection(SelectMode::ForList);
+                    self.history.push(
+                        "  list — Select dobjects: click to add/toggle, click empty corners for window (L→R inside, R→L crossing), Enter when done (Esc cancels)".into());
+                    self.history.push(
+                        "         Sub-commands: all | before (re-select last) | none | remove | addmode".into());
+                }
             }
             Ok(Command::Select) => {
                 self.begin_selection(SelectMode::ForSelect);
@@ -1983,6 +2006,12 @@ impl CadApp {
                 } else {
                     self.apply_join();
                 }
+            }
+            Ok(Command::Dist) => {
+                // Pure measurement: prompt for two clicks, log
+                // distance + dx + dy + angle. Doesn't touch the doc.
+                self.dist_state = DistState::WaitingForP1;
+                self.set_prompt("dist: click FIRST point  [Esc=cancel]");
             }
             Err(e) => self.history.push(format!("  ! {}", e)),
         }
@@ -7802,6 +7831,10 @@ impl eframe::App for CadApp {
                 self.offset_applied_count = 0;
                 self.history.push("  offset cancelled".into());
             }
+            if self.dist_state != DistState::Off {
+                self.dist_state = DistState::Off;
+                self.history.push("  dist cancelled".into());
+            }
             if self.lengthen_state != LengthenState::Off {
                 self.lengthen_state = LengthenState::Off;
                 self.history.push("  lengthen cancelled".into());
@@ -8138,6 +8171,17 @@ impl eframe::App for CadApp {
                     if ui.button("Toggle Grips").clicked() {
                         self.env.GrpEnb = !self.env.GrpEnb;
                         let _ = self.env.save();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Inquiry").small().color(
+                        egui::Color32::from_rgb(150, 165, 185)));
+                    if ui.button("Distance (2 clicks)").clicked() {
+                        self.run_command("dist");
+                        ui.close_menu();
+                    }
+                    if ui.button("List selected dobjects").clicked() {
+                        self.run_command("list");
                         ui.close_menu();
                     }
                     ui.separator();
@@ -9323,6 +9367,7 @@ impl eframe::App for CadApp {
                 || self.matchprops_state != MatchPropsState::Off
                 || self.fillet_state     != FilletState::Off
                 || self.chamfer_state    != ChamferState::Off
+                || self.dist_state       != DistState::Off
                 || self.picking_source
                 || self.intersect_pending_click;
             // Drag is the rubber-band window only when (a) we're in
@@ -9839,6 +9884,36 @@ impl eframe::App for CadApp {
                                 self.refresh_offset_prompt();
                             }
                             OffsetState::Off => unreachable!(),
+                        }
+                        self.refocus_cmd = true;
+                    } else if self.dist_state != DistState::Off {
+                        match self.dist_state {
+                            DistState::WaitingForP1 => {
+                                self.dist_state = DistState::WaitingForP2(click_world);
+                                self.history.push(format!(
+                                    "  dist: P1 = ({:.4}, {:.4}) — click SECOND point",
+                                    click_world.x, click_world.y));
+                                self.set_prompt("dist: click SECOND point  [Esc=cancel]");
+                            }
+                            DistState::WaitingForP2(p1) => {
+                                let dx = click_world.x - p1.x;
+                                let dy = click_world.y - p1.y;
+                                let d  = (dx * dx + dy * dy).sqrt();
+                                let ang_rad = dy.atan2(dx);
+                                let ang_deg = ang_rad.to_degrees();
+                                self.history.push(format!(
+                                    "  dist: P2 = ({:.4}, {:.4})",
+                                    click_world.x, click_world.y));
+                                self.history.push(format!(
+                                    "  dist: distance = {:.6}", d));
+                                self.history.push(format!(
+                                    "  dist: ΔX = {:+.6}   ΔY = {:+.6}", dx, dy));
+                                self.history.push(format!(
+                                    "  dist: angle (from X-axis) = {:+.4}°", ang_deg));
+                                self.dist_state = DistState::Off;
+                                self.clear_prompt();
+                            }
+                            DistState::Off => unreachable!(),
                         }
                         self.refocus_cmd = true;
                     } else if self.lengthen_state != LengthenState::Off {

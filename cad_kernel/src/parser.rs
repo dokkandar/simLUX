@@ -116,6 +116,9 @@ pub enum Command {
     /// dobjects per the kernel's three-pass strategy (collinear lines →
     /// concentric arcs → chain-to-polyline).
     Join,
+    /// AutoCAD DIST: measure distance + dx + dy + angle between two
+    /// clicked points. Pure inspection — does not modify the doc.
+    Dist,
     /// Open a file from disk (.dxf or .rsm) and load it into the document.
     Open(String),
     /// Save the current document to disk (.dxf or .rsm). Extension
@@ -173,6 +176,7 @@ impl Command {
             Command::Fillet(_)          => "Fillet",
             Command::Chamfer(_)         => "Chamfer",
             Command::Join               => "Join",
+            Command::Dist               => "Dist",
             Command::Open(_)            => "Open",
             Command::SaveAs(_)          => "SaveAs",
             Command::SetTool(_)         => "SetTool",
@@ -319,6 +323,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
             }
         }
         "join" | "j"      => Ok(Command::Join),
+        "dist" | "di"     => Ok(Command::Dist),
         "open"            => {
             let path = toks.get(1)
                 .ok_or("usage: open <path.dxf|path.rsm>")?
