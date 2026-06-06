@@ -505,9 +505,11 @@ pub struct CadApp {
     chamfer_state:  ChamferState,
     /// Same as `fillet_multiple` for Chamfer.
     chamfer_multiple: bool,
-    /// True when chamfer is waiting for distance value(s) after `d`
-    /// alone. Next input is parsed as `<a>` or `<a> <b>`.
-    chamfer_waiting_distance: bool,
+    /// Chamfer's two-step distance entry after `d` alone (AutoCAD
+    /// style): Off → WaitingD1 → WaitingD2(d1) → back to WaitingForFirst.
+    /// At each step, empty input keeps the current value. Inline
+    /// `d 2 3` / `d 2,3` / `d1=2 d2=3` bypasses both steps.
+    chamfer_dist_wait: ChamferDistWait,
 
     // ---- Slice M.1 / M.2: trim / extend (two-basket) ----
     trim_state:   TrimState,
@@ -684,6 +686,12 @@ pub enum OffsetState {
 }
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum LengthenState { Off, WaitingForSide(f64) }
+
+/// Chamfer two-step distance prompt — AutoCAD CHAMFER `d` flow:
+/// type `d`, then "first distance <X>:" (empty keeps X), then
+/// "second distance <d1>:" (empty makes d2 = d1).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum ChamferDistWait { Off, WaitingD1, WaitingD2(f64) }
 
 /// DIST measurement: click two points, get distance / dx / dy / angle
 /// printed to the history. Pure inspection — never mutates the doc.
@@ -996,7 +1004,7 @@ impl Default for CadApp {
             fillet_waiting_radius: false,
             chamfer_state:  ChamferState::Off,
             chamfer_multiple: false,
-            chamfer_waiting_distance: false,
+            chamfer_dist_wait: ChamferDistWait::Off,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
             pre_op_selection: Vec::new(),
@@ -1107,9 +1115,19 @@ impl CadApp {
         // is consumed as that number and must NOT reach the main
         // parser. Without this, typing `2` after `r` produced
         // `unknown command '2'`.
-        if self.fillet_waiting_radius && !trimmed.is_empty() {
-            match trimmed.parse::<f64>() {
-                Ok(v) => {
+        if self.fillet_waiting_radius {
+            // Empty input keeps the current radius.
+            if trimmed.is_empty() {
+                let v = self.env.FltRad;
+                self.fillet_state = FilletState::WaitingForFirst(v);
+                self.fillet_waiting_radius = false;
+                self.history.push(format!("  fillet: radius kept at {}", v));
+                self.refresh_fillet_prompt();
+                return;
+            }
+            // Lenient: accepts "2", "r=2", " 2 ", etc.
+            match parse_dist_lenient(trimmed) {
+                Some(v) => {
                     self.env.FltRad = v;
                     let _ = self.env.save();
                     self.fillet_state = FilletState::WaitingForFirst(v);
@@ -1117,37 +1135,68 @@ impl CadApp {
                     self.history.push(format!("  fillet: radius → {}", v));
                     self.refresh_fillet_prompt();
                 }
-                Err(_) => {
+                None => {
                     self.history.push(format!(
-                        "  ! fillet: '{}' is not a number — type a radius or Esc to cancel",
-                        trimmed));
+                        "  ! fillet: '{}' is not a number — type a radius (current {}) or Esc",
+                        trimmed, self.env.FltRad));
                 }
             }
             return;
         }
-        if self.chamfer_waiting_distance && !trimmed.is_empty() {
-            let mut toks = trimmed.split_ascii_whitespace();
-            let a = toks.next().and_then(|s| s.parse::<f64>().ok());
-            let b = toks.next().and_then(|s| s.parse::<f64>().ok());
-            match a {
-                Some(d1) => {
-                    let d2 = b.unwrap_or(d1);
-                    self.env.ChmDs1 = d1;
-                    self.env.ChmDs2 = d2;
-                    let _ = self.env.save();
-                    self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
-                    self.chamfer_waiting_distance = false;
-                    self.history.push(format!(
-                        "  chamfer: distances → ({}, {})", d1, d2));
-                    self.refresh_chamfer_prompt();
-                }
-                None => {
-                    self.history.push(format!(
-                        "  ! chamfer: '{}' is not a number — type `<a>` or `<a> <b>` or Esc",
-                        trimmed));
-                }
+        // Chamfer two-step distance entry (AutoCAD-style):
+        //   d → "first distance <X>:"  (X = ChmDs1)
+        //       empty → keep, Some(v) → set, then →
+        //   "second distance <d1>:"
+        //       empty → d2 = d1, Some(v) → set
+        // Inline `d 2 3` / `d 2,3` / `d1=2 d2=3` is handled in the
+        // chamfer sub-cmd intercept further down — bypasses both
+        // wait states.
+        match self.chamfer_dist_wait {
+            ChamferDistWait::WaitingD1 => {
+                let d1 = if trimmed.is_empty() {
+                    self.env.ChmDs1
+                } else {
+                    match parse_dist_lenient(trimmed) {
+                        Some(v) => { self.env.ChmDs1 = v; let _ = self.env.save(); v }
+                        None => {
+                            self.history.push(format!(
+                                "  ! chamfer: '{}' is not a number (current d1={}); type a number, blank for default, or Esc",
+                                trimmed, self.env.ChmDs1));
+                            return;
+                        }
+                    }
+                };
+                self.chamfer_dist_wait = ChamferDistWait::WaitingD2(d1);
+                self.history.push(format!("  chamfer: first distance → {}", d1));
+                self.set_prompt(format!(
+                    "chamfer: second distance <{}> (Enter = same as first)  [Esc=cancel]", d1));
+                return;
             }
-            return;
+            ChamferDistWait::WaitingD2(d1) => {
+                let d2 = if trimmed.is_empty() {
+                    d1
+                } else {
+                    match parse_dist_lenient(trimmed) {
+                        Some(v) => { v }
+                        None => {
+                            self.history.push(format!(
+                                "  ! chamfer: '{}' is not a number; type a number, blank for d2 = d1 = {}, or Esc",
+                                trimmed, d1));
+                            return;
+                        }
+                    }
+                };
+                self.env.ChmDs1 = d1;
+                self.env.ChmDs2 = d2;
+                let _ = self.env.save();
+                self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                self.chamfer_dist_wait = ChamferDistWait::Off;
+                self.history.push(format!(
+                    "  chamfer: distances → ({}, {})", d1, d2));
+                self.refresh_chamfer_prompt();
+                return;
+            }
+            ChamferDistWait::Off => {}
         }
 
         // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
@@ -1258,28 +1307,27 @@ impl CadApp {
                     return;
                 }
                 Some("r") | Some("radius") => {
-                    if let Some(num) = toks.next() {
-                        if let Ok(v) = num.parse::<f64>() {
-                            self.env.FltRad = v;
-                            let _ = self.env.save();
-                            self.fillet_state = FilletState::WaitingForFirst(v);
-                            self.history.push(format!(
-                                "  fillet: radius → {}", v));
-                            self.refresh_fillet_prompt();
-                            return;
-                        }
-                        self.history.push(
-                            format!("  ! fillet: bad radius '{}'", num));
+                    // Inline form: `r 2`, `r 2.5`, `r r=3`, `r,2` all
+                    // accepted via parse_dist_tokens leniency.
+                    let nums = parse_dist_tokens(trimmed);
+                    // First token is "r"/"radius" itself — it parses
+                    // as None, so parse_dist_tokens returns only the
+                    // numeric tail.
+                    if let Some(&v) = nums.first() {
+                        self.env.FltRad = v;
+                        let _ = self.env.save();
+                        self.fillet_state = FilletState::WaitingForFirst(v);
+                        self.history.push(format!(
+                            "  fillet: radius → {}", v));
+                        self.refresh_fillet_prompt();
                         return;
                     }
                     // `r` alone — arm pending-radius-input. The next
                     // numeric input fires the pending-input intercept
-                    // above and sets the radius. Without this flag,
-                    // typing `2` next would hit the main parser as
-                    // an unknown command.
+                    // above and sets the radius.
                     self.fillet_waiting_radius = true;
                     self.set_prompt(format!(
-                        "fillet: enter new radius (current {})  [Esc=cancel]",
+                        "fillet: radius <{}> (Enter = keep)  [Esc=cancel]",
                         self.env.FltRad));
                     return;
                 }
@@ -1316,8 +1364,17 @@ impl CadApp {
                     return;
                 }
                 Some("d") | Some("distance") => {
-                    if let Some(a) = toks.next().and_then(|s| s.parse::<f64>().ok()) {
-                        let b = toks.next().and_then(|s| s.parse::<f64>().ok()).unwrap_or(a);
+                    // Inline form, lenient about separators:
+                    //   d 2 3        → (2, 3)
+                    //   d 2,3        → (2, 3)
+                    //   d 2          → (2, 2)  (d2 defaults to d1)
+                    //   d1=2 d2=3    → (2, 3)
+                    //   d 2.5 4      → (2.5, 4)
+                    // parse_dist_tokens strips the leading "d"/"distance"
+                    // token (returns None) and the "d1="/"d2=" prefixes.
+                    let nums = parse_dist_tokens(trimmed);
+                    if let Some(&a) = nums.first() {
+                        let b = nums.get(1).copied().unwrap_or(a);
                         self.env.ChmDs1 = a;
                         self.env.ChmDs2 = b;
                         let _ = self.env.save();
@@ -1327,13 +1384,13 @@ impl CadApp {
                         self.refresh_chamfer_prompt();
                         return;
                     }
-                    // `d` alone — arm pending-distance-input. The
-                    // next numeric input (or pair) fires the
-                    // pending-input intercept above.
-                    self.chamfer_waiting_distance = true;
+                    // `d` alone — arm AutoCAD's two-step prompt:
+                    // first distance, then second. Empty input at
+                    // each step keeps the current default.
+                    self.chamfer_dist_wait = ChamferDistWait::WaitingD1;
                     self.set_prompt(format!(
-                        "chamfer: enter `<a>` or `<a> <b>` (current {}, {})  [Esc=cancel]",
-                        self.env.ChmDs1, self.env.ChmDs2));
+                        "chamfer: first distance <{}> (Enter = keep)  [Esc=cancel]",
+                        self.env.ChmDs1));
                     return;
                 }
                 _ => {}
@@ -8029,7 +8086,7 @@ impl eframe::App for CadApp {
             if self.chamfer_state != ChamferState::Off {
                 self.chamfer_state = ChamferState::Off;
                 self.chamfer_multiple = false;
-                self.chamfer_waiting_distance = false;
+                self.chamfer_dist_wait = ChamferDistWait::Off;
                 self.history.push("  chamfer cancelled".into());
             }
             if self.grip_drag.is_some() {
@@ -12269,6 +12326,34 @@ fn draw_polyline_full_ellipse(
 /// distance the new parallel copy should be from the source. Returns
 /// `f64::NAN` for geometry types we don't support (caller should treat
 /// NaN as failure).
+/// Parse a single distance value leniently. Accepts:
+///   "2"          → Some(2.0)
+///   " 2.5 "      → Some(2.5)
+///   "d1=2"       → Some(2.0)   (strips "d1=", "d2=", "r=" prefixes)
+///   "r=3"        → Some(3.0)
+/// Returns None for anything else (including empty string — caller
+/// should test for empty before calling).
+fn parse_dist_lenient(raw: &str) -> Option<f64> {
+    let t = raw.trim();
+    if t.is_empty() { return None; }
+    let lower = t.to_ascii_lowercase();
+    let cleaned = if let Some(rest) = lower.strip_prefix("d1=") { rest.to_string() }
+        else if let Some(rest) = lower.strip_prefix("d2=")      { rest.to_string() }
+        else if let Some(rest) = lower.strip_prefix("r=")       { rest.to_string() }
+        else { t.to_string() };
+    cleaned.trim().parse::<f64>().ok()
+}
+
+/// Tokenize a distance phrase into numeric values, lenient about
+/// separators. Accepts both whitespace and commas (and "d1=", "d2=",
+/// "r=" prefixes on each token). E.g. "2,3" → [2,3]; "d1=2 d2=3" →
+/// [2,3]; "2 3 4" → [2,3,4].
+fn parse_dist_tokens(raw: &str) -> Vec<f64> {
+    raw.split(|c: char| c.is_whitespace() || c == ',')
+        .filter_map(|s| if s.is_empty() { None } else { parse_dist_lenient(s) })
+        .collect()
+}
+
 /// UCS indicator — small "where's (0,0)" marker. Anchors at the world
 /// origin's screen position when that's inside the canvas; otherwise
 /// pins to the bottom-left corner of the canvas with a fixed offset.
