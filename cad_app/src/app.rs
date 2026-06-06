@@ -10262,10 +10262,13 @@ impl eframe::App for CadApp {
             let fillet_or_chamfer_picked = matches!(
                 self.fillet_state,  FilletState::WaitingForSecond(..))
                 || matches!(self.chamfer_state, ChamferState::WaitingForSecond(..));
+            let offset_picked = matches!(
+                self.offset_state, OffsetState::WaitingForSide(..));
             let pulse_animation_active =
                 cutter_or_bound_active
                 || !self.selection.is_empty()
-                || fillet_or_chamfer_picked;
+                || fillet_or_chamfer_picked
+                || offset_picked;
             if pulse_animation_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
@@ -10467,7 +10470,10 @@ impl eframe::App for CadApp {
                         let is_chamfer_first = matches!(
                             self.chamfer_state,
                             ChamferState::WaitingForSecond(_, _, ci, _) if ci == i);
-                        if in_selection || is_fillet_first || is_chamfer_first {
+                        let is_offset_src = matches!(
+                            self.offset_state,
+                            OffsetState::WaitingForSide(_, oi) if oi == i);
+                        if in_selection || is_fillet_first || is_chamfer_first || is_offset_src {
                             let (r, g, b) = resolve_color(
                                 e.style.color, e.style.layer, &self.doc.layers,
                                 &self.doc.truecolors);
@@ -10924,6 +10930,57 @@ impl eframe::App for CadApp {
                     };
                     painter.rect_filled(r, 0.0, fill);
                     painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, stroke));
+                }
+            }
+
+            // ---- Offset live ghost preview --------------------------------
+            // While WaitingForSide, compute the would-be offset for the
+            // current cursor position and ghost-render it so the user
+            // sees where the new dobject will land before clicking.
+            // Distance mode: cursor is the side hint, distance is fixed
+            //   (env.OfsDis). Result distance = env.OfsDis, side toward
+            //   the cursor.
+            // Through mode: cursor IS the through-point, distance is
+            //   computed from cursor to source.
+            if let OffsetState::WaitingForSide(mode, src_idx) = self.offset_state {
+                if let Some(src) = self.doc.dobjects.get(src_idx) {
+                    let cursor_w = ctx.input(|i| i.pointer.hover_pos())
+                        .map(|p| self.s2w(p, rect));
+                    if let Some(cur) = cursor_w {
+                        let (dist, side_hint, ok) = match mode {
+                            OffsetMode::Distance(d) => (d, cur, true),
+                            OffsetMode::Through => {
+                                let d = distance_world_to_geom(&src.geom, cur);
+                                (d, cur, d.is_finite() && d.abs() > 1e-9)
+                            }
+                        };
+                        if ok {
+                            if let Ok(ghost_geom) = src.geom.offset(dist, side_hint) {
+                                // Warm-amber ghost — distinct from the
+                                // gray-cyan basket dashes so it reads as
+                                // "preview, not committed". Pulses with
+                                // the same alpha as everything else.
+                                let base = egui::Color32::from_rgb(255, 200, 100);
+                                let ghost_col = egui::Color32::from_rgba_unmultiplied(
+                                    base.r(), base.g(), base.b(), pulse_alpha);
+                                draw_dobject_dashed(&painter, rect, self,
+                                    &ghost_geom, ghost_col, 8.0, 5.0);
+                                // Through-mode also draws a small x at
+                                // the cursor so the through-point is
+                                // visually located.
+                                if matches!(mode, OffsetMode::Through) {
+                                    let c_s = self.w2s(cur, rect);
+                                    let pen = egui::Stroke::new(1.2, base);
+                                    painter.line_segment(
+                                        [c_s + egui::vec2(-6.0, -6.0),
+                                         c_s + egui::vec2( 6.0,  6.0)], pen);
+                                    painter.line_segment(
+                                        [c_s + egui::vec2(-6.0,  6.0),
+                                         c_s + egui::vec2( 6.0, -6.0)], pen);
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
