@@ -1624,20 +1624,26 @@ impl CadApp {
                 ));
             }
             Ok(Command::List) => {
-                // If something is already selected, dump it immediately
-                // without re-entering select mode. Matches AutoCAD's
-                // pickfirst semantics: `list` on a non-empty basket
-                // just lists. Empty basket → enter select-for-list.
+                // If something is already selected, dump full details
+                // immediately. Matches AutoCAD's pickfirst semantics.
+                // After dumping we clear the basket so the pulsing
+                // highlight goes away (user told us 2026-06-06: nothing
+                // should stay selected after the report).
                 if !self.selection.is_empty() {
                     let sel = self.selection.clone();
                     self.history.push(format!(
                         "  list — {} dobject(s) currently selected:", sel.len()));
                     for &i in &sel {
                         if let Some(d) = self.doc.dobjects.get(i) {
-                            self.history.push(format!(
-                                "      #{:>5}  {}", i, describe(&d.geom)));
+                            self.history.push(format!("    ─── #{} ───", i));
+                            for line in list_full_details(&d.geom) {
+                                self.history.push(format!("      {}", line));
+                            }
                         }
                     }
+                    self.selection_prev = self.selection.clone();
+                    self.selection.clear();
+                    self.selected = None;
                 } else {
                     self.begin_selection(SelectMode::ForList);
                     self.history.push(
@@ -2078,11 +2084,22 @@ impl CadApp {
             SelectMode::ForList => {
                 self.history.push(format!(
                     "  list — {} dobject(s) selected:", self.selection.len()));
-                for &i in &self.selection {
-                    if let Some(d) = self.doc.dobjects.get(i) {
-                        self.history.push(format!("      #{:>5}  {}", i, describe(&d.geom)));
+                let sel = self.selection.clone();
+                for i in &sel {
+                    if let Some(d) = self.doc.dobjects.get(*i) {
+                        self.history.push(format!("    ─── #{} ───", i));
+                        for line in list_full_details(&d.geom) {
+                            self.history.push(format!("      {}", line));
+                        }
                     }
                 }
+                // Clear the basket so the dashed pulse goes away —
+                // 'list' is an inspection command, not a selection
+                // command. (Same rule the user set for the pickfirst
+                // branch above.)
+                self.selection_prev = self.selection.clone();
+                self.selection.clear();
+                self.selected = None;
             }
             SelectMode::ForSelect => {
                 self.history.push(format!(
@@ -7079,6 +7096,147 @@ fn describe(g: &Geom) -> String {
 /// IDs in order. Coordinates print at 3 decimal places — enough to spot
 /// "1e-3 gap between supposedly coincident endpoints" without flooding
 /// the log on big polylines.
+/// Full property dump for the LIST command — every meaningful
+/// measurement (length, perimeter, area, angles, bbox) per geom type,
+/// one line per measurement. Returns a Vec<String> so the caller can
+/// indent and push each line to the command history.
+fn list_full_details(g: &Geom) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    match g {
+        Geom::Line(l) => {
+            let d = l.b - l.a;
+            let len = d.len();
+            let mid = (l.a + l.b) * 0.5;
+            out.push(format!("type           : line"));
+            out.push(format!("from           : ({:.4}, {:.4})", l.a.x, l.a.y));
+            out.push(format!("to             : ({:.4}, {:.4})", l.b.x, l.b.y));
+            out.push(format!("midpoint       : ({:.4}, {:.4})", mid.x, mid.y));
+            out.push(format!("length         : {:.6}", len));
+            out.push(format!("ΔX, ΔY         : {:+.6}, {:+.6}", d.x, d.y));
+            out.push(format!("angle (X-axis) : {:+.4}°", d.y.atan2(d.x).to_degrees()));
+        }
+        Geom::Circle(c) => {
+            let area = std::f64::consts::PI * c.radius * c.radius;
+            let circ = std::f64::consts::TAU * c.radius;
+            out.push(format!("type           : circle"));
+            out.push(format!("center         : ({:.4}, {:.4})", c.center.x, c.center.y));
+            out.push(format!("radius         : {:.6}", c.radius));
+            out.push(format!("diameter       : {:.6}", c.radius * 2.0));
+            out.push(format!("circumference  : {:.6}", circ));
+            out.push(format!("area           : {:.6}", area));
+        }
+        Geom::Arc(a) => {
+            let arc_len    = a.radius * a.sweep_angle.abs();
+            let chord_len  = 2.0 * a.radius * (a.sweep_angle.abs() * 0.5).sin();
+            let sector_area = 0.5 * a.radius * a.radius * a.sweep_angle.abs();
+            let p_start = Vec2::new(
+                a.center.x + a.radius * a.start_angle.cos(),
+                a.center.y + a.radius * a.start_angle.sin());
+            let p_end   = Vec2::new(
+                a.center.x + a.radius * (a.start_angle + a.sweep_angle).cos(),
+                a.center.y + a.radius * (a.start_angle + a.sweep_angle).sin());
+            out.push(format!("type           : arc"));
+            out.push(format!("center         : ({:.4}, {:.4})", a.center.x, a.center.y));
+            out.push(format!("radius         : {:.6}", a.radius));
+            out.push(format!("start angle    : {:+.4}°", a.start_angle.to_degrees()));
+            out.push(format!("sweep angle    : {:+.4}°", a.sweep_angle.to_degrees()));
+            out.push(format!("start point    : ({:.4}, {:.4})", p_start.x, p_start.y));
+            out.push(format!("end point      : ({:.4}, {:.4})", p_end.x, p_end.y));
+            out.push(format!("arc length     : {:.6}", arc_len));
+            out.push(format!("chord length   : {:.6}", chord_len));
+            out.push(format!("sector area    : {:.6}", sector_area));
+        }
+        Geom::Ellipse(el) => {
+            let a = el.semi_major();
+            let b = el.semi_minor();
+            // Ramanujan's approximation for ellipse perimeter.
+            let h = ((a - b) / (a + b)).powi(2);
+            let perim = std::f64::consts::PI * (a + b)
+                * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).sqrt()));
+            let area = std::f64::consts::PI * a * b;
+            out.push(format!("type           : ellipse"));
+            out.push(format!("center         : ({:.4}, {:.4})", el.center.x, el.center.y));
+            out.push(format!("semi-major (a) : {:.6}", a));
+            out.push(format!("semi-minor (b) : {:.6}", b));
+            out.push(format!("ratio b/a      : {:.6}", el.ratio));
+            out.push(format!("rotation       : {:+.4}°", el.major.angle().to_degrees()));
+            out.push(format!("perimeter (≈)  : {:.6}  (Ramanujan)", perim));
+            out.push(format!("area           : {:.6}", area));
+        }
+        Geom::EllipseArc(ea) => {
+            let a = ea.ellipse.semi_major();
+            let b = ea.ellipse.semi_minor();
+            let area = std::f64::consts::PI * a * b
+                * (ea.sweep_param.abs() / std::f64::consts::TAU);
+            out.push(format!("type           : ellipse arc"));
+            out.push(format!("center         : ({:.4}, {:.4})",
+                ea.ellipse.center.x, ea.ellipse.center.y));
+            out.push(format!("semi-major (a) : {:.6}", a));
+            out.push(format!("semi-minor (b) : {:.6}", b));
+            out.push(format!("rotation       : {:+.4}°",
+                ea.ellipse.major.angle().to_degrees()));
+            out.push(format!("start param    : {:+.4}°", ea.start_param.to_degrees()));
+            out.push(format!("sweep param    : {:+.4}°", ea.sweep_param.to_degrees()));
+            out.push(format!("sector area    : {:.6}  (fraction of full ellipse)", area));
+        }
+        Geom::Point(pt) => {
+            out.push(format!("type           : point"));
+            out.push(format!("location       : ({:.4}, {:.4})",
+                pt.location.x, pt.location.y));
+        }
+        Geom::Polyline(p) => {
+            let n = p.vertices.len();
+            // Perimeter = sum of segment lengths (existing helper).
+            let perim = p.length();
+            // Shoelace area — only meaningful for closed polylines.
+            // Bulge contribution to area is approximated by chord; refine
+            // later if precision matters.
+            let area = if p.closed && n >= 3 {
+                let mut a = 0.0;
+                for i in 0..n {
+                    let p0 = p.vertices[i].pos;
+                    let p1 = p.vertices[(i + 1) % n].pos;
+                    a += p0.x * p1.y - p1.x * p0.y;
+                }
+                Some(a.abs() * 0.5)
+            } else { None };
+            // Bbox.
+            let mut min = p.vertices[0].pos;
+            let mut max = min;
+            for v in &p.vertices {
+                if v.pos.x < min.x { min.x = v.pos.x; }
+                if v.pos.y < min.y { min.y = v.pos.y; }
+                if v.pos.x > max.x { max.x = v.pos.x; }
+                if v.pos.y > max.y { max.y = v.pos.y; }
+            }
+            out.push(format!("type           : polyline"));
+            out.push(format!("vertices       : {}", n));
+            out.push(format!("closed         : {}", p.closed));
+            out.push(format!("perimeter      : {:.6}", perim));
+            if let Some(a) = area {
+                out.push(format!("area (shoelace): {:.6}", a));
+            }
+            out.push(format!("bbox min       : ({:.4}, {:.4})", min.x, min.y));
+            out.push(format!("bbox max       : ({:.4}, {:.4})", max.x, max.y));
+            out.push(format!("bbox size      : {:.4} × {:.4}",
+                max.x - min.x, max.y - min.y));
+        }
+        Geom::Spline(s) => {
+            out.push(format!("type           : spline"));
+            out.push(format!("degree         : {}", s.degree));
+            out.push(format!("control pts    : {}", s.control_points.len()));
+            out.push(format!("rational       : {}",
+                s.weights.iter().any(|w| (*w - 1.0).abs() > 1e-9)));
+        }
+        Geom::Hatch(h) => {
+            out.push(format!("type           : hatch"));
+            out.push(format!("pattern        : {:?}", h.pattern));
+            out.push(format!("boundary loops : {}", h.boundary_handles.len()));
+        }
+    }
+    out
+}
+
 fn describe_verbose(g: &Geom) -> String {
     match g {
         Geom::Line(l) => format!(
@@ -10354,11 +10512,13 @@ impl eframe::App for CadApp {
                 || matches!(self.chamfer_state, ChamferState::WaitingForSecond(..));
             let offset_picked = matches!(
                 self.offset_state, OffsetState::WaitingForSide(..));
+            let dist_picked = matches!(self.dist_state, DistState::WaitingForP2(_));
             let pulse_animation_active =
                 cutter_or_bound_active
                 || !self.selection.is_empty()
                 || fillet_or_chamfer_picked
-                || offset_picked;
+                || offset_picked
+                || dist_picked;
             if pulse_animation_active {
                 ctx.request_repaint_after(std::time::Duration::from_millis(80));
             }
@@ -11020,6 +11180,52 @@ impl eframe::App for CadApp {
                     };
                     painter.rect_filled(r, 0.0, fill);
                     painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0, stroke));
+                }
+            }
+
+            // ---- Dist ghost line ------------------------------------------
+            // After the first click, render a live line from P1 to the
+            // cursor plus a running readout of distance / Δx / Δy /
+            // angle so the user can preview the measurement before
+            // clicking P2.
+            if let DistState::WaitingForP2(p1) = self.dist_state {
+                if let Some(cur_s) = ctx.input(|i| i.pointer.hover_pos()) {
+                    let p1_s = self.w2s(p1, rect);
+                    let cur_w = self.s2w(cur_s, rect);
+                    // Warm-amber dashed line — same family as offset's
+                    // ghost so the user reads it as "preview".
+                    let base = egui::Color32::from_rgb(255, 200, 100);
+                    let col = egui::Color32::from_rgba_unmultiplied(
+                        base.r(), base.g(), base.b(), pulse_alpha);
+                    for s in egui::Shape::dashed_line(
+                        &[p1_s, cur_s],
+                        egui::Stroke::new(1.6, col), 6.0, 4.0)
+                    {
+                        painter.add(s);
+                    }
+                    // Small ✕ marks at both endpoints.
+                    for p in [p1_s, cur_s] {
+                        let pen = egui::Stroke::new(1.2, base);
+                        painter.line_segment(
+                            [p + egui::vec2(-6.0, -6.0),
+                             p + egui::vec2( 6.0,  6.0)], pen);
+                        painter.line_segment(
+                            [p + egui::vec2(-6.0,  6.0),
+                             p + egui::vec2( 6.0, -6.0)], pen);
+                    }
+                    // Running readout near the cursor.
+                    let dx = cur_w.x - p1.x;
+                    let dy = cur_w.y - p1.y;
+                    let d  = (dx * dx + dy * dy).sqrt();
+                    let ang = dy.atan2(dx).to_degrees();
+                    painter.text(
+                        cur_s + egui::vec2(12.0, 12.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "d={:.3}  Δ=({:+.3},{:+.3})  ∠{:+.2}°",
+                            d, dx, dy, ang),
+                        egui::FontId::monospace(11.0),
+                        egui::Color32::from_rgb(255, 220, 140));
                 }
             }
 
