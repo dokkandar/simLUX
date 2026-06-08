@@ -64,6 +64,17 @@ pub struct UserEnv {
     /// passing `offset <d>` — the new value persists across sessions
     /// and bare `offset` re-uses it. Initial default 1.0.
     pub OfsDis: f64,
+    /// Default wall thickness for the `wall` drafting command. Two
+    /// parallel lines are drawn ±`WlThk/2` from an implicit centerline
+    /// between the user's two clicks. Set inline with `wall <t>`;
+    /// persists across sessions. Initial default 0.20 (200mm).
+    pub WlThk: f64,
+    /// Wall Centerline visible. Renders the implicit centerline of
+    /// every `Geom::Wall` as a dashed half-alpha overlay on top of
+    /// the two solid side lines. Useful while developing the wall-
+    /// aware fillet/extend/trim semantics; flip off for production.
+    /// Default `true` for now.
+    pub WlCnL: bool,
     /// Trim mode shared by Fillet and Chamfer (AutoCAD `TRIMMODE`).
     /// `true` (default) → trim originals back to the new corner.
     /// `false` → keep originals full-length, add the arc/bevel as a
@@ -189,6 +200,8 @@ impl Default for UserEnv {
             ChmDs1: 0.0,
             ChmDs2: 0.0,
             OfsDis: 1.0,
+            WlThk:  0.20,
+            WlCnL:  true,
             TrmMd: true,
             DrDspM: 2,
             MnuBar: false,
@@ -269,6 +282,8 @@ impl UserEnv {
         push_f64(&mut s, "ChmDs1", self.ChmDs1);
         push_f64(&mut s, "ChmDs2", self.ChmDs2);
         push_f64(&mut s, "OfsDis", self.OfsDis);
+        push_f64(&mut s, "WlThk",  self.WlThk);
+        push_bool(&mut s, "WlCnL", self.WlCnL);
         push_bool(&mut s, "TrmMd", self.TrmMd);
         push_u8(&mut s, "DrDspM", self.DrDspM);
         push_bool(&mut s, "MnuBar", self.MnuBar);
@@ -329,6 +344,8 @@ impl UserEnv {
             "ChmDs1" => if let Ok(v) = val.parse() { self.ChmDs1 = v; }
             "ChmDs2" => if let Ok(v) = val.parse() { self.ChmDs2 = v; }
             "OfsDis" => if let Ok(v) = val.parse() { self.OfsDis = v; }
+            "WlThk"  => if let Ok(v) = val.parse() { self.WlThk  = v; }
+            "WlCnL"  => if let Some(v) = parse_bool(val) { self.WlCnL = v; }
             "TrmMd"  => if let Some(v) = parse_bool(val) { self.TrmMd = v; }
             "DrDspM" => if let Ok(v) = val.parse() { self.DrDspM = v; }
             "MnuBar" => if let Some(v) = parse_bool(val) { self.MnuBar = v; }

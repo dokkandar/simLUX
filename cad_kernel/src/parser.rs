@@ -91,6 +91,26 @@ pub enum Command {
     /// `None` means "use the persistent default" (`env.OfsDis`); the app
     /// resolves it. Matches the fillet pattern (radius optional).
     Offset(Option<f64>),
+    /// Change-property command. Bulk-set one style attribute on every
+    /// dobject in the current selection. AutoCAD CHPROP-style:
+    ///   `chprop`                  → print sub-options
+    ///   `chprop layer <name>`     → reassign to named layer
+    ///   `chprop color <spec>`     → ACI number 0-256, "bylayer", "byblock"
+    ///   `chprop linetype <name>`  → set linetype to named entry
+    ///                               (or "bylayer" → CONTINUOUS id 0)
+    /// Empty selection → enters select-mode and resumes via QueuedOp.
+    ChProp(Option<(String, String)>),
+    /// Linetype command — either list available linetypes (no arg) or
+    /// set the ACTIVE layer's linetype to the named one. Inline with
+    /// `layer`'s shape: `linetype` (list) / `linetype <name>` (set).
+    /// Unknown name → app responds with a hint listing valid names.
+    Linetype(Option<String>),
+    /// Draw a wall — two parallel lines spaced `thickness` apart,
+    /// symmetric about the centerline between the two user clicks.
+    /// `None` means "use the persistent default" (`env.WlThk`).
+    /// Produces two normal `Line` dobjects so existing trim/extend/
+    /// fillet operations work on the side lines directly.
+    Wall(Option<f64>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -167,6 +187,9 @@ impl Command {
             Command::Reverse            => "Reverse",
             Command::ChangeLayer        => "ChangeLayer",
             Command::Offset(_)          => "Offset",
+            Command::Wall(_)            => "Wall",
+            Command::Linetype(_)        => "Linetype",
+            Command::ChProp(_)          => "ChProp",
             Command::Lengthen(_)        => "Lengthen",
             Command::Break              => "Break",
             Command::Align              => "Align",
@@ -196,6 +219,7 @@ pub enum ToolKind {
     Point,
     Polyline,
     Spline,
+    Wall,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -276,6 +300,49 @@ pub fn parse(line: &str) -> Result<Command, String> {
                     let d: f64 = s.parse().map_err(|_| "bad distance".to_string())?;
                     if d.abs() < 1e-12 { return Err("offset distance must be non-zero".into()); }
                     Ok(Command::Offset(Some(d)))
+                }
+            }
+        }
+        "chprop" | "chpr" | "props" | "properties" => {
+            // `chprop`                → no-arg form, prints help
+            // `chprop layer Walls`    → set layer
+            // `chprop color 1`        → set color (ACI number or "bylayer")
+            // `chprop linetype Dashed`→ set linetype
+            match (toks.get(1), toks.get(2)) {
+                (None, _) => Ok(Command::ChProp(None)),
+                (Some(_), None) => Err("chprop: usage — chprop <layer|color|linetype> <value>".into()),
+                (Some(what), Some(val)) => {
+                    let what_lc = what.to_ascii_lowercase();
+                    let what_norm = match what_lc.as_str() {
+                        "layer" | "la" | "l"      => "layer",
+                        "color" | "col" | "c"     => "color",
+                        "linetype" | "ltype" | "lt" => "linetype",
+                        other => return Err(format!(
+                            "chprop: unknown property '{}' (try layer / color / linetype)", other)),
+                    };
+                    Ok(Command::ChProp(Some((what_norm.to_string(), (*val).to_string()))))
+                }
+            }
+        }
+        "linetype" | "ltype" | "lt" => {
+            // Bare → list; `linetype <name>` → set active layer's
+            // linetype. Multiple-word names not supported (the catalog
+            // uses single tokens like "Continuous", "Dashed", "DashDot").
+            match toks.get(1) {
+                None    => Ok(Command::Linetype(None)),
+                Some(s) => Ok(Command::Linetype(Some((*s).to_string()))),
+            }
+        }
+        "wall" | "w"      => {
+            // Bare `wall` → use env.WlThk (the app resolves None).
+            // `wall <t>` → use that thickness AND persist it. Same
+            // shape as `offset` for muscle-memory consistency.
+            match toks.get(1) {
+                None    => Ok(Command::Wall(None)),
+                Some(s) => {
+                    let t: f64 = s.parse().map_err(|_| "bad thickness".to_string())?;
+                    if t <= 1e-12 { return Err("wall thickness must be positive".into()); }
+                    Ok(Command::Wall(Some(t)))
                 }
             }
         }

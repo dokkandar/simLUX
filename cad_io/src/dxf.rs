@@ -537,6 +537,20 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
         // control points / fit points / fit tolerance. v1 doesn't
         // export it yet — skip silently. Round-trip in RSM works.
         Geom::Spline(_) => {}
+        // Wall — DXF has no native wall entity. Export the two side
+        // lines as LINE entities so the geometry round-trips
+        // visually. The "smart" centerline+thickness link is lost on
+        // export (recoverable on re-import only via heuristics).
+        Geom::Wall(w) => {
+            if let (Some(l), Some(r)) = (w.left_line(), w.right_line()) {
+                common(s, "LINE");
+                pair_f(s, 10, l.a.x); pair_f(s, 20, l.a.y); pair_f(s, 30, 0.0);
+                pair_f(s, 11, l.b.x); pair_f(s, 21, l.b.y); pair_f(s, 31, 0.0);
+                common(s, "LINE");
+                pair_f(s, 10, r.a.x); pair_f(s, 20, r.a.y); pair_f(s, 30, 0.0);
+                pair_f(s, 11, r.b.x); pair_f(s, 21, r.b.y); pair_f(s, 31, 0.0);
+            }
+        }
     }
 }
 

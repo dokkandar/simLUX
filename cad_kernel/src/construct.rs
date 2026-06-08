@@ -10,9 +10,41 @@
 // Each is a pure function returning Option<Arc>. None means the inputs were
 // degenerate (collinear / chord longer than 2·radius / chord longer than arc length).
 
-use crate::geom::{Arc, Ellipse};
+use crate::geom::{Arc, Ellipse, Line};
 use crate::math::{norm_angle, Vec2, EPS};
 use std::f64::consts::{PI, TAU};
+
+// ---- Wall: two parallel lines from a centerline + thickness -----------------
+
+/// Build the two side lines of a wall from its implicit CENTERLINE
+/// (`start` → `end`) and `thickness`. The wall is symmetric about the
+/// centerline: each side line is offset by `thickness/2` along the
+/// perpendicular to the wall direction.
+///
+/// Returns `(left, right)` where "left" is on the CCW side of the
+/// direction (`+perp` of (end - start)) and "right" is the opposite
+/// (`-perp`). When `(end - start)` has near-zero length OR `thickness`
+/// is non-positive, returns `None` (degenerate wall — caller should
+/// treat as no-op).
+///
+/// Design rationale: keeping the centerline IMPLICIT means a wall is
+/// just two normal `Line` dobjects on the canvas — every existing
+/// trim/extend/offset/fillet/mirror operation works on the side lines
+/// directly with no new infrastructure. The reverse direction (recover
+/// the centerline from the two side lines) is trivial via midpoint of
+/// the perpendicular between them; useful for a future wall-aware
+/// fillet that fillets the centerlines first then re-derives the sides.
+pub fn wall_sides(start: Vec2, end: Vec2, thickness: f64) -> Option<(Line, Line)> {
+    let dir = end - start;
+    let len = dir.len();
+    if len < EPS || thickness <= EPS { return None; }
+    let perp = (dir / len).perp();
+    let off = perp * (thickness * 0.5);
+    Some((
+        Line { a: start + off, b: end + off },
+        Line { a: start - off, b: end - off },
+    ))
+}
 
 // ---- Ellipse from centre + end-of-major + minor length ---------------------
 
@@ -317,5 +349,44 @@ mod tests {
             false,
         );
         assert!(r.is_none());
+    }
+
+    #[test]
+    fn wall_sides_horizontal() {
+        // Horizontal centerline (0,0)→(10,0), thickness 2 → sides at y=±1.
+        let (l, r) = wall_sides(
+            Vec2::new(0.0, 0.0), Vec2::new(10.0, 0.0), 2.0,
+        ).expect("non-degenerate");
+        // dir = (1,0); perp = (0,1) (CCW); off = (0,1).
+        // left  = (0,1) → (10,1); right = (0,-1) → (10,-1).
+        assert!((l.a - Vec2::new(0.0,  1.0)).len() < 1e-12);
+        assert!((l.b - Vec2::new(10.0, 1.0)).len() < 1e-12);
+        assert!((r.a - Vec2::new(0.0, -1.0)).len() < 1e-12);
+        assert!((r.b - Vec2::new(10.0,-1.0)).len() < 1e-12);
+    }
+
+    #[test]
+    fn wall_sides_diagonal_preserves_spacing() {
+        // 45° wall; verify the two side lines are still `thickness` apart
+        // when measured perpendicular to the centerline.
+        let s = Vec2::new(0.0, 0.0);
+        let e = Vec2::new(7.0, 7.0);
+        let thk = 3.0;
+        let (l, r) = wall_sides(s, e, thk).expect("non-degenerate");
+        // Distance between corresponding endpoints = thickness.
+        assert!(((l.a - r.a).len() - thk).abs() < 1e-12);
+        assert!(((l.b - r.b).len() - thk).abs() < 1e-12);
+    }
+
+    #[test]
+    fn wall_sides_degenerate_returns_none() {
+        // Zero-length centerline.
+        assert!(wall_sides(
+            Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0), 1.0).is_none());
+        // Non-positive thickness.
+        assert!(wall_sides(
+            Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0).is_none());
+        assert!(wall_sides(
+            Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), -1.0).is_none());
     }
 }

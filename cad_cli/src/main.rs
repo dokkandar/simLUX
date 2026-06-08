@@ -85,7 +85,8 @@ fn main() {
             Ok(Command::Copy) | Ok(Command::Rotate) | Ok(Command::Scale)
             | Ok(Command::Mirror) | Ok(Command::Hatch { .. }) | Ok(Command::DeleteSelected) | Ok(Command::Undo)
             | Ok(Command::Redo) | Ok(Command::MatchProps) | Ok(Command::Reverse)
-            | Ok(Command::ChangeLayer) | Ok(Command::Offset(_))
+            | Ok(Command::ChangeLayer) | Ok(Command::Offset(_)) | Ok(Command::Wall(_))
+            | Ok(Command::Linetype(_)) | Ok(Command::ChProp(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)
@@ -153,5 +154,8 @@ fn describe(g: &Geom) -> String {
         Geom::Spline(s) => format!(
             "spline (degree {}, {} control points)",
             s.degree, s.control_points.len()),
+        Geom::Wall(w) => format!(
+            "wall ({:.4},{:.4}) -> ({:.4},{:.4}) thk={:.4}",
+            w.start.x, w.start.y, w.end.x, w.end.y, w.thickness),
     }
 }

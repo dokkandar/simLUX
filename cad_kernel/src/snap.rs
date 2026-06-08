@@ -369,6 +369,14 @@ fn candidate_points(
                 }
             }
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Hatch(_) => Vec::new(),
+            // Wall — endpoints of BOTH visible side lines (the user
+            // sees them; snapping there matches expectations).
+            Geom::Wall(w) => {
+                let mut out: Vec<Vec2> = Vec::new();
+                if let Some(l) = w.left_line()  { out.push(l.a); out.push(l.b); }
+                if let Some(r) = w.right_line() { out.push(r.a); out.push(r.b); }
+                plain(out)
+            }
         },
         SnapKind::Mid => match e {
             Geom::Line(l) => plain([(l.a + l.b) * 0.5]),
@@ -393,6 +401,13 @@ fn candidate_points(
                 plain(pts)
             }
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
+            // Wall MID — midpoint of each visible side line.
+            Geom::Wall(w) => {
+                let mut out: Vec<Vec2> = Vec::new();
+                if let Some(l) = w.left_line()  { out.push((l.a + l.b) * 0.5); }
+                if let Some(r) = w.right_line() { out.push((r.a + r.b) * 0.5); }
+                plain(out)
+            }
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -401,13 +416,15 @@ fn candidate_points(
             Geom::Ellipse(e)     => plain([e.center]),
             Geom::EllipseArc(ea) => plain([ea.ellipse.center]),
             Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
+            // Wall has no canonical centre.
+            Geom::Wall(_) => Vec::new(),
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -539,6 +556,21 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
             }
             best.map(|(pt, _)| pt)
         }
+        // Wall — closest point on the NEARER of the two visible side lines.
+        Geom::Wall(w) => {
+            let l = w.left_line();
+            let r = w.right_line();
+            let cand_l = l.and_then(|line| nearest_on_line(p, &line)
+                .map(|q| (q, q.dist(p))));
+            let cand_r = r.and_then(|line| nearest_on_line(p, &line)
+                .map(|q| (q, q.dist(p))));
+            match (cand_l, cand_r) {
+                (Some((ql, dl)), Some((qr, dr))) =>
+                    Some(if dl <= dr { ql } else { qr }),
+                (Some((q, _)), None) | (None, Some((q, _))) => Some(q),
+                (None, None) => None,
+            }
+        }
     }
 }
 
@@ -641,6 +673,17 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
             for w in samples.windows(2) {
                 let l = Line { a: w[0], b: w[1] };
                 if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
+        // Wall PER — perpendicular feet onto BOTH visible side lines.
+        Geom::Wall(w) => {
+            let mut out = Vec::new();
+            if let Some(l) = w.left_line() {
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            if let Some(r) = w.right_line() {
+                if let Some(hit) = per_to_line(from, &r) { out.push(hit); }
             }
             out
         }
@@ -761,6 +804,18 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
             for w in samples.windows(2) {
                 let l = Line { a: w[0], b: w[1] };
                 if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            out
+        }
+        // Wall TAN — same as line fallback on each side line (a line
+        // is its own tangent; this gives the perpendicular foot).
+        Geom::Wall(w) => {
+            let mut out = Vec::new();
+            if let Some(l) = w.left_line() {
+                if let Some(hit) = per_to_line(from, &l) { out.push(hit); }
+            }
+            if let Some(r) = w.right_line() {
+                if let Some(hit) = per_to_line(from, &r) { out.push(hit); }
             }
             out
         }

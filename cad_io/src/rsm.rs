@@ -56,7 +56,7 @@
 use cad_kernel::{
     Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Hatch,
     HatchPattern, Layer, LayerTable, Line, Lineweight, Linetype, LinetypeTable,
-    Pen, PenTable, Point, PolyVertex, Polyline, Spline, Style, Vec2,
+    Pen, PenTable, Point, PolyVertex, Polyline, Spline, Style, Vec2, Wall,
 };
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
@@ -262,6 +262,13 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             for wt in &s.weights {
                 write_f64(w, *wt);
             }
+        }
+        Geom::Wall(wall) => {
+            // tag 9 = Wall; centerline + thickness.
+            write_u8(w, 9);
+            write_vec2(w, wall.start);
+            write_vec2(w, wall.end);
+            write_f64(w, wall.thickness);
         }
     }
 }
@@ -485,6 +492,9 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
             for _ in 0..n { weights.push(r.f64()?); }
             Geom::Spline(Spline { degree, control_points, weights })
         }
+        9 => Geom::Wall(Wall {
+            start: r.vec2()?, end: r.vec2()?, thickness: r.f64()?,
+        }),
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
 }

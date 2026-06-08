@@ -210,6 +210,16 @@ fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
                 out.push(TessSeg { a: w[0], b: w[1], src });
             }
         }
+        Geom::Wall(w) => {
+            // Hatch boundary tracing — emit the two visible side lines
+            // so the wall contributes as a real boundary candidate.
+            if let Some(l) = w.left_line() {
+                out.push(TessSeg { a: l.a, b: l.b, src });
+            }
+            if let Some(r) = w.right_line() {
+                out.push(TessSeg { a: r.a, b: r.b, src });
+            }
+        }
         Geom::Point(_) | Geom::Hatch(_) => {}
     }
 }

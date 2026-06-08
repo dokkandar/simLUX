@@ -39,7 +39,7 @@ pub mod snap;
 
 // Convenience re-exports
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
-pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line, Point, PolyVertex, Polyline, Spline};
+pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line, Point, PolyVertex, Polyline, Spline, Wall};
 pub mod patterns;
 pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms};
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
@@ -54,7 +54,7 @@ pub use intersect::intersect;
 pub use parser::{parse, Command, ToolKind};
 pub use construct::{
     arc_center_start_end, arc_chord_length, arc_chord_radius, arc_three_points,
-    ellipse_center_major_minor,
+    ellipse_center_major_minor, wall_sides,
 };
 pub use spatial::UniformGrid;
 pub use snap::{find_all_snaps, find_snap, snap_to, SnapHit, SnapKind, SnapSet};

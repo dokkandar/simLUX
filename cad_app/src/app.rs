@@ -34,7 +34,7 @@ fn aci_mapping_path() -> std::path::PathBuf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline }
+enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall }
 
 /// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
 /// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
@@ -131,6 +131,8 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::None,   _) => "select a tool above, or type a command below",
         (Tool::Line,   0) => "line: click first endpoint",
         (Tool::Line,   _) => "line: click second endpoint    [Esc cancels]",
+        (Tool::Wall,   0) => "wall: click first centerline endpoint",
+        (Tool::Wall,   _) => "wall: click second centerline endpoint    [Esc cancels]",
         (Tool::Circle, 0) => "circle: click center",
         (Tool::Circle, _) => "circle: click point on circumference    [Esc cancels]",
         (Tool::Ellipse, 0) => "ellipse: click CENTER",
@@ -303,6 +305,28 @@ pub struct CadApp {
     /// without snapshotting, the second click would render SOLID
     /// instead of the originally-chosen pattern.
     hatch_pick_point_session: Option<(Option<String>, f64, f64)>,
+    /// Post-apply confirmation panel — shown after every successful
+    /// `apply_hatch()` so the user can confirm, edit, or extend the
+    /// hatch they just created without leaving the hatch flow. Set by
+    /// `apply_hatch` on success, cleared by the panel's buttons.
+    hatch_confirm_open: bool,
+    /// Snapshot of the document state captured at the START of a hatch
+    /// preview session — taken on the FIRST `apply_hatch` in the
+    /// session, restored on "Discard". On "Confirm" we promote it onto
+    /// `undo_stack` so a single undo from then on reverts the whole
+    /// hatch flow (including any "Change pattern/Scale" tweaks) as one
+    /// step. While the session is open we DON'T push to `undo_stack`,
+    /// so iterative tweaking doesn't bloat undo history.
+    hatch_preview_snap: Option<cad_kernel::Document>,
+    /// Index of the LAST Hatch dobject created in this flow, used by
+    /// the post-apply confirmation panel's "Change pattern/Scale"
+    /// action to MODIFY the existing hatch in-place instead of creating
+    /// a new one. None means no recent hatch (panel hides).
+    hatch_last_idx: Option<usize>,
+    /// When true, the next dialog OK applies its pattern/scale/angle to
+    /// `hatch_last_idx` (in-place edit) instead of pushing a new Hatch.
+    /// Set by the confirm panel's "Change pattern/Scale" button.
+    hatch_dialog_edit_mode: bool,
     /// ACI polar-wheel picker — shared state for the floating picker
     /// window. The same window serves every call site; `pick_request`
     /// names who asked for the pick so the chosen ACI flows back to
@@ -574,7 +598,7 @@ pub enum MoveState {
 ///   `move` → auto-enter select mode → user picks → Enter → base/dest clicks.
 ///
 /// Extend this enum when adding copy / rotate / scale / mirror / trim …
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub enum QueuedOp {
     None,
     Move,
@@ -600,6 +624,11 @@ pub enum QueuedOp {
     /// in one batch. AutoCAD's ERASE: type `erase`, pick targets,
     /// Enter to commit.
     Erase,
+    /// ChProp — applied on Enter. The finalised selection has the
+    /// captured (property, value) pair applied to every dobject:
+    /// layer/color/linetype reassignment. Pair stored as Strings so
+    /// the kernel layer-id / linetype-id lookups happen at apply time.
+    ChProp(String, String),
 }
 
 /// State machine for the interactive copy tool — same shape as MoveState.
@@ -966,6 +995,10 @@ impl Default for CadApp {
             hatch_dialog_angle: 0.0,
             hatch_pick_point_armed: false,
             hatch_pick_point_session: None,
+            hatch_confirm_open: false,
+            hatch_last_idx: None,
+            hatch_dialog_edit_mode: false,
+            hatch_preview_snap: None,
             fps_smooth: 0.0,
             index:       None,
             index_dirty: true,
@@ -1197,6 +1230,41 @@ impl CadApp {
                 return;
             }
             ChamferDistWait::Off => {}
+        }
+
+        // ---- Hatch-confirm-panel cmd-line shortcuts -----------------
+        // When a hatch preview is awaiting confirmation, the floating
+        // panel can also be driven from the command line so the user
+        // never has to leave the keyboard.
+        if self.hatch_confirm_open {
+            let lc = trimmed.to_ascii_lowercase();
+            match lc.as_str() {
+                "" | "y" | "yes" | "confirm" | "c" | "ok" => {
+                    self.hatch_confirm_accept();
+                    return;
+                }
+                "n" | "no" | "discard" | "cancel" | "x" => {
+                    self.hatch_confirm_discard();
+                    return;
+                }
+                "change" | "edit" | "ch" | "ed" | "r" | "redo" => {
+                    self.hatch_confirm_change();
+                    return;
+                }
+                "+p" | "p" | "point" | "addpoint" | "pickpoint" => {
+                    self.hatch_confirm_add_point();
+                    return;
+                }
+                "+d" | "d" | "dobj" | "dobject" | "adddobject" => {
+                    self.hatch_confirm_add_dobject();
+                    return;
+                }
+                _ => {
+                    self.history.push(
+                        "  ! hatch panel awaiting: type `c`onfirm / `d`iscard / `ch`ange / `p`oint / `D`object".into());
+                    return;
+                }
+            }
         }
 
         // ---- PLINE sub-command intercept (AutoCAD PLINE Line/Arc flow) ----
@@ -1644,6 +1712,7 @@ impl CadApp {
                 // points from any prior session are cleared.
                 self.tool = match kind {
                     ToolKind::Line       => Tool::Line,
+                    ToolKind::Wall       => Tool::Wall,
                     ToolKind::Circle     => Tool::Circle,
                     ToolKind::Arc        => Tool::Arc,
                     ToolKind::Ellipse    => Tool::Ellipse,
@@ -1918,6 +1987,85 @@ impl CadApp {
             }
             Ok(Command::Reverse)     => self.apply_reverse(),
             Ok(Command::ChangeLayer) => self.apply_chlayer(),
+            Ok(Command::ChProp(arg)) => {
+                match arg {
+                    None => {
+                        self.history.push(
+                            "  chprop — usage:".into());
+                        self.history.push(
+                            "    chprop layer <name>     change layer of selected".into());
+                        self.history.push(
+                            "    chprop color <aci>      ACI 0-256, 'bylayer', 'byblock'".into());
+                        self.history.push(
+                            "    chprop linetype <name>  Continuous / Dashed / DashDot / …".into());
+                    }
+                    Some((prop, val)) => {
+                        if self.selection.is_empty() {
+                            self.begin_selection(SelectMode::ForSelect);
+                            self.queued_op = QueuedOp::ChProp(prop.clone(), val.clone());
+                            self.set_prompt(format!(
+                                "chprop {}={}: pick dobjects, Enter to apply  [Esc=cancel]",
+                                prop, val));
+                        } else {
+                            self.apply_chprop(&prop, &val);
+                        }
+                    }
+                }
+            }
+            Ok(Command::Linetype(name_opt)) => {
+                // `linetype`        → list available linetypes
+                // `linetype <name>` → set the ACTIVE layer's linetype
+                //                     (case-insensitive lookup)
+                match name_opt {
+                    None => {
+                        let names: Vec<String> = self.doc.linetypes.linetypes
+                            .iter().enumerate()
+                            .map(|(i, lt)| format!("  {} {} — {}",
+                                i, lt.name, lt.description))
+                            .collect();
+                        self.history.push(format!(
+                            "  linetypes ({} available):", names.len()));
+                        for n in names { self.history.push(n); }
+                    }
+                    Some(name) => {
+                        match self.doc.linetypes.find(&name) {
+                            Some(id) => {
+                                let active = self.doc.layers.active;
+                                if let Some(l) = self.doc.layers.get_mut(active) {
+                                    l.linetype = id;
+                                    self.history.push(format!(
+                                        "  layer '{}' linetype → '{}' (id {})",
+                                        l.name, name, id));
+                                    self.gpu_dirty = true;
+                                }
+                            }
+                            None => {
+                                let available: Vec<&str> = self.doc.linetypes.linetypes
+                                    .iter().map(|l| l.name.as_str()).collect();
+                                self.history.push(format!(
+                                    "  ! linetype '{}' not found — try one of: {}",
+                                    name, available.join(", ")));
+                            }
+                        }
+                    }
+                }
+            }
+            Ok(Command::Wall(t_opt)) => {
+                // Persist thickness if user supplied one, then enter
+                // the Wall drafting tool. Two clicks → two side lines
+                // via cad_kernel::wall_sides.
+                if let Some(v) = t_opt {
+                    if (self.env.WlThk - v).abs() > 1e-12 {
+                        self.env.WlThk = v;
+                        let _ = self.env.save();
+                    }
+                }
+                self.tool = Tool::Wall;
+                self.pending.clear();
+                self.history.push(format!(
+                    "  wall: thickness {} — click first centerline endpoint  [Esc cancels]",
+                    self.env.WlThk));
+            }
             Ok(Command::Offset(d_opt)) => {
                 // AutoCAD-style flow:
                 //   offset            → enter with persisted distance
@@ -2005,6 +2153,16 @@ impl CadApp {
                 }
             }
             Ok(Command::Hatch { pattern, scale, angle_deg }) => {
+                // Block re-entry while a preview confirm panel is open
+                // — otherwise typing `hatch` again stacks duplicate
+                // fills on the same boundary before the user gets to
+                // accept/reject the first one (the bug from the user's
+                // log dump).
+                if self.hatch_confirm_open {
+                    self.history.push(
+                        "  ! hatch: a hatch preview is awaiting your decision — Confirm, Discard, or pick an action in the panel first".into());
+                    return;
+                }
                 // Auto-open the Hatch Debug window so the user sees the
                 // live log without having to hunt for the toolbar
                 // toggle. Mirrors the trim/extend pattern. Does NOT
@@ -2195,6 +2353,11 @@ impl CadApp {
                 }
                 self.trim_dbg(format!(
                     "CUTTERS captured = {} indices: {:?}", cutters.len(), cutters));
+                // Dump every cutter's full geometry — bug-reportable input.
+                let cutters_for_log = cutters.clone();
+                for idx in &cutters_for_log {
+                    self.trim_dbg_dobject(*idx, "CUTTER");
+                }
                 self.history.push(format!(
                     "  trim — {} cutter(s) ready (warm orange). Click each TARGET to cut. Enter / Esc to finish.",
                     cutters.len()));
@@ -2306,6 +2469,9 @@ impl CadApp {
                 // Replay the same path Command::DeleteSelected uses.
                 self.run_command("erase");
             }
+            QueuedOp::ChProp(prop, val) => {
+                self.apply_chprop(&prop, &val);
+            }
         }
         // self.selection persists so follow-up commands (move, list, …) can use it.
     }
@@ -2415,8 +2581,8 @@ impl CadApp {
         user_scale: f64,
         user_angle_deg: f64,
     ) {
-        let families = cad_kernel::patterns::lookup(name);
-        if families.is_empty() { return; }
+        let pat = cad_kernel::patterns::lookup(name);
+        if pat.is_empty() { return; }
         // Union bbox of all loops in world coords.
         let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
         let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
@@ -2431,7 +2597,17 @@ impl CadApp {
         if !min.x.is_finite() || !max.x.is_finite() { return; }
         let user_angle = user_angle_deg.to_radians();
         let stroke = egui::Stroke::new(0.9, color);
-        for fam in &families {
+        let families = match &pat {
+            cad_kernel::patterns::Pattern::Families(fs) => fs.as_slice(),
+            cad_kernel::patterns::Pattern::Tile { period_x, period_y, segments, circles } => {
+                self.render_hatch_tile(
+                    painter, rect, loops, stroke,
+                    *period_x, *period_y, segments, circles,
+                    user_scale, user_angle, min, max);
+                return;
+            }
+        };
+        for fam in families {
             // Effective angle + spacing after user transform.
             let theta = fam.angle + user_angle;
             let spacing = fam.spacing * user_scale.abs().max(1e-9);
@@ -2498,6 +2674,169 @@ impl CadApp {
                     }
                 }
                 s += spacing;
+            }
+        }
+    }
+
+    /// Tile-pattern renderer — tiles a finite-segment cell across the
+    /// boundary bbox and clips each segment against the loops using the
+    /// same infinite-line + even-odd machinery as families, then clamps
+    /// the resulting visible intervals to the segment's own length so
+    /// only its in-cell portion is drawn.
+    ///
+    /// `user_scale` multiplies the period AND the segment coords; the
+    /// user_angle rotates the whole pattern about the origin.
+    #[allow(clippy::too_many_arguments)]
+    fn render_hatch_tile(
+        &self,
+        painter:    &egui::Painter,
+        rect:       egui::Rect,
+        loops:      &[Vec<Vec2>],
+        stroke:     egui::Stroke,
+        period_x:   f64,
+        period_y:   f64,
+        segments:   &[cad_kernel::patterns::PatternSegment],
+        circles:    &[cad_kernel::patterns::PatternCircle],
+        user_scale: f64,
+        user_angle: f64,
+        min:        Vec2,
+        max:        Vec2,
+    ) {
+        let s = user_scale.abs().max(1e-9);
+        let px = period_x * s;
+        let py = period_y * s;
+        if px < 1e-9 || py < 1e-9 { return; }
+        let cos = user_angle.cos();
+        let sin = user_angle.sin();
+        // Cells in the AXIS-ALIGNED pattern frame that need rendering.
+        // After user_angle rotation the cell axes no longer align with
+        // the world bbox — invert the rotation on each world-bbox corner
+        // to find the bbox in pattern frame, then iterate cells.
+        let corners_world = [
+            Vec2::new(min.x, min.y), Vec2::new(max.x, min.y),
+            Vec2::new(max.x, max.y), Vec2::new(min.x, max.y),
+        ];
+        let mut pmin = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut pmax = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for c in &corners_world {
+            // inverse rotation: (cos, sin) → (cos, -sin)
+            let px_w = c.x * cos + c.y * sin;
+            let py_w = -c.x * sin + c.y * cos;
+            if px_w < pmin.x { pmin.x = px_w; }
+            if py_w < pmin.y { pmin.y = py_w; }
+            if px_w > pmax.x { pmax.x = px_w; }
+            if py_w > pmax.y { pmax.y = py_w; }
+        }
+        let i0 = (pmin.x / px).floor() as i64 - 1;
+        let i1 = (pmax.x / px).ceil()  as i64 + 1;
+        let j0 = (pmin.y / py).floor() as i64 - 1;
+        let j1 = (pmax.y / py).ceil()  as i64 + 1;
+        // Safety cap — millions of cells would freeze the UI.
+        let tile_count = (i1 - i0).max(0) * (j1 - j0).max(0);
+        if tile_count > 200_000 { return; }
+        for j in j0..=j1 {
+            for i in i0..=i1 {
+                let ox = (i as f64) * px;
+                let oy = (j as f64) * py;
+                for seg in segments {
+                    // Segment endpoints in PATTERN frame (with user scale).
+                    let ax_p = ox + seg.x1 * s;
+                    let ay_p = oy + seg.y1 * s;
+                    let bx_p = ox + seg.x2 * s;
+                    let by_p = oy + seg.y2 * s;
+                    // Rotate to WORLD frame by user_angle.
+                    let ax = ax_p * cos - ay_p * sin;
+                    let ay = ax_p * sin + ay_p * cos;
+                    let bx = bx_p * cos - by_p * sin;
+                    let by = bx_p * sin + by_p * cos;
+                    let a = Vec2::new(ax, ay);
+                    let b = Vec2::new(bx, by);
+                    let dvec = b - a;
+                    let seg_len2 = dvec.x * dvec.x + dvec.y * dvec.y;
+                    if seg_len2 < 1e-18 { continue; }
+                    // Use the segment itself as the parametric line:
+                    //   line(t) = a + t * (b - a), so t ∈ [0,1] is the
+                    //   drawable portion of THIS tile-segment. Clip
+                    //   against all loop edges with even-odd, intersect
+                    //   the resulting intervals with [0, 1].
+                    let mut hits: Vec<f64> = Vec::new();
+                    for l in loops {
+                        let m = l.len();
+                        if m < 2 { continue; }
+                        for k in 0..m {
+                            let p0 = l[k];
+                            let p1 = l[(k + 1) % m];
+                            if let Some(t) = line_segment_intersect_t(a, dvec, p0, p1) {
+                                // Filter to the segment's own parameter
+                                // range. `line_segment_intersect_t`
+                                // returns t for an INFINITE line through
+                                // a in direction dvec; hits at t<0 or
+                                // t>1 are intersections of that infinite
+                                // extension with boundary edges that lie
+                                // BEYOND our segment endpoints, and they
+                                // would corrupt the even-odd interval
+                                // walk if mixed in. Parity at the seg
+                                // endpoints is recovered separately via
+                                // point_in_polygon.
+                                if t > -1e-9 && t < 1.0 + 1e-9 {
+                                    hits.push(t.clamp(0.0, 1.0));
+                                }
+                            }
+                        }
+                    }
+                    // Even-odd parity at the segment START. Each in-range
+                    // crossing flips it; tail interval up to t=1 closes
+                    // the walk if we end inside.
+                    let a_in = loops.iter().fold(false,
+                        |acc, l| acc ^ point_in_polygon(a, l.iter().copied()));
+                    if hits.is_empty() {
+                        if !a_in { continue; }
+                        painter.line_segment(
+                            [self.w2s(a, rect), self.w2s(b, rect)],
+                            stroke);
+                        continue;
+                    }
+                    hits.sort_by(|x, y| x.partial_cmp(y).unwrap_or(std::cmp::Ordering::Equal));
+                    let mut inside = a_in;
+                    let mut t_prev = 0.0_f64;
+                    let mut intervals: Vec<(f64, f64)> = Vec::new();
+                    for &t in &hits {
+                        if inside { intervals.push((t_prev, t)); }
+                        inside = !inside;
+                        t_prev = t;
+                    }
+                    if inside { intervals.push((t_prev, 1.0)); }
+                    for (t0, t1) in intervals {
+                        if t1 - t0 > 1e-6 {
+                            let p0 = a + dvec * t0;
+                            let p1 = a + dvec * t1;
+                            painter.line_segment(
+                                [self.w2s(p0, rect), self.w2s(p1, rect)],
+                                stroke);
+                        }
+                    }
+                }
+                // Circles in the cell — paint each, but only when its
+                // CENTRE lies inside the resolved hatch boundary loops
+                // (even-odd). v1 simplification: a circle is "in or out"
+                // as a whole. Boundary-intersecting circles render with
+                // their full ring beyond the boundary; refine later by
+                // arc-clipping when a circle straddles the boundary.
+                for c in circles {
+                    let cx_p = ox + c.cx * s;
+                    let cy_p = oy + c.cy * s;
+                    let cx = cx_p * cos - cy_p * sin;
+                    let cy = cx_p * sin + cy_p * cos;
+                    let centre = Vec2::new(cx, cy);
+                    let r_world = c.radius * s;
+                    if r_world < 1e-9 { continue; }
+                    let inside = loops.iter().fold(false,
+                        |acc, l| acc ^ point_in_polygon(centre, l.iter().copied()));
+                    if !inside { continue; }
+                    let r_px = (r_world as f32) * self.scale;
+                    if r_px < 0.5 { continue; }
+                    painter.circle_stroke(self.w2s(centre, rect), r_px, stroke);
+                }
             }
         }
     }
@@ -2832,6 +3171,95 @@ impl CadApp {
     /// Non-closed-polyline selections are silently skipped with a
     /// message. Multi-loop selection = one hatch with islands; single
     /// loop = solid disc.
+    /// Bulk-set one style attribute on every dobject in the current
+    /// selection. Driven by the `chprop` command. Snapshots the doc
+    /// before mutating so a single undo reverts the whole batch.
+    /// Unknown property or value → no-op + error in history.
+    fn apply_chprop(&mut self, prop: &str, val: &str) {
+        if self.selection.is_empty() {
+            self.history.push("  ! chprop: empty selection".into());
+            return;
+        }
+        // Resolve VALUE → target style field. Done once before the
+        // loop so the error message fires before any mutation.
+        enum Target {
+            Layer(LayerId),
+            Color(cad_kernel::Color),
+            Linetype(u32),
+        }
+        let target = match prop {
+            "layer" => match self.doc.layers.find(val) {
+                Some(id) => Target::Layer(id),
+                None => {
+                    let names: Vec<String> = self.doc.layers.layers.iter()
+                        .map(|l| l.name.clone()).collect();
+                    self.history.push(format!(
+                        "  ! chprop: layer '{}' not found — available: {}",
+                        val, names.join(", ")));
+                    return;
+                }
+            },
+            "color" => {
+                let val_lc = val.to_ascii_lowercase();
+                match val_lc.as_str() {
+                    "bylayer" => Target::Color(cad_kernel::Color::ByLayer),
+                    "byblock" => Target::Color(cad_kernel::Color::ByBlock),
+                    _ => match val.parse::<u8>() {
+                        Ok(n) => Target::Color(cad_kernel::Color::Aci(n)),
+                        Err(_) => {
+                            self.history.push(format!(
+                                "  ! chprop color '{}': expected ACI 0-255, 'bylayer', or 'byblock'",
+                                val));
+                            return;
+                        }
+                    },
+                }
+            }
+            "linetype" => {
+                let val_lc = val.to_ascii_lowercase();
+                let lt_id = if val_lc == "bylayer" {
+                    cad_kernel::LinetypeTable::CONTINUOUS
+                } else {
+                    match self.doc.linetypes.find(val) {
+                        Some(id) => id,
+                        None => {
+                            let names: Vec<&str> = self.doc.linetypes.linetypes.iter()
+                                .map(|l| l.name.as_str()).collect();
+                            self.history.push(format!(
+                                "  ! chprop linetype '{}' not found — available: {}",
+                                val, names.join(", ")));
+                            return;
+                        }
+                    }
+                };
+                Target::Linetype(lt_id)
+            }
+            other => {
+                self.history.push(format!(
+                    "  ! chprop: unknown property '{}'", other));
+                return;
+            }
+        };
+        // Snapshot before mutating so one undo reverts the whole batch.
+        self.snapshot_doc();
+        let mut changed = 0usize;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                match &target {
+                    Target::Layer(id)    => d.style.layer    = *id,
+                    Target::Color(c)     => d.style.color    = *c,
+                    Target::Linetype(id) => d.style.linetype = *id,
+                }
+                changed += 1;
+            }
+        }
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!(
+            "  ⊛ chprop {}={}: {} dobject(s) updated",
+            prop, val, changed));
+    }
+
     fn apply_hatch(&mut self) {
         self.hatch_dbg(format!(
             "apply_hatch() entry — selection.len() = {}, idx = {:?}",
@@ -2886,7 +3314,14 @@ impl CadApp {
             self.history.push("  ! hatch: no closed boundary in selection".into());
             return;
         }
-        self.snapshot_doc();
+        // Preview snapshot — taken once at the start of the hatch flow.
+        // While the confirm panel is open, all "Change pattern/Scale"
+        // tweaks mutate in place; one Discard reverts everything;
+        // Confirm promotes the snap onto undo_stack so a future undo
+        // reverts the whole flow as one step.
+        if self.hatch_preview_snap.is_none() {
+            self.hatch_preview_snap = Some(self.doc.clone());
+        }
         let loop_count = handles.len();
         // Build pattern from the args the user provided to `hatch`.
         // None → Solid; Some(name) → Pattern { name, scale, angle }.
@@ -2906,22 +3341,68 @@ impl CadApp {
             cad_kernel::HatchPattern::Solid => "SOLID".to_string(),
             cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
         };
-        self.hatch_dbg(format!(
-            "  pushing Hatch dobject: pattern={}, scale={:.3}, angle={:.2}, {} boundary handle(s)",
-            pattern_label, pat_scale, pat_angle, loop_count));
-        self.doc.push(cad_kernel::Hatch {
-            boundary_handles: handles,
-            pattern,
-        }.into());
-        self.gpu_dirty = true;
-        self.index_dirty = true;
-        self.history.push(format!(
-            "  + hatch ({}): 1 fill, {} boundary loop(s){}",
-            pattern_label, loop_count,
-            if skipped > 0 {
-                format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
-            } else { String::new() },
-        ));
+        // EDIT-MODE: when the confirm panel's "Change pattern/Scale"
+        // button armed this flow, REPLACE the pattern of the last
+        // hatch (and its boundary handles, if a new selection was
+        // gathered) instead of pushing a new dobject. Empty selection
+        // re-uses the existing boundary — typical "tweak the look".
+        let edit_target = if self.hatch_dialog_edit_mode {
+            self.hatch_last_idx
+        } else { None };
+        self.hatch_dialog_edit_mode = false;
+        if let Some(idx) = edit_target {
+            self.hatch_dbg(format!(
+                "  EDIT mode — patching hatch #{} pattern→{}, scale={:.3}, angle={:.2}",
+                idx, pattern_label, pat_scale, pat_angle));
+            if let Some(d) = self.doc.dobjects.get_mut(idx) {
+                if let Geom::Hatch(h) = &mut d.geom {
+                    h.pattern = pattern;
+                    // Only overwrite boundary if the user selected new
+                    // dobjects to hatch. A bare "change pattern/scale"
+                    // with no selection just retints the existing fill.
+                    if !handles.is_empty() && self.selection.iter().any(|i| *i != idx) {
+                        h.boundary_handles = handles;
+                    }
+                }
+            }
+            self.gpu_dirty = true;
+            self.index_dirty = true;
+            self.history.push(format!(
+                "  ⊛ hatch #{} updated → {}", idx, pattern_label));
+        } else {
+            self.hatch_dbg(format!(
+                "  pushing Hatch dobject: pattern={}, scale={:.3}, angle={:.2}, {} boundary handle(s)",
+                pattern_label, pat_scale, pat_angle, loop_count));
+            self.doc.push(cad_kernel::Hatch {
+                boundary_handles: handles,
+                pattern,
+            }.into());
+            self.gpu_dirty = true;
+            self.index_dirty = true;
+            self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
+            self.history.push(format!(
+                "  + hatch ({}): 1 fill, {} boundary loop(s){}",
+                pattern_label, loop_count,
+                if skipped > 0 {
+                    format!("  ({} non-closed-polyline dobject(s) skipped)", skipped)
+                } else { String::new() },
+            ));
+        }
+        // PAUSE any active pick-point session — otherwise the next
+        // canvas click would stack another hatch before the user gets
+        // to see/confirm the current one. The panel's "+ Pick Point"
+        // button re-arms the session for the next region.
+        if self.hatch_pick_point_armed {
+            self.hatch_pick_point_armed = false;
+            self.hatch_dbg(
+                "  pick-point session paused — confirm panel open".to_string());
+        }
+        // Pop the confirmation panel so the user can decide next steps
+        // (Confirm / Discard / Change pattern/Scale / + Pick Point / + Dobject)
+        // without having to retype `hatch`. Prompt mirrors the panel.
+        self.hatch_confirm_open = true;
+        self.set_prompt(
+            "hatch preview ready — Confirm(c)/Discard(d)/Change(ch)/+Point(p)/+Dobject(D) — type in cmd OR click panel buttons".to_string());
         // Auto-dump after each apply so the log captures bbox + line-
         // count diagnostics for the new hatch without making the user
         // press the button. Only logs when the debug window is open
@@ -3101,7 +3582,12 @@ impl CadApp {
                             "  worker: outer bbox extends beyond viewport — zoom out to see full hatch");
                     }
                 }
-                self.snapshot_doc();
+                // Preview snapshot (see apply_hatch's twin) — taken once
+                // per hatch flow, restored on Discard, promoted to undo
+                // on Confirm.
+                if self.hatch_preview_snap.is_none() {
+                    self.hatch_preview_snap = Some(self.doc.clone());
+                }
                 let mut handles: Vec<cad_kernel::Handle> = Vec::new();
                 for loop_verts in loops {
                     let mut verts: Vec<cad_kernel::PolyVertex> = loop_verts.iter()
@@ -3118,6 +3604,11 @@ impl CadApp {
                     let pl = cad_kernel::Polyline { vertices: verts, closed: true };
                     let mut d = cad_kernel::DObject::from(pl);
                     d.style = cad_kernel::Style::on_layer(worker.active_layer);
+                    // Synthetic auxiliary boundary — exists only so the
+                    // hatch has something to reference by handle. Don't
+                    // render it; the user never asked for this line on
+                    // the drawing.
+                    d.style.visible = false;
                     let idx = self.doc.push(d);
                     handles.push(self.doc.dobjects[idx].handle);
                 }
@@ -3139,22 +3630,23 @@ impl CadApp {
                 self.doc.push(d);
                 self.gpu_dirty = true;
                 self.index_dirty = true;
+                self.hatch_last_idx = Some(self.doc.dobjects.len() - 1);
                 self.history.push(format!(
                     "  + hatch ({}): traced boundary, {} loop(s) materialised (async)",
                     pattern_label, n_loops));
                 self.dump_hatch_state();
-                // If pick-point session is still armed, restore prompt
-                // for the next click.
+                // PAUSE any active pick-point session and open the confirm
+                // panel — otherwise consecutive clicks would stack hatches
+                // before the user gets to confirm or discard the first one.
+                // The panel's "+ Pick Point" button re-arms the session.
                 if self.hatch_pick_point_armed {
-                    let style = self.hatch_pick_point_session.as_ref()
-                        .and_then(|(n, _, _)| n.clone())
-                        .unwrap_or_else(|| "SOLID".to_string());
-                    self.set_prompt(format!(
-                        "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
-                        style));
-                } else {
-                    self.clear_prompt();
+                    self.hatch_pick_point_armed = false;
+                    self.hatch_dbg(
+                        "  pick-point session paused — confirm panel open".to_string());
                 }
+                self.hatch_confirm_open = true;
+                self.set_prompt(
+                    "hatch preview ready — Confirm(c)/Discard(d)/Change(ch)/+Point(p)/+Dobject(D) — type in cmd OR click panel buttons".to_string());
             }
             HatchWorkerResult::Failure { reason, log_lines } => {
                 for line in log_lines { self.hatch_dbg(line); }
@@ -3597,138 +4089,230 @@ impl CadApp {
         let mut open = true;
         let mut clicked_dobjects   = false;
         let mut clicked_pick_point = false;
+        // ============ COMBINED FLOATING WINDOW ============
+        // Single floating window with a 3-row horizontal thumbnail
+        // strip at the TOP and Preview + Hatch Parameters BELOW.
+        // No anchor, no fixed pos — fully draggable. Initial position
+        // centred. Thumbnails fill column-by-column (top→bottom, then
+        // next column) so adding new patterns just appends more columns
+        // to the right; the strip scrolls horizontally if it overflows
+        // the visible area.
+        let screen = ctx.screen_rect();
+        let win_w = 1100.0_f32;
+        let win_h = 620.0_f32;
+        let default_pos = egui::pos2(
+            screen.center().x - win_w * 0.5,
+            screen.center().y - win_h * 0.5);
+        let accent = egui::Color32::from_rgb(255, 80, 80);
+        let thumb_w   = 112.0_f32;
+        let thumb_h   = 64.0_f32;
+        let cell_w    = thumb_w + 6.0;
+        let cell_h    = thumb_h + 22.0;
+        let rows      = 3_usize;
         egui::Window::new("Choose Hatch Attributes")
             .id(egui::Id::new("hatch_dialog"))
             .open(&mut open)
-            .default_size(egui::vec2(560.0, 360.0))
+            .default_size(egui::vec2(win_w, win_h))
+            .default_pos(default_pos)
             .resizable(false)
-            .collapsible(false)
+            .collapsible(true)
             .show(ctx, |ui| {
+                // ============ TOP: 3-row thumbnail strip ============
                 ui.horizontal(|ui| {
-                    // --- LEFT: pattern + scale + angle ---
-                    ui.vertical(|ui| {
-                        ui.heading("Pattern");
-                        ui.add_space(4.0);
-                        ui.checkbox(&mut self.hatch_dialog_solid, "Solid Fill");
-                        ui.add_space(4.0);
-                        ui.add_enabled_ui(!self.hatch_dialog_solid, |ui| {
-                            egui::ComboBox::from_id_salt("hatch_pattern_combo")
-                                .selected_text(&self.hatch_dialog_name)
-                                .width(200.0)
-                                .show_ui(ui, |ui| {
-                                    for name in cad_kernel::patterns::PATTERN_NAMES {
-                                        if *name == "SOLID" { continue; }
-                                        ui.selectable_value(
-                                            &mut self.hatch_dialog_name,
-                                            (*name).to_string(),
-                                            *name);
-                                    }
-                                });
+                    ui.heading("Pattern");
+                    ui.add_space(12.0);
+                    ui.checkbox(&mut self.hatch_dialog_solid, "Solid Fill");
+                });
+                ui.add_space(4.0);
+                ui.add_enabled_ui(!self.hatch_dialog_solid, |ui| {
+                    egui::ScrollArea::horizontal()
+                        .id_salt("hatch_thumb_scroll")
+                        .max_width(win_w - 32.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            let names: Vec<&str> =
+                                cad_kernel::patterns::PATTERN_NAMES
+                                    .iter()
+                                    .copied()
+                                    .filter(|n| *n != "SOLID")
+                                    .collect();
+                            let n_cols = names.len().div_ceil(rows).max(1);
+                            let total_w =
+                                (n_cols as f32) * cell_w + 4.0;
+                            let total_h = (rows as f32) * cell_h + 4.0;
+                            let (alloc_rect, _) =
+                                ui.allocate_exact_size(
+                                    egui::vec2(total_w, total_h),
+                                    egui::Sense::hover());
+                            let origin = alloc_rect.left_top();
+                            // Column-major fill: ANSI31, ANSI32, ANSI33
+                            // go down COL 0; ANSI37, CROSS, NET down COL 1
+                            // — keeps related patterns vertically grouped.
+                            for (i, name) in names.iter().enumerate() {
+                                let col = i / rows;
+                                let row = i % rows;
+                                let cell_origin = origin
+                                    + egui::vec2(
+                                        col as f32 * cell_w,
+                                        row as f32 * cell_h);
+                                let thumb_rect = egui::Rect::from_min_size(
+                                    cell_origin,
+                                    egui::vec2(thumb_w, thumb_h));
+                                let label_pos = egui::pos2(
+                                    cell_origin.x + thumb_w * 0.5,
+                                    cell_origin.y + thumb_h + 11.0);
+                                let resp = ui.interact(
+                                    thumb_rect,
+                                    egui::Id::new(("hatch_thumb", i)),
+                                    egui::Sense::click());
+                                let selected =
+                                    self.hatch_dialog_name == *name;
+                                let bg = if selected {
+                                    egui::Color32::from_rgb(30, 60, 110)
+                                } else {
+                                    egui::Color32::from_rgb(18, 22, 28)
+                                };
+                                let border = if selected {
+                                    egui::Color32::from_rgb(120, 180, 255)
+                                } else if resp.hovered() {
+                                    egui::Color32::from_rgb(150, 160, 175)
+                                } else {
+                                    egui::Color32::from_rgb(70, 80, 95)
+                                };
+                                let bw = if selected { 2.0 } else { 1.0 };
+                                let p = ui.painter();
+                                p.rect_filled(thumb_rect, 3.0, bg);
+                                p.rect_stroke(thumb_rect, 3.0,
+                                    egui::Stroke::new(bw, border));
+                                let pad = 6.0_f32;
+                                let inner = egui::Rect::from_min_max(
+                                    thumb_rect.left_top()
+                                        + egui::vec2(pad, pad),
+                                    thumb_rect.right_bottom()
+                                        - egui::vec2(pad, pad));
+                                paint_pattern_preview(
+                                    p, inner, name, 1.0, 0.0,
+                                    accent, 3.2, 1.4);
+                                let label_col = if selected {
+                                    egui::Color32::from_rgb(180, 210, 255)
+                                } else {
+                                    egui::Color32::from_rgb(200, 210, 220)
+                                };
+                                p.text(label_pos,
+                                    egui::Align2::CENTER_CENTER,
+                                    *name,
+                                    egui::FontId::proportional(11.0),
+                                    label_col);
+                                if resp.clicked() {
+                                    self.hatch_dialog_name =
+                                        (*name).to_string();
+                                }
+                            }
                         });
-                        ui.add_space(8.0);
-                        ui.horizontal(|ui| {
-                            ui.label("Scale:");
-                            ui.add(egui::DragValue::new(&mut self.hatch_dialog_scale)
-                                .speed(0.05).range(0.05..=100.0));
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label("Angle:");
-                            ui.add(egui::DragValue::new(&mut self.hatch_dialog_angle)
-                                .speed(1.0).range(-360.0..=360.0).suffix("°"));
-                        });
-                    });
-                    ui.separator();
-                    // --- RIGHT: live preview ---
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                // ============ BOTTOM: preview LEFT, parameters RIGHT ============
+                ui.horizontal(|ui| {
+                    // ----- Preview -----
                     ui.vertical(|ui| {
                         ui.heading("Preview");
-                        ui.add_space(4.0);
                         let (rect, _resp) = ui.allocate_exact_size(
-                            egui::vec2(240.0, 240.0), egui::Sense::hover());
+                            egui::vec2(260.0, 260.0), egui::Sense::hover());
                         let p = ui.painter_at(rect);
-                        // Backdrop
                         p.rect_filled(rect, 0.0,
                             egui::Color32::from_rgb(18, 22, 28));
                         p.rect_stroke(rect, 0.0,
-                            egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
-                        // Square boundary in preview-local coords
+                            egui::Stroke::new(1.0,
+                                egui::Color32::from_rgb(70, 80, 95)));
                         let pad = 18.0_f32;
                         let bound = egui::Rect::from_min_max(
-                            rect.left_top() + egui::vec2(pad, pad),
+                            rect.left_top()  + egui::vec2(pad, pad),
                             rect.right_bottom() - egui::vec2(pad, pad));
-                        let accent = egui::Color32::from_rgb(255, 80, 80);
-                        // Pattern fill preview
                         if self.hatch_dialog_solid {
                             p.rect_filled(bound, 0.0, accent);
                         } else {
-                            // Render the chosen pattern inside `bound`
-                            // by walking each LineFamily, generating
-                            // parallel screen-space lines, clipping to
-                            // bound. No world↔screen transform — the
-                            // preview just shows the pattern's shape.
-                            let families = cad_kernel::patterns::lookup(
-                                &self.hatch_dialog_name);
-                            let user_angle = self.hatch_dialog_angle.to_radians();
-                            let user_scale = self.hatch_dialog_scale.max(0.05);
-                            // World→preview scale: ~10 px per world unit
-                            // so the catalog's natural spacings of a
-                            // few mm read as visible textures.
-                            let px_per_unit = 10.0_f32;
-                            for fam in &families {
-                                let theta = fam.angle + user_angle;
-                                let spacing_px = (fam.spacing * user_scale) as f32 * px_per_unit;
-                                if spacing_px < 1.0 { continue; }   // safety
-                                let cos = theta.cos() as f32;
-                                let sin = theta.sin() as f32;
-                                // bbox diag = max distance from any
-                                // point in bound to any other, gives a
-                                // safe range to walk.
-                                let diag = (bound.width()*bound.width()
-                                            + bound.height()*bound.height()).sqrt();
-                                let n_lines = (diag / spacing_px).ceil() as i32;
-                                let centre = bound.center();
-                                for k in -n_lines..=n_lines {
-                                    let s = (k as f32) * spacing_px;
-                                    // Line through centre+s*normal, direction = (cos, sin).
-                                    let nx = -sin; let ny = cos;
-                                    let mid = egui::pos2(
-                                        centre.x + nx * s,
-                                        centre.y + ny * s);
-                                    let a = egui::pos2(
-                                        mid.x - cos * diag,
-                                        mid.y - sin * diag);
-                                    let b = egui::pos2(
-                                        mid.x + cos * diag,
-                                        mid.y + sin * diag);
-                                    // Clip the line to bound via
-                                    // Cohen-Sutherland-lite (egui has
-                                    // no built-in line clip; do a
-                                    // parametric clamp against the
-                                    // 4 edges).
-                                    if let Some((p1, p2)) = clip_line_to_rect(a, b, bound) {
-                                        p.line_segment([p1, p2],
-                                            egui::Stroke::new(1.0, accent));
-                                    }
-                                }
-                            }
+                            paint_pattern_preview(
+                                &p, bound,
+                                &self.hatch_dialog_name,
+                                self.hatch_dialog_scale.max(0.05),
+                                self.hatch_dialog_angle.to_radians(),
+                                accent, 10.0, 1.0);
                         }
-                        // Centre marker (the "+" shown in LibreCAD's preview)
                         let c = rect.center();
                         let mk = egui::Stroke::new(1.0,
                             egui::Color32::from_rgb(80, 90, 105));
-                        p.line_segment(
-                            [egui::pos2(c.x - 8.0, c.y), egui::pos2(c.x + 8.0, c.y)], mk);
-                        p.line_segment(
-                            [egui::pos2(c.x, c.y - 8.0), egui::pos2(c.x, c.y + 8.0)], mk);
+                        p.line_segment([egui::pos2(c.x - 8.0, c.y),
+                                        egui::pos2(c.x + 8.0, c.y)], mk);
+                        p.line_segment([egui::pos2(c.x, c.y - 8.0),
+                                        egui::pos2(c.x, c.y + 8.0)], mk);
+                    });
+                    ui.separator();
+                    // ----- Hatch Parameters (RIGHT side of bottom row) -----
+                    ui.vertical(|ui| {
+                        ui.heading("Hatch Parameters");
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Scale:");
+                            ui.add_space(4.0);
+                            ui.spacing_mut().slider_width = 160.0;
+                            ui.add(egui::Slider::new(
+                                    &mut self.hatch_dialog_scale, 0.05..=20.0)
+                                .logarithmic(true)
+                                .show_value(false));
+                            ui.add_space(4.0);
+                            ui.add(egui::DragValue::new(
+                                    &mut self.hatch_dialog_scale)
+                                .speed(0.01)
+                                .range(0.05..=100.0)
+                                .min_decimals(3)
+                                .max_decimals(3));
+                        });
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.vertical(|ui| {
+                                ui.label("Angle:");
+                                ui.add_space(80.0);
+                            });
+                            polar_angle_picker(ui,
+                                &mut self.hatch_dialog_angle, 120.0);
+                            ui.add_space(10.0);
+                            ui.vertical(|ui| {
+                                ui.add_space(54.0);
+                                ui.add(egui::DragValue::new(
+                                        &mut self.hatch_dialog_angle)
+                                    .speed(1.0)
+                                    .range(-360.0..=360.0)
+                                    .suffix("°"));
+                            });
+                        });
                     });
                 });
-                ui.add_space(10.0);
+                ui.add_space(8.0);
                 ui.separator();
                 ui.horizontal(|ui| {
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui|
+                    {
+                        if ui.button("Cancel")
+                            .on_hover_text("Discard these choices and close the dialog")
+                            .clicked()
+                        {
+                            self.hatch_dialog_open = false;
+                            self.hatch_dialog_edit_mode = false;
+                            self.hatch_dbg("dialog cancelled".to_string());
+                            self.clear_prompt();
+                        }
+                        if ui.button("OK")
+                            .on_hover_text("Save these attributes; pick boundary via Select Objects or Pick Point next")
+                            .clicked() { clicked_dobjects = true; }
+                        ui.separator();
                         if ui.button("◉ Pick Point")
                             .on_hover_text("Click inside a closed region — the app finds the smallest containing closed dobject and hatches it")
                             .clicked() { clicked_pick_point = true; }
-                        if ui.button("☐ Dobject/s")
+                        if ui.button("☐ Select Objects")
                             .on_hover_text("Select boundary dobjects (closed polylines / circles / ellipses), Enter to fill")
                             .clicked() { clicked_dobjects = true; }
                     });
@@ -3787,6 +4371,358 @@ impl CadApp {
                     style));
             }
         }
+    }
+
+    /// Hatch Pattern Library — a SEPARATE floating window that opens
+    /// alongside the attributes dialog. Holds just the thumbnail grid:
+    /// 3 columns wide, scrollable vertically, room for a 3 × 9 layout
+    /// (27 patterns) and beyond. Clicking a thumbnail sets
+    /// `hatch_dialog_name` so the attributes dialog's preview reflects
+    /// the choice instantly.
+    ///
+    /// Kept separate from the attributes dialog because nested egui
+    /// layouts (ScrollArea inside vertical inside horizontal) had
+    /// recurring sizing-pass bugs that hid rows beyond the first one.
+    /// A standalone window owns its own root layout pass and renders
+    /// every thumbnail deterministically.
+    fn render_hatch_pattern_library(&mut self, ctx: &egui::Context) {
+        if !self.hatch_dialog_open { return; }
+        let accent = egui::Color32::from_rgb(255, 80, 80);
+        let thumb_w   = 112.0_f32;
+        let thumb_h   = 64.0_f32;
+        let cell_w    = thumb_w + 6.0;
+        let cell_h    = thumb_h + 22.0;
+        let cols      = 3_usize;
+        let win_w     = (cell_w * cols as f32) + 24.0;          // 360
+        let win_h     = 600.0_f32;                              // ~6 rows visible
+        // Position the library to the LEFT of the centred attributes
+        // dialog. The attributes dialog is 440 wide, anchored centre;
+        // its left edge is at (screen_w - 440)/2. Place the library
+        // immediately left of that with a small gap.
+        let screen = ctx.screen_rect();
+        let attr_left = (screen.width() - 440.0) * 0.5 + screen.left();
+        let lib_pos = egui::pos2(attr_left - win_w - 12.0, screen.top() + 80.0);
+        let mut open = true;
+        egui::Window::new("Hatch Pattern Library")
+            .id(egui::Id::new("hatch_pattern_library"))
+            .open(&mut open)
+            .default_size(egui::vec2(win_w, win_h))
+            .resizable(false)
+            .collapsible(true)
+            // Float freely — user can drag anywhere. `default_pos` only
+            // applies the FIRST time the window appears; after that
+            // egui remembers the user's chosen position.
+            .default_pos(lib_pos)
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(
+                    "Click a thumbnail to choose the pattern")
+                    .small()
+                    .weak());
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Manual grid: compute the absolute screen
+                        // position for every cell using `ui.cursor()`
+                        // + advance manually. This bypasses egui's
+                        // wrap/grid sizing entirely.
+                        let names: Vec<&str> = cad_kernel::patterns::PATTERN_NAMES
+                            .iter()
+                            .copied()
+                            .filter(|n| *n != "SOLID")
+                            .collect();
+                        let n_rows = (names.len() + cols - 1) / cols;
+                        let total_h = (n_rows as f32) * cell_h + 4.0;
+                        let (alloc_rect, _) = ui.allocate_exact_size(
+                            egui::vec2(cell_w * cols as f32, total_h),
+                            egui::Sense::hover());
+                        let origin = alloc_rect.left_top();
+                        for (i, name) in names.iter().enumerate() {
+                            let col = i % cols;
+                            let row = i / cols;
+                            let cell_origin = origin
+                                + egui::vec2(col as f32 * cell_w,
+                                             row as f32 * cell_h);
+                            let thumb_rect = egui::Rect::from_min_size(
+                                cell_origin, egui::vec2(thumb_w, thumb_h));
+                            let label_pos = egui::pos2(
+                                cell_origin.x + thumb_w * 0.5,
+                                cell_origin.y + thumb_h + 11.0);
+                            let resp = ui.interact(
+                                thumb_rect,
+                                egui::Id::new(("hatch_thumb", i)),
+                                egui::Sense::click());
+                            let selected = self.hatch_dialog_name == *name;
+                            let bg = if selected {
+                                egui::Color32::from_rgb(30, 60, 110)
+                            } else {
+                                egui::Color32::from_rgb(18, 22, 28)
+                            };
+                            let border = if selected {
+                                egui::Color32::from_rgb(120, 180, 255)
+                            } else if resp.hovered() {
+                                egui::Color32::from_rgb(150, 160, 175)
+                            } else {
+                                egui::Color32::from_rgb(70, 80, 95)
+                            };
+                            let bw = if selected { 2.0 } else { 1.0 };
+                            let p = ui.painter();
+                            p.rect_filled(thumb_rect, 3.0, bg);
+                            p.rect_stroke(thumb_rect, 3.0,
+                                egui::Stroke::new(bw, border));
+                            let pad = 6.0_f32;
+                            let inner = egui::Rect::from_min_max(
+                                thumb_rect.left_top()
+                                    + egui::vec2(pad, pad),
+                                thumb_rect.right_bottom()
+                                    - egui::vec2(pad, pad));
+                            paint_pattern_preview(
+                                p, inner, name, 1.0, 0.0,
+                                accent, 3.2, 1.4);
+                            let label_col = if selected {
+                                egui::Color32::from_rgb(180, 210, 255)
+                            } else {
+                                egui::Color32::from_rgb(200, 210, 220)
+                            };
+                            p.text(label_pos,
+                                egui::Align2::CENTER_CENTER,
+                                *name,
+                                egui::FontId::proportional(11.0),
+                                label_col);
+                            if resp.clicked() {
+                                self.hatch_dialog_name = (*name).to_string();
+                            }
+                        }
+                    });
+            });
+        if !open {
+            // Closing the library also closes the attributes dialog
+            // — they're a pair.
+            self.hatch_dialog_open  = false;
+            self.hatch_dialog_edit_mode = false;
+            self.clear_prompt();
+        }
+    }
+
+    /// Post-apply confirmation panel. Opens after every successful
+    /// `apply_hatch()`. Four actions:
+    ///   • Confirm           — close the panel, hatch flow done
+    ///   • Change pattern/Scale — re-open the attributes dialog in
+    ///                            edit-mode; OK patches the LAST hatch
+    ///                            in place rather than pushing a new one
+    ///   • + Pick Point      — re-arm pick-point mode so the user can
+    ///                         click more interior seeds (each fires a
+    ///                         new hatch with the same pattern)
+    ///   • + Dobject         — open a fresh boundary-pick selection so
+    ///                         the user can build another hatch from
+    ///                         specific boundary dobjects.
+    /// Esc/X dismisses the panel without consequence.
+    fn render_hatch_confirm_panel(&mut self, ctx: &egui::Context) {
+        if !self.hatch_confirm_open { return; }
+        let Some(idx) = self.hatch_last_idx else {
+            self.hatch_confirm_open = false;
+            return;
+        };
+        let (pat_label, scale, angle) = match self.doc.dobjects.get(idx) {
+            Some(d) => match &d.geom {
+                Geom::Hatch(h) => match &h.pattern {
+                    cad_kernel::HatchPattern::Solid => (
+                        "SOLID".to_string(), 1.0_f64, 0.0_f64),
+                    cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } =>
+                        (name.clone(), *scale, *angle_deg),
+                },
+                _ => { self.hatch_confirm_open = false; return; }
+            },
+            None => { self.hatch_confirm_open = false; return; }
+        };
+        let mut open = true;
+        let mut do_confirm   = false;
+        let mut do_discard   = false;
+        let mut do_change    = false;
+        let mut do_add_point = false;
+        let mut do_add_dob   = false;
+        // Modal-style backdrop — dims the rest of the screen so the
+        // confirm dialog is impossible to miss. Painted on a foreground
+        // layer below the window itself.
+        let screen = ctx.screen_rect();
+        let backdrop_layer = egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("hatch_confirm_backdrop"));
+        ctx.layer_painter(backdrop_layer).rect_filled(
+            screen, 0.0,
+            egui::Color32::from_rgba_unmultiplied(0, 0, 0, 110));
+        // Swallow clicks on the backdrop so users can't accidentally
+        // click through into the canvas while the modal is up.
+        let _ = ctx.read_response(backdrop_layer.id);
+        egui::Window::new("Hatch — Confirm preview")
+            .id(egui::Id::new("hatch_confirm_panel"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .movable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                ui.set_min_width(440.0);
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(format!(
+                    "Hatch #{} preview — pattern: {}  scale: {:.3}  angle: {:.2}°",
+                    idx, pat_label, scale, angle))
+                    .strong()
+                    .size(14.0));
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.label("The fill on the canvas is a PREVIEW.");
+                ui.label("Confirm to commit, Discard to revert, or pick another action below.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.add_sized([110.0, 28.0],
+                        egui::Button::new(egui::RichText::new("✔ Confirm").size(13.0))
+                            .fill(egui::Color32::from_rgb(40, 110, 60)))
+                        .on_hover_text("Accept this hatch and end the hatch flow  [cmd: c / y / Enter]")
+                        .clicked() { do_confirm = true; }
+                    if ui.add_sized([110.0, 28.0],
+                        egui::Button::new(egui::RichText::new("✗ Discard").size(13.0))
+                            .fill(egui::Color32::from_rgb(140, 50, 50)))
+                        .on_hover_text("Revert to the state BEFORE this hatch flow started  [cmd: d / n]")
+                        .clicked() { do_discard = true; }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("✎ Change pattern/Scale")
+                        .on_hover_text("Reopen the attributes dialog; OK will modify THIS hatch in place  [cmd: ch]")
+                        .clicked() { do_change = true; }
+                    if ui.button("◉ + Pick Point")
+                        .on_hover_text("Click more interior seeds to create additional hatches with the same pattern  [cmd: p]")
+                        .clicked() { do_add_point = true; }
+                    if ui.button("☐ + Dobject")
+                        .on_hover_text("Pick more boundary dobjects to build another hatch with the same pattern  [cmd: D]")
+                        .clicked() { do_add_dob = true; }
+                });
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new(
+                    "tip: Enter = Confirm   ·   Esc = Discard   ·   single-letter aliases work")
+                    .small()
+                    .weak());
+            });
+        if !open       { self.hatch_confirm_discard();      return; }
+        if do_confirm  { self.hatch_confirm_accept();       return; }
+        if do_discard  { self.hatch_confirm_discard();      return; }
+        if do_change   { self.hatch_confirm_change();       return; }
+        if do_add_point{ self.hatch_confirm_add_point();    return; }
+        if do_add_dob  { self.hatch_confirm_add_dobject();  return; }
+    }
+
+    /// Helper — fetch the active hatch's pattern label, scale, angle.
+    /// Returns None if the panel state is stale (last index out of
+    /// range or no longer a Hatch).
+    fn hatch_confirm_info(&self) -> Option<(usize, String, f64, f64)> {
+        let idx = self.hatch_last_idx?;
+        let d = self.doc.dobjects.get(idx)?;
+        if let Geom::Hatch(h) = &d.geom {
+            match &h.pattern {
+                cad_kernel::HatchPattern::Solid =>
+                    Some((idx, "SOLID".to_string(), 1.0, 0.0)),
+                cad_kernel::HatchPattern::Pattern { name, scale, angle_deg } =>
+                    Some((idx, name.clone(), *scale, *angle_deg)),
+            }
+        } else { None }
+    }
+
+    /// Confirm-panel action: accept the hatch, end the flow. Promotes
+    /// the preview snapshot onto the global undo stack so a single
+    /// Ctrl+Z reverts the entire flow.
+    fn hatch_confirm_accept(&mut self) {
+        let idx_for_log = self.hatch_last_idx;
+        self.hatch_confirm_open = false;
+        if let Some(snap) = self.hatch_preview_snap.take() {
+            if self.undo_stack.len() >= UNDO_STACK_CAP {
+                self.undo_stack.remove(0);
+            }
+            self.undo_stack.push(snap);
+            self.redo_stack.clear();
+        }
+        self.clear_prompt();
+        if let Some(i) = idx_for_log {
+            self.history.push(format!("  ✔ hatch #{} confirmed", i));
+        }
+    }
+
+    /// Confirm-panel action: revert to pre-hatch state.
+    fn hatch_confirm_discard(&mut self) {
+        self.hatch_confirm_open = false;
+        if let Some(snap) = self.hatch_preview_snap.take() {
+            self.doc = snap;
+            self.selection.clear();
+            self.selected = None;
+            self.index_dirty = true;
+            self.gpu_dirty   = true;
+            self.hatch_last_idx = None;
+            self.history.push(
+                "  ✗ hatch discarded — reverted to pre-hatch state".into());
+            self.hatch_dbg(
+                "confirm panel: Discard — restored pre-hatch document snapshot".to_string());
+        }
+        self.clear_prompt();
+    }
+
+    /// Confirm-panel action: reopen the attributes dialog in edit-mode.
+    fn hatch_confirm_change(&mut self) {
+        let Some((idx, pat_label, scale, angle)) = self.hatch_confirm_info() else {
+            self.hatch_confirm_open = false; return;
+        };
+        self.hatch_confirm_open = false;
+        self.hatch_dialog_edit_mode = true;
+        self.hatch_dialog_solid = pat_label == "SOLID";
+        if !self.hatch_dialog_solid {
+            self.hatch_dialog_name  = pat_label;
+            self.hatch_dialog_scale = scale;
+            self.hatch_dialog_angle = angle;
+        }
+        self.hatch_dialog_open = true;
+        self.hatch_dbg(format!(
+            "confirm panel: change pattern/scale on #{} — re-opened dialog in edit mode",
+            idx));
+    }
+
+    /// Confirm-panel action: re-arm pick-point session with same pattern.
+    fn hatch_confirm_add_point(&mut self) {
+        let Some((_, pat_label, scale, angle)) = self.hatch_confirm_info() else {
+            self.hatch_confirm_open = false; return;
+        };
+        self.hatch_confirm_open = false;
+        self.hatch_dialog_edit_mode = false;
+        let pat_opt = if pat_label == "SOLID" { None } else { Some(pat_label.clone()) };
+        self.pending_hatch_pattern = (pat_opt.clone(), scale, angle);
+        self.hatch_pick_point_session = Some((pat_opt, scale, angle));
+        self.hatch_pick_point_armed = true;
+        self.set_prompt(format!(
+            "hatch ({}): click inside closed region(s); Enter to finish  [Esc=cancel]",
+            pat_label));
+        self.hatch_dbg(
+            "confirm panel: + Pick Point — re-armed pick-point session".to_string());
+    }
+
+    /// Confirm-panel action: open a fresh boundary-pick selection.
+    fn hatch_confirm_add_dobject(&mut self) {
+        let Some((_, pat_label, scale, angle)) = self.hatch_confirm_info() else {
+            self.hatch_confirm_open = false; return;
+        };
+        self.hatch_confirm_open = false;
+        self.hatch_dialog_edit_mode = false;
+        let pat_opt = if pat_label == "SOLID" { None } else { Some(pat_label.clone()) };
+        self.pending_hatch_pattern = (pat_opt, scale, angle);
+        self.selection.clear();
+        self.begin_selection(SelectMode::ForSelect);
+        self.queued_op = QueuedOp::Hatch;
+        self.set_prompt(format!(
+            "hatch ({}): pick CLOSED boundary dobject(s), Enter to fill  [Esc=cancel]",
+            pat_label));
+        self.hatch_dbg(
+            "confirm panel: + Dobject — opened selection for new boundary".to_string());
     }
 
     /// Trim Debug floating window — instrumented log of every trim /
@@ -3985,17 +4921,34 @@ impl CadApp {
                     if union_max.x.is_finite() {
                         let diag = ((union_max.x - union_min.x).powi(2)
                                   + (union_max.y - union_min.y).powi(2)).sqrt();
-                        let fams = cad_kernel::patterns::lookup(name);
-                        let counts: Vec<String> = fams.iter().map(|f| {
-                            let s = f.spacing * scale.abs().max(1e-9);
-                            let n = (diag / s).ceil() as i64;
-                            format!("{}({} lines @ spacing {:.3})",
-                                (f.angle.to_degrees() as i32 % 360), n, s)
-                        }).collect();
-                        line_estimate = format!("  estimated families: [{}]",
-                            counts.join(", "));
-                        if counts.iter().any(|c| c.contains("(0 lines")) {
-                            line_estimate.push_str("  ⚠ ZERO LINES — raise scale or pick a finer pattern");
+                        match cad_kernel::patterns::lookup(name) {
+                            cad_kernel::patterns::Pattern::Families(fams) => {
+                                let counts: Vec<String> = fams.iter().map(|f| {
+                                    let s = f.spacing * scale.abs().max(1e-9);
+                                    let n = (diag / s).ceil() as i64;
+                                    format!("{}({} lines @ spacing {:.3})",
+                                        (f.angle.to_degrees() as i32 % 360), n, s)
+                                }).collect();
+                                line_estimate = format!("  estimated families: [{}]",
+                                    counts.join(", "));
+                                if counts.iter().any(|c| c.contains("(0 lines")) {
+                                    line_estimate.push_str(
+                                        "  ⚠ ZERO LINES — raise scale or pick a finer pattern");
+                                }
+                            }
+                            cad_kernel::patterns::Pattern::Tile { period_x, period_y, segments, circles } => {
+                                let px = period_x * scale.abs().max(1e-9);
+                                let py = period_y * scale.abs().max(1e-9);
+                                let nx = (diag / px).ceil() as i64;
+                                let ny = (diag / py).ceil() as i64;
+                                line_estimate = format!(
+                                    "  tile period={:.2}x{:.2} segs={} circles={} cells≈{}x{}",
+                                    px, py, segments.len(), circles.len(), nx, ny);
+                                if px > diag || py > diag {
+                                    line_estimate.push_str(
+                                        "  ⚠ tile period exceeds boundary — lower scale");
+                                }
+                            }
                         }
                     }
                 }
@@ -4187,13 +5140,15 @@ impl CadApp {
 
                 // ---- header row -----------------------------------------
                 egui::Grid::new("layer_header_grid")
-                    .num_columns(5)
+                    .num_columns(7)
                     .spacing([6.0, 4.0])
                     .show(ui, |ui| {
                         ui.label(""); // active
                         ui.label("👁");
                         ui.label("❄");
                         ui.label("🔒");
+                        ui.label("color");
+                        ui.label("linetype");
                         ui.label("name");
                         ui.end_row();
                     });
@@ -4211,13 +5166,23 @@ impl CadApp {
                 // window-open assignment runs after the loop to stay clear
                 // of the &mut self borrow chain.
                 let mut pick_layer_color: Option<LayerId> = None;
+                // Linetype changes captured here, applied AFTER the loop —
+                // same pattern as color edits (can't borrow doc.linetypes
+                // while doc.layers is borrowed mutably).
+                let mut linetype_change: Vec<(LayerId, u32)> = Vec::new();
+                // Snapshot the available linetypes so the ComboBox can list
+                // them without holding a borrow on self.doc.
+                let lt_names: Vec<(u32, String)> = self.doc.linetypes.linetypes
+                    .iter().enumerate()
+                    .map(|(i, lt)| (i as u32, lt.name.clone()))
+                    .collect();
                 let n = self.doc.layers.len();
 
                 egui::ScrollArea::vertical()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
                         egui::Grid::new("layer_rows")
-                            .num_columns(6)
+                            .num_columns(7)
                             .spacing([6.0, 4.0])
                             .striped(true)
                             .show(ui, |ui| {
@@ -4299,6 +5264,31 @@ impl CadApp {
                                         pick_layer_color = Some(id);
                                     }
 
+                                    // ----- linetype combo -----------------
+                                    // ComboBox listing every linetype in the
+                                    // doc's table. Selecting one updates the
+                                    // layer's default linetype; rendered
+                                    // dobjects on this layer pick it up via
+                                    // the ByLayer resolution in
+                                    // paint_dobject_with_style.
+                                    let cur_lt = layer.linetype;
+                                    let cur_name = lt_names.iter()
+                                        .find(|(i, _)| *i == cur_lt)
+                                        .map(|(_, n)| n.clone())
+                                        .unwrap_or_else(|| "?".into());
+                                    egui::ComboBox::from_id_salt(("layer_lt", id))
+                                        .selected_text(cur_name)
+                                        .width(96.0)
+                                        .show_ui(ui, |ui| {
+                                            for (lt_id, name) in &lt_names {
+                                                let resp = ui.selectable_label(
+                                                    *lt_id == cur_lt, name);
+                                                if resp.clicked() {
+                                                    linetype_change.push((id, *lt_id));
+                                                }
+                                            }
+                                        });
+
                                     // ----- name (click to rename) ---------
                                     if self.layer_rename == Some(id) {
                                         let resp = ui.text_edit_singleline(&mut self.layer_rename_buf);
@@ -4345,6 +5335,17 @@ impl CadApp {
                     let idx = self.doc.truecolors.intern(packed_rgb);
                     if let Some(l) = self.doc.layers.get_mut(id) {
                         l.color = Color::TrueColorRef(idx);
+                    }
+                }
+                // Apply linetype changes (deferred to escape borrow chain).
+                for (id, lt_id) in linetype_change.drain(..) {
+                    if let Some(l) = self.doc.layers.get_mut(id) {
+                        let lt_name = self.doc.linetypes.get(lt_id)
+                            .map(|lt| lt.name.clone()).unwrap_or_default();
+                        l.linetype = lt_id;
+                        self.history.push(format!(
+                            "  layer '{}' linetype → '{}'", l.name, lt_name));
+                        self.gpu_dirty = true;
                     }
                 }
                 if let Some((id, new_name)) = rename_commit {
@@ -4846,6 +5847,7 @@ impl CadApp {
         // Count by Geom variant.
         let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh, mut nsp) =
             (0, 0, 0, 0, 0, 0, 0, 0, 0);
+        let mut nw = 0_usize;
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -4858,13 +5860,14 @@ impl CadApp {
                     Geom::Polyline(_)   => npl += 1,
                     Geom::Hatch(_)      => nh  += 1,
                     Geom::Spline(_)     => nsp += 1,
+                    Geom::Wall(_)       => nw  += 1,
                 }
             }
         }
         ui.monospace(format!(
             "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}",
-            nl, nc, na, ne, nea, npt, npl, nh, nsp
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}",
+            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw
         ));
         ui.add_space(8.0);
 
@@ -5486,6 +6489,36 @@ impl CadApp {
         self.trim_dbg(format!(
             "  doc.dobjects.len() = {}  EdgMod = {}",
             self.doc.dobjects.len(), self.env.EdgMod));
+        // FULL DOC SNAPSHOT — every dobject with its index + full
+        // geometry. Lets the user reproduce a trim bug exactly: the
+        // log says "trim of #5 with cutters [0, 5] @ click X" and
+        // here are the EXACT coordinates of every dobject involved.
+        // Auto-trimmed lists are useless without the inputs.
+        let dump: Vec<String> = self.doc.dobjects.iter().enumerate()
+            .map(|(i, d)| {
+                let vis = if d.style.visible { "vis" } else { "HID" };
+                format!("    #{:02} [{}] L{} {}",
+                    i, vis, d.style.layer, describe_verbose(&d.geom))
+            })
+            .collect();
+        self.trim_dbg("  --- doc snapshot at session start ---".to_string());
+        for line in dump { self.trim_dbg(line); }
+    }
+
+    /// Dump one dobject's full state to the trim log. Used at
+    /// cutter-capture and target-click points so a bug report has
+    /// the EXACT coordinates of every input — no need to re-derive
+    /// from screen pixels or re-open the file.
+    fn trim_dbg_dobject(&mut self, idx: usize, role: &str) {
+        if let Some(d) = self.doc.dobjects.get(idx) {
+            let vis = if d.style.visible { "vis" } else { "HID" };
+            let line = format!(
+                "    {} #{} [{}] L{} {}",
+                role, idx, vis, d.style.layer, describe_verbose(&d.geom));
+            self.trim_dbg(line);
+        } else {
+            self.trim_dbg(format!("    {} #{} <out of range>", role, idx));
+        }
     }
 
     /// Format a Vec2 compactly for log entries.
@@ -5558,6 +6591,7 @@ impl CadApp {
                     Some(Geom::Point(_))      => "Point",
                     Some(Geom::Hatch(_))      => "Hatch",
                     Some(Geom::Spline(_))     => "Spline",
+                    Some(Geom::Wall(_))       => "Wall",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
@@ -6328,7 +7362,7 @@ impl CadApp {
         if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
         // Polyline / Line / Arc draw tools: the last captured point is
         // the ortho anchor for the next click.
-        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc) {
+        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc | Tool::Wall) {
             if let Some(p) = self.pending.last().copied() { return Some(p); }
         }
         None
@@ -6382,15 +7416,48 @@ impl CadApp {
             (0..self.doc.dobjects.len()).collect()
         };
         let mut best: Option<(usize, f64)> = None;
-        for i in cands {
-            let d = self.doc.dobjects[i].distance_to_point(w);
+        for i in &cands {
+            let d = self.doc.dobjects[*i].distance_to_point(w);
             if d < tol_world {
                 if best.map_or(true, |(_, bd)| d < bd) {
-                    best = Some((i, d));
+                    best = Some((*i, d));
                 }
             }
         }
-        best.map(|(i, _)| i)
+        if best.is_some() { return best.map(|(i, _)| i); }
+        // Fallback for Hatch dobjects: kernel-level distance is INFINITY
+        // (Hatch can't resolve its own boundary without the Document), so
+        // a click inside the fill never gets picked by the loop above.
+        // Walk all hatches whose resolved interior contains `w` and pick
+        // the SMALLEST by bbox area (mirrors hatch pick-point's
+        // smallest-containing rule — clicking the inner island wins over
+        // the outer ring). Boundary-edge clicks already won above, so
+        // this fallback only kicks in for clicks in the empty fill.
+        let mut hatch_best: Option<(usize, f64)> = None;
+        for i in 0..self.doc.dobjects.len() {
+            let Geom::Hatch(h) = &self.doc.dobjects[i].geom else { continue; };
+            let loops = self.resolve_hatch_loops(h);
+            if loops.is_empty() { continue; }
+            let inside = loops.iter().fold(false,
+                |acc, l| acc ^ point_in_polygon(w, l.iter().copied()));
+            if !inside { continue; }
+            // Loop bbox area as a smallest-containing tiebreak.
+            let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+            let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+            for l in &loops {
+                for v in l {
+                    if v.x < mn.x { mn.x = v.x; }
+                    if v.y < mn.y { mn.y = v.y; }
+                    if v.x > mx.x { mx.x = v.x; }
+                    if v.y > mx.y { mx.y = v.y; }
+                }
+            }
+            let area = (mx.x - mn.x).max(0.0) * (mx.y - mn.y).max(0.0);
+            if hatch_best.map_or(true, |(_, ba)| area < ba) {
+                hatch_best = Some((i, area));
+            }
+        }
+        hatch_best.map(|(i, _)| i)
     }
 
     // ---- interactive draw: finalise dobject from clicked points ---------
@@ -6401,6 +7468,25 @@ impl CadApp {
                 let g = Geom::Line(Line { a: self.pending[0], b: self.pending[1] });
                 self.pending.clear();
                 self.add_dobject(g, "canvas");
+            }
+            (Tool::Wall, 2) => {
+                // SMART DOBJECT: one Geom::Wall, not two Lines. The
+                // kernel knows how to render it as two parallel side
+                // lines and apply all editing ops to the centerline.
+                let start = self.pending[0];
+                let end   = self.pending[1];
+                self.pending.clear();
+                let thk = self.env.WlThk;
+                if (end - start).len() < EPS || thk <= 1e-9 {
+                    self.history.push(
+                        "  ! wall: zero-length centerline or non-positive thickness".into());
+                } else {
+                    self.add_dobject(
+                        Geom::Wall(cad_kernel::Wall { start, end, thickness: thk }),
+                        "canvas");
+                    self.history.push(format!(
+                        "  + wall: thickness={}", thk));
+                }
             }
             (Tool::Point, 1) => {
                 let loc = self.pending[0];
@@ -6880,6 +7966,179 @@ fn append_arc_world_samples(a: Vec2, b: Vec2, bulge: f64, out: &mut Vec<Vec2>) {
 /// standard correct PIP. Used today by the hatch pick-point boundary
 /// finder; would also fit hit-testing closed splines / regions when
 /// those land.
+/// Paint a hatch pattern preview into `bound` (a screen-space rect).
+/// Used by the attributes dialog's main preview panel AND every
+/// thumbnail in the pattern picker grid. `px_per_unit` controls how
+/// many screen pixels one pattern-unit covers (the catalog's natural
+/// spacings of a few mm) — main preview ≈ 10 px/unit, thumbnails ≈ 4-6.
+fn paint_pattern_preview(
+    p:           &egui::Painter,
+    bound:       egui::Rect,
+    name:        &str,
+    user_scale:  f64,
+    user_angle:  f64,        // radians
+    accent:      egui::Color32,
+    px_per_unit: f32,
+    stroke_w:    f32,
+) {
+    let pat = cad_kernel::patterns::lookup(name);
+    let centre = bound.center();
+    match &pat {
+        cad_kernel::patterns::Pattern::Families(families) => {
+            for fam in families {
+                let theta = fam.angle + user_angle;
+                let spacing_px = (fam.spacing * user_scale) as f32 * px_per_unit;
+                if spacing_px < 1.0 { continue; }
+                let cos = theta.cos() as f32;
+                let sin = theta.sin() as f32;
+                let diag = (bound.width()*bound.width()
+                          + bound.height()*bound.height()).sqrt();
+                let n_lines = (diag / spacing_px).ceil() as i32;
+                for k in -n_lines..=n_lines {
+                    let s = (k as f32) * spacing_px;
+                    let nx = -sin; let ny = cos;
+                    let mid = egui::pos2(centre.x + nx * s, centre.y + ny * s);
+                    let a = egui::pos2(mid.x - cos * diag, mid.y - sin * diag);
+                    let b = egui::pos2(mid.x + cos * diag, mid.y + sin * diag);
+                    if let Some((p1, p2)) = clip_line_to_rect(a, b, bound) {
+                        p.line_segment([p1, p2], egui::Stroke::new(stroke_w, accent));
+                    }
+                }
+            }
+        }
+        cad_kernel::patterns::Pattern::Tile { period_x, period_y, segments, circles } => {
+            let px = (*period_x * user_scale) as f32 * px_per_unit;
+            let py = (*period_y * user_scale) as f32 * px_per_unit;
+            if px < 1.0 || py < 1.0 { return; }
+            let cos = user_angle.cos() as f32;
+            let sin = user_angle.sin() as f32;
+            let diag = (bound.width()*bound.width()
+                      + bound.height()*bound.height()).sqrt();
+            let nx_cells = (diag / px).ceil() as i32 + 1;
+            let ny_cells = (diag / py).ceil() as i32 + 1;
+            for j in -ny_cells..=ny_cells {
+                for i in -nx_cells..=nx_cells {
+                    let ox = (i as f32) * px;
+                    let oy = (j as f32) * py;
+                    for seg in segments {
+                        let ax_p = ox + (seg.x1 * user_scale) as f32 * px_per_unit;
+                        let ay_p = oy + (seg.y1 * user_scale) as f32 * px_per_unit;
+                        let bx_p = ox + (seg.x2 * user_scale) as f32 * px_per_unit;
+                        let by_p = oy + (seg.y2 * user_scale) as f32 * px_per_unit;
+                        let ax = centre.x + ax_p * cos - ay_p * sin;
+                        let ay = centre.y + ax_p * sin + ay_p * cos;
+                        let bx = centre.x + bx_p * cos - by_p * sin;
+                        let by = centre.y + bx_p * sin + by_p * cos;
+                        if let Some((p1, p2)) = clip_line_to_rect(
+                            egui::pos2(ax, ay), egui::pos2(bx, by), bound)
+                        {
+                            p.line_segment([p1, p2], egui::Stroke::new(stroke_w, accent));
+                        }
+                    }
+                    // Circles in the tile cell (e.g. CONCENTRIC).
+                    // Painted only when their bbox overlaps `bound` —
+                    // simple culling keeps the preview snappy.
+                    for c in circles {
+                        let r_px = (c.radius * user_scale) as f32 * px_per_unit;
+                        if r_px < 0.5 { continue; }
+                        let cx_p = ox + (c.cx * user_scale) as f32 * px_per_unit;
+                        let cy_p = oy + (c.cy * user_scale) as f32 * px_per_unit;
+                        let cx = centre.x + cx_p * cos - cy_p * sin;
+                        let cy = centre.y + cx_p * sin + cy_p * cos;
+                        let pos = egui::pos2(cx, cy);
+                        // Cull if entirely outside bound expanded by r.
+                        if pos.x + r_px < bound.left() || pos.x - r_px > bound.right()
+                        || pos.y + r_px < bound.top()  || pos.y - r_px > bound.bottom() {
+                            continue;
+                        }
+                        p.circle_stroke(pos, r_px, egui::Stroke::new(stroke_w, accent));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Polar angle dial — a circular widget for picking an angle in
+/// degrees. Click or drag anywhere inside to set the angle to the
+/// vector from centre to cursor (CCW from +X, screen-Y-inverted so 0°
+/// points RIGHT and 90° points UP).
+///
+/// Visual: outer ring + 12 tick marks (cardinals heavier) + cardinal
+/// labels + amber indicator line + tip dot. Numeric readout below.
+///
+/// `size` = pixel diameter (the widget allocates a square `size × (size
+/// + 32)` — extra 32 px for the readout).
+fn polar_angle_picker(ui: &mut egui::Ui, angle_deg: &mut f64, size: f32) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(size, size + 32.0),
+        egui::Sense::click_and_drag());
+    let painter = ui.painter_at(rect);
+    let dial_rect = egui::Rect::from_min_size(
+        rect.left_top(), egui::vec2(size, size));
+    let centre = dial_rect.center();
+    let r = (size * 0.5) - 14.0;
+    // Backdrop + outer ring.
+    painter.circle_filled(centre, r,
+        egui::Color32::from_rgb(18, 22, 28));
+    painter.circle_stroke(centre, r,
+        egui::Stroke::new(1.5, egui::Color32::from_rgb(120, 130, 145)));
+    // 12 tick marks (every 30°), cardinals heavier.
+    for k in 0..12 {
+        let t = (k as f32) * std::f32::consts::TAU / 12.0;
+        let is_cardinal = k % 3 == 0;
+        let inner = r - if is_cardinal { 9.0 } else { 5.0 };
+        let p1 = centre + egui::vec2( inner * t.cos(), -inner * t.sin());
+        let p2 = centre + egui::vec2( r     * t.cos(), -r     * t.sin());
+        let col = if is_cardinal {
+            egui::Color32::from_rgb(190, 200, 215)
+        } else {
+            egui::Color32::from_rgb(95, 105, 120)
+        };
+        let w = if is_cardinal { 1.4 } else { 0.9 };
+        painter.line_segment([p1, p2], egui::Stroke::new(w, col));
+    }
+    // Cardinal labels (0/90/180/270).
+    let lbl_r = r + 11.0;
+    let labels = [(0.0_f32, "0°"), (90.0, "90°"), (180.0, "180°"), (270.0, "270°")];
+    for (deg, txt) in labels {
+        let t = deg.to_radians();
+        let pos = centre + egui::vec2(lbl_r * t.cos(), -lbl_r * t.sin());
+        painter.text(pos, egui::Align2::CENTER_CENTER, txt,
+            egui::FontId::monospace(9.0),
+            egui::Color32::from_rgb(170, 185, 210));
+    }
+    // Indicator — amber line + dot at current angle.
+    let theta = (*angle_deg as f32).to_radians();
+    let tip = centre + egui::vec2(r * theta.cos(), -r * theta.sin());
+    painter.line_segment([centre, tip],
+        egui::Stroke::new(2.0, egui::Color32::from_rgb(255, 180, 80)));
+    painter.circle_filled(centre, 3.0,
+        egui::Color32::from_rgb(255, 180, 80));
+    painter.circle_filled(tip, 5.5,
+        egui::Color32::from_rgb(255, 180, 80));
+    painter.circle_stroke(tip, 5.5,
+        egui::Stroke::new(1.0, egui::Color32::from_rgb(20, 20, 20)));
+    // Capture click / drag — set angle from cursor vector.
+    if response.dragged() || response.clicked() {
+        if let Some(pos) = response.interact_pointer_pos() {
+            let d = pos - centre;
+            // Screen Y grows DOWN; flip to math Y for CCW-from-+X angle.
+            let mut deg = (-d.y).atan2(d.x).to_degrees() as f64;
+            if deg < 0.0 { deg += 360.0; }
+            *angle_deg = deg;
+        }
+    }
+    // Numeric readout under the dial.
+    painter.text(
+        egui::pos2(rect.center().x, rect.bottom() - 14.0),
+        egui::Align2::CENTER_CENTER,
+        format!("{:.1}°", *angle_deg),
+        egui::FontId::proportional(13.0),
+        egui::Color32::from_rgb(220, 230, 240));
+    response
+}
+
 fn point_in_polygon<I: IntoIterator<Item = Vec2>>(p: Vec2, verts: I) -> bool {
     let vs: Vec<Vec2> = verts.into_iter().collect();
     let n = vs.len();
@@ -7091,6 +8350,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Polyline(_)   => "Polyline",
         Geom::Hatch(_)      => "Hatch",
         Geom::Spline(_)     => "Spline",
+        Geom::Wall(_)       => "Wall",
     }
 }
 
@@ -7141,6 +8401,10 @@ fn describe(g: &Geom) -> String {
             s.degree, s.control_points.len(),
             if s.weights.iter().all(|w| (*w - 1.0).abs() < 1e-9) { "" }
             else { " (rational)" }
+        ),
+        Geom::Wall(w) => format!(
+            "wall ({:.2},{:.2}) → ({:.2},{:.2}) thk={:.3} len={:.3}",
+            w.start.x, w.start.y, w.end.x, w.end.y, w.thickness, w.length()
         ),
     }
 }
@@ -7290,6 +8554,16 @@ fn list_full_details(g: &Geom) -> Vec<String> {
             out.push(format!("pattern        : {:?}", h.pattern));
             out.push(format!("boundary loops : {}", h.boundary_handles.len()));
         }
+        Geom::Wall(w) => {
+            let len = w.length();
+            let mid = (w.start + w.end) * 0.5;
+            out.push(format!("type           : wall"));
+            out.push(format!("start          : ({:.4}, {:.4})", w.start.x, w.start.y));
+            out.push(format!("end            : ({:.4}, {:.4})", w.end.x, w.end.y));
+            out.push(format!("midpoint       : ({:.4}, {:.4})", mid.x, mid.y));
+            out.push(format!("length         : {:.6}", len));
+            out.push(format!("thickness      : {:.6}", w.thickness));
+        }
     }
     out
 }
@@ -7371,6 +8645,10 @@ fn describe_verbose(g: &Geom) -> String {
             }
             out
         }
+        Geom::Wall(w) => format!(
+            "wall  start=({:.3},{:.3})  end=({:.3},{:.3})  thk={:.3}  len={:.3}",
+            w.start.x, w.start.y, w.end.x, w.end.y, w.thickness, w.length(),
+        ),
     }
 }
 
@@ -7913,6 +9191,18 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
             }
             // Control-point dots
             dot(p1); dot(p2); dot(p3); dot(p4);
+        }
+        Tool::Wall => {
+            // Two parallel horizontals — the wall's two side lines.
+            // Endpoint dots show the click anchors (the centerline
+            // endpoints the user actually clicks). The "thickness" is
+            // the gap between the two parallels.
+            painter.line_segment(
+                [c + egui::vec2(-14.0, -4.0), c + egui::vec2( 14.0, -4.0)], pen);
+            painter.line_segment(
+                [c + egui::vec2(-14.0,  4.0), c + egui::vec2( 14.0,  4.0)], pen);
+            dot(c + egui::vec2(-14.0, 0.0));
+            dot(c + egui::vec2( 14.0, 0.0));
         }
     }
 
@@ -8826,6 +10116,7 @@ impl eframe::App for CadApp {
                 tool_button(ui, &mut self.tool, Tool::Point,    "point");
                 tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
                 tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
+                tool_button(ui, &mut self.tool, Tool::Wall,     "wall");
                 // Three quick-access buttons for the functional arc methods.
                 let prev_method = self.arc_method;
                 arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
@@ -8897,6 +10188,7 @@ impl eframe::App for CadApp {
                         self.pending.len()), green),
                     Tool::Arc     => (format!("DRAWING ARC ({})",
                         self.arc_method.name()), green),
+                    Tool::Wall    => (format!("DRAWING WALL (thickness={})", self.env.WlThk), green),
                 };
                 ui.colored_label(color, egui::RichText::new(label_s)
                     .monospace().size(14.0).strong());
@@ -9399,6 +10691,7 @@ impl eframe::App for CadApp {
         // Modal-ish (resizable=false, collapsible=false), opens when
         // bare `hatch` is typed; closes on OK / Cancel / X.
         self.render_hatch_dialog(ctx);
+        self.render_hatch_confirm_panel(ctx);
 
         // ---- floating: Hatch Debug Log (instrumentation) ---------------
         if self.hatch_debug_open {
@@ -10409,6 +11702,9 @@ impl eframe::App for CadApp {
                             },
                         ));
                         if let Some(tgt) = hit {
+                            // FULL TARGET GEOMETRY BEFORE TRIM — bug-reportable.
+                            // Tells you exactly what kernel::trim_at was given.
+                            self.trim_dbg_dobject(tgt, "TARGET (pre-trim)");
                             let n_before = self.doc.dobjects.len();
                             // Note this BEFORE the trim — we use it to
                             // decide whether the new pieces inherit cutter
@@ -10421,6 +11717,26 @@ impl eframe::App for CadApp {
                             self.trim_dbg(format!(
                                 "  → apply_trim_pick success={}  dobjects {}→{}  (net {:+})",
                                 did_trim, n_before, n_after, net));
+                            // FULL GEOMETRY OF EVERY NEW-BORN PIECE.
+                            // apply_trim_pick removes target_idx (indices
+                            // above shift down by 1), then appends N new
+                            // pieces at the end. New pieces live at indices
+                            // [n_after - n_pieces .. n_after) where
+                            // n_pieces = n_after + 1 - n_before.
+                            if did_trim && n_after + 1 > n_before {
+                                let n_pieces = n_after + 1 - n_before;
+                                let first_new = n_after - n_pieces;
+                                self.trim_dbg(format!(
+                                    "  --- {} new piece(s) at indices {}..{} ---",
+                                    n_pieces, first_new, n_after));
+                                for i in first_new..n_after {
+                                    self.trim_dbg_dobject(i, "NEW PIECE");
+                                }
+                            } else if did_trim {
+                                self.trim_dbg(
+                                    "  --- 0 new pieces (whole target dropped — degenerate trim) ---"
+                                        .to_string());
+                            }
                             // Patch the cutter list ONLY in explicit-list
                             // mode and ONLY when the doc actually changed.
                             // In all-mode the next click re-derives cutters
@@ -11225,7 +12541,10 @@ impl eframe::App for CadApp {
                             drawn += 1;
                             continue;
                         }
-                        draw_dobject(&painter, rect, self, &e.geom, color);
+                        // Honour style.linetype (resolved through ByLayer
+                        // when needed). Solid for Continuous; dashed via
+                        // egui::Shape::dashed_line otherwise.
+                        paint_dobject_with_style(&painter, rect, self, e, color);
                         drawn += 1;
                     }
                 }
@@ -11411,6 +12730,7 @@ impl eframe::App for CadApp {
                     egui::Stroke::new(1.0, egui::Color32::WHITE),
                 );
             }
+
 
             // pick-mode hover preview: highlight the dobject that would be selected
             if self.picking_source {
@@ -11928,6 +13248,25 @@ impl eframe::App for CadApp {
                     match (self.tool, self.pending.as_slice()) {
                         (Tool::Line, [a]) => {
                             painter.line_segment([self.w2s(*a, rect), cursor], dash);
+                        }
+                        (Tool::Wall, [a]) => {
+                            // Ghost = the wall the user is about to
+                            // commit. Build a temporary Geom::Wall and
+                            // walk its side-line accessors so the
+                            // preview matches what apply will draw.
+                            let ghost = cad_kernel::Wall {
+                                start: *a, end: cw, thickness: self.env.WlThk,
+                            };
+                            if let Some(l) = ghost.left_line() {
+                                painter.line_segment(
+                                    [self.w2s(l.a, rect), self.w2s(l.b, rect)], dash);
+                            }
+                            if let Some(r) = ghost.right_line() {
+                                painter.line_segment(
+                                    [self.w2s(r.a, rect), self.w2s(r.b, rect)], dash);
+                            }
+                            painter.line_segment(
+                                [self.w2s(*a, rect), cursor], hint);
                         }
                         (Tool::Circle, [c]) => {
                             let r_px = c.dist(cw) as f32 * self.scale;
@@ -12667,6 +14006,12 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             // in the kernel).
             for p in &s.control_points { draw(*p); }
         }
+        Geom::Wall(w) => {
+            // Wall grips = centerline endpoints + centerline midpoint.
+            draw(w.start);
+            draw(w.end);
+            draw((w.start + w.end) * 0.5);
+        }
     }
 }
 
@@ -12888,6 +14233,85 @@ fn draw_dobject(
     draw_dobject_thick(painter, rect, app, g, color, 1.6);
 }
 
+/// Render a DObject honouring its style.linetype (resolved through
+/// ByLayer when the dobject's linetype is `Continuous`/0). Falls back
+/// to a solid draw via `draw_dobject_thick` for Continuous patterns —
+/// the dashed path only kicks in when the resolved pattern is non-
+/// empty. Currently shapes: Line, Wall (left+right sides). Other
+/// variants fall through to solid (Arc/Circle/etc. linetype rendering
+/// is a follow-up — needs polyline-from-tessellation + dash).
+fn paint_dobject_with_style(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    d: &cad_kernel::DObject,
+    color: egui::Color32,
+) {
+    use cad_kernel::LinetypeTable;
+    // Effective linetype id: dobject's own when explicit; otherwise
+    // the layer's. Continuous (id 0) on both → solid render.
+    let lt_id = if d.style.linetype == LinetypeTable::CONTINUOUS {
+        app.doc.layers.get(d.style.layer)
+            .map(|l| l.linetype)
+            .unwrap_or(LinetypeTable::CONTINUOUS)
+    } else {
+        d.style.linetype
+    };
+    let pattern = match app.doc.linetypes.get(lt_id) {
+        Some(lt) if !lt.is_continuous() => lt.pattern.clone(),
+        _ => {
+            draw_dobject(painter, rect, app, &d.geom, color);
+            return;
+        }
+    };
+    // Dash length in WORLD units → screen px via the camera scale.
+    // pattern[0] is dash length; pattern[1] is gap length. Even index = dash,
+    // odd = gap. We support arbitrary even-length patterns by stepping
+    // through them; for v1 we honour just dash[0] / gap[1] and pass any
+    // extras through (egui::Shape::dashed_line takes a single dash + gap,
+    // so longer patterns degrade gracefully to "first dash, first gap").
+    let dash_w = pattern[0] as f64 * app.scale as f64;
+    let gap_w  = pattern.get(1).copied().unwrap_or(pattern[0]) as f64 * app.scale as f64;
+    // Minimum visible dash — below 1 px the line reads as solid anyway.
+    if dash_w < 1.0 {
+        draw_dobject(painter, rect, app, &d.geom, color);
+        return;
+    }
+    let stroke = egui::Stroke::new(1.6, color);
+    let push = |a: egui::Pos2, b: egui::Pos2| {
+        for s in egui::Shape::dashed_line(
+            &[a, b], stroke, dash_w as f32, gap_w as f32) {
+            painter.add(s);
+        }
+    };
+    match &d.geom {
+        Geom::Line(l) => push(app.w2s(l.a, rect), app.w2s(l.b, rect)),
+        Geom::Wall(w) => {
+            if let Some(l) = w.left_line() {
+                push(app.w2s(l.a, rect), app.w2s(l.b, rect));
+            }
+            if let Some(r) = w.right_line() {
+                push(app.w2s(r.a, rect), app.w2s(r.b, rect));
+            }
+            // Also re-issue the centerline if WlCnL — keep the debug
+            // overlay even when the wall has a custom linetype.
+            if app.env.WlCnL {
+                let cl_col = egui::Color32::from_rgba_unmultiplied(
+                    color.r(), color.g(), color.b(), 110);
+                let cl_stroke = egui::Stroke::new(1.2, cl_col);
+                let a = app.w2s(w.start, rect);
+                let b = app.w2s(w.end,   rect);
+                for s in egui::Shape::dashed_line(&[a, b], cl_stroke, 6.0, 4.0) {
+                    painter.add(s);
+                }
+            }
+        }
+        // Other variants — solid for now. Arc/Circle/Polyline/Spline
+        // dashed render = tessellate + dashed_line. Add when needed.
+        _ => draw_dobject(painter, rect, app, &d.geom, color),
+    }
+}
+
 /// Same as `draw_dobject` with a parameterised stroke width. Used for the
 /// trim-cutter / extend-boundary pulse overlay (Item 5) which draws a
 /// thicker animated outline above the dobject's normal color.
@@ -12986,6 +14410,32 @@ fn draw_dobject_thick(
             let pts: Vec<egui::Pos2> = samples.iter()
                 .map(|w| app.w2s(*w, rect)).collect();
             painter.add(egui::Shape::line(pts, stroke));
+        }
+        Geom::Wall(w) => {
+            // Solid sides + optional dashed centerline (gated by the
+            // WlCnL SYSVAR — true while we're developing the wall-
+            // aware fillet, off for production).
+            if let Some(l) = w.left_line() {
+                painter.line_segment(
+                    [app.w2s(l.a, rect), app.w2s(l.b, rect)], stroke);
+            }
+            if let Some(r) = w.right_line() {
+                painter.line_segment(
+                    [app.w2s(r.a, rect), app.w2s(r.b, rect)], stroke);
+            }
+            if app.env.WlCnL {
+                // Centerline rendered as a dashed line in the same
+                // colour but at half-alpha so it reads as a debug
+                // overlay rather than primary geometry.
+                let cl_col = egui::Color32::from_rgba_unmultiplied(
+                    color.r(), color.g(), color.b(), 110);
+                let cl_stroke = egui::Stroke::new(width * 0.8, cl_col);
+                let a = app.w2s(w.start, rect);
+                let b = app.w2s(w.end,   rect);
+                for s in egui::Shape::dashed_line(&[a, b], cl_stroke, 6.0, 4.0) {
+                    painter.add(s);
+                }
+            }
         }
     }
 }
@@ -13098,6 +14548,16 @@ fn draw_dobject_dashed(
             let pts: Vec<egui::Pos2> = samples.iter()
                 .map(|w| app.w2s(*w, rect)).collect();
             push_dashed(pts);
+        }
+        Geom::Wall(w) => {
+            // Dashed selection overlay covers BOTH visible side lines
+            // so a selected wall reads as one entity.
+            if let Some(l) = w.left_line() {
+                push_dashed(vec![app.w2s(l.a, rect), app.w2s(l.b, rect)]);
+            }
+            if let Some(r) = w.right_line() {
+                push_dashed(vec![app.w2s(r.a, rect), app.w2s(r.b, rect)]);
+            }
         }
     }
 }

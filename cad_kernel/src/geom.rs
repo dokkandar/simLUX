@@ -5,6 +5,59 @@ use crate::math::{Vec2, EPS, norm_angle};
 #[derive(Clone, Copy, Debug)]
 pub struct Line { pub a: Vec2, pub b: Vec2 }
 
+/// Architectural smart-dobject: a wall is its IMPLICIT centerline
+/// (`start` → `end`) plus a perpendicular `thickness`. Renders as two
+/// parallel side lines ±thickness/2 from the centerline. All editing
+/// operations (translate / rotate / scale / mirror / lengthen / trim /
+/// extend) modify the centerline; the two visible sides re-derive
+/// automatically. This is the "smart" part — one user gesture, both
+/// sides move.
+///
+/// Forms the foundation of the AEC-primitive family (future Window
+/// and Door dobjects will reference a Wall by handle + a position
+/// along its centerline).
+#[derive(Clone, Copy, Debug)]
+pub struct Wall {
+    pub start:     Vec2,
+    pub end:       Vec2,
+    pub thickness: f64,
+}
+
+impl Wall {
+    /// CCW unit normal of the centerline direction. `None` if the
+    /// centerline is degenerate (start ≈ end).
+    pub fn normal(&self) -> Option<Vec2> {
+        let d = self.end - self.start;
+        let len = d.len();
+        if len < EPS { return None; }
+        Some((d / len).perp())
+    }
+
+    /// The "left" (CCW-side) face line of the wall.
+    pub fn left_line(&self) -> Option<Line> {
+        let n = self.normal()?;
+        let off = n * (self.thickness * 0.5);
+        Some(Line { a: self.start + off, b: self.end + off })
+    }
+
+    /// The "right" (CW-side) face line of the wall.
+    pub fn right_line(&self) -> Option<Line> {
+        let n = self.normal()?;
+        let off = n * (self.thickness * 0.5);
+        Some(Line { a: self.start - off, b: self.end - off })
+    }
+
+    /// The implicit centerline as a regular Line.
+    pub fn centerline(&self) -> Line {
+        Line { a: self.start, b: self.end }
+    }
+
+    /// Centerline length.
+    pub fn length(&self) -> f64 {
+        (self.end - self.start).len()
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Circle { pub center: Vec2, pub radius: f64 }
 
@@ -331,6 +384,10 @@ pub enum Geom {
     Polyline(Polyline),
     Hatch(Hatch),
     Spline(Spline),
+    /// Architectural wall — see `Wall` for the design. All transforms
+    /// operate on the centerline; the visible side lines re-derive
+    /// automatically.
+    Wall(Wall),
 }
 
 impl Geom {
@@ -398,6 +455,13 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| rot(*p)).collect(),
                 weights:        s.weights.clone(),
             }),
+            // Wall — rotate the centerline; thickness is direction-
+            // invariant. Side lines re-derive from the new endpoints.
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start:     rot(w.start),
+                end:       rot(w.end),
+                thickness: w.thickness,
+            }),
         }
     }
 
@@ -445,6 +509,13 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
                 weights:        s.weights.clone(),
+            }),
+            // Wall — scale the centerline + thickness uniformly so
+            // the wall stays geometrically similar.
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start:     sc(w.start),
+                end:       sc(w.end),
+                thickness: w.thickness * f_abs,
             }),
         }
     }
@@ -512,6 +583,12 @@ impl Geom {
                 degree:         s.degree,
                 control_points: s.control_points.iter().map(|p| mirror(*p)).collect(),
                 weights:        s.weights.clone(),
+            }),
+            // Wall — mirror the centerline; thickness unchanged.
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start:     mirror(w.start),
+                end:       mirror(w.end),
+                thickness: w.thickness,
             }),
         }
     }
@@ -588,7 +665,19 @@ impl Geom {
                     }))
                 }
             }
-            _ => Err("lengthen: only Line / Arc / EllipseArc are supported"),
+            Geom::Wall(w) => {
+                // Lengthen the centerline; thickness unchanged.
+                let line = w.centerline();
+                let g = Geom::Line(line).lengthened(delta, near)?;
+                if let Geom::Line(new_line) = g {
+                    Ok(Geom::Wall(Wall {
+                        start: new_line.a,
+                        end:   new_line.b,
+                        thickness: w.thickness,
+                    }))
+                } else { Err("lengthen wall: unexpected non-Line result") }
+            }
+            _ => Err("lengthen: only Line / Arc / EllipseArc / Wall are supported"),
         }
     }
 
@@ -653,17 +742,57 @@ impl Geom {
             return Err("trim: target has no intersection with the cutting edges");
         }
 
-        /// Drop the segment containing `pick_t` from a list of consecutive
-        /// param bounds; return every other segment as (t_start, t_end).
+        /// AutoCAD-correct TRIM survivors. `bounds` = sorted parameters
+        /// [target_start, …intersection_ts…, target_end]. The clicked
+        /// interval is the one containing `pick_t`; that interval is the
+        /// only thing removed. Everything to the LEFT of the clicked
+        /// interval stays as ONE continuous piece (target_start → left
+        /// boundary of clicked interval), and everything to the RIGHT
+        /// stays as ONE continuous piece (right boundary → target_end).
+        /// Cutter intersections that lie OUTSIDE the clicked interval do
+        /// NOT cause splits — the line passes through them uninterrupted.
+        ///
+        /// Net survivors: 0, 1, or 2 pieces.
+        ///   0 → clicked interval spans the whole target (degenerate cut).
+        ///   1 → click is in the FIRST or LAST interval; the other end
+        ///       survives as one continuous piece (typical case for a
+        ///       line crossing a closed cutter from outside).
+        ///   2 → click is in a MIDDLE interval; removing it disconnects
+        ///       the target into two pieces.
+        ///
+        /// Earlier the algorithm kept every non-clicked interval as its
+        /// own piece (over-split — the trim docs in
+        /// `feedback_rust_cad_trim_breaks_into_all_segments` reflect the
+        /// old rule). Confirmed bug 2026-06-08: trimming a line outside
+        /// an ellipse produced 2 separate dobjects (Inside + Outside-B)
+        /// when only Outside-A should have been removed.
         fn surviving_segments(bounds: &[f64], pick_t: f64, eps: f64) -> Vec<(f64, f64)> {
-            let mut out = Vec::new();
-            for i in 0..bounds.len() - 1 {
+            let n = bounds.len();
+            if n < 2 { return Vec::new(); }
+            // Find the interval containing `pick_t`.
+            let mut clicked: Option<(f64, f64)> = None;
+            for i in 0..n - 1 {
                 let t1 = bounds[i];
                 let t2 = bounds[i + 1];
-                if (t2 - t1) <= eps { continue; }   // skip empty segments
-                let click_inside = pick_t > t1 - eps && pick_t < t2 + eps;
-                if click_inside { continue; }       // drop the clicked one
-                out.push((t1, t2));
+                if (t2 - t1) <= eps { continue; }   // skip empty intervals
+                if pick_t >= t1 - eps && pick_t <= t2 + eps {
+                    clicked = Some((t1, t2));
+                    break;
+                }
+            }
+            let Some((left, right)) = clicked else {
+                // Pick fell outside all intervals (shouldn't happen for
+                // clamped pick_t) — defensively keep the whole target.
+                return vec![(bounds[0], bounds[n - 1])];
+            };
+            let mut out = Vec::new();
+            // Left survivor: target_start → left edge of clicked interval.
+            if left - bounds[0] > eps {
+                out.push((bounds[0], left));
+            }
+            // Right survivor: right edge of clicked interval → target_end.
+            if bounds[n - 1] - right > eps {
+                out.push((right, bounds[n - 1]));
             }
             out
         }
@@ -840,6 +969,20 @@ impl Geom {
                 Err("trim: hatch entities cannot be trimmed"),
             Geom::Spline(_) =>
                 Err("trim: spline entities cannot be trimmed in v1 (knot insertion + split + reparametrise pending)"),
+            Geom::Wall(w) => {
+                // Trim the centerline; wrap each surviving sub-segment
+                // as a new Wall with the same thickness. Side lines
+                // re-derive on render.
+                let line = Geom::Line(w.centerline());
+                let pieces = line.trim_at(cutters, pick, edge_mode)?;
+                Ok(pieces.into_iter().filter_map(|g| {
+                    if let Geom::Line(seg) = g {
+                        Some(Geom::Wall(Wall {
+                            start: seg.a, end: seg.b, thickness: w.thickness,
+                        }))
+                    } else { None }
+                }).collect())
+            }
         }
     }
 
@@ -926,7 +1069,17 @@ impl Geom {
                     }))
                 }
             }
-            _ => Err("extend: only Line / Arc are supported in v1"),
+            Geom::Wall(w) => {
+                let line = Geom::Line(w.centerline());
+                let g = line.extend_to(boundaries, pick, edge_mode)?;
+                if let Geom::Line(new_line) = g {
+                    Ok(Geom::Wall(Wall {
+                        start: new_line.a, end: new_line.b,
+                        thickness: w.thickness,
+                    }))
+                } else { Err("extend wall: unexpected non-Line result") }
+            }
+            _ => Err("extend: only Line / Arc / Wall are supported in v1"),
         }
     }
 
@@ -1024,6 +1177,19 @@ impl Geom {
                 Err("split: hatch entities cannot be split"),
             Geom::Spline(_) =>
                 Err("split: spline entities cannot be split in v1 (knot insertion pending)"),
+            Geom::Wall(w) => {
+                // Split the centerline at `at`; wrap each piece as a
+                // Wall with the same thickness.
+                let line = Geom::Line(w.centerline());
+                let (g1, g2) = line.split_at(at)?;
+                match (g1, g2) {
+                    (Geom::Line(l1), Geom::Line(l2)) => Ok((
+                        Geom::Wall(Wall { start: l1.a, end: l1.b, thickness: w.thickness }),
+                        Geom::Wall(Wall { start: l2.a, end: l2.b, thickness: w.thickness }),
+                    )),
+                    _ => Err("split wall: unexpected non-Line result"),
+                }
+            }
         }
     }
 
@@ -1103,6 +1269,16 @@ impl Geom {
                 Err("offset on hatch is undefined (offset the boundary instead)"),
             Geom::Spline(_) =>
                 Err("offset on spline not implemented yet (true offset of a NURBS isn't a NURBS — needs sampling + refit)"),
+            Geom::Wall(w) => {
+                // Offset the centerline; new Wall keeps the same
+                // thickness on the offset centerline.
+                let g = Geom::Line(w.centerline()).offset(dist, side)?;
+                if let Geom::Line(l) = g {
+                    Ok(Geom::Wall(Wall {
+                        start: l.a, end: l.b, thickness: w.thickness,
+                    }))
+                } else { Err("offset wall: unexpected non-Line result") }
+            }
         }
     }
 
@@ -1171,6 +1347,12 @@ impl Geom {
                 weights:        s.weights.iter().rev().copied().collect(),
             }),
             Geom::Circle(_) | Geom::Ellipse(_) | Geom::Point(_) | Geom::Hatch(_) => self.clone(),
+            // Wall — reverse the centerline; thickness unchanged. The
+            // visible side-line naming (left/right) swaps because the
+            // CCW normal flips, but the geometry is identical.
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start: w.end, end: w.start, thickness: w.thickness,
+            }),
         }
     }
 
@@ -1221,6 +1403,9 @@ impl Geom {
                 control_points: s.control_points.iter().map(|p| *p + off).collect(),
                 weights:        s.weights.clone(),
             }),
+            Geom::Wall(w) => Geom::Wall(Wall {
+                start: w.start + off, end: w.end + off, thickness: w.thickness,
+            }),
         }
     }
 
@@ -1236,6 +1421,18 @@ impl Geom {
             Geom::Polyline(pl)   => pl.distance_to_point(p),
             Geom::Hatch(h)       => h.distance_to_point(p),
             Geom::Spline(s)      => s.distance_to_point(p),
+            // Wall — min distance to either visible side line. The
+            // centerline ITSELF is invisible (a debug overlay) so it
+            // doesn't participate in pick-test.
+            Geom::Wall(w) => {
+                let l = w.left_line();
+                let r = w.right_line();
+                match (l, r) {
+                    (Some(l), Some(r)) =>
+                        l.distance_to_point(p).min(r.distance_to_point(p)),
+                    _ => f64::INFINITY,
+                }
+            }
         }
     }
 }
@@ -1300,6 +1497,21 @@ impl Geom {
             Geom::Polyline(pl) => pl.bbox(),
             Geom::Hatch(h)  => h.bbox(),
             Geom::Spline(s) => s.bbox(),
+            // Wall bbox = centerline bbox EXPANDED by thickness/2 in
+            // both axes (loose but cheap; the rotated side-line corners
+            // are always within this box).
+            Geom::Wall(w) => {
+                let h = w.thickness * 0.5;
+                let min = Vec2::new(
+                    w.start.x.min(w.end.x) - h,
+                    w.start.y.min(w.end.y) - h,
+                );
+                let max = Vec2::new(
+                    w.start.x.max(w.end.x) + h,
+                    w.start.y.max(w.end.y) + h,
+                );
+                (min, max)
+            }
         }
     }
 
@@ -1561,35 +1773,70 @@ mod transform_tests {
     }
 
     #[test]
-    fn trim_line_with_three_cutters_breaks_into_separate_pieces() {
-        // Critical multi-cut test: line 0→10 with cuts at x=2, 5, 8.
-        // 3 cuts = 4 segments. Click in segment (2..5) → 3 separate pieces
-        // remain: (0..2), (5..8), (8..10). NOT merged into 2 outer chunks.
+    fn trim_line_with_three_cutters_two_outer_pieces() {
+        // AutoCAD-correct: line 0→10 with cuts at x=2, 5, 8. Click in
+        // interval (2..5) → ONLY that interval is removed. Surviving
+        // pieces (NOT further split at x=8): (0..2) and (5..10).
+        // Updated from the prior N+1 over-split rule (2026-06-08 — user
+        // bug report: trimming outside a closed cutter incorrectly split
+        // the line at the far intersection too).
         let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(10.0, 0.0) });
         let cs: Vec<Geom> = [2.0, 5.0, 8.0].iter().map(|&x| {
             Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
         }).collect();
         let out = target.trim_at(&cs, Vec2::new(3.5, 0.0), false).unwrap();
-        assert_eq!(out.len(), 3, "expected 3 surviving pieces, got {}", out.len());
+        assert_eq!(out.len(), 2,
+            "expected 2 surviving pieces (AutoCAD-style), got {}", out.len());
         let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
             if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
         }).collect();
         xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
         assert!(approx_eq(xs[0].0, 0.0) && approx_eq(xs[0].1, 2.0));
-        assert!(approx_eq(xs[1].0, 5.0) && approx_eq(xs[1].1, 8.0));
-        assert!(approx_eq(xs[2].0, 8.0) && approx_eq(xs[2].1, 10.0));
+        assert!(approx_eq(xs[1].0, 5.0) && approx_eq(xs[1].1, 10.0));   // not split at 8!
     }
 
     #[test]
-    fn trim_line_with_five_cutters_makes_5_pieces_on_middle_click() {
-        // 5 cuts = 6 segments. Click in segment 3 → 5 pieces survive.
+    fn trim_line_with_five_cutters_two_pieces_on_middle_click() {
+        // AutoCAD-correct: 5 cuts at x=2,4,6,8,10; click in interval
+        // (4..6) → 2 surviving pieces: (0..4) and (6..12). Non-bounding
+        // intersections at x=2, 8, 10 do NOT cause splits.
         let target = Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(12.0, 0.0) });
         let cs: Vec<Geom> = [2.0, 4.0, 6.0, 8.0, 10.0].iter().map(|&x| {
             Geom::Line(Line { a: Vec2::new(x, -5.0), b: Vec2::new(x, 5.0) })
         }).collect();
-        // Click in segment (4..6), at x=5.
         let out = target.trim_at(&cs, Vec2::new(5.0, 0.0), false).unwrap();
-        assert_eq!(out.len(), 5, "expected 5 surviving pieces, got {}", out.len());
+        assert_eq!(out.len(), 2,
+            "expected 2 surviving pieces (AutoCAD-style), got {}", out.len());
+        let mut xs: Vec<(f64, f64)> = out.iter().map(|g| {
+            if let Geom::Line(l) = g { (l.a.x, l.b.x) } else { panic!() }
+        }).collect();
+        xs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+        assert!(approx_eq(xs[0].0, 0.0) && approx_eq(xs[0].1, 4.0));
+        assert!(approx_eq(xs[1].0, 6.0) && approx_eq(xs[1].1, 12.0));
+    }
+
+    #[test]
+    fn trim_line_outside_closed_cutter_keeps_one_continuous_piece() {
+        // User-reported bug 2026-06-08: line crosses an ellipse at TWO
+        // points; click on the OUTSIDE-A portion (before first
+        // intersection). Survivor should be ONE continuous piece from
+        // intersection1 → line.end (passing through the inside AND
+        // outside-B without further splits).
+        let target = Geom::Line(Line {
+            a: Vec2::new(0.0, 0.0), b: Vec2::new(10.0, 0.0),
+        });
+        // Two perpendicular cutters at x=3 and x=7 (simulate ellipse's
+        // two intersections with the line).
+        let c1 = Geom::Line(Line { a: Vec2::new(3.0, -2.0), b: Vec2::new(3.0, 2.0) });
+        let c2 = Geom::Line(Line { a: Vec2::new(7.0, -2.0), b: Vec2::new(7.0, 2.0) });
+        // Click before first intersection — on the OUTSIDE-A portion.
+        let out = target.trim_at(&[c1, c2], Vec2::new(1.5, 0.0), false).unwrap();
+        assert_eq!(out.len(), 1,
+            "expected ONE continuous piece (3 → 10), got {}", out.len());
+        if let Geom::Line(l) = &out[0] {
+            assert!(approx_eq(l.a.x, 3.0));
+            assert!(approx_eq(l.b.x, 10.0));
+        }
     }
 
     #[test]
@@ -2001,6 +2248,14 @@ impl Geom {
             Geom::Spline(s) => s.control_points.iter().enumerate()
                 .map(|(i, p)| (*p, GripRole::SplineCtrlPt(i)))
                 .collect(),
+            // Wall — grip at each centerline endpoint + midpoint.
+            // Re-uses Line grip roles so the existing renderer + apply
+            // path "just work"; `with_grip_moved` below maps them back.
+            Geom::Wall(w) => vec![
+                (w.start, GripRole::LineEndA),
+                (w.end,   GripRole::LineEndB),
+                ((w.start + w.end) * 0.5, GripRole::LineMid),
+            ],
         }
     }
 
@@ -2167,6 +2422,24 @@ impl Geom {
             // ---- Point -------------------------------------------------
             (Geom::Point(p), GripRole::PointLoc) =>
                 Geom::Point(Point { location: new_pos, style: p.style, size: p.size }),
+            // ---- Wall — re-uses Line grip roles --------------------------
+            // Grip drags reshape the centerline; both side lines re-derive
+            // on render so the wall moves coherently as one entity.
+            (Geom::Wall(w), GripRole::LineEndA) => Geom::Wall(Wall {
+                start: new_pos, end: w.end, thickness: w.thickness,
+            }),
+            (Geom::Wall(w), GripRole::LineEndB) => Geom::Wall(Wall {
+                start: w.start, end: new_pos, thickness: w.thickness,
+            }),
+            (Geom::Wall(w), GripRole::LineMid) => {
+                // Move the whole wall — translate by (new_pos - current mid).
+                let mid = (w.start + w.end) * 0.5;
+                let off = new_pos - mid;
+                Geom::Wall(Wall {
+                    start: w.start + off, end: w.end + off,
+                    thickness: w.thickness,
+                })
+            }
             // Mismatched (role, geom) — return unchanged.
             (g, _) => g.clone(),
         }
@@ -3137,5 +3410,57 @@ mod fillet_chamfer_join_tests {
         let err = g.trim_at(&[tangent], Vec2::new(0.0, 0.5), false).unwrap_err();
         assert!(err.contains("at least 2 intersections")
              || err.contains("no intersection"));
+    }
+
+    // ---- Wall ----------------------------------------------------------
+    #[test]
+    fn wall_translated_moves_centerline_keeps_thickness() {
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 2.0 };
+        let g = Geom::Wall(w).translated(Vec2::new(5.0, 3.0));
+        if let Geom::Wall(w2) = g {
+            assert_eq!(w2.start, Vec2::new(5.0, 3.0));
+            assert_eq!(w2.end,   Vec2::new(15.0, 3.0));
+            assert_eq!(w2.thickness, 2.0);
+        } else { panic!("translated lost variant"); }
+    }
+
+    #[test]
+    fn wall_scaled_scales_thickness() {
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(4.0, 0.0), thickness: 1.0 };
+        let g = Geom::Wall(w).scaled(Vec2::ZERO, 2.5);
+        if let Geom::Wall(w2) = g {
+            assert!((w2.end.x - 10.0).abs() < 1e-12);
+            assert!((w2.thickness - 2.5).abs() < 1e-12);
+        } else { panic!("scaled lost variant"); }
+    }
+
+    #[test]
+    fn wall_rotated_90_swaps_axes() {
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(5.0, 0.0), thickness: 1.0 };
+        let g = Geom::Wall(w).rotated(Vec2::ZERO, std::f64::consts::FRAC_PI_2);
+        if let Geom::Wall(w2) = g {
+            assert!((w2.end - Vec2::new(0.0, 5.0)).len() < 1e-9);
+            assert_eq!(w2.thickness, 1.0);
+        } else { panic!("rotated lost variant"); }
+    }
+
+    #[test]
+    fn wall_distance_to_point_picks_nearer_side() {
+        // Horizontal wall along the X-axis, thickness 2 → sides at y=±1.
+        // Point at (5, 0.3) is distance 0.7 from the upper side and 1.3 from the lower.
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 2.0 };
+        let d = Geom::Wall(w).distance_to_point(Vec2::new(5.0, 0.3));
+        assert!((d - 0.7).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wall_bbox_includes_thickness() {
+        let w = Wall { start: Vec2::ZERO, end: Vec2::new(10.0, 0.0), thickness: 2.0 };
+        let (min, max) = Geom::Wall(w).bbox();
+        // Loose bbox: expanded by thk/2 = 1.0 in both axes.
+        assert!((min.y + 1.0).abs() < 1e-9);
+        assert!((max.y - 1.0).abs() < 1e-9);
     }
 }

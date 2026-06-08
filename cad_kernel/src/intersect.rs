@@ -59,6 +59,21 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // Bézier-subdivision + Newton refinement). Return empty for
         // v1; trim/extend against splines is also gated upstream.
         (Spline(_), _) | (_, Spline(_)) => Vec::new(),
+
+        // Wall ∩ anything — intersect the WALL's CENTERLINE with the
+        // other geom. The centerline is the smart-dobject's identity;
+        // the visible side lines are derived. fillet/trim/etc. on
+        // walls operate through the centerline (per the design), so
+        // intersect must too.
+        //
+        // Wall ∩ Wall = intersect the two centerlines.
+        (Wall(w), other) | (other, Wall(w)) => {
+            let cl = Geom::Line(w.centerline());
+            match other {
+                Wall(w2) => intersect(&cl, &Geom::Line(w2.centerline())),
+                _        => intersect(&cl, other),
+            }
+        }
     }
 }
 
