@@ -709,6 +709,10 @@ pub enum QueuedOp {
     /// Generate. Multi-source: every grid cell instantiates a copy of
     /// every dobject in the selection (offset by cell position).
     Array,
+    /// Align — on Enter the finalised selection becomes the align basket
+    /// and the command proceeds to the 4-point capture (src1 → src2 →
+    /// tgt1 → tgt2). Same select-first flow as Move/Copy/Rotate.
+    Align,
     /// Erase — applied on Enter. The finalised selection is deleted
     /// in one batch. AutoCAD's ERASE: type `erase`, pick targets,
     /// Enter to commit.
@@ -2674,12 +2678,18 @@ impl CadApp {
                 }
             }
             Ok(Command::Align) => {
+                // Universal selection model: empty basket → open a select
+                // session and queue the op (same as Move/Copy/Rotate);
+                // pre-selected basket skips straight to point capture.
                 if self.selection.is_empty() {
-                    self.history.push("  ! align: empty basket — `select` first".into());
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Align;
+                    self.set_prompt(
+                        "align: select dobjects, Enter to continue  [Esc=cancel]");
                 } else {
                     self.align_state = AlignState::WaitingForSrc1;
-                    self.history.push(format!(
-                        "  align — {} in basket. Click SOURCE point 1 (Esc cancels)",
+                    self.set_prompt(format!(
+                        "align ({} dobject(s)): click SOURCE point 1  [Esc=cancel]",
                         self.selection.len()));
                 }
             }
@@ -3028,6 +3038,12 @@ impl CadApp {
                 self.clear_prompt();
                 self.history.push(format!(
                     "  array: {} source dobject(s) picked — set rows/cols and Generate",
+                    self.selection.len()));
+            }
+            QueuedOp::Align => {
+                self.align_state = AlignState::WaitingForSrc1;
+                self.set_prompt(format!(
+                    "align ({} dobject(s)): click SOURCE point 1  [Esc=cancel]",
                     self.selection.len()));
             }
             QueuedOp::Erase => {
@@ -4536,6 +4552,39 @@ impl CadApp {
     /// Modifier = sign: `shift` (or the persistent `select_remove_mode`)
     /// makes the window SUBTRACT instead of ADD.
     #[track_caller]
+    /// Narrow-phase crossing test: does the REAL geometry of `geom` enter the
+    /// window rectangle [rmin,rmax]? Run after the cheap bbox broad-phase so
+    /// crossing-selection doesn't false-positive on objects whose bounding box
+    /// overlaps the window but whose stroke never crosses it (e.g. a long
+    /// diagonal line — the #7 bug). Tests the geometry against the 4 window
+    /// edges via the intersection kernel.
+    ///
+    /// Types `intersect()` can't handle (Point / Hatch / Spline / Text /
+    /// Dimension) fall back to TRUE — i.e. keep the prior bbox-overlap result
+    /// (the caller only invokes this when the bbox already overlaps), so this
+    /// change can never DROP a selection that used to work.
+    fn geom_enters_window(geom: &Geom, rmin: Vec2, rmax: Vec2) -> bool {
+        match geom {
+            Geom::Point(_) | Geom::Hatch(_) | Geom::Spline(_)
+            | Geom::Text(_) | Geom::Dimension(_) => true,
+            _ => {
+                let c = [
+                    Vec2::new(rmin.x, rmin.y),
+                    Vec2::new(rmax.x, rmin.y),
+                    Vec2::new(rmax.x, rmax.y),
+                    Vec2::new(rmin.x, rmax.y),
+                ];
+                for k in 0..4 {
+                    let edge = Geom::Line(Line { a: c[k], b: c[(k + 1) % 4] });
+                    if !intersect(geom, &edge).is_empty() {
+                        return true;
+                    }
+                }
+                false
+            }
+        }
+    }
+
     fn add_window_selection(&mut self, p1: Vec2, p2: Vec2, shift: bool) {
         let basket_before = self.selection.clone();
         let bbox_min = Vec2::new(p1.x.min(p2.x), p1.y.min(p2.y));
@@ -4574,12 +4623,23 @@ impl CadApp {
         for i in &cands {
             let i = *i;
             let (emin, emax) = self.doc.dobjects[i].bbox();
+            let bbox_inside = emin.x >= bbox_min.x && emax.x <= bbox_max.x
+                && emin.y >= bbox_min.y && emax.y <= bbox_max.y;
             let inside = if crossing {
-                !(emax.x < bbox_min.x || emin.x > bbox_max.x
-                    || emax.y < bbox_min.y || emin.y > bbox_max.y)
+                // CROSSING: select if the geometry is fully inside the window
+                // (bbox inside ⟹ geom inside) OR its REAL geometry actually
+                // enters the window. Bbox-overlap alone over-selects — a long
+                // diagonal object has a big bbox that overlaps the window even
+                // when its stroke never crosses it (the #7 false-positive).
+                let bbox_overlaps = !(emax.x < bbox_min.x || emin.x > bbox_max.x
+                    || emax.y < bbox_min.y || emin.y > bbox_max.y);
+                bbox_inside
+                    || (bbox_overlaps
+                        && Self::geom_enters_window(
+                            &self.doc.dobjects[i].geom, bbox_min, bbox_max))
             } else {
-                emin.x >= bbox_min.x && emax.x <= bbox_max.x
-                    && emin.y >= bbox_min.y && emax.y <= bbox_max.y
+                // INSIDE (window) mode: bbox fully inside ⟹ geom fully inside.
+                bbox_inside
             };
             // Recorder verdict (only push first 20 to bound dump size).
             if verdicts.len() < 20 {
@@ -12389,6 +12449,91 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                 });
+                // ---- Styles menu — ONE home for every style table. Maps
+                // 1:1 onto a future ribbon "Styles" tab. Managers first,
+                // then current-style quick switchers (✔ = current).
+                ui.menu_button("Styles", |ui| {
+                    ui.label(egui::RichText::new("Managers").small().color(
+                        egui::Color32::from_rgb(150, 165, 185)));
+                    for (label, cmd, tip) in [
+                        ("Text Style…", "style",
+                         "Named text styles (font, default height)"),
+                        ("Dimension Style…", "dimstyle",
+                         "Arrow size, text height/placement, decimals, colors"),
+                        ("Wall Style…", "wallstyle",
+                         "Wall types (Dry Wall / Structural / …): thickness, poché fill, face color"),
+                    ] {
+                        if ui.button(label).on_hover_text(tip).clicked() {
+                            self.run_command(cmd);
+                            ui.close_menu();
+                        }
+                    }
+                    ui.separator();
+                    ui.label(egui::RichText::new("Current").small().color(
+                        egui::Color32::from_rgb(150, 165, 185)));
+                    // Snapshot names so the submenu closures don't borrow doc.
+                    let dim_names: Vec<(u32, String)> = self.doc.dim_styles.styles
+                        .iter().enumerate()
+                        .map(|(i, s)| (i as u32, s.name.clone())).collect();
+                    let wall_names: Vec<(u32, String)> = self.doc.wall_styles.styles
+                        .iter().enumerate()
+                        .map(|(i, s)| (i as u32, s.name.clone())).collect();
+                    let mut set_dim:  Option<u32> = None;
+                    let mut set_wall: Option<u32> = None;
+                    ui.menu_button(
+                        format!("Dim style:  {}", dim_names
+                            .get(self.current_dim_style as usize)
+                            .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
+                        |ui| {
+                            for (id, name) in &dim_names {
+                                if ui.selectable_label(
+                                    *id == self.current_dim_style, name).clicked()
+                                {
+                                    set_dim = Some(*id);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    ui.menu_button(
+                        format!("Wall style:  {}", wall_names
+                            .get(self.current_wall_style as usize)
+                            .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
+                        |ui| {
+                            for (id, name) in &wall_names {
+                                if ui.selectable_label(
+                                    *id == self.current_wall_style, name).clicked()
+                                {
+                                    set_wall = Some(*id);
+                                    ui.close_menu();
+                                }
+                            }
+                        });
+                    if let Some(id) = set_dim {
+                        self.current_dim_style = id;
+                        self.history.push(format!(
+                            "  dim style: '{}' set current",
+                            dim_names[id as usize].1));
+                    }
+                    if let Some(id) = set_wall {
+                        self.current_wall_style = id;
+                        // Same WlThk sync the Wall Style Manager's Set
+                        // Current does, so the next wall draws at the
+                        // style's thickness.
+                        if let Some(s) = self.doc.wall_styles.get(id) {
+                            self.env.WlThk = s.thickness;
+                            let _ = self.env.save();
+                        }
+                        self.history.push(format!(
+                            "  wall style: '{}' set current",
+                            wall_names[id as usize].1));
+                    }
+                    ui.separator();
+                    // Future style tables — visible intent, honestly disabled.
+                    ui.add_enabled(false, egui::Button::new("Opening Style…  (planned)"))
+                        .on_disabled_hover_text(
+                            "Door / window / niche styles riding on walls — \
+                             see Smart_Dobjects.md §2.6");
+                });
                 ui.menu_button("Tools", |ui| {
                     ui.label(egui::RichText::new("Palettes").small().color(
                         egui::Color32::from_rgb(150, 165, 185)));
@@ -14531,20 +14676,27 @@ impl eframe::App for CadApp {
                                 self.history.push(format!(
                                     "    align: SRC1 = ({:.2},{:.2}) — click SOURCE point 2",
                                     click_world.x, click_world.y));
+                                self.set_prompt(
+                                    "align: click SOURCE point 2  [Esc=cancel]");
                             }
                             AlignState::WaitingForSrc2(s1) => {
                                 self.align_state = AlignState::WaitingForTgt1(s1, click_world);
                                 self.history.push(
                                     "    align: SRC2 captured — click TARGET point 1".into());
+                                self.set_prompt(
+                                    "align: click TARGET point 1  [Esc=cancel]");
                             }
                             AlignState::WaitingForTgt1(s1, s2) => {
                                 self.align_state = AlignState::WaitingForTgt2(s1, s2, click_world);
                                 self.history.push(
                                     "    align: TGT1 captured — click TARGET point 2".into());
+                                self.set_prompt(
+                                    "align: click TARGET point 2  [Esc=cancel]");
                             }
                             AlignState::WaitingForTgt2(s1, s2, t1) => {
                                 self.apply_align(s1, s2, t1, click_world);
                                 self.align_state = AlignState::Off;
+                                self.clear_prompt();
                             }
                             AlignState::Off => unreachable!(),
                         }

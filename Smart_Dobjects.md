@@ -182,6 +182,50 @@ Turns a room outline into walls in one step.
 Wall.style; DimStyle Manager dialog → Wall Style dialog; hatch fill + HatchPattern
 → poché; ACI wheel → colors; polyline offset → convert-to-wall.
 
+## 2.6 Opening styles — doors, windows, niches
+*(plan, user 2026-06-11; do NOT build until asked)*
+
+Openings are smart **sub-dobjects that ride on a wall**: they don't own
+free geometry — they own a position on a host wall's centerline and derive
+their cut from the wall's thickness. Third member of the style-table family
+(after DimStyle and WallStyle); surfaced in the **Styles menu** (placeholder
+entry already present, disabled).
+
+**Data model (mirrors the established pattern):**
+- `Opening { wall: handle, t: f64 /* 0..1 along centerline */, width: f64,
+  style: u32, flip: bool }` — `t` parameterizes along the host centerline so
+  the opening *rides the wall* when the wall moves/stretches (smart-dobject
+  identity rule: the anchor is parametric, not absolute coords).
+- `OpeningStyle { name, kind: Door | Window | Niche, width_default, depth,
+  sill_height, swing: Option<…>, fill/face colors, description }`
+- `OpeningStyleTable` on `Document`, STANDARD presets ("Door 0.9",
+  "Window 1.2", "Niche 0.6"); `wall_styles`-style Manager dialog (third
+  clone of the DimStyle Manager).
+
+**Kind semantics (the user's "niche" point):**
+- **Door / Window** — cut the FULL thickness: both faces open between the
+  opening's two ends (window additionally draws sill lines, door a swing arc).
+- **Niche** — `depth < thickness`: only the NEAR face opens; a recess
+  polyline (3 segments at `depth` into the wall) replaces it. The far face
+  stays continuous. This falls out of the same face-splitting primitive the
+  T-junction needs ("open a face between two stations") — build T first,
+  reuse the splitter here.
+
+**Derive pipeline:** wall face derivation (cad_wall) gains a post-pass:
+collect the host wall's openings, sort by `t`, split each affected face at
+the opening stations, drop/replace the gap segments per kind. Pure logic →
+lives in `cad_wall`; data type + Geom variant (or wall-attached list) →
+cad_kernel; dialog → cad_app (per ARCHITECTURE.md).
+
+**Storage decision to make at build time:** `Geom::Opening` as its own
+dobject referencing the wall by handle (selectable/erasable on its own —
+preferred) vs `Vec<Opening>` inside `Wall` (simpler, but invisible to
+selection). Preferred = own dobject; needs handle lookup, which the
+handle-first Document API work also wants → schedule together.
+
+**Order:** T-junction (#2) → face-splitting primitive exists → openings
+slice 1 (Door, full cut, no swing) → niche → window/sill → swing/flip UI.
+
 ## 3. Open questions
 - **Auto-join vs explicit:** join automatically when two wall ends coincide
   (within tol), or require an explicit pick like the demo's fillet clicks?
