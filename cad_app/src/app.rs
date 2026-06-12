@@ -2496,13 +2496,15 @@ impl CadApp {
                 self.set_prompt(current_hint(self.tool, self.arc_method, 0));
             }
             Ok(Command::SnapOverride(kind)) => {
-                // PER and TAN need an anchor point — the last clicked point
-                // of an in-progress draw. The other snap kinds (END, MID,
-                // CEN, INT, NEA) work at any click, with or without a
-                // previous pending point.
-                if kind.requires_from() && (self.pending.is_empty() || self.tool == Tool::None) {
+                // PER and TAN need a "from" anchor. That anchor is the draw's
+                // last pending point OR the active edit op's base/pivot —
+                // exactly what `card_anchor()` reports. The old guard only
+                // accepted a draw pending point, so PER/TAN were refused
+                // during move/copy/STRETCH/mirror/rotate point picks (the
+                // reported "PER not active during stretch").
+                if kind.requires_from() && self.card_anchor().is_none() {
                     self.history.push(format!(
-                        "  ! {} needs an anchor — first click of a draw, then type {}",
+                        "  ! {} needs an anchor — start a draw or an edit op (e.g. stretch base), then type {}",
                         kind.name(), kind.name().to_lowercase()
                     ));
                 } else {
@@ -2768,7 +2770,7 @@ impl CadApp {
                         self.history.push(
                             "    chprop color <aci>      ACI 0-256, 'bylayer', 'byblock'".into());
                         self.history.push(
-                            "    chprop linetype <name>  Continuous / Dashed / DashDot / …".into());
+                            "    chprop linetype <name>  Continuous / Dash / Dot / Center / …".into());
                     }
                     Some((prop, val)) => {
                         if self.selection.is_empty() {
@@ -7517,11 +7519,12 @@ impl CadApp {
                 // same pattern as color edits (can't borrow doc.linetypes
                 // while doc.layers is borrowed mutably).
                 let mut linetype_change: Vec<(LayerId, u32)> = Vec::new();
-                // Snapshot the available linetypes so the ComboBox can list
-                // them without holding a borrow on self.doc.
-                let lt_names: Vec<(u32, String)> = self.doc.linetypes.linetypes
+                // Snapshot the available linetypes (id, pattern, name) so the
+                // graphical picker can render a sample per row without holding
+                // a borrow on self.doc.
+                let lt_entries: Vec<(u32, Vec<f32>, String)> = self.doc.linetypes.linetypes
                     .iter().enumerate()
-                    .map(|(i, lt)| (i as u32, lt.name.clone()))
+                    .map(|(i, lt)| (i as u32, lt.pattern.clone(), lt.name.clone()))
                     .collect();
                 let n = self.doc.layers.len();
 
@@ -7611,30 +7614,18 @@ impl CadApp {
                                         pick_layer_color = Some(id);
                                     }
 
-                                    // ----- linetype combo -----------------
-                                    // ComboBox listing every linetype in the
-                                    // doc's table. Selecting one updates the
-                                    // layer's default linetype; rendered
-                                    // dobjects on this layer pick it up via
-                                    // the ByLayer resolution in
-                                    // paint_dobject_with_style.
+                                    // ----- linetype combo (graphical) -----
+                                    // Each row renders a SAMPLE of the pattern
+                                    // (line / dashes / dots) next to its name.
+                                    // Selecting one updates the layer's default
+                                    // linetype; dobjects on this layer pick it
+                                    // up via ByLayer in paint_dobject_with_style.
                                     let cur_lt = layer.linetype;
-                                    let cur_name = lt_names.iter()
-                                        .find(|(i, _)| *i == cur_lt)
-                                        .map(|(_, n)| n.clone())
-                                        .unwrap_or_else(|| "?".into());
-                                    egui::ComboBox::from_id_salt(("layer_lt", id))
-                                        .selected_text(cur_name)
-                                        .width(96.0)
-                                        .show_ui(ui, |ui| {
-                                            for (lt_id, name) in &lt_names {
-                                                let resp = ui.selectable_label(
-                                                    *lt_id == cur_lt, name);
-                                                if resp.clicked() {
-                                                    linetype_change.push((id, *lt_id));
-                                                }
-                                            }
-                                        });
+                                    if let Some(picked) = graphical_linetype_combo(
+                                        ui, ("layer_lt", id), cur_lt, &lt_entries)
+                                    {
+                                        linetype_change.push((id, picked));
+                                    }
 
                                     // ----- name (click to rename) ---------
                                     if self.layer_rename == Some(id) {
@@ -18661,6 +18652,135 @@ fn draw_dobject(
 /// empty. Currently shapes: Line, Wall (left+right sides). Other
 /// variants fall through to solid (Arc/Circle/etc. linetype rendering
 /// is a follow-up — needs polyline-from-tessellation + dash).
+/// Stroke a screen-space polyline with a dash/gap pattern. `pattern` is in
+/// WORLD units; `scale` is px per world unit. Even pattern index = dash,
+/// odd = gap. A dash whose ON-SCREEN length is below ~1.5 px renders as a
+/// filled DOT so dot/centre/border linetypes stay readable. The pattern
+/// PHASE carries across polyline segments so corners look continuous.
+/// Empty / sub-pixel patterns fall back to a solid polyline.
+fn paint_pattern_polyline(
+    painter: &egui::Painter,
+    pts: &[egui::Pos2],
+    pattern_world: &[f32],
+    scale: f32,
+    stroke: egui::Stroke,
+) {
+    if pts.len() < 2 { return; }
+    let pat: Vec<f32> = pattern_world.iter().map(|p| (p.abs() * scale).max(0.0)).collect();
+    let total: f32 = pat.iter().sum();
+    if pat.is_empty() || total < 0.5 {
+        painter.add(egui::Shape::line(pts.to_vec(), stroke));
+        return;
+    }
+    let dot_thresh = 1.5_f32;                 // px: dash shorter than this = dot
+    let dot_r = (stroke.width * 0.65).max(1.0);
+    let n = pat.len();
+    let mut idx = 0usize;
+    let mut remaining = pat[0];
+    while remaining <= 1e-4 && idx + 1 < n { idx += 1; remaining = pat[idx]; }
+    let mut pen_down = idx % 2 == 0;
+    let mut dot_pending = pen_down && pat[idx] <= dot_thresh;
+    for w in pts.windows(2) {
+        let a = w[0]; let b = w[1];
+        let seg = b - a;
+        let seg_len = seg.length();
+        if seg_len < 1e-6 { continue; }
+        let dir = seg / seg_len;
+        let mut pos = 0.0f32;
+        while pos < seg_len - 1e-4 {
+            if pen_down && dot_pending {
+                painter.circle_filled(a + dir * pos, dot_r, stroke.color);
+                dot_pending = false;
+            }
+            let step = remaining.min(seg_len - pos);
+            if pen_down && pat[idx] > dot_thresh {
+                painter.line_segment([a + dir * pos, a + dir * (pos + step)], stroke);
+            }
+            pos += step;
+            remaining -= step;
+            if remaining <= 1e-4 {
+                let mut guard = 0;
+                loop {
+                    idx = (idx + 1) % n;
+                    remaining = pat[idx];
+                    pen_down = idx % 2 == 0;
+                    guard += 1;
+                    if remaining > 1e-4 || guard > n { break; }
+                }
+                dot_pending = pen_down && pat[idx] <= dot_thresh;
+            }
+        }
+    }
+}
+
+/// Paint a linetype's pattern as a horizontal SAMPLE inside `rect` (for the
+/// graphical picker). The pattern is normalised so ~2.2 cycles span the
+/// width, so every linetype shows its character regardless of its world
+/// magnitudes. Continuous draws a plain line.
+fn paint_linetype_sample(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    pattern: &[f32],
+    color: egui::Color32,
+) {
+    let y = rect.center().y;
+    let stroke = egui::Stroke::new(1.4, color);
+    let pts = [egui::pos2(rect.left() + 3.0, y), egui::pos2(rect.right() - 3.0, y)];
+    if pattern.is_empty() {
+        painter.line_segment(pts, stroke);
+        return;
+    }
+    let total: f32 = pattern.iter().map(|p| p.abs()).sum();
+    let w = (rect.width() - 6.0).max(1.0);
+    let scale = if total > 1e-6 { (w / total) / 2.2 } else { 1.0 };
+    paint_pattern_polyline(painter, &pts, pattern, scale, stroke);
+}
+
+/// Graphical linetype dropdown — each row shows the rendered SAMPLE of the
+/// pattern (line / dashes / dots, like LibreCAD's picker) next to the name,
+/// plus an inline sample of the current one before the combo. Returns the
+/// id the user clicked, if any. `lts` = (id, pattern, name).
+fn graphical_linetype_combo(
+    ui: &mut egui::Ui,
+    salt: impl std::hash::Hash,
+    cur_id: u32,
+    lts: &[(u32, Vec<f32>, String)],
+) -> Option<u32> {
+    let mut picked = None;
+    let sample_col = ui.visuals().text_color();
+    let cur_name = lts.iter().find(|(i, _, _)| *i == cur_id)
+        .map(|(_, _, n)| n.clone()).unwrap_or_else(|| "?".into());
+    // Inline sample of the CURRENT linetype before the combo.
+    let (cr, _) = ui.allocate_exact_size(egui::vec2(44.0, 14.0), egui::Sense::hover());
+    if let Some((_, pat, _)) = lts.iter().find(|(i, _, _)| *i == cur_id) {
+        paint_linetype_sample(ui.painter(), cr, pat, sample_col);
+    }
+    egui::ComboBox::from_id_salt(salt)
+        .selected_text(cur_name)
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for (id, pat, name) in lts {
+                let desired = egui::vec2(ui.available_width().max(200.0), 18.0);
+                let (rect, resp) = ui.allocate_exact_size(desired, egui::Sense::click());
+                if *id == cur_id {
+                    ui.painter().rect_filled(rect, 2.0, ui.visuals().selection.bg_fill);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(rect, 2.0, ui.visuals().widgets.hovered.bg_fill);
+                }
+                let sr = egui::Rect::from_min_size(
+                    rect.left_top() + egui::vec2(2.0, 0.0),
+                    egui::vec2(60.0, rect.height()));
+                paint_linetype_sample(ui.painter(), sr, pat, sample_col);
+                ui.painter().text(
+                    egui::pos2(sr.right() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, name,
+                    egui::FontId::proportional(13.0), ui.visuals().text_color());
+                if resp.clicked() { picked = Some(*id); }
+            }
+        });
+    picked
+}
+
 fn paint_dobject_with_style(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -18669,8 +18789,8 @@ fn paint_dobject_with_style(
     color: egui::Color32,
 ) {
     use cad_kernel::LinetypeTable;
-    // Effective linetype id: dobject's own when explicit; otherwise
-    // the layer's. Continuous (id 0) on both → solid render.
+    // Effective linetype id: dobject's own when explicit; otherwise the
+    // layer's (ByLayer). Continuous on both → solid render.
     let lt_id = if d.style.linetype == LinetypeTable::CONTINUOUS {
         app.doc.layers.get(d.style.layer)
             .map(|l| l.linetype)
@@ -18685,53 +18805,22 @@ fn paint_dobject_with_style(
             return;
         }
     };
-    // Dash length in WORLD units → screen px via the camera scale.
-    // pattern[0] is dash length; pattern[1] is gap length. Even index = dash,
-    // odd = gap. We support arbitrary even-length patterns by stepping
-    // through them; for v1 we honour just dash[0] / gap[1] and pass any
-    // extras through (egui::Shape::dashed_line takes a single dash + gap,
-    // so longer patterns degrade gracefully to "first dash, first gap").
-    let dash_w = pattern[0] as f64 * app.scale as f64;
-    let gap_w  = pattern.get(1).copied().unwrap_or(pattern[0]) as f64 * app.scale as f64;
-    // Minimum visible dash — below 1 px the line reads as solid anyway.
-    if dash_w < 1.0 {
-        draw_dobject(painter, rect, app, &d.geom, color);
-        return;
-    }
+    // Effective px scale = camera px/unit × per-dobject linetype scale.
+    let lt_scale = if d.style.linetype_scale > 1e-6 { d.style.linetype_scale } else { 1.0 };
+    let scale_px = app.scale * lt_scale;
     let stroke = egui::Stroke::new(1.6, color);
-    let push = |a: egui::Pos2, b: egui::Pos2| {
-        for s in egui::Shape::dashed_line(
-            &[a, b], stroke, dash_w as f32, gap_w as f32) {
-            painter.add(s);
-        }
-    };
     match &d.geom {
-        Geom::Line(l) => push(app.w2s(l.a, rect), app.w2s(l.b, rect)),
-        Geom::Wall(w) => {
-            // Shared face derivation (mitred straights / exact curved
-            // arcs) — the old left_line()/right_line() chords drew WRONG
-            // straight faces for curved walls. The linetype pattern is
-            // applied per tessellation segment (dash phase restarts each
-            // segment — cosmetic, segments are short).
-            let (l_pts, r_pts) = wall_face_screen_pts(app, rect, w);
-            for seg in l_pts.windows(2) { push(seg[0], seg[1]); }
-            for seg in r_pts.windows(2) { push(seg[0], seg[1]); }
-            // Also re-issue the centerline if WlCnL — keep the debug
-            // overlay even when the wall has a custom linetype.
-            if app.env.WlCnL {
-                let cl_col = egui::Color32::from_rgba_unmultiplied(
-                    color.r(), color.g(), color.b(), 110);
-                let cl_stroke = egui::Stroke::new(1.2, cl_col);
-                let clpts: Vec<egui::Pos2> =
-                    w.centerline_polyline(l_pts.len().max(3) - 1).iter()
-                        .map(|p| app.w2s(*p, rect)).collect();
-                for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
-                    painter.add(s);
-                }
+        // Stroked geometry: tessellate to world polylines (curves sampled),
+        // then walk the full pattern. Wall/Hatch/Text/Dimension/BlockRef
+        // keep their dedicated solid render (fill / glyphs / recursion).
+        Geom::Line(_) | Geom::Polyline(_) | Geom::Circle(_) | Geom::Arc(_)
+        | Geom::Ellipse(_) | Geom::EllipseArc(_) | Geom::Spline(_) => {
+            for pl in app.preview_world_polylines(&d.geom) {
+                let pts: Vec<egui::Pos2> =
+                    pl.iter().map(|p| app.w2s(*p, rect)).collect();
+                paint_pattern_polyline(painter, &pts, &pattern, scale_px, stroke);
             }
         }
-        // Other variants — solid for now. Arc/Circle/Polyline/Spline
-        // dashed render = tessellate + dashed_line. Add when needed.
         _ => draw_dobject(painter, rect, app, &d.geom, color),
     }
 }
