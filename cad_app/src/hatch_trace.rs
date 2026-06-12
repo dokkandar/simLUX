@@ -220,7 +220,11 @@ fn tessellate_one(d: &DObject, src: usize, out: &mut Vec<TessSeg>) {
                 out.push(TessSeg { a: r.a, b: r.b, src });
             }
         }
-        Geom::Point(_) | Geom::Hatch(_) | Geom::Text(_) | Geom::Dimension(_) => {}
+        // BlockRef: instances don't contribute hatch-boundary segments in
+        // v1 (contents resolve through the Document, which the
+        // tessellator doesn't carry). Explode to hatch against contents.
+        Geom::Point(_) | Geom::Hatch(_) | Geom::Text(_) | Geom::Dimension(_)
+            | Geom::BlockRef(_) => {}
     }
 }
 

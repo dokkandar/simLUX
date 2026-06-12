@@ -34,7 +34,7 @@ fn aci_mapping_path() -> std::path::PathBuf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall, Text, Dim }
+enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall, Text, Dim, Rectangle }
 
 /// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
 /// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
@@ -126,6 +126,59 @@ const ALL_ARC_METHODS: &[ArcMethod] = &[
     ArcMethod::Continue,
 ];
 
+/// Build an axis-aligned rectangle (CLOSED 4-vertex Polyline) from two
+/// opposite corners. Vertices are emitted CCW-ish in corner order; `closed`
+/// makes the 4th→1st edge implicit. Mirrors AutoCAD RECTANG (one LWPOLYLINE).
+fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
+    let v = |x: f64, y: f64| PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+    Geom::Polyline(Polyline {
+        vertices: vec![
+            v(a.x, a.y),
+            v(b.x, a.y),
+            v(b.x, b.y),
+            v(a.x, b.y),
+        ],
+        closed: true,
+    })
+}
+
+/// The per-vertex stretch rule (used by the live ghost preview; mirrors the
+/// logic in `apply_stretch`): any vertex / centre inside the box moves by
+/// `v`, the rest stay. Returns the moved geom (an unchanged clone when
+/// nothing in this dobject is inside).
+fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
+    let inside = |p: Vec2| p.x >= win_min.x && p.x <= win_max.x
+                        && p.y >= win_min.y && p.y <= win_max.y;
+    match g {
+        Geom::Line(l) => Geom::Line(Line {
+            a: if inside(l.a) { l.a + v } else { l.a },
+            b: if inside(l.b) { l.b + v } else { l.b },
+        }),
+        Geom::Polyline(p) => Geom::Polyline(Polyline {
+            vertices: p.vertices.iter().map(|vt| if inside(vt.pos) {
+                PolyVertex { pos: vt.pos + v, bulge: vt.bulge }
+            } else { *vt }).collect(),
+            closed: p.closed,
+        }),
+        Geom::Circle(c) if inside(c.center) =>
+            Geom::Circle(Circle { center: c.center + v, radius: c.radius }),
+        Geom::Arc(a) if inside(a.center) => Geom::Arc(Arc {
+            center: a.center + v, radius: a.radius,
+            start_angle: a.start_angle, sweep_angle: a.sweep_angle,
+        }),
+        Geom::Ellipse(e) if inside(e.center) =>
+            Geom::Ellipse(Ellipse { center: e.center + v, major: e.major, ratio: e.ratio }),
+        Geom::EllipseArc(ea) if inside(ea.ellipse.center) => Geom::EllipseArc(EllipseArc {
+            ellipse: Ellipse { center: ea.ellipse.center + v,
+                               major: ea.ellipse.major, ratio: ea.ellipse.ratio },
+            start_param: ea.start_param, sweep_param: ea.sweep_param,
+        }),
+        Geom::Point(pt) if inside(pt.location) =>
+            Geom::Point(Point { location: pt.location + v, style: pt.style, size: pt.size }),
+        other => other.clone(),
+    }
+}
+
 fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
     match (tool, n) {
         (Tool::None,   _) => "select a tool above, or type a command below",
@@ -146,6 +199,8 @@ fn current_hint(tool: Tool, arc_method: ArcMethod, n: usize) -> &'static str {
         (Tool::EllipseArc, 3) => "ell.arc: click START point on the ellipse",
         (Tool::EllipseArc, _) => "ell.arc: click END point on the ellipse (CCW)    [Esc cancels]",
         (Tool::Point, _) => "point: click to place    [Esc cancels]",
+        (Tool::Rectangle, 0) => "rectangle: click FIRST corner    [Esc cancels]",
+        (Tool::Rectangle, _) => "rectangle: click OPPOSITE corner — or type  width height  (e.g. 5 3)    [Esc cancels]",
         (Tool::Polyline, 0) => "polyline: click first vertex    [Esc cancels]",
         (Tool::Polyline, 1) => "polyline: click next vertex; Enter finishes (open); 'c' Enter closes",
         (Tool::Polyline, _) => "polyline: keep clicking vertices; Enter finishes (open); 'c' Enter closes",
@@ -504,6 +559,36 @@ pub struct CadApp {
 
     // ---- Slice K: matchprop click capture ----
     matchprops_state: MatchPropsState,
+    // ---- Blocks ----
+    block_def_state: BlockDefState,
+    insert_state:    InsertState,
+    block_dialog:    Option<BlockDialog>,
+    /// Block dialog parked while a round-trip runs (Select objects → canvas
+    /// selection, or Pick point → one canvas click). Restored when the
+    /// round-trip finishes so the user lands back in the dialog.
+    block_dialog_stash:    Option<BlockDialog>,
+    /// Armed by the dialog's "Pick ⊕" button — the next canvas click is
+    /// captured as the block's insertion point and the dialog reopens.
+    block_dialog_pick_base: bool,
+    /// Live cursor in world coords (RAW, before constraints), refreshed
+    /// every canvas frame. Lets the command line's direct-distance entry
+    /// know which direction to throw a typed distance.
+    last_cursor_raw_world: Option<Vec2>,
+    /// Armed when a press-fires-click captured a press; the MATCHING release
+    /// is then swallowed. Without it, a press-fires-click edit op that ENDS
+    /// on the press (e.g. stretch destination, move/copy dest, fillet 2nd
+    /// pick) leaves click-only mode, so the release of that same physical
+    /// click gets re-classified as a pointer-mode click and spuriously
+    /// selects whatever sits under the cursor.
+    pending_release_swallow: bool,
+    /// The crossing window box captured during a STRETCH selection (last
+    /// crossing window). `apply_stretch` tests vertices against it. `None`
+    /// → fall back to the selection's bbox (whole-object move).
+    stretch_window_box: Option<(Vec2, Vec2)>,
+    /// In-app file browser (Open / Save As). `None` when closed.
+    file_dialog: Option<FileDialog>,
+    /// Directory the file browser last sat in, so reopening lands there.
+    file_dialog_dir: Option<std::path::PathBuf>,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -713,6 +798,20 @@ pub enum QueuedOp {
     /// and the command proceeds to the 4-point capture (src1 → src2 →
     /// tgt1 → tgt2). Same select-first flow as Move/Copy/Rotate.
     Align,
+    /// Block definition — on Enter the finalised selection becomes the
+    /// block contents; the command proceeds to the base-point click.
+    BlockDef(String),
+    /// Block DIALOG re-open — the user clicked "Select objects" inside the
+    /// Block dialog. On Enter the finalised selection is kept and the
+    /// (stashed) dialog re-opens so they can finish defining the block.
+    BlockReopen,
+    /// Stretch — the selection session (crossing window; Shift excludes)
+    /// picks the objects; on Enter we capture the crossing box and proceed
+    /// to the base / second-point clicks.
+    Stretch,
+    /// Explode — on Enter every selected BlockRef is replaced by
+    /// transformed copies of its contents (one level).
+    Explode,
     /// Erase — applied on Enter. The finalised selection is deleted
     /// in one batch. AutoCAD's ERASE: type `erase`, pick targets,
     /// Enter to commit.
@@ -772,12 +871,16 @@ pub enum ScaleState {
     WaitingForNewLength(Vec2, f64),                         // pivot, ref_d
 }
 
-/// State machine for the interactive mirror tool — two clicks define the axis.
+/// State machine for the interactive mirror tool — two clicks define the
+/// axis, then a keep-original prompt.
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum MirrorState {
     Off,
     WaitingForA,
     WaitingForB(Vec2),
+    /// Axis fixed (a, b); waiting for the keep-original answer
+    /// (Enter/Y = keep a copy, n/no/ni = erase the original).
+    AwaitingKeep(Vec2, Vec2),
 }
 
 /// State machine for matchprop — one click selects a source dobject;
@@ -786,6 +889,86 @@ pub enum MirrorState {
 pub enum MatchPropsState {
     Off,
     WaitingForSource,
+}
+
+/// `block <name>` — after the selection is confirmed, one click picks the
+/// BASE point; the definition is stored and the selection is replaced by
+/// a single instance (visual unchanged: insert == base).
+#[derive(Clone, PartialEq, Debug)]
+pub enum BlockDefState {
+    Off,
+    WaitingForBase { name: String },
+}
+
+/// `insert <name>` — one click places an instance of the named block.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum InsertState {
+    Off,
+    WaitingForPoint { block: u32 },
+}
+
+/// Block dialog — opened by bare `block` (no name) and the Draw menu.
+/// Collects everything needed to define a block: name, the contents
+/// (Select objects round-trips to the canvas), insertion/base point
+/// (typed X/Y or picked), instance color (ACI wheel), and the smart-block
+/// flag. A live preview shows the current selection. Also lists existing
+/// blocks with one-click Insert.
+pub struct BlockDialog {
+    pub name: String,
+    /// Insertion / base point, edited as text so partial input doesn't
+    /// snap. Defaults to the selection's lower-left corner on open.
+    pub base_x: String,
+    pub base_y: String,
+    /// Instance color. `None` = inherit the first selected dobject's color
+    /// (legacy behavior); `Some(aci)` = explicit ACI for the instance.
+    pub color_aci: Option<u8>,
+    /// Smart-block marker — stored on the created `Block`. The re-derive
+    /// algorithm is supplied later; today this only sets the flag + a badge.
+    pub smart: bool,
+}
+
+impl BlockDialog {
+    fn new(base: Vec2) -> Self {
+        BlockDialog {
+            name: String::new(),
+            base_x: format!("{:.4}", base.x),
+            base_y: format!("{:.4}", base.y),
+            color_aci: None,
+            smart: false,
+        }
+    }
+    /// Parse the X/Y text fields into a world point (falls back to 0 for
+    /// unparseable fields so a half-typed value never blocks OK).
+    fn base_point(&self) -> Vec2 {
+        Vec2::new(
+            self.base_x.trim().parse().unwrap_or(0.0),
+            self.base_y.trim().parse().unwrap_or(0.0),
+        )
+    }
+}
+
+/// Open vs Save As for the in-app file browser.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FileDialogMode { Open, Save }
+
+/// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
+/// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
+/// a name, and (for Save) choose the format. Confirm routes to
+/// `do_open` / `do_save`.
+pub struct FileDialog {
+    pub mode:     FileDialogMode,
+    pub dir:      std::path::PathBuf,
+    pub filename: String,
+    /// Save format extension, ".dxf" or ".rsm". Ignored in Open mode.
+    pub ext:      String,
+    pub error:    Option<String>,
+}
+
+impl FileDialog {
+    fn new(mode: FileDialogMode, dir: std::path::PathBuf, ext: &str) -> Self {
+        FileDialog { mode, dir, filename: String::new(),
+                     ext: ext.to_string(), error: None }
+    }
 }
 
 /// State machines for the Slice-L click-driven actions.
@@ -1086,10 +1269,8 @@ pub enum AlignState {
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum StretchState {
     Off,
-    WaitingForWin1,
-    WaitingForWin2(Vec2),         // first corner captured
-    WaitingForBase(Vec2, Vec2),   // window captured, click base
-    WaitingForDest(Vec2, Vec2, Vec2),   // window + base; click dest to apply
+    WaitingForBase(Vec2, Vec2),   // crossing box captured (min,max); click base
+    WaitingForDest(Vec2, Vec2, Vec2),   // box + base; click dest to apply
 }
 
 /// Trim/extend session state. Each holds the confirmed cutting/boundary
@@ -1237,6 +1418,8 @@ pub enum AciPickRequest {
     DimStyleForm(DimColorSlot),
     /// Picker is editing a Wall Style form color (fill or face).
     WallStyleForm(WallColorSlot),
+    /// Picker is editing the Block dialog's instance color.
+    BlockForm,
 }
 
 impl Default for CadApp {
@@ -1345,6 +1528,16 @@ impl Default for CadApp {
             undo_stack:   Vec::new(),
             redo_stack:   Vec::new(),
             matchprops_state: MatchPropsState::Off,
+            block_def_state: BlockDefState::Off,
+            block_dialog_stash:    None,
+            block_dialog_pick_base: false,
+            last_cursor_raw_world: None,
+            pending_release_swallow: false,
+            stretch_window_box: None,
+            file_dialog: None,
+            file_dialog_dir: None,
+            insert_state:    InsertState::Off,
+            block_dialog:    None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             text_draft:     TextDraftState::Off,
@@ -1602,6 +1795,119 @@ impl CadApp {
                     }
                 }
                 return;
+            }
+        }
+
+        // ---- Rectangle width/height entry --------------------------
+        // After the first corner is captured, the user can type `W H`
+        // (or `W,H`) instead of clicking the opposite corner — the two
+        // ways to draw a rectangle. Signed: negative width/height extend
+        // left/down from the first corner. Must run before the main
+        // parser, which would otherwise choke on "5 3".
+        if self.tool == Tool::Rectangle && self.pending.len() == 1 {
+            let toks: Vec<&str> = trimmed
+                .split(|c: char| c.is_whitespace() || c == ',')
+                .filter(|s| !s.is_empty())
+                .collect();
+            if toks.len() == 2 {
+                if let (Ok(w), Ok(h)) =
+                    (toks[0].parse::<f64>(), toks[1].parse::<f64>())
+                {
+                    let a = self.pending[0];
+                    self.pending.clear();
+                    if w.abs() < EPS || h.abs() < EPS {
+                        self.history.push(
+                            "  ! rectangle: width and height must be non-zero".into());
+                    } else {
+                        let b = Vec2::new(a.x + w, a.y + h);
+                        self.add_dobject(rect_polyline(a, b), "canvas (W×H)");
+                        self.history.push(format!(
+                            "  ▭ rectangle {}×{} from ({:.3},{:.3})",
+                            w, h, a.x, a.y));
+                    }
+                    // Tool stays active for the next rectangle (like line).
+                    self.set_prompt(current_hint(self.tool, self.arc_method, 0));
+                    return;
+                }
+            }
+            // Not two numbers — fall through (user may be switching tools).
+        }
+
+        // ---- Mirror keep-original answer ---------------------------
+        // After the axis is set the user answers Y (keep a copy — the
+        // default) or n/no/ni (erase the original). Must run before the
+        // main parser so "no"/"n" aren't treated as commands. The empty
+        // Enter = keep is handled in the empty-Enter cascade.
+        if let MirrorState::AwaitingKeep(a, b) = self.mirror_state {
+            let t = trimmed.to_ascii_lowercase();
+            let keep = match t.as_str() {
+                "" | "y" | "yes" | "keep" => Some(true),
+                "n" | "no" | "ni"         => Some(false),
+                _ => None,
+            };
+            match keep {
+                Some(k) => {
+                    self.mirror_state = MirrorState::Off;
+                    self.apply_mirror(a, b, k);
+                    self.clear_prompt();
+                }
+                None => self.history.push(
+                    "  ! mirror: answer Y (keep a copy) or n (erase original) — Esc cancels".into()),
+            }
+            return;
+        }
+
+        // ---- Direct distance entry (DDE) ---------------------------
+        // While a line / move / copy is waiting for its NEXT point, a
+        // single typed number = the distance from the anchor along the
+        // current cursor DIRECTION. With CARD on that direction is the
+        // locked H/V axis, so "100 ⏎" drops the point exactly 100 units
+        // horizontally/vertically — the user's "type a value = second
+        // point" flow. Without CARD it throws toward the raw cursor
+        // (standard AutoCAD DDE). Must precede the main parser.
+        {
+            let dde_anchor: Option<Vec2> =
+                if self.tool == Tool::Line && self.pending.len() == 1 {
+                    Some(self.pending[0])
+                } else if let MoveState::WaitingForDest(base) = self.move_state {
+                    Some(base)
+                } else if let CopyState::WaitingForDest(base) = self.copy_state {
+                    Some(base)
+                } else { None };
+            if let Some(anchor) = dde_anchor {
+                if let Ok(dist) = trimmed.parse::<f64>() {
+                    match self.last_cursor_raw_world {
+                        Some(raw) => {
+                            let constrained = self.apply_constraints(raw);
+                            let dir = constrained - anchor;
+                            if dir.len() > EPS {
+                                let p = anchor + dir / dir.len() * dist;
+                                if self.tool == Tool::Line {
+                                    self.pending.push(p);
+                                    self.try_finalise();
+                                } else if let MoveState::WaitingForDest(base)
+                                    = self.move_state
+                                {
+                                    self.apply_move(p - base);
+                                    self.move_state = MoveState::Off;
+                                    self.clear_prompt();
+                                } else if let CopyState::WaitingForDest(base)
+                                    = self.copy_state
+                                {
+                                    self.apply_copy(p - base);
+                                    self.copy_state = CopyState::Off;
+                                    self.clear_prompt();
+                                }
+                            } else {
+                                self.history.push(
+                                    "  ! move the cursor to set a direction, then type the distance".into());
+                            }
+                        }
+                        None => self.history.push(
+                            "  ! hover the canvas to set a direction, then type the distance".into()),
+                    }
+                    return;
+                }
             }
         }
 
@@ -2184,6 +2490,7 @@ impl CadApp {
                     ToolKind::Point      => Tool::Point,
                     ToolKind::Polyline   => Tool::Polyline,
                     ToolKind::Spline     => Tool::Spline,
+                    ToolKind::Rectangle  => Tool::Rectangle,
                 };
                 self.pending.clear();
                 self.set_prompt(current_hint(self.tool, self.arc_method, 0));
@@ -2619,6 +2926,69 @@ impl CadApp {
                 self.wall_style_manager_open = true;
                 self.history.push("  Wall Style Manager opened".into());
             }
+            Ok(Command::BlockDef(name_opt)) => {
+                // `block <name>` — create a definition from the selection.
+                // Bare `block` opens the Block dialog to collect the name.
+                match name_opt {
+                    None => {
+                        let base = self.selection_min_corner();
+                        self.block_dialog = Some(BlockDialog::new(base));
+                        self.history.push("  Block dialog opened".into());
+                    }
+                    Some(name) => { self.start_block_def(name.clone()); }
+                }
+            }
+            Ok(Command::Insert(name_opt)) => {
+                let names: Vec<String> = self.doc.blocks.blocks.iter()
+                    .map(|b| b.name.clone()).collect();
+                match name_opt {
+                    None => {
+                        if names.is_empty() {
+                            self.history.push(
+                                "  ! insert: no blocks defined — create one with `block <name>`".into());
+                        } else {
+                            self.history.push(format!(
+                                "  insert: usage `insert <name>` — available: {}",
+                                names.join(", ")));
+                        }
+                    }
+                    Some(ref name) => match self.doc.blocks.find(name) {
+                        Some(id) => {
+                            self.insert_state = InsertState::WaitingForPoint { block: id };
+                            self.set_prompt(format!(
+                                "insert '{}': click insertion point  [Esc=cancel]", name));
+                        }
+                        None => {
+                            self.history.push(format!(
+                                "  ! insert: no block named '{}'  (available: {})",
+                                name,
+                                if names.is_empty() { "none".to_string() }
+                                else { names.join(", ") }));
+                        }
+                    },
+                }
+            }
+            Ok(Command::Card(set_opt)) => {
+                // CARD — same state F8 and the status badge flip.
+                self.env.CrdEnb = match set_opt {
+                    Some(v) => v,
+                    None    => !self.env.CrdEnb,
+                };
+                let _ = self.env.save();
+                self.history.push(format!(
+                    "  CARD {}", if self.env.CrdEnb { "on" } else { "off" }));
+            }
+            Ok(Command::Explode) => {
+                // Select-first like erase: empty basket queues the op.
+                if self.selection.is_empty() {
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Explode;
+                    self.set_prompt(
+                        "explode: select block instances, Enter to apply  [Esc=cancel]");
+                } else {
+                    self.apply_explode();
+                }
+            }
             Ok(Command::Wall(t_opt)) => {
                 // Persist thickness if user supplied one, then enter
                 // the Wall drafting tool. Two clicks → two side lines
@@ -2694,9 +3064,27 @@ impl CadApp {
                 }
             }
             Ok(Command::Stretch) => {
-                self.stretch_state = StretchState::WaitingForWin1;
-                self.set_prompt(
-                    "stretch: click FIRST corner of crossing window  [Esc=cancel]");
+                // Drop any active draw tool so its click-only semantics don't
+                // hijack the crossing-window drag.
+                self.tool = Tool::None;
+                self.pending.clear();
+                self.stretch_window_box = None;
+                if self.selection.is_empty() {
+                    // Select-during: crossing window picks the objects; Shift
+                    // excludes; Enter finishes → base/dest. The crossing box
+                    // is captured for the per-vertex test.
+                    self.begin_selection(SelectMode::ForSelect);
+                    self.queued_op = QueuedOp::Stretch;
+                    self.set_prompt(
+                        "stretch: crossing window to select (Shift-click excludes), \
+                         Enter when done  [Esc=cancel]");
+                } else {
+                    // Select-first (pickfirst): no crossing box → the whole
+                    // selection's bbox is the test region (whole-object move).
+                    let (mn, mx) = self.selection_bbox();
+                    self.stretch_state = StretchState::WaitingForBase(mn, mx);
+                    self.set_prompt("stretch: click BASE point  [Esc=cancel]");
+                }
             }
             Ok(Command::Trim) => {
                 self.pre_op_selection = std::mem::take(&mut self.selection);
@@ -2985,10 +3373,17 @@ impl CadApp {
         // (e.g. `move` opened the session; finalising it transitions
         // straight to base-point capture).
         let queued = std::mem::replace(&mut self.queued_op, QueuedOp::None);
-        if queued != QueuedOp::None && self.selection.is_empty() {
+        // BlockReopen always restores its dialog (even with an empty
+        // basket — the user can just select again from there).
+        if queued != QueuedOp::None
+            && queued != QueuedOp::BlockReopen
+            && self.selection.is_empty()
+        {
             self.history.push(format!(
                 "  ! {:?}: nothing selected — operation cancelled", queued
             ));
+            // Drop any parked dialog so we don't leak it.
+            self.block_dialog_stash = None;
             return;
         }
         match queued {
@@ -3045,6 +3440,34 @@ impl CadApp {
                 self.set_prompt(format!(
                     "align ({} dobject(s)): click SOURCE point 1  [Esc=cancel]",
                     self.selection.len()));
+            }
+            QueuedOp::BlockDef(name) => {
+                self.set_prompt(format!(
+                    "block '{}' ({} dobject(s)): click BASE point  [Esc=cancel]",
+                    name, self.selection.len()));
+                self.block_def_state = BlockDefState::WaitingForBase { name };
+            }
+            QueuedOp::BlockReopen => {
+                // Selection done — restore the parked Block dialog so the
+                // user can finish (set base / color / smart / OK).
+                if let Some(dlg) = self.block_dialog_stash.take() {
+                    self.block_dialog = Some(dlg);
+                }
+                self.clear_prompt();
+            }
+            QueuedOp::Stretch => {
+                // Selection done. Test region = the captured crossing box,
+                // or (no crossing window) the selection's bbox → whole move.
+                let (mn, mx) = self.stretch_window_box
+                    .take()
+                    .unwrap_or_else(|| self.selection_bbox());
+                self.stretch_state = StretchState::WaitingForBase(mn, mx);
+                self.set_prompt(format!(
+                    "stretch ({} dobject(s)): click BASE point  [Esc=cancel]",
+                    self.selection.len()));
+            }
+            QueuedOp::Explode => {
+                self.apply_explode();
             }
             QueuedOp::Erase => {
                 // Replay the same path Command::DeleteSelected uses.
@@ -4622,7 +5045,12 @@ impl CadApp {
         let mut changed = 0usize;
         for i in &cands {
             let i = *i;
-            let (emin, emax) = self.doc.dobjects[i].bbox();
+            // BlockRefs resolve their real extent through the block table
+            // (the kernel bbox is just the insertion point).
+            let (emin, emax) = match &self.doc.dobjects[i].geom {
+                Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                _ => self.doc.dobjects[i].bbox(),
+            };
             let bbox_inside = emin.x >= bbox_min.x && emax.x <= bbox_max.x
                 && emin.y >= bbox_min.y && emax.y <= bbox_max.y;
             let inside = if crossing {
@@ -7333,6 +7761,7 @@ impl CadApp {
                 WallColorSlot::Fill => "ACI color — wall fill".to_string(),
                 WallColorSlot::Face => "ACI color — wall faces".to_string(),
             },
+            AciPickRequest::BlockForm => "ACI color — block instance".to_string(),
         };
 
         let mut open = true;
@@ -7467,6 +7896,11 @@ impl CadApp {
                             WallColorSlot::Fill => d.fill_aci = Some(aci),
                             WallColorSlot::Face => d.face_aci = Some(aci),
                         }
+                    }
+                }
+                AciPickRequest::BlockForm => {
+                    if let Some(d) = self.block_dialog.as_mut() {
+                        d.color_aci = Some(aci);
                     }
                 }
             }
@@ -7800,6 +8234,7 @@ impl CadApp {
         let mut nw = 0_usize;
         let mut ntx = 0_usize;
         let mut ndim = 0_usize;
+        let mut nblk = 0_usize;
         for &i in &self.selection {
             if let Some(d) = self.doc.dobjects.get(i) {
                 match &d.geom {
@@ -7815,13 +8250,14 @@ impl CadApp {
                     Geom::Wall(_)       => nw  += 1,
                     Geom::Text(_)       => ntx += 1,
                     Geom::Dimension(_)  => ndim += 1,
+                    Geom::BlockRef(_)   => nblk += 1,
                 }
             }
         }
         ui.monospace(format!(
             "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}\n  texts: {}\n  dims: {}",
-            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw, ntx, ndim
+             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}\n  texts: {}\n  dims: {}\n  blocks: {}",
+            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw, ntx, ndim, nblk
         ));
         ui.add_space(8.0);
 
@@ -7974,6 +8410,188 @@ impl CadApp {
         }
     }
 
+    /// Open the in-app file browser. Starting directory = last-used, else
+    /// the current working dir, else `/`.
+    fn open_file_dialog(&mut self, mode: FileDialogMode, ext: &str) {
+        let dir = self.file_dialog_dir.clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("/"));
+        self.file_dialog = Some(FileDialog::new(mode, dir, ext));
+    }
+
+    /// Render the file browser window. Pure `std::fs` — lists sub-dirs and
+    /// .dxf/.rsm files, supports navigation (`..`, click a folder), name
+    /// entry, and a format toggle for Save. Confirm routes to do_open /
+    /// do_save.
+    fn render_file_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.file_dialog.take() else { return; };
+        let mut open      = true;
+        let mut do_confirm = false;
+        let mut do_cancel  = false;
+        let mut navigate: Option<std::path::PathBuf> = None;
+
+        // List the current directory (dirs + .dxf/.rsm files).
+        let mut dirs: Vec<String> = Vec::new();
+        let mut files: Vec<String> = Vec::new();
+        match std::fs::read_dir(&dlg.dir) {
+            Ok(rd) => {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name.starts_with('.') { continue; }   // hide dotfiles
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    if is_dir {
+                        dirs.push(name);
+                    } else {
+                        let l = name.to_ascii_lowercase();
+                        if l.ends_with(".dxf") || l.ends_with(".rsm") {
+                            files.push(name);
+                        }
+                    }
+                }
+                dirs.sort_unstable();
+                files.sort_unstable();
+            }
+            Err(e) => dlg.error = Some(format!("cannot read directory: {}", e)),
+        }
+
+        let title = match dlg.mode {
+            FileDialogMode::Open => "Open  .dxf / .rsm",
+            FileDialogMode::Save => "Save As",
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("file_dialog"))
+            .open(&mut open)
+            .resizable(true)
+            .collapsible(false)
+            .default_size(egui::vec2(460.0, 420.0))
+            .default_pos(egui::pos2(220.0, 90.0))
+            .show(ctx, |ui| {
+                // Path bar (editable — paste a path then Enter to jump).
+                ui.horizontal(|ui| {
+                    ui.label("Path");
+                    let mut path_str = dlg.dir.to_string_lossy().to_string();
+                    let resp = ui.add(egui::TextEdit::singleline(&mut path_str)
+                        .desired_width(360.0));
+                    if resp.changed() { dlg.dir = std::path::PathBuf::from(path_str); }
+                });
+                ui.add_space(4.0);
+
+                // Directory + file list.
+                egui::ScrollArea::vertical().max_height(280.0)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Up one level.
+                        if dlg.dir.parent().is_some()
+                            && ui.selectable_label(false, "📁 ..").clicked()
+                        {
+                            if let Some(p) = dlg.dir.parent() {
+                                navigate = Some(p.to_path_buf());
+                            }
+                        }
+                        for d in &dirs {
+                            if ui.selectable_label(false, format!("📁 {}", d)).clicked() {
+                                navigate = Some(dlg.dir.join(d));
+                            }
+                        }
+                        for f in &files {
+                            let selected = dlg.filename.eq_ignore_ascii_case(f);
+                            let resp = ui.selectable_label(
+                                selected, format!("📄 {}", f));
+                            if resp.clicked() {
+                                dlg.filename = f.clone();
+                                // Sync the Save format toggle to the picked file.
+                                let l = f.to_ascii_lowercase();
+                                if l.ends_with(".rsm") { dlg.ext = ".rsm".into(); }
+                                else if l.ends_with(".dxf") { dlg.ext = ".dxf".into(); }
+                            }
+                            if resp.double_clicked() {
+                                dlg.filename = f.clone();
+                                do_confirm = true;
+                            }
+                        }
+                        if dirs.is_empty() && files.is_empty() {
+                            ui.weak("(no folders or .dxf/.rsm files here)");
+                        }
+                    });
+
+                ui.separator();
+                // Filename + (Save) format.
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    ui.add(egui::TextEdit::singleline(&mut dlg.filename)
+                        .desired_width(260.0)
+                        .hint_text(match dlg.mode {
+                            FileDialogMode::Open => "pick a file above",
+                            FileDialogMode::Save => "drawing name",
+                        }));
+                });
+                if dlg.mode == FileDialogMode::Save {
+                    ui.horizontal(|ui| {
+                        ui.label("Format");
+                        ui.selectable_value(&mut dlg.ext, ".dxf".to_string(), "DXF (.dxf)");
+                        ui.selectable_value(&mut dlg.ext, ".rsm".to_string(), "Native (.rsm)");
+                    });
+                }
+                if let Some(err) = &dlg.error {
+                    ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        let label = match dlg.mode {
+                            FileDialogMode::Open => "Open",
+                            FileDialogMode::Save => "Save",
+                        };
+                        if ui.button(label).clicked() { do_confirm = true; }
+                    });
+                });
+            });
+
+        // ---- resolve actions --------------------------------------------
+        if let Some(target) = navigate {
+            dlg.dir = target;
+            dlg.error = None;
+            self.file_dialog = Some(dlg);
+            return;
+        }
+        if !open || do_cancel {
+            self.file_dialog_dir = Some(dlg.dir);
+            self.history.push("  file: cancelled".into());
+            return;
+        }
+        if do_confirm {
+            self.file_dialog_dir = Some(dlg.dir.clone());
+            let name = dlg.filename.trim();
+            if name.is_empty() {
+                dlg.error = Some("enter or pick a file name".into());
+                self.file_dialog = Some(dlg);
+                return;
+            }
+            match dlg.mode {
+                FileDialogMode::Open => {
+                    let path = dlg.dir.join(name);
+                    self.do_open(&path.to_string_lossy());
+                }
+                FileDialogMode::Save => {
+                    // Ensure the chosen extension; if the name already ends
+                    // in .dxf/.rsm honour that, else append the toggle's ext.
+                    let l = name.to_ascii_lowercase();
+                    let fname = if l.ends_with(".dxf") || l.ends_with(".rsm") {
+                        name.to_string()
+                    } else {
+                        format!("{}{}", name, dlg.ext)
+                    };
+                    let path = dlg.dir.join(fname);
+                    self.do_save(&path.to_string_lossy());
+                }
+            }
+            return;   // dialog closes on success
+        }
+        self.file_dialog = Some(dlg);
+    }
+
     // ===================================================================
     // Slice J — Editing operations
     // ===================================================================
@@ -8096,6 +8714,527 @@ impl CadApp {
             "  ✓ matchprop: style from #{} applied to {} dobject(s)",
             source_idx, n.saturating_sub(if self.selection.contains(&source_idx) {1} else {0})
         ));
+        self.gpu_dirty = true;
+    }
+
+    // ---- Blocks: create / insert / explode ----
+
+    /// Shared entry for block creation (typed `block <name>` AND the
+    /// Block dialog's OK). Universal selection model: empty basket opens
+    /// a select session with the op queued; otherwise straight to the
+    /// base-point click.
+    /// Lower-left (min) corner of the current selection's combined bbox,
+    /// in world coords. (0,0) when nothing is selected. Used as the Block
+    /// dialog's default insertion point.
+    fn selection_min_corner(&self) -> Vec2 {
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut any = false;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                let (mn, _mx) = d.geom.bbox();
+                if mn.x < min.x { min.x = mn.x; }
+                if mn.y < min.y { min.y = mn.y; }
+                any = true;
+            }
+        }
+        if any { min } else { Vec2::ZERO }
+    }
+
+    /// Combined bbox (min,max) of the current selection. Degenerate
+    /// (0,0)-(0,0) when empty. Used as the stretch test region for a
+    /// pickfirst selection that has no crossing window.
+    fn selection_bbox(&self) -> (Vec2, Vec2) {
+        let mut mn = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut mx = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut any = false;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                let (a, b) = d.geom.bbox();
+                mn.x = mn.x.min(a.x); mn.y = mn.y.min(a.y);
+                mx.x = mx.x.max(b.x); mx.y = mx.y.max(b.y);
+                any = true;
+            }
+        }
+        if any { (mn, mx) } else { (Vec2::ZERO, Vec2::ZERO) }
+    }
+
+    fn start_block_def(&mut self, name: String) {
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            self.history.push("  ! block: name cannot be empty".into());
+            return;
+        }
+        if self.doc.blocks.find(&name).is_some() {
+            self.history.push(format!(
+                "  ! block: '{}' already exists (no redefinition yet)", name));
+            return;
+        }
+        if self.selection.is_empty() {
+            self.begin_selection(SelectMode::ForSelect);
+            self.queued_op = QueuedOp::BlockDef(name.clone());
+            self.set_prompt(format!(
+                "block '{}': select dobjects, Enter to continue  [Esc=cancel]",
+                name));
+        } else {
+            self.set_prompt(format!(
+                "block '{}' ({} dobject(s)): click BASE point  [Esc=cancel]",
+                name, self.selection.len()));
+            self.block_def_state = BlockDefState::WaitingForBase { name };
+        }
+    }
+
+    /// World-space wireframe polylines approximating a geom, for the Block
+    /// dialog preview. Curves sample to short chords; Walls use their exact
+    /// face polylines; BlockRefs recurse into their (transformed) contents;
+    /// Text/Dimension fall back to their bbox rectangle. Hatch contributes
+    /// its boundary loops. Good enough for a thumbnail, NOT a pick source.
+    fn preview_world_polylines(&self, g: &Geom) -> Vec<Vec<Vec2>> {
+        use std::f64::consts::TAU;
+        let n = 48usize;
+        match g {
+            Geom::Line(l) => vec![vec![l.a, l.b]],
+            Geom::Polyline(p) => {
+                let mut v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
+                if p.closed { if let Some(&f) = v.first() { v.push(f); } }
+                vec![v]
+            }
+            Geom::Circle(c) => {
+                let mut v = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let t = i as f64 / n as f64 * TAU;
+                    v.push(Vec2::new(c.center.x + c.radius * t.cos(),
+                                     c.center.y + c.radius * t.sin()));
+                }
+                vec![v]
+            }
+            Geom::Arc(a) => {
+                let mut v = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let t = a.start_angle + (i as f64 / n as f64) * a.sweep_angle;
+                    v.push(Vec2::new(a.center.x + a.radius * t.cos(),
+                                     a.center.y + a.radius * t.sin()));
+                }
+                vec![v]
+            }
+            Geom::Ellipse(el) => {
+                let mut v = Vec::with_capacity(n + 1);
+                for i in 0..=n { v.push(el.point_at(i as f64 / n as f64 * TAU)); }
+                vec![v]
+            }
+            Geom::EllipseArc(ea) => {
+                let mut v = Vec::with_capacity(n + 1);
+                for i in 0..=n {
+                    let t = ea.start_param + (i as f64 / n as f64) * ea.sweep_param;
+                    v.push(ea.ellipse.point_at(t));
+                }
+                vec![v]
+            }
+            Geom::Point(pt) => {
+                let s = 0.5;
+                vec![
+                    vec![Vec2::new(pt.location.x - s, pt.location.y),
+                         Vec2::new(pt.location.x + s, pt.location.y)],
+                    vec![Vec2::new(pt.location.x, pt.location.y - s),
+                         Vec2::new(pt.location.x, pt.location.y + s)],
+                ]
+            }
+            Geom::Spline(s) => vec![s.tessellate(64)],
+            Geom::Wall(w) => {
+                if let Some((l, r)) = w.face_polylines(24) { vec![l, r] }
+                else { vec![vec![w.start, w.end]] }
+            }
+            Geom::Hatch(h) => self.resolve_hatch_loops(h),
+            Geom::Text(_) | Geom::Dimension(_) => {
+                let (mn, mx) = g.bbox();
+                vec![vec![
+                    Vec2::new(mn.x, mn.y), Vec2::new(mx.x, mn.y),
+                    Vec2::new(mx.x, mx.y), Vec2::new(mn.x, mx.y),
+                    Vec2::new(mn.x, mn.y),
+                ]]
+            }
+            Geom::BlockRef(br) => {
+                let mut out = Vec::new();
+                if let Some(blk) = self.doc.blocks.get(br.block) {
+                    for cd in &blk.dobjects {
+                        let wg = br.transform_geom(&cd.geom, blk.base);
+                        out.extend(self.preview_world_polylines(&wg));
+                    }
+                }
+                out
+            }
+        }
+    }
+
+    /// Block dialog — bare `block` / Draw menu. Full define-a-block form:
+    /// name, live PREVIEW of the selection, "Select objects" (round-trips
+    /// to canvas), insertion point (typed X/Y or "Pick ⊕"), instance COLOR
+    /// (ACI wheel), and the SMART block flag. Plus an Existing list with
+    /// one-click Insert.
+    fn render_block_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.block_dialog.take() else { return; };
+        let mut open        = true;
+        let mut do_create   = false;
+        let mut do_cancel   = false;
+        let mut do_select   = false;   // Select objects (round-trip)
+        let mut do_pick_base= false;   // Pick insertion point (round-trip)
+        let mut do_pick_color = false; // open ACI wheel
+        let mut clear_color = false;   // reset to inherit/ByLayer
+        let mut insert_id: Option<u32> = None;
+
+        let existing: Vec<(u32, String, usize, bool)> = self.doc.blocks.blocks.iter()
+            .enumerate()
+            .map(|(i, b)| (i as u32, b.name.clone(), b.dobjects.len(), b.smart))
+            .collect();
+        let sel_count = self.selection.len();
+
+        // Pre-extract preview wireframe (world polylines + resolved color)
+        // and its combined bbox — done here where `&self` is available.
+        let mut preview: Vec<(Vec<Vec2>, egui::Color32)> = Vec::new();
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                let (r, g, b) = resolve_color(
+                    d.style.color, d.style.layer,
+                    &self.doc.layers, &self.doc.truecolors);
+                let col = egui::Color32::from_rgb(r, g, b);
+                for pl in self.preview_world_polylines(&d.geom) {
+                    preview.push((pl, col));
+                }
+            }
+        }
+        let mut pmin = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut pmax = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (pl, _) in &preview {
+            for w in pl {
+                pmin.x = pmin.x.min(w.x); pmin.y = pmin.y.min(w.y);
+                pmax.x = pmax.x.max(w.x); pmax.y = pmax.y.max(w.y);
+            }
+        }
+        let has_preview = pmax.x >= pmin.x && pmax.y >= pmin.y;
+
+        let swatch = match dialog.color_aci {
+            Some(aci) => {
+                let (r, g, b) = aci_palette(aci);
+                egui::Color32::from_rgb(r, g, b)
+            }
+            None => egui::Color32::from_rgb(90, 100, 115),
+        };
+
+        egui::Window::new("Block")
+            .id(egui::Id::new("block_dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_size(egui::vec2(360.0, 520.0))
+            .default_pos(egui::pos2(240.0, 90.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Create new block").strong());
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    let resp = ui.add(egui::TextEdit::singleline(&mut dialog.name)
+                        .desired_width(220.0)
+                        .hint_text("CHAIR, DOOR-90, …"));
+                    if resp.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter))
+                    {
+                        do_create = true;
+                    }
+                });
+
+                // ---- Preview --------------------------------------------
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Preview").strong());
+                let (resp, painter) = ui.allocate_painter(
+                    egui::vec2(320.0, 130.0), egui::Sense::hover());
+                let pr = resp.rect;
+                painter.rect_filled(pr, 4.0, egui::Color32::from_rgb(18, 22, 28));
+                painter.rect_stroke(pr, 4.0,
+                    egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
+                if has_preview && !preview.is_empty() {
+                    let size = pmax - pmin;
+                    let sx = (pr.width() as f64 - 16.0) / size.x.max(1e-9);
+                    let sy = (pr.height() as f64 - 16.0) / size.y.max(1e-9);
+                    let s  = sx.min(sy);                 // uniform fit, padded
+                    let cw = (pmin + pmax) * 0.5;
+                    let cx = pr.center().x;
+                    let cy = pr.center().y;
+                    let map = |w: Vec2| egui::pos2(
+                        cx + ((w.x - cw.x) * s) as f32,
+                        cy - ((w.y - cw.y) * s) as f32);
+                    let clip = painter.with_clip_rect(pr);
+                    for (pl, col) in &preview {
+                        if pl.len() >= 2 {
+                            let pts: Vec<egui::Pos2> =
+                                pl.iter().map(|w| map(*w)).collect();
+                            clip.add(egui::Shape::line(
+                                pts, egui::Stroke::new(1.2, *col)));
+                        }
+                    }
+                } else {
+                    painter.text(pr.center(), egui::Align2::CENTER_CENTER,
+                        "(no objects selected)",
+                        egui::FontId::proportional(12.0),
+                        egui::Color32::from_rgb(130, 140, 155));
+                }
+
+                // ---- Select objects -------------------------------------
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Select objects…").clicked() { do_select = true; }
+                    ui.label(format!("{} selected", sel_count));
+                });
+
+                // ---- Insertion point ------------------------------------
+                ui.add_space(4.0);
+                ui.label(egui::RichText::new("Insertion point").strong());
+                ui.horizontal(|ui| {
+                    ui.label("X");
+                    ui.add(egui::TextEdit::singleline(&mut dialog.base_x)
+                        .desired_width(80.0));
+                    ui.label("Y");
+                    ui.add(egui::TextEdit::singleline(&mut dialog.base_y)
+                        .desired_width(80.0));
+                    if ui.button("Pick ⊕").clicked() { do_pick_base = true; }
+                });
+
+                // ---- Color ----------------------------------------------
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("Color").strong());
+                    let (rect, sresp) = ui.allocate_exact_size(
+                        egui::vec2(28.0, 16.0), egui::Sense::click());
+                    ui.painter().rect_filled(rect, 2.0, swatch);
+                    ui.painter().rect_stroke(rect, 2.0,
+                        egui::Stroke::new(1.0, egui::Color32::from_gray(160)));
+                    if sresp.clicked() { do_pick_color = true; }
+                    ui.label(match dialog.color_aci {
+                        Some(aci) => format!("ACI {}", aci),
+                        None      => "inherit (ByLayer)".to_string(),
+                    });
+                    if ui.button("ACI…").clicked()   { do_pick_color = true; }
+                    if dialog.color_aci.is_some()
+                        && ui.button("inherit").clicked() { clear_color = true; }
+                });
+
+                // ---- Smart block ----------------------------------------
+                ui.add_space(4.0);
+                ui.checkbox(&mut dialog.smart, "Smart block")
+                    .on_hover_text("Mark this definition as a smart block \
+                        (re-derive algorithm wired later).");
+
+                // ---- OK / Cancel ----------------------------------------
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.button("OK").clicked()     { do_create = true; }
+                    });
+                });
+
+                if !existing.is_empty() {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Existing blocks").strong());
+                    egui::ScrollArea::vertical().max_height(120.0)
+                        .show(ui, |ui| {
+                            for (id, name, n, smart) in &existing {
+                                ui.horizontal(|ui| {
+                                    ui.label(format!("{}{}  ({} dobj)",
+                                        name,
+                                        if *smart { " ⚙" } else { "" },
+                                        n));
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                        if ui.small_button("Insert").clicked() {
+                                            insert_id = Some(*id);
+                                        }
+                                    });
+                                });
+                            }
+                        });
+                }
+            });
+
+        // ---- post-frame actions ------------------------------------------
+        if let Some(id) = insert_id {
+            let name = existing.iter()
+                .find(|(i, _, _, _)| *i == id)
+                .map(|(_, n, _, _)| n.clone())
+                .unwrap_or_default();
+            self.insert_state = InsertState::WaitingForPoint { block: id };
+            self.set_prompt(format!(
+                "insert '{}': click insertion point  [Esc=cancel]", name));
+            return;   // dialog closes; insert click takes over
+        }
+        if clear_color { dialog.color_aci = None; }
+        if do_pick_color {
+            // Open the ACI wheel; it writes back into block_dialog.color_aci,
+            // so the dialog MUST be restored first.
+            self.aci_pick_request = Some(AciPickRequest::BlockForm);
+            self.block_dialog = Some(dialog);
+            return;
+        }
+        if do_select {
+            // Park the dialog, run a fresh selection session; BlockReopen
+            // restores the dialog when the user presses Enter.
+            self.block_dialog_stash = Some(dialog);
+            self.begin_selection(SelectMode::ForSelect);
+            self.queued_op = QueuedOp::BlockReopen;
+            self.set_prompt(
+                "block: select objects, Enter to return to the dialog  [Esc=cancel]");
+            return;
+        }
+        if do_pick_base {
+            // Park the dialog, capture one canvas click as the base point.
+            self.block_dialog_stash = Some(dialog);
+            self.block_dialog_pick_base = true;
+            self.set_prompt("block: click the insertion point  [Esc=cancel]");
+            return;
+        }
+        if !open || do_cancel {
+            self.history.push("  block: cancelled".into());
+            return;
+        }
+        if do_create {
+            let name = dialog.name.trim().to_string();
+            if name.is_empty() {
+                self.history.push("  ! block: name cannot be empty".into());
+                self.block_dialog = Some(dialog);
+            } else if self.doc.blocks.find(&name).is_some() {
+                self.history.push(format!(
+                    "  ! block: '{}' already exists (no redefinition yet)", name));
+                self.block_dialog = Some(dialog);
+            } else if self.selection.is_empty() {
+                self.history.push(
+                    "  ! block: select objects first (Select objects…)".into());
+                self.block_dialog = Some(dialog);
+            } else {
+                let base = dialog.base_point();
+                self.apply_block_create(&name, base, dialog.color_aci, dialog.smart);
+                // success → dialog closes (not restored)
+            }
+            return;
+        }
+        self.block_dialog = Some(dialog);
+    }
+
+    /// `block <name>` final step — store the definition (contents = the
+    /// selected dobjects, cloned verbatim; coordinates stay as-is and
+    /// `base` is what the instance transform carries), then replace the
+    /// originals with ONE instance at insert == base so the drawing is
+    /// visually unchanged (AutoCAD BLOCK behavior).
+    /// `color_aci`: `Some(aci)` sets the instance color explicitly;
+    /// `None` inherits the first selected dobject's style (layer/color).
+    /// `smart` marks the definition as a smart block.
+    fn apply_block_create(&mut self, name: &str, base: Vec2,
+                          color_aci: Option<u8>, smart: bool) {
+        if self.selection.is_empty() {
+            self.history.push("  ! block: empty selection".into());
+            return;
+        }
+        self.snapshot_doc();
+        let mut sel: Vec<usize> = self.selection.clone();
+        sel.sort_unstable();
+        let mut contents: Vec<DObject> = Vec::new();
+        for &i in &sel {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                contents.push(d.clone());
+            }
+        }
+        let n = contents.len();
+        // Instance inherits the FIRST selected dobject's style so the
+        // blockref lands on a sensible layer/color — then the dialog's
+        // explicit color (if any) overrides just the color.
+        let inst_style = contents.first().map(|d| d.style);
+        let id = self.doc.blocks.add(cad_kernel::Block {
+            name: name.to_string(), base, dobjects: contents, smart,
+        });
+        for &i in sel.iter().rev() {
+            self.doc.dobjects.remove(i);
+        }
+        self.selection.clear();
+        let geom = Geom::BlockRef(cad_kernel::BlockRef {
+            block: id, insert: base, scale: 1.0, rotation: 0.0,
+        });
+        let mut d = match inst_style {
+            Some(st) => DObject::with_style(geom, st),
+            None     => DObject::new(geom),
+        };
+        if let Some(aci) = color_aci {
+            d.style.color = Color::Aci(aci);
+        }
+        self.doc.push(d);
+        self.history.push(format!(
+            "  + block '{}'{} defined (#{}, {} dobject(s)) and instanced at base",
+            name, if smart { " [smart]" } else { "" }, id, n));
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    /// `insert <name>` final step — place one instance (scale 1, rot 0;
+    /// scale/rotation sub-options are a follow-up).
+    fn apply_insert(&mut self, block: u32, insert: Vec2) {
+        self.snapshot_doc();
+        self.add_dobject(Geom::BlockRef(cad_kernel::BlockRef {
+            block, insert, scale: 1.0, rotation: 0.0,
+        }), "insert");
+    }
+
+    /// Explode: replace each selected BlockRef with transformed copies of
+    /// its contents (ONE level — nested blockrefs stay instances, like
+    /// AutoCAD). `Color::ByBlock` contents take the instance's color.
+    /// Fresh handles via `DObject::with_style` (clones must not reuse the
+    /// definition's handles).
+    fn apply_explode(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  ! explode: empty selection".into());
+            return;
+        }
+        self.snapshot_doc();
+        let mut sel: Vec<usize> = self.selection.clone();
+        sel.sort_unstable();
+        let mut to_remove: Vec<usize> = Vec::new();
+        let mut to_add: Vec<DObject> = Vec::new();
+        let mut skipped = 0_usize;
+        for &i in &sel {
+            let Some(d) = self.doc.dobjects.get(i) else { continue };
+            if let Geom::BlockRef(br) = &d.geom {
+                if let Some(blk) = self.doc.blocks.get(br.block) {
+                    for cd in &blk.dobjects {
+                        let mut style = cd.style;
+                        if matches!(style.color, Color::ByBlock) {
+                            style.color = d.style.color;
+                        }
+                        to_add.push(DObject::with_style(
+                            br.transform_geom(&cd.geom, blk.base), style));
+                    }
+                    to_remove.push(i);
+                } else {
+                    skipped += 1;   // dangling reference
+                }
+            } else {
+                skipped += 1;       // not a block instance
+            }
+        }
+        let exploded = to_remove.len();
+        let added = to_add.len();
+        for &i in to_remove.iter().rev() {
+            self.doc.dobjects.remove(i);
+        }
+        for nd in to_add {
+            self.doc.push(nd);
+        }
+        self.selection.clear();
+        self.history.push(format!(
+            "  ✸ explode: {} instance(s) → {} dobject(s){}",
+            exploded, added,
+            if skipped > 0 { format!("  ({} skipped — not a block)", skipped) }
+            else { String::new() }));
+        self.intersections.clear();
+        self.index_dirty = true;
         self.gpu_dirty = true;
     }
 
@@ -8353,74 +9492,20 @@ impl CadApp {
 
     fn apply_stretch(&mut self, win_min: Vec2, win_max: Vec2, base: Vec2, dest: Vec2) {
         let v = dest - base;
-        if v.len() < EPS { return; }
+        if v.len() < EPS || self.selection.is_empty() { return; }
         self.snapshot_doc();
-        let inside = |p: Vec2| -> bool {
-            p.x >= win_min.x && p.x <= win_max.x
-                && p.y >= win_min.y && p.y <= win_max.y
-        };
-        // Per-variant logic: move any vertex/center that lies inside the window.
-        let mut touched = 0usize;
-        for d in self.doc.dobjects.iter_mut() {
-            let new_geom = match &d.geom {
-                Geom::Line(l) => {
-                    let na = if inside(l.a) { l.a + v } else { l.a };
-                    let nb = if inside(l.b) { l.b + v } else { l.b };
-                    if na != l.a || nb != l.b { touched += 1; }
-                    Some(Geom::Line(Line { a: na, b: nb }))
-                }
-                Geom::Polyline(p) => {
-                    let mut changed = false;
-                    let new_verts: Vec<PolyVertex> = p.vertices.iter().map(|vt| {
-                        if inside(vt.pos) {
-                            changed = true;
-                            PolyVertex { pos: vt.pos + v, bulge: vt.bulge }
-                        } else { *vt }
-                    }).collect();
-                    if changed { touched += 1; }
-                    Some(Geom::Polyline(Polyline { vertices: new_verts, closed: p.closed }))
-                }
-                // Translate as a whole iff the canonical "center" is inside.
-                Geom::Circle(c) if inside(c.center) => {
-                    touched += 1;
-                    Some(Geom::Circle(Circle { center: c.center + v, radius: c.radius }))
-                }
-                Geom::Arc(a) if inside(a.center) => {
-                    touched += 1;
-                    Some(Geom::Arc(Arc {
-                        center: a.center + v, radius: a.radius,
-                        start_angle: a.start_angle, sweep_angle: a.sweep_angle,
-                    }))
-                }
-                Geom::Ellipse(e) if inside(e.center) => {
-                    touched += 1;
-                    Some(Geom::Ellipse(Ellipse {
-                        center: e.center + v, major: e.major, ratio: e.ratio,
-                    }))
-                }
-                Geom::EllipseArc(ea) if inside(ea.ellipse.center) => {
-                    touched += 1;
-                    Some(Geom::EllipseArc(EllipseArc {
-                        ellipse: Ellipse {
-                            center: ea.ellipse.center + v,
-                            major: ea.ellipse.major, ratio: ea.ellipse.ratio,
-                        },
-                        start_param: ea.start_param, sweep_param: ea.sweep_param,
-                    }))
-                }
-                Geom::Point(pt) if inside(pt.location) => {
-                    touched += 1;
-                    Some(Geom::Point(Point {
-                        location: pt.location + v, style: pt.style, size: pt.size,
-                    }))
-                }
-                _ => None,
-            };
-            if let Some(g) = new_geom { d.geom = g; }
+        // Only the SELECTED dobjects are stretched (the crossing window +
+        // Shift-exclude during the selection phase decided the set); each
+        // one's vertices inside the box move by `v`, the rest stay.
+        let sel: Vec<usize> = self.selection.clone();
+        for &i in &sel {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.geom = stretch_one(&d.geom, win_min, win_max, v);
+            }
         }
         self.history.push(format!(
-            "  ↔ stretch by ({:.2},{:.2})  touched {} dobject(s)",
-            v.x, v.y, touched));
+            "  ↔ stretch by ({:.2},{:.2})  {} dobject(s)", v.x, v.y, sel.len()));
+        self.selection.clear();
         self.intersections.clear();
         self.index_dirty = true;
         self.gpu_dirty = true;
@@ -8595,6 +9680,7 @@ impl CadApp {
                     Some(Geom::Wall(_))       => "Wall",
                     Some(Geom::Text(_))       => "Text",
                     Some(Geom::Dimension(_))  => "Dimension",
+                    Some(Geom::BlockRef(_))   => "BlockRef",
                     None                      => "<gone>",
                 };
                 self.history.push(format!("  ! trim #{}: {}", target_idx, msg));
@@ -9020,18 +10106,36 @@ impl CadApp {
     }
 
     /// Mirror the current selection in place across the axis A→B.
-    fn apply_mirror(&mut self, a: Vec2, b: Vec2) {
+    /// Mirror the selection across the axis (a, b). `keep_original = true`
+    /// appends mirrored COPIES (originals stay — fresh handles, like copy);
+    /// `false` flips the originals in place.
+    fn apply_mirror(&mut self, a: Vec2, b: Vec2, keep_original: bool) {
         if a.dist(b) < EPS { return; }
         self.snapshot_doc();
         let n = self.selection.len();
-        for &i in &self.selection {
-            if let Some(d) = self.doc.dobjects.get_mut(i) {
-                d.geom = d.geom.mirrored(a, b);
+        if keep_original {
+            let copies: Vec<DObject> = self.selection.iter()
+                .filter_map(|&i| self.doc.dobjects.get(i))
+                .map(|d| {
+                    let mut new = DObject::new(d.geom.mirrored(a, b));
+                    new.style = d.style;
+                    new
+                })
+                .collect();
+            for c in copies { self.doc.push(c); }
+            self.selection_prev = self.selection.clone();
+            self.selection.clear();
+        } else {
+            for &i in &self.selection {
+                if let Some(d) = self.doc.dobjects.get_mut(i) {
+                    d.geom = d.geom.mirrored(a, b);
+                }
             }
         }
         self.history.push(format!(
-            "  ⇄ mirror: {} dobject(s) across axis ({:.2},{:.2})–({:.2},{:.2})",
-            n, a.x, a.y, b.x, b.y
+            "  ⇄ mirror: {} dobject(s) across ({:.2},{:.2})–({:.2},{:.2}) [{}]",
+            n, a.x, a.y, b.x, b.y,
+            if keep_original { "kept original" } else { "erased original" }
         ));
         self.intersections.clear();
         self.index_dirty = true;
@@ -9541,36 +10645,45 @@ impl CadApp {
         (alpha / 2.0).tan()
     }
 
-    /// The "from" point that ortho (lock drafting orientation) constrains
-    /// the cursor against — the most recent locked-in point in whatever
-    /// command is active. None means ortho has no anchor and therefore
-    /// no effect this frame (e.g. waiting for the first endpoint of a
-    /// line, or no active command at all).
-    fn ortho_anchor(&self) -> Option<Vec2> {
+    /// The "from" point that CARD (cardinal-directions drafting lock)
+    /// constrains the cursor against — the most recent locked-in point in
+    /// whatever command is active. None means CARD has no anchor and
+    /// therefore no effect this frame (e.g. waiting for the first
+    /// endpoint of a line, or no active command at all).
+    fn card_anchor(&self) -> Option<Vec2> {
         if let MoveState::WaitingForDest(base) = self.move_state { return Some(base); }
         if let CopyState::WaitingForDest(base) = self.copy_state { return Some(base); }
         if let MirrorState::WaitingForB(a)    = self.mirror_state { return Some(a); }
         if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
+        // Rotate — the angle / reference picks pivot about the pivot point,
+        // so CARD snaps the rotation to the cardinal directions (0/90/…).
+        match self.rotate_state {
+            RotateState::WaitingForAngle(pivot)
+            | RotateState::WaitingForRefSrc1(pivot)
+            | RotateState::WaitingForRefSrc2(pivot, _)
+            | RotateState::WaitingForRefTgt(pivot, _) => return Some(pivot),
+            _ => {}
+        }
         // Polyline / Line / Arc draw tools: the last captured point is
-        // the ortho anchor for the next click.
-        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc | Tool::Wall | Tool::Text) {
+        // the CARD anchor for the next click.
+        if matches!(self.tool, Tool::Line | Tool::Polyline | Tool::Spline | Tool::Arc | Tool::Ellipse | Tool::EllipseArc | Tool::Wall | Tool::Text | Tool::Rectangle) {
             if let Some(p) = self.pending.last().copied() { return Some(p); }
         }
         None
     }
 
-    /// Apply ortho + grid-snap constraints to a raw world position. Order:
-    ///   1. Ortho first if enabled AND an anchor exists — projects onto
-    ///      whichever axis from the anchor is closer (pure horizontal or
-    ///      vertical move).
+    /// Apply CARD + grid-snap constraints to a raw world position. Order:
+    ///   1. CARD first if enabled AND an anchor exists — projects onto
+    ///      whichever axis from the anchor is closer (ONLY horizontal or
+    ///      vertical).
     ///   2. Grid-snap second if enabled — rounds to the nearest
     ///      `GrdSpc` multiple in both axes.
     /// Object-snap is NOT handled here; callers apply it BEFORE this so
-    /// osnap always wins over both ortho and grid (the AutoCAD priority).
+    /// osnap always wins over both CARD and grid.
     fn apply_constraints(&self, raw: Vec2) -> Vec2 {
         let mut p = raw;
-        if self.env.OrtEnb {
-            if let Some(a) = self.ortho_anchor() {
+        if self.env.CrdEnb {
+            if let Some(a) = self.card_anchor() {
                 let dx = (p.x - a.x).abs();
                 let dy = (p.y - a.y).abs();
                 if dx >= dy { p.y = a.y; } else { p.x = a.x; }
@@ -9585,7 +10698,7 @@ impl CadApp {
     }
 
     /// World position of the cursor with all current constraints applied
-    /// in AutoCAD priority: osnap > ortho > grid-snap > raw. Used both
+    /// in priority order: osnap > CARD > grid-snap > raw. Used both
     /// for click-capture and for live-preview rendering so the user
     /// sees exactly what the click will produce.
     fn cursor_world_constrained(
@@ -9648,7 +10761,53 @@ impl CadApp {
                 hatch_best = Some((i, area));
             }
         }
-        hatch_best.map(|(i, _)| i)
+        if hatch_best.is_some() {
+            return hatch_best.map(|(i, _)| i);
+        }
+        // BlockRef fallback — kernel distance_to_point is INFINITY for
+        // instances (contents resolve through the Document), so the main
+        // loop above never matches them. Test the transformed contents
+        // directly (one nesting level; nested instances contribute their
+        // insertion point only — full recursion when pick perf matters).
+        let mut blk_best: Option<(usize, f64)> = None;
+        for i in 0..self.doc.dobjects.len() {
+            let Geom::BlockRef(br) = &self.doc.dobjects[i].geom else { continue; };
+            let Some(blk) = self.doc.blocks.get(br.block) else { continue; };
+            for cd in &blk.dobjects {
+                let g = br.transform_geom(&cd.geom, blk.base);
+                let dist = match &g {
+                    Geom::BlockRef(nb) => nb.insert.dist(w),
+                    _ => g.distance_to_point(w),
+                };
+                if dist < tol_world
+                    && blk_best.map_or(true, |(_, bd)| dist < bd)
+                {
+                    blk_best = Some((i, dist));
+                }
+            }
+        }
+        blk_best.map(|(i, _)| i)
+    }
+
+    /// World bbox of a block instance, resolved through the block table:
+    /// union of the transformed contents' bboxes (nested instances
+    /// contribute their insertion point — one level, consistent with the
+    /// pick fallback). Falls back to the insertion point when dangling.
+    fn resolved_blockref_bbox(&self, br: &cad_kernel::BlockRef) -> (Vec2, Vec2) {
+        let mut min = br.insert;
+        let mut max = br.insert;
+        if let Some(blk) = self.doc.blocks.get(br.block) {
+            for cd in &blk.dobjects {
+                let g = br.transform_geom(&cd.geom, blk.base);
+                let (gmin, gmax) = match &g {
+                    Geom::BlockRef(nb) => (nb.insert, nb.insert),
+                    _ => g.bbox(),
+                };
+                min.x = min.x.min(gmin.x); min.y = min.y.min(gmin.y);
+                max.x = max.x.max(gmax.x); max.y = max.y.max(gmax.y);
+            }
+        }
+        (min, max)
     }
 
     // ---- interactive draw: finalise dobject from clicked points ---------
@@ -9659,6 +10818,18 @@ impl CadApp {
                 let g = Geom::Line(Line { a: self.pending[0], b: self.pending[1] });
                 self.pending.clear();
                 self.add_dobject(g, "canvas");
+            }
+            (Tool::Rectangle, 2) => {
+                // Two opposite corners → an axis-aligned closed polyline.
+                let a = self.pending[0];
+                let b = self.pending[1];
+                self.pending.clear();
+                if (b.x - a.x).abs() < EPS || (b.y - a.y).abs() < EPS {
+                    self.history.push(
+                        "  ! rectangle: corners are collinear (zero width or height)".into());
+                } else {
+                    self.add_dobject(rect_polyline(a, b), "canvas");
+                }
             }
             (Tool::Wall, 2) => {
                 // SMART DOBJECT: one Geom::Wall, not two Lines. The kernel
@@ -10584,6 +11755,7 @@ fn dobject_kind_name(g: &Geom) -> &'static str {
         Geom::Wall(_)       => "Wall",
         Geom::Text(_)       => "Text",
         Geom::Dimension(_)  => "Dimension",
+        Geom::BlockRef(_)   => "Block",
     }
 }
 
@@ -10656,6 +11828,10 @@ fn describe(g: &Geom) -> String {
             };
             format!("{} = {:.3} style={}", kind_name, d.measured_value(), d.style)
         }
+        Geom::BlockRef(br) => format!(
+            "block #{} @ ({:.3},{:.3}) s={:.3} rot={:.2}°",
+            br.block, br.insert.x, br.insert.y, br.scale,
+            br.rotation.to_degrees()),
     }
 }
 
@@ -10859,6 +12035,14 @@ fn list_full_details(g: &Geom) -> Vec<String> {
                 out.push(format!("text override  : \"{}\"", s));
             }
         }
+        Geom::BlockRef(br) => {
+            out.push("type           : block reference".to_string());
+            out.push(format!("block id       : {}", br.block));
+            out.push(format!("insert         : ({:.4}, {:.4})",
+                br.insert.x, br.insert.y));
+            out.push(format!("scale          : {:.4}", br.scale));
+            out.push(format!("rotation       : {:.4}°", br.rotation.to_degrees()));
+        }
     }
     out
 }
@@ -10951,6 +12135,11 @@ fn describe_verbose(g: &Geom) -> String {
         Geom::Dimension(d) => format!(
             "dimension  measured={:.4}  style=#{}  override={:?}",
             d.measured_value(), d.style, d.text_override,
+        ),
+        Geom::BlockRef(br) => format!(
+            "blockref  block=#{}  insert=({:.3},{:.3})  scale={:.3}  rot={:+.2}°",
+            br.block, br.insert.x, br.insert.y, br.scale,
+            br.rotation.to_degrees(),
         ),
     }
 }
@@ -11450,6 +12639,14 @@ fn tool_button(ui: &mut egui::Ui, current: &mut Tool, this: Tool, label: &str) -
             painter.line_segment([c + egui::vec2(0.0, -9.0), c + egui::vec2(0.0, 9.0)], pen);
             dot(c);
         }
+        Tool::Rectangle => {
+            // a rectangle outline with two opposite-corner dots (the two
+            // clicks the user makes).
+            let r = egui::Rect::from_center_size(c, egui::vec2(26.0, 18.0));
+            painter.rect_stroke(r, 0.0, pen);
+            dot(r.left_top());
+            dot(r.right_bottom());
+        }
         Tool::Polyline => {
             // a 3-segment chevron-ish shape with vertex dots
             let p1 = c + egui::vec2(-14.0,  8.0);
@@ -11906,9 +13103,12 @@ impl eframe::App for CadApp {
             self.history.push(format!("  GRID {}", if self.env.GrdEnb { "on" } else { "off" }));
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F8)) {
-            self.env.OrtEnb = !self.env.OrtEnb;
+            // CARD — cardinal-directions drafting lock (cursor
+            // constrained to ONLY horizontal or vertical from the
+            // anchor).
+            self.env.CrdEnb = !self.env.CrdEnb;
             let _ = self.env.save();
-            self.history.push(format!("  ORTHO {}", if self.env.OrtEnb { "on" } else { "off" }));
+            self.history.push(format!("  CARD {}", if self.env.CrdEnb { "on" } else { "off" }));
         }
         if ctx.input(|i| i.key_pressed(egui::Key::F9)) {
             self.env.GrdSnp = !self.env.GrdSnp;
@@ -11923,6 +13123,14 @@ impl eframe::App for CadApp {
             self.pline_mode = PlineMode::Line;
             self.pline_arc_sub = PlineArcSub::Normal;
             self.wall_waiting_thickness = false;
+            if self.block_def_state != BlockDefState::Off {
+                self.block_def_state = BlockDefState::Off;
+                self.history.push("  block creation cancelled".into());
+            }
+            if self.insert_state != InsertState::Off {
+                self.insert_state = InsertState::Off;
+                self.history.push("  insert cancelled".into());
+            }
             self.tool = Tool::None;
             self.picking_source = false;
             // Set the cooperative-cancellation flag for any long-
@@ -11934,6 +13142,13 @@ impl eframe::App for CadApp {
             self.hatch_pick_point_session = None;
             self.pending_hatch_pattern = (None, 1.0, 0.0);
             self.hatch_dialog_open = false;
+            self.block_dialog = None;
+            // Abandon any parked Block-dialog round-trip (Select / Pick).
+            self.block_dialog_stash = None;
+            self.block_dialog_pick_base = false;
+            // Drop any captured stretch crossing box (e.g. Esc mid-select).
+            self.stretch_window_box = None;
+            if let Some(d) = self.file_dialog.take() { self.file_dialog_dir = Some(d.dir); }
             self.intersect_pending_click = false;
             self.intersect_view_pending  = false;
             self.snap_override = None;
@@ -12022,6 +13237,7 @@ impl eframe::App for CadApp {
             }
             if self.stretch_state != StretchState::Off {
                 self.stretch_state = StretchState::Off;
+                self.stretch_window_box = None;
                 self.history.push("  stretch cancelled".into());
             }
             // Trim / extend cancel — also restore the stashed main selection
@@ -12162,6 +13378,65 @@ impl eframe::App for CadApp {
                 self.history.push(format!(
                     "  offset: exit ({} offset{} applied)",
                     n, if n == 1 { "" } else { "s" }));
+            } else if let MirrorState::AwaitingKeep(a, b) = self.mirror_state {
+                // Enter at the mirror keep-original prompt = keep a copy
+                // (the default). n/no/ni (typed) erases; handled in
+                // run_command's mirror intercept.
+                self.mirror_state = MirrorState::Off;
+                self.apply_mirror(a, b, true);
+                self.clear_prompt();
+            } else if self.fillet_waiting_radius {
+                // Fillet radius sub-prompt ("radius <r> (Enter = keep)").
+                // A bare Enter accepts the CURRENT radius and advances to
+                // the pick phase. The keep-branch in `run_command` (which
+                // does the same thing) is unreachable for an empty cmd
+                // line — `run_command` is only called when the cmd is
+                // non-empty — so the empty Enter must be handled here, or
+                // it falls through to "repeat last command" and the radius
+                // prompt appears stuck.
+                let v = self.env.FltRad;
+                self.fillet_waiting_radius = false;
+                self.fillet_state = FilletState::WaitingForFirst(v);
+                self.history.push(format!("  fillet: radius kept at {}", v));
+                self.refresh_fillet_prompt();
+            } else if matches!(self.fillet_state,
+                FilletState::WaitingForFirst(_) | FilletState::WaitingForSecond(..)) {
+                // Enter at the MAIN fillet prompt ("fillet (r=0.5, …): click
+                // FIRST line"): the user pressed Enter without typing a new
+                // radius — treat it as "keep the current value and carry on".
+                // Just re-issue the prompt; do NOT fall through to repeat-last
+                // (which would restart the command). Lines are picked with
+                // the mouse, not Enter.
+                self.refresh_fillet_prompt();
+            } else if self.chamfer_dist_wait != ChamferDistWait::Off {
+                // Mirror of the fillet radius-keep, for chamfer's two
+                // distance sub-prompts. Same unreachable-empty-cmd reason.
+                match self.chamfer_dist_wait {
+                    ChamferDistWait::WaitingD1 => {
+                        let d1 = self.env.ChmDs1;
+                        self.chamfer_dist_wait = ChamferDistWait::WaitingD2(d1);
+                        self.history.push(format!(
+                            "  chamfer: first distance kept at {}", d1));
+                        self.set_prompt(format!(
+                            "chamfer: second distance <{}> (Enter = same as first)  [Esc=cancel]", d1));
+                    }
+                    ChamferDistWait::WaitingD2(d1) => {
+                        self.env.ChmDs1 = d1;
+                        self.env.ChmDs2 = d1;   // empty 2nd → d2 = d1
+                        let _ = self.env.save();
+                        self.chamfer_state = ChamferState::WaitingForFirst(d1, d1);
+                        self.chamfer_dist_wait = ChamferDistWait::Off;
+                        self.history.push(format!(
+                            "  chamfer: distances → ({}, {})", d1, d1));
+                        self.refresh_chamfer_prompt();
+                    }
+                    ChamferDistWait::Off => unreachable!(),
+                }
+            } else if matches!(self.chamfer_state,
+                ChamferState::WaitingForFirst(..) | ChamferState::WaitingForSecond(..)) {
+                // Enter at the main chamfer prompt — keep current distances,
+                // stay in the command (see fillet rationale above).
+                self.refresh_chamfer_prompt();
             } else {
                 // Item 4 — fully idle: Enter on empty cmd repeats last cmd.
                 if let Some(last) = self.last_command.clone() {
@@ -12262,15 +13537,15 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                     if ui.button("Open .dxf / .rsm…").clicked() {
-                        self.run_command("open /tmp/in.dxf");
+                        self.open_file_dialog(FileDialogMode::Open, ".dxf");
                         ui.close_menu();
                     }
-                    if ui.button("Save As .dxf").clicked() {
-                        self.run_command("saveas /tmp/out.dxf");
+                    if ui.button("Save As .dxf…").clicked() {
+                        self.open_file_dialog(FileDialogMode::Save, ".dxf");
                         ui.close_menu();
                     }
-                    if ui.button("Save As .rsm").clicked() {
-                        self.run_command("saveas /tmp/out.rsm");
+                    if ui.button("Save As .rsm…").clicked() {
+                        self.open_file_dialog(FileDialogMode::Save, ".rsm");
                         ui.close_menu();
                     }
                     ui.separator();
@@ -12339,6 +13614,7 @@ impl eframe::App for CadApp {
                 ui.menu_button("Draw", |ui| {
                     for (label, cmd) in [
                         ("Line",        "line"),
+                        ("Rectangle",   "rec"),
                         ("Circle",      "circle"),
                         ("Arc (3pt)",   "arc"),
                         ("Ellipse",     "ellipse"),
@@ -12352,6 +13628,35 @@ impl eframe::App for CadApp {
                             self.run_command(cmd);
                             ui.close_menu();
                         }
+                    }
+                    ui.separator();
+                    // Blocks — the dialog collects the name; insert lists
+                    // the defined blocks as a submenu.
+                    if ui.button("Block…")
+                        .on_hover_text("Create a block from the selection \
+                                        (opens the Block dialog)")
+                        .clicked()
+                    {
+                        self.run_command("block");
+                        ui.close_menu();
+                    }
+                    let block_names: Vec<String> = self.doc.blocks.blocks.iter()
+                        .map(|b| b.name.clone()).collect();
+                    let mut insert_pick: Option<String> = None;
+                    ui.menu_button("Insert Block", |ui| {
+                        if block_names.is_empty() {
+                            ui.label("(no blocks defined)");
+                        }
+                        for n in &block_names {
+                            if ui.button(n).clicked() {
+                                insert_pick = Some(n.clone());
+                                ui.close_menu();
+                            }
+                        }
+                    });
+                    if let Some(n) = insert_pick {
+                        self.run_command(&format!("insert {}", n));
+                        ui.close_menu();
                     }
                 });
                 ui.menu_button("Modify", |ui| {
@@ -12663,6 +13968,7 @@ impl eframe::App for CadApp {
                 tool_button(ui, &mut self.tool, Tool::None,   "pointer");
                 ui.add_space(4.0);
                 tool_button(ui, &mut self.tool, Tool::Line,     "line");
+                tool_button(ui, &mut self.tool, Tool::Rectangle, "rect");
                 tool_button(ui, &mut self.tool, Tool::Circle,   "circle");
                 // Hatch is a one-shot command (not a persistent draw
                 // tool); custom-painted icon — clicking opens the
@@ -12755,6 +14061,12 @@ impl eframe::App for CadApp {
                     Tool::Ellipse    => (String::from("DRAWING ELLIPSE"), green),
                     Tool::EllipseArc => (String::from("DRAWING ELLIPTICAL ARC"), green),
                     Tool::Point     => (String::from("PLACING POINT"), green),
+                    Tool::Rectangle => (
+                        if self.pending.is_empty() {
+                            String::from("DRAWING RECTANGLE — click first corner")
+                        } else {
+                            String::from("DRAWING RECTANGLE — click opposite corner, or type  width height")
+                        }, green),
                     Tool::Polyline  => (format!("DRAWING POLYLINE ({} verts; Enter to finish, 'c' Enter to close)",
                         self.pending.len()), green),
                     Tool::Spline    => (format!("DRAWING SPLINE ({} ctrl pts; Enter finishes after \u{2265}3)",
@@ -13283,6 +14595,8 @@ impl eframe::App for CadApp {
         self.render_dim_style_manager(ctx);
         self.render_wall_style_manager(ctx);
         self.render_wall_style_dialog(ctx);
+        self.render_block_dialog(ctx);
+        self.render_file_dialog(ctx);
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
         self.render_dbg_recorder_window(ctx);
@@ -13505,10 +14819,10 @@ impl eframe::App for CadApp {
                             ).sense(egui::Sense::click()));
                             resp.on_hover_text(tip).clicked()
                         };
-                        if drafting_badge(ui, "ORTHO", self.env.OrtEnb,
-                            "Lock drafting orientation (F8) — cursor pulled to horizontal or vertical from the anchor point.")
+                        if drafting_badge(ui, "CARD", self.env.CrdEnb,
+                            "CARD (F8, or type `card`) — cursor pulled to horizontal or vertical from the anchor point.")
                         {
-                            self.env.OrtEnb = !self.env.OrtEnb;
+                            self.env.CrdEnb = !self.env.CrdEnb;
                             let _ = self.env.save();
                         }
                         if drafting_badge(ui, "SNAP", self.env.GrdSnp,
@@ -13688,6 +15002,11 @@ impl eframe::App for CadApp {
             // the canvas area (below toolbar, above status bar) not
             // the full window rect.
             self.canvas_screen_rect = Some(rect);
+            // Stash the live cursor (raw world) so the command line's
+            // direct-distance entry knows which way to throw a typed
+            // distance (CARD-locked when CARD is on).
+            let lc = resp.hover_pos().map(|p| self.s2w(p, rect));
+            if lc.is_some() { self.last_cursor_raw_world = lc; }
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
 
@@ -13783,6 +15102,14 @@ impl eframe::App for CadApp {
                 && !self.picking_source && !self.intersect_pending_click
                 && (!self.doc.dobjects.is_empty() || pline_phantom.is_some())
             {
+                // PER / TAN need a "from" anchor. During a draw it's the
+                // last pending point; during an edit op (move/copy/STRETCH
+                // destination, mirror, rotate) it's that op's base/pivot —
+                // `card_anchor()` returns exactly that. Previously only
+                // `pending.last()` was fed, so PER/TAN were dead during
+                // every edit-op point pick (the reported "PER unresponsive
+                // during stretch").
+                let snap_anchor = self.card_anchor();
                 resp.hover_pos().map(|cur| {
                     let world = self.s2w(cur, rect);
                     let world_radius = self.env.SpTGSZ as f64 / self.scale as f64;
@@ -13793,7 +15120,7 @@ impl eframe::App for CadApp {
                         find_all_snaps(
                             world, world_radius,
                             self.snap_enabled, self.snap_override,
-                            self.pending.last().copied(),
+                            snap_anchor,
                             &self.doc.dobjects, grid,
                         )
                     };
@@ -13802,7 +15129,7 @@ impl eframe::App for CadApp {
                         let phantom_hits = find_all_snaps(
                             world, world_radius,
                             self.snap_enabled, self.snap_override,
-                            self.pending.last().copied(),
+                            snap_anchor,
                             phantom_slice, None,
                         );
                         hits.extend(phantom_hits);
@@ -14089,14 +15416,15 @@ impl eframe::App for CadApp {
             // drag window, grip drag) stay on release — they need both
             // endpoints. Visual cue: the square+cross drafting cursor
             // is drawn iff in_click_only_phase.
-            let press_now = in_click_only_phase
+            let press_fires_click = in_click_only_phase;
+            let press_now = press_fires_click
                 && ctx.input(|i| i.pointer.primary_pressed())
                 && resp.contains_pointer();
-            let click_now = if in_click_only_phase { press_now } else { click_now };
+            let click_now = if press_fires_click { press_now } else { click_now };
             // In drafting mode the press fired the click; suppress the
             // release-time drag-promoted click so we don't double-fire
             // when egui later reports a tiny accidental drag_stopped.
-            let drag_was_a_click = drag_was_a_click && !in_click_only_phase;
+            let drag_was_a_click = drag_was_a_click && !press_fires_click;
             // ---- Grip drag handling (v2: per-grip role semantics) -----------
             // Two ways to grab a grip in pointer mode + GrpEnb:
             //   (a) press-and-drag (release = commit)
@@ -14190,13 +15518,25 @@ impl eframe::App for CadApp {
                 ) {
                     let press_world   = press_world_stashed;
                     let release_world = self.s2w(r, rect);
+                    let shift = ctx.input(|i| i.modifiers.shift);
                     let was_off = self.select_mode == SelectMode::Off;
                     if was_off {
                         // Shift+drag from idle — open a one-shot ForSelect
                         // window, apply, finalise.
                         self.begin_selection(SelectMode::ForSelect);
                     }
-                    self.add_window_selection(press_world, release_world, false);
+                    // Shift removes only WITHIN an active session (so an idle
+                    // Shift-drag still selects rather than removing from nothing).
+                    self.add_window_selection(press_world, release_world, shift && !was_off);
+                    // STRETCH: the crossing window is also the per-vertex
+                    // test region — remember it (last window wins).
+                    if self.queued_op == QueuedOp::Stretch {
+                        let wmin = Vec2::new(press_world.x.min(release_world.x),
+                                             press_world.y.min(release_world.y));
+                        let wmax = Vec2::new(press_world.x.max(release_world.x),
+                                             press_world.y.max(release_world.y));
+                        self.stretch_window_box = Some((wmin, wmax));
+                    }
                     if was_off {
                         self.finalise_selection();
                     } else {
@@ -14208,9 +15548,18 @@ impl eframe::App for CadApp {
                     window_drag_consumed_click = true;
                 }
             }
+            // Swallow the release of a press-fires-click whose op already
+            // ended on the press (e.g. stretch/move/copy destination): the
+            // op leaves click-only mode, so this release would otherwise be
+            // re-read as a pointer-mode click and spuriously select.
+            let primary_released_now = ctx.input(|i| i.pointer.primary_released());
+            let release_swallow = self.pending_release_swallow && primary_released_now;
+            if primary_released_now { self.pending_release_swallow = false; }
+            if press_now && !primary_released_now { self.pending_release_swallow = true; }
             let click_fired = (click_now || drag_was_a_click)
                 && !grip_drag_consumed_click
-                && !window_drag_consumed_click;
+                && !window_drag_consumed_click
+                && !release_swallow;
             if (click_now || drag_stopped) && self.trim_debug_open {
                 // Only log when the user has the diagnostic window open, to
                 // keep the log uncluttered.
@@ -14255,7 +15604,7 @@ impl eframe::App for CadApp {
                     // for downstream branches that need it unconstrained
                     // (selection hit-test, intersect-click, etc.).
                     let world = self.s2w(pos, rect);
-                    // AutoCAD priority for the captured POINT: osnap > ortho
+                    // Priority for the captured POINT: osnap > CARD
                     // > grid-snap > raw. Used wherever a click commits a
                     // point (line endpoint, move base/dest, …).
                     let click_world = snap_hit.map(|h| h.point)
@@ -14703,36 +16052,45 @@ impl eframe::App for CadApp {
                         self.refocus_cmd = true;
                     } else if self.stretch_state != StretchState::Off {
                         match self.stretch_state {
-                            StretchState::WaitingForWin1 => {
-                                self.stretch_state = StretchState::WaitingForWin2(click_world);
-                                self.history.push(format!(
-                                    "    stretch: window corner 1 = ({:.2},{:.2}) — click SECOND corner",
-                                    click_world.x, click_world.y));
-                            }
-                            StretchState::WaitingForWin2(c1) => {
-                                let wmin = Vec2 {
-                                    x: c1.x.min(click_world.x),
-                                    y: c1.y.min(click_world.y),
-                                };
-                                let wmax = Vec2 {
-                                    x: c1.x.max(click_world.x),
-                                    y: c1.y.max(click_world.y),
-                                };
-                                self.stretch_state = StretchState::WaitingForBase(wmin, wmax);
-                                self.history.push(
-                                    "    stretch: window captured — click BASE point".into());
-                            }
                             StretchState::WaitingForBase(wmin, wmax) => {
                                 self.stretch_state = StretchState::WaitingForDest(wmin, wmax, click_world);
+                                self.set_prompt("stretch: click DESTINATION point  [Esc=cancel]");
                                 self.history.push(
                                     "    stretch: BASE captured — click DESTINATION".into());
                             }
                             StretchState::WaitingForDest(wmin, wmax, base) => {
                                 self.apply_stretch(wmin, wmax, base, click_world);
                                 self.stretch_state = StretchState::Off;
+                                self.clear_prompt();
                             }
                             StretchState::Off => unreachable!(),
                         }
+                        self.refocus_cmd = true;
+                    } else if self.block_dialog_pick_base {
+                        // Dialog "Pick ⊕" — this click is the insertion point.
+                        // Write it into the parked dialog and reopen.
+                        self.block_dialog_pick_base = false;
+                        if let Some(mut dlg) = self.block_dialog_stash.take() {
+                            dlg.base_x = format!("{:.4}", click_world.x);
+                            dlg.base_y = format!("{:.4}", click_world.y);
+                            self.block_dialog = Some(dlg);
+                        }
+                        self.clear_prompt();
+                        self.refocus_cmd = true;
+                    } else if self.block_def_state != BlockDefState::Off {
+                        // block creation — this click is the BASE point.
+                        if let BlockDefState::WaitingForBase { name } =
+                            std::mem::replace(&mut self.block_def_state, BlockDefState::Off)
+                        {
+                            self.apply_block_create(&name, click_world, None, false);
+                            self.clear_prompt();
+                        }
+                        self.refocus_cmd = true;
+                    } else if let InsertState::WaitingForPoint { block } = self.insert_state {
+                        // insert — place one instance, end the session.
+                        self.apply_insert(block, click_world);
+                        self.insert_state = InsertState::Off;
+                        self.clear_prompt();
                         self.refocus_cmd = true;
                     } else if self.matchprops_state != MatchPropsState::Off {
                         // matchprop is in source-pick mode — find the dobject
@@ -14807,8 +16165,17 @@ impl eframe::App for CadApp {
                                     click_world.x, click_world.y));
                             }
                             MirrorState::WaitingForB(a) => {
-                                self.apply_mirror(a, click_world);
-                                self.mirror_state = MirrorState::Off;
+                                // Axis fixed — ask whether to keep the
+                                // original before committing.
+                                self.mirror_state =
+                                    MirrorState::AwaitingKeep(a, click_world);
+                                self.set_prompt(
+                                    "mirror: keep original? [Y]/n  \
+                                     (Enter = keep a copy, n/no = erase original)");
+                            }
+                            MirrorState::AwaitingKeep(..) => {
+                                // Answer comes from the command line, not a
+                                // click — ignore stray canvas clicks here.
                             }
                             MirrorState::Off => unreachable!(),
                         }
@@ -14896,7 +16263,12 @@ impl eframe::App for CadApp {
                                     self.history.push(
                                         "  ! snap missed — used raw click".into());
                                 }
-                                world
+                                // Apply CARD + grid-snap (priority osnap >
+                                // CARD > grid > raw), same as the click_world
+                                // used for move/copy/etc. WITHOUT this the
+                                // committed draw point ignored CARD and grid
+                                // even though the live preview honoured them.
+                                self.apply_constraints(world)
                             }
                         };
                         if self.snap_override.is_some() {
@@ -16006,11 +17378,17 @@ impl eframe::App for CadApp {
                         [pivot_s + egui::vec2(0.0, -9.0), pivot_s + egui::vec2(0.0, 9.0)],
                         egui::Stroke::new(0.8, mark));
                     if let Some(cur) = resp.hover_pos() {
-                        let cur_world = self.s2w(cur, rect);
+                        // Use the CONSTRAINED cursor so CARD snaps the
+                        // rotation to the cardinal directions and the ghost
+                        // matches what the click commits.
+                        let cur_world = self.cursor_world_constrained(
+                            Some(cur), rect, snap_hit.map(|h| h.point))
+                            .unwrap_or_else(|| self.s2w(cur, rect));
+                        let cur_s = self.w2s(cur_world, rect);
                         let angle = (cur_world - pivot).angle();
                         // Baseline pivot→cursor.
                         painter.line_segment(
-                            [pivot_s, cur],
+                            [pivot_s, cur_s],
                             egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
                         // Ghost of the rotated selection.
                         let ghost = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 130);
@@ -16022,7 +17400,7 @@ impl eframe::App for CadApp {
                         // Angle label near cursor.
                         let deg = angle.to_degrees();
                         painter.text(
-                            cur + egui::vec2(12.0, -12.0),
+                            cur_s + egui::vec2(12.0, -12.0),
                             egui::Align2::LEFT_BOTTOM,
                             format!("{:.1}°{}", deg, if self.rotate_copy { "  (copy)" } else { "" }),
                             egui::FontId::monospace(12.0), mark);
@@ -16146,14 +17524,19 @@ impl eframe::App for CadApp {
             }
             if self.tool != Tool::None {
                 if let Some(raw_cursor) = resp.hover_pos() {
-                    // When a snap is active the preview must agree with what
-                    // the click will actually commit — the snap point, not
-                    // the raw cursor position. Otherwise the rubber-band line
-                    // ends one place and the marker glyph sits elsewhere.
-                    let (cw, cursor) = match snap_hit {
-                        Some(h) => (h.point, self.w2s(h.point, rect)),
-                        None    => (self.s2w(raw_cursor, rect), raw_cursor),
-                    };
+                    // The preview must agree with what the click will
+                    // actually commit, in the SAME priority the capture
+                    // path uses: osnap > CARD > grid > raw. Without the
+                    // constraint pass the rubber-band tracked the raw
+                    // cursor while the committed point honoured CARD/grid,
+                    // so a CARD-locked line previewed diagonal but drew
+                    // horizontal. `cw` is the constrained world point and
+                    // `cursor` its exact screen position, so the band end
+                    // and the snap marker glyph always coincide.
+                    let cw = self.cursor_world_constrained(
+                        Some(raw_cursor), rect, snap_hit.map(|h| h.point))
+                        .unwrap_or_else(|| self.s2w(raw_cursor, rect));
+                    let cursor = self.w2s(cw, rect);
                     let dash = egui::Stroke::new(1.0, preview_col);
                     let hint = egui::Stroke::new(0.5, preview_col.gamma_multiply(0.45));
 
@@ -16162,6 +17545,14 @@ impl eframe::App for CadApp {
                     match (self.tool, self.pending.as_slice()) {
                         (Tool::Line, [a]) => {
                             painter.line_segment([self.w2s(*a, rect), cursor], dash);
+                        }
+                        (Tool::Rectangle, [a]) => {
+                            // Rubber-band rectangle from the first corner to
+                            // the (constrained) cursor — the shape the click
+                            // will commit.
+                            let a_s = self.w2s(*a, rect);
+                            let r = egui::Rect::from_two_pos(a_s, cursor);
+                            painter.rect_stroke(r, 0.0, dash);
                         }
                         (Tool::Wall, [a]) => {
                             // Ghost = the wall the user is about to
@@ -16558,6 +17949,96 @@ impl eframe::App for CadApp {
                 }
             }
 
+            // ---- mirror axis overlay (preview line + ghost result) -----
+            // While picking the second axis point (WaitingForB) the axis is
+            // a→cursor; once fixed (AwaitingKeep) it's a→b. Either way we
+            // draw the dashed axis (extended past both ends so it reads as
+            // a mirror line) plus a translucent ghost of the mirrored
+            // selection, so the result is visible before committing.
+            let mirror_axis: Option<(Vec2, Option<Vec2>)> = match self.mirror_state {
+                MirrorState::WaitingForB(a)     => Some((a, None)),
+                MirrorState::AwaitingKeep(a, b) => Some((a, Some(b))),
+                _ => None,
+            };
+            if let Some((a, b_fixed)) = mirror_axis {
+                let b = b_fixed.or_else(|| self.cursor_world_constrained(
+                    resp.hover_pos(), rect, snap_hit.map(|h| h.point)));
+                if let Some(b) = b {
+                    let dir = b - a;
+                    let len = dir.len();
+                    if len > EPS {
+                        let accent = egui::Color32::from_rgb(200, 160, 255);
+                        let u = dir / len;
+                        let ext = 40.0 / self.scale as f64;   // ~40 px past each end
+                        let p0 = self.w2s(a - u * ext, rect);
+                        let p1 = self.w2s(b + u * ext, rect);
+                        let time = ctx.input(|i| i.time) as f32;
+                        draw_dashed_line(&painter, p0, p1, 8.0, 5.0,
+                            time * 40.0, egui::Stroke::new(1.4, accent));
+                        draw_base_blip(&painter, self.w2s(a, rect), accent);
+                        painter.circle_filled(self.w2s(b, rect), 3.0, accent);
+                        // Ghost of the mirrored selection.
+                        let ghost = egui::Color32::from_rgba_unmultiplied(
+                            200, 160, 255, 150);
+                        for &i in &self.selection {
+                            if let Some(d) = self.doc.dobjects.get(i) {
+                                let m = d.geom.mirrored(a, b);
+                                draw_dobject(&painter, rect, self, &m, ghost);
+                            }
+                        }
+                    }
+                }
+                let hint = match self.mirror_state {
+                    MirrorState::WaitingForB(_) =>
+                        "MIRROR: click SECOND axis point (axis + ghost shown)",
+                    _ => "MIRROR: keep original? [Y]/n  (Enter = keep a copy)",
+                };
+                painter.text(rect.left_top() + egui::vec2(10.0, 48.0),
+                    egui::Align2::LEFT_TOP, hint,
+                    egui::FontId::monospace(11.0),
+                    egui::Color32::from_rgb(200, 160, 255));
+            }
+
+            // ---- stretch overlay (window box + vector + ghost) ---------
+            // Once the crossing window is captured, keep it drawn (faint
+            // green box) and — while picking the destination — show the
+            // base→cursor vector plus a ghost of the stretched result so
+            // the user sees exactly which vertices move and by how much.
+            match self.stretch_state {
+                StretchState::WaitingForBase(wmin, wmax)
+                | StretchState::WaitingForDest(wmin, wmax, _) => {
+                    let box_col = egui::Color32::from_rgb(140, 220, 100);
+                    let r = egui::Rect::from_two_pos(
+                        self.w2s(wmin, rect), self.w2s(wmax, rect));
+                    painter.rect_stroke(r, 0.0, egui::Stroke::new(1.0,
+                        egui::Color32::from_rgba_unmultiplied(140, 220, 100, 160)));
+                    if let StretchState::WaitingForDest(_, _, base) = self.stretch_state {
+                        let cur = self.cursor_world_constrained(
+                            resp.hover_pos(), rect, snap_hit.map(|h| h.point));
+                        if let Some(cw) = cur {
+                            let v = cw - base;
+                            let base_s = self.w2s(base, rect);
+                            let dest_s = self.w2s(cw, rect);
+                            draw_base_blip(&painter, base_s, box_col);
+                            let time = ctx.input(|i| i.time) as f32;
+                            draw_dashed_line(&painter, base_s, dest_s, 6.0, 4.0,
+                                time * 60.0, egui::Stroke::new(1.2, box_col));
+                            // Ghost of the stretched geometry — only the
+                            // SELECTED dobjects (the stretch set).
+                            let ghost = egui::Color32::from_rgba_unmultiplied(
+                                140, 220, 100, 150);
+                            for &i in &self.selection {
+                                if let Some(d) = self.doc.dobjects.get(i) {
+                                    let g = stretch_one(&d.geom, wmin, wmax, v);
+                                    draw_dobject(&painter, rect, self, &g, ghost);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+
             // ---- selection mode overlay --------------------------------
             //
             // Rubber-band rectangle from the first-corner click to the
@@ -16936,6 +18417,10 @@ fn draw_grips(painter: &egui::Painter, rect: egui::Rect, app: &CadApp, g: &Geom)
             // dim-line / leader anchor.
             for gp in d.grip_points() { draw(gp); }
         }
+        Geom::BlockRef(br) => {
+            // BlockRef — one grip at the insertion point (drag = move).
+            draw(br.insert);
+        }
     }
 }
 
@@ -17223,21 +18708,24 @@ fn paint_dobject_with_style(
     match &d.geom {
         Geom::Line(l) => push(app.w2s(l.a, rect), app.w2s(l.b, rect)),
         Geom::Wall(w) => {
-            if let Some(l) = w.left_line() {
-                push(app.w2s(l.a, rect), app.w2s(l.b, rect));
-            }
-            if let Some(r) = w.right_line() {
-                push(app.w2s(r.a, rect), app.w2s(r.b, rect));
-            }
+            // Shared face derivation (mitred straights / exact curved
+            // arcs) — the old left_line()/right_line() chords drew WRONG
+            // straight faces for curved walls. The linetype pattern is
+            // applied per tessellation segment (dash phase restarts each
+            // segment — cosmetic, segments are short).
+            let (l_pts, r_pts) = wall_face_screen_pts(app, rect, w);
+            for seg in l_pts.windows(2) { push(seg[0], seg[1]); }
+            for seg in r_pts.windows(2) { push(seg[0], seg[1]); }
             // Also re-issue the centerline if WlCnL — keep the debug
             // overlay even when the wall has a custom linetype.
             if app.env.WlCnL {
                 let cl_col = egui::Color32::from_rgba_unmultiplied(
                     color.r(), color.g(), color.b(), 110);
                 let cl_stroke = egui::Stroke::new(1.2, cl_col);
-                let a = app.w2s(w.start, rect);
-                let b = app.w2s(w.end,   rect);
-                for s in egui::Shape::dashed_line(&[a, b], cl_stroke, 6.0, 4.0) {
+                let clpts: Vec<egui::Pos2> =
+                    w.centerline_polyline(l_pts.len().max(3) - 1).iter()
+                        .map(|p| app.w2s(*p, rect)).collect();
+                for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
                     painter.add(s);
                 }
             }
@@ -17245,6 +18733,56 @@ fn paint_dobject_with_style(
         // Other variants — solid for now. Arc/Circle/Polyline/Spline
         // dashed render = tessellate + dashed_line. Add when needed.
         _ => draw_dobject(painter, rect, app, &d.geom, color),
+    }
+}
+
+/// Screen-space face polylines for a wall — the SINGLE source the solid,
+/// dashed-selection, and linetype render paths all share so they can't
+/// diverge. Straight walls get neighbour-mitred faces via
+/// `cad_wall::solve_faces`; curved walls get EXACT concentric arc samples
+/// (`Wall::face_polylines`, radial normals — no chord-tilt gap at fillet
+/// joints) with a zoom-adaptive sample count (same pattern as the Arc
+/// renderer, so close zoom shows no faceting).
+fn wall_face_screen_pts(
+    app:  &CadApp,
+    rect: egui::Rect,
+    w:    &cad_kernel::Wall,
+) -> (Vec<egui::Pos2>, Vec<egui::Pos2>) {
+    if w.is_curved() {
+        let n = match cad_kernel::bulge_arc(w.start, w.end, w.bulge) {
+            Some((_c, r, _a0, sweep)) => {
+                // Samples proportional to the on-screen OUTER arc length.
+                let arc_px = ((r + w.thickness * 0.5) * sweep.abs()) as f32
+                    * app.scale;
+                (arc_px * 0.25).clamp(12.0, 256.0) as usize
+            }
+            None => 28,
+        };
+        match w.face_polylines(n) {
+            Some((l, r)) => (
+                l.iter().map(|p| app.w2s(*p, rect)).collect(),
+                r.iter().map(|p| app.w2s(*p, rect)).collect(),
+            ),
+            None => (Vec::new(), Vec::new()),
+        }
+    } else {
+        let walls: Vec<cad_kernel::Wall> = app.doc.dobjects.iter()
+            .filter_map(|d| if let Geom::Wall(x) = &d.geom {
+                Some(x.clone()) } else { None })
+            .collect();
+        match cad_wall::solve_faces(w, &walls) {
+            Some(f) => (
+                vec![app.w2s(f.left.0, rect),  app.w2s(f.left.1, rect)],
+                vec![app.w2s(f.right.0, rect), app.w2s(f.right.1, rect)],
+            ),
+            None => match (w.left_line(), w.right_line()) {
+                (Some(l), Some(r)) => (
+                    vec![app.w2s(l.a, rect), app.w2s(l.b, rect)],
+                    vec![app.w2s(r.a, rect), app.w2s(r.b, rect)],
+                ),
+                _ => (Vec::new(), Vec::new()),
+            },
+        }
     }
 }
 
@@ -17360,56 +18898,34 @@ fn draw_dobject_thick(
             let face_stroke = egui::Stroke::new(width, face_col);
             let fill_aci = wstyle.map(|s| s.fill_color).unwrap_or(0);
 
-            // Build the two face polylines (screen space).
-            let (left_pts, right_pts): (Vec<egui::Pos2>, Vec<egui::Pos2>) =
-            if w.is_curved() {
-                // Curved corner wall — offset a tessellated centerline
-                // per-point along the local CCW normal (sign-robust).
-                let cl = w.centerline_polyline(28);
-                let n = cl.len();
-                let mut lp = Vec::with_capacity(n);
-                let mut rp = Vec::with_capacity(n);
-                for i in 0..n {
-                    let p = cl[i];
-                    let dir = if i + 1 < n { cl[i + 1] - p } else { p - cl[i - 1] };
-                    let nrm = dir.perp().normalized();
-                    lp.push(app.w2s(p + nrm * (w.thickness * 0.5), rect));
-                    rp.push(app.w2s(p - nrm * (w.thickness * 0.5), rect));
-                }
-                (lp, rp)
-            } else {
-                // Straight wall — mitred faces from the join solver.
-                let walls: Vec<cad_kernel::Wall> = app.doc.dobjects.iter()
-                    .filter_map(|d| if let Geom::Wall(x) = &d.geom {
-                        Some(x.clone()) } else { None })
-                    .collect();
-                match cad_wall::solve_faces(w, &walls) {
-                    Some(f) => (
-                        vec![app.w2s(f.left.0, rect),  app.w2s(f.left.1, rect)],
-                        vec![app.w2s(f.right.0, rect), app.w2s(f.right.1, rect)],
-                    ),
-                    None => match (w.left_line(), w.right_line()) {
-                        (Some(l), Some(r)) => (
-                            vec![app.w2s(l.a, rect), app.w2s(l.b, rect)],
-                            vec![app.w2s(r.a, rect), app.w2s(r.b, rect)],
-                        ),
-                        _ => (Vec::new(), Vec::new()),
-                    },
-                }
-            };
+            // Faces from the shared derivation (mitred straights / exact
+            // concentric curved arcs, zoom-adaptive samples).
+            let (left_pts, right_pts) = wall_face_screen_pts(app, rect, w);
 
-            // Poché fill — footprint quad (left ++ reversed right). Convex
-            // for straight walls; skip curved (would need a concave path).
-            if fill_aci != 0 && !w.is_curved()
-                && left_pts.len() == 2 && right_pts.len() == 2
+            // Poché fill — triangle-strip mesh between the two face
+            // polylines. One path for BOTH the straight quad and the
+            // concave curved band; shared vertices, so no AA seams
+            // between segments.
+            if fill_aci != 0
+                && left_pts.len() >= 2
+                && left_pts.len() == right_pts.len()
             {
                 let (fr, fg, fb) = aci_palette(fill_aci.min(255) as u8);
-                let poly = vec![left_pts[0], left_pts[1], right_pts[1], right_pts[0]];
-                painter.add(egui::Shape::convex_polygon(
-                    poly, egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 80),
-                    egui::Stroke::NONE));
+                let fill = egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 80);
+                let mut mesh = egui::Mesh::default();
+                for i in 0..left_pts.len() {
+                    mesh.colored_vertex(left_pts[i],  fill);
+                    mesh.colored_vertex(right_pts[i], fill);
+                }
+                for i in 0..left_pts.len() - 1 {
+                    let a = (2 * i) as u32;
+                    mesh.add_triangle(a, a + 1, a + 2);
+                    mesh.add_triangle(a + 1, a + 3, a + 2);
+                }
+                painter.add(egui::Shape::mesh(mesh));
             }
             // Faces.
+            let n_face = left_pts.len();
             if left_pts.len()  >= 2 { painter.add(egui::Shape::line(left_pts,  face_stroke)); }
             if right_pts.len() >= 2 { painter.add(egui::Shape::line(right_pts, face_stroke)); }
 
@@ -17417,8 +18933,10 @@ fn draw_dobject_thick(
                 let cl_col = egui::Color32::from_rgba_unmultiplied(
                     color.r(), color.g(), color.b(), 110);
                 let cl_stroke = egui::Stroke::new(width * 0.8, cl_col);
-                let clpts: Vec<egui::Pos2> = w.centerline_polyline(28).iter()
-                    .map(|p| app.w2s(*p, rect)).collect();
+                // Same sample count as the faces so the overlays agree.
+                let clpts: Vec<egui::Pos2> =
+                    w.centerline_polyline(n_face.max(3) - 1).iter()
+                        .map(|p| app.w2s(*p, rect)).collect();
                 for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
                     painter.add(s);
                 }
@@ -17463,6 +18981,51 @@ fn draw_dobject_thick(
         }
         Geom::Dimension(d) => {
             draw_dimension(painter, rect, app, d, color);
+        }
+        Geom::BlockRef(br) => {
+            draw_blockref(painter, rect, app, br, color, width, 0);
+        }
+    }
+}
+
+/// Render a block instance: every contained dobject transformed into
+/// world space and drawn with its own resolved style; `Color::ByBlock`
+/// contents take the instance's color (this is where ByBlock finally
+/// means something). Nested instances recurse; `depth` is a hard cap —
+/// cycles can't form in v1 (see block.rs) but render stays bounded
+/// regardless.
+fn draw_blockref(
+    painter: &egui::Painter,
+    rect:    egui::Rect,
+    app:     &CadApp,
+    br:      &cad_kernel::BlockRef,
+    instance_color: egui::Color32,
+    width:   f32,
+    depth:   u8,
+) {
+    if depth > 8 { return; }
+    let Some(blk) = app.doc.blocks.get(br.block) else {
+        // Dangling reference — draw a small red marker at the insertion
+        // point instead of silently vanishing.
+        let p = app.w2s(br.insert, rect);
+        painter.circle_stroke(p, 5.0,
+            egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60)));
+        return;
+    };
+    for cd in &blk.dobjects {
+        let g = br.transform_geom(&cd.geom, blk.base);
+        let col = if matches!(cd.style.color, Color::ByBlock) {
+            instance_color
+        } else {
+            let (r, gn, b) = resolve_color(
+                cd.style.color, cd.style.layer,
+                &app.doc.layers, &app.doc.truecolors);
+            egui::Color32::from_rgb(r, gn, b)
+        };
+        if let Geom::BlockRef(nested) = &g {
+            draw_blockref(painter, rect, app, nested, col, width, depth + 1);
+        } else {
+            draw_dobject_thick(painter, rect, app, &g, col, width);
         }
     }
 }
@@ -18123,14 +19686,14 @@ fn draw_dobject_dashed(
             push_dashed(pts);
         }
         Geom::Wall(w) => {
-            // Dashed selection overlay covers BOTH visible side lines
-            // so a selected wall reads as one entity.
-            if let Some(l) = w.left_line() {
-                push_dashed(vec![app.w2s(l.a, rect), app.w2s(l.b, rect)]);
-            }
-            if let Some(r) = w.right_line() {
-                push_dashed(vec![app.w2s(r.a, rect), app.w2s(r.b, rect)]);
-            }
+            // Dashed selection overlay — same shared face derivation as
+            // the solid renderer (mitred straights, exact curved arcs) so
+            // the highlight matches what is actually drawn. The old
+            // left_line()/right_line() chords showed straight dashes
+            // across curved walls.
+            let (l_pts, r_pts) = wall_face_screen_pts(app, rect, w);
+            if l_pts.len() >= 2 { push_dashed(l_pts); }
+            if r_pts.len() >= 2 { push_dashed(r_pts); }
         }
         Geom::Text(t) => {
             // Dashed-selection overlay on Text isn't a dashed string
@@ -18166,6 +19729,16 @@ fn draw_dobject_dashed(
                     &[app.w2s(*a, rect), app.w2s(*b, rect)], stroke, dash, gap)
                 {
                     painter.add(s);
+                }
+            }
+        }
+        Geom::BlockRef(br) => {
+            // Dashed-selection overlay — recurse into the transformed
+            // contents so the whole instance highlights as one entity.
+            if let Some(blk) = app.doc.blocks.get(br.block) {
+                for cd in &blk.dobjects {
+                    let g = br.transform_geom(&cd.geom, blk.base);
+                    draw_dobject_dashed(painter, rect, app, &g, color, dash, gap);
                 }
             }
         }

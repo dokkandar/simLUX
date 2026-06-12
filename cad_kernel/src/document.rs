@@ -14,6 +14,7 @@ use crate::pen::PenTable;
 use crate::text::TextStyleTable;
 use crate::dim::DimStyleTable;
 use crate::wallstyle::WallStyleTable;
+use crate::block::BlockTable;
 
 #[derive(Clone)]
 pub struct Document {
@@ -34,8 +35,10 @@ pub struct Document {
     /// Named wall styles (Dry Wall / Structural / …). Walls reference an
     /// entry via `w.style`. Index 0 is reserved STANDARD.
     pub wall_styles: WallStyleTable,
+    /// Block definitions. Dobjects with `Geom::BlockRef(br)` reference an
+    /// entry via `br.block`. No reserved id-0 entry — starts empty.
+    pub blocks:      BlockTable,
     // Reserved for future slices — leave the field list extensible:
-    // pub blocks:      BlockTable,
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
     // pub doc_settings: DocSettings,
@@ -52,6 +55,7 @@ impl Default for Document {
             text_styles: TextStyleTable::with_defaults(),
             dim_styles:  DimStyleTable::with_defaults(),
             wall_styles: WallStyleTable::with_defaults(),
+            blocks:      BlockTable::default(),
         }
     }
 }

@@ -54,6 +54,49 @@ impl Wall {
         }
     }
 
+    /// Face polylines `(left, right)` derived from the centerline,
+    /// UNJOINED (no neighbour miters — `cad_wall::solve_faces` adds those
+    /// for straight walls). Straight wall → two 2-point lines (identical
+    /// to `left_line`/`right_line`). Curved wall → EXACT concentric arc
+    /// samples: every centerline sample is offset ±t/2 along the TRUE
+    /// radial direction, so the end face points land exactly at
+    /// `start/end ± perp(tangent)·t/2` and meet a tangent straight wall's
+    /// face endpoints with no gap. (The old render path used
+    /// finite-difference chord normals, which tilt the end normals by
+    /// sweep/(2·steps) and left a zoom-visible gap ≈ (t/2)·sweep/(2·steps)
+    /// at fillet joints.)
+    pub fn face_polylines(&self, n: usize) -> Option<(Vec<Vec2>, Vec<Vec2>)> {
+        let half = self.thickness * 0.5;
+        if !self.is_curved() {
+            let l = self.left_line()?;
+            let r = self.right_line()?;
+            return Some((vec![l.a, l.b], vec![r.a, r.b]));
+        }
+        let Some((center, radius, a0, sweep)) =
+            bulge_arc(self.start, self.end, self.bulge)
+        else {
+            // Degenerate chord — fall back to the straight faces.
+            let l = self.left_line()?;
+            let r = self.right_line()?;
+            return Some((vec![l.a, l.b], vec![r.a, r.b]));
+        };
+        // "Left" = CCW-perp of the travel direction. On a CCW arc
+        // (sweep > 0) that perp points INWARD (−radial); on a CW arc it
+        // points OUTWARD (+radial).
+        let side = if sweep >= 0.0 { -1.0 } else { 1.0 };
+        let steps = n.max(2);
+        let mut left  = Vec::with_capacity(steps + 1);
+        let mut right = Vec::with_capacity(steps + 1);
+        for i in 0..=steps {
+            let t = a0 + sweep * (i as f64 / steps as f64);
+            let radial = Vec2::new(t.cos(), t.sin());
+            let p = center + radial * radius;
+            left.push(p + radial * (side * half));
+            right.push(p - radial * (side * half));
+        }
+        Some((left, right))
+    }
+
     /// CCW unit normal of the centerline direction. `None` if the
     /// centerline is degenerate (start ≈ end).
     pub fn normal(&self) -> Option<Vec2> {
@@ -454,6 +497,12 @@ pub enum Geom {
     /// from the def points + DimStyle every frame; the kernel stores
     /// only the inputs. See `dim::Dim` for the full data model.
     Dimension(crate::dim::Dim),
+    /// Placed block instance — references `Document.blocks` by id and
+    /// carries a similarity transform (insert + rotation + uniform
+    /// scale). Like Hatch, it can't resolve its own contents without the
+    /// Document, so kernel-level bbox/distance are placeholders and the
+    /// app resolves through the block table. See `block::BlockRef`.
+    BlockRef(crate::block::BlockRef),
 }
 
 impl Geom {
@@ -540,6 +589,14 @@ impl Geom {
             // Dimension — rotate every def point. Text orientation
             // re-derives at render time from the dim-line direction.
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(rot)),
+            // BlockRef — rotate the insertion point about the pivot and
+            // add the angle to the instance rotation. Exact (similarity
+            // transforms compose).
+            Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
+                insert:   rot(br.insert),
+                rotation: br.rotation + angle,
+                ..*br
+            }),
         }
     }
 
@@ -609,6 +666,14 @@ impl Geom {
             // current DimStyle's text_height + arrow_size; those are
             // already in world units so they scale with the camera.
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(sc)),
+            // BlockRef — scale the insertion point about the pivot and
+            // multiply the uniform instance scale (|factor| like Wall
+            // thickness; negative factors don't reflect a block in v1).
+            Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
+                insert: sc(br.insert),
+                scale:  br.scale * f_abs,
+                ..*br
+            }),
         }
     }
 
@@ -701,6 +766,19 @@ impl Geom {
             // because the dim line direction is recomputed; no need to
             // flip the text angle separately.
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(mirror)),
+            // BlockRef — v1 LIMITATION (documented in block.rs): the
+            // insertion point and rotation are reflected, but the content
+            // keeps its handedness (no `mirrored` flag yet). Symmetric
+            // blocks look right; mirror asymmetric blocks by exploding
+            // first. Reflected rotation = 2·axis_angle − rotation.
+            Geom::BlockRef(br) => {
+                let axis_angle = (b - a).angle();
+                Geom::BlockRef(crate::block::BlockRef {
+                    insert:   mirror(br.insert),
+                    rotation: 2.0 * axis_angle - br.rotation,
+                    ..*br
+                })
+            }
         }
     }
 
@@ -1101,6 +1179,8 @@ impl Geom {
                 Err("trim: text entities have no curve to cut"),
             Geom::Dimension(_) =>
                 Err("trim: dimensions have no curve to cut"),
+            Geom::BlockRef(_) =>
+                Err("trim: explode the block first"),
         }
     }
 
@@ -1313,6 +1393,8 @@ impl Geom {
                 Err("split: cannot split a text entity"),
             Geom::Dimension(_) =>
                 Err("split: cannot split a dimension entity"),
+            Geom::BlockRef(_) =>
+                Err("split: explode the block first"),
         }
     }
 
@@ -1384,8 +1466,7 @@ impl Geom {
                     closed: false,
                 }))
             }
-            Geom::Polyline(_) =>
-                Err("offset on polyline not implemented yet (corner math TBD)"),
+            Geom::Polyline(p) => offset_polyline(p, dist, side),
             Geom::Point(_) =>
                 Err("offset on point is undefined"),
             Geom::Hatch(_) =>
@@ -1407,6 +1488,8 @@ impl Geom {
                 Err("offset on text is undefined"),
             Geom::Dimension(_) =>
                 Err("offset on dimension is undefined"),
+            Geom::BlockRef(_) =>
+                Err("offset: explode the block first"),
         }
     }
 
@@ -1486,6 +1569,8 @@ impl Geom {
             Geom::Text(t) => Geom::Text(t.clone()),
             // Dimension — direction-agnostic; clone.
             Geom::Dimension(d) => Geom::Dimension(d.clone()),
+            // BlockRef — direction-agnostic; clone.
+            Geom::BlockRef(br) => Geom::BlockRef(*br),
         }
     }
 
@@ -1546,6 +1631,10 @@ impl Geom {
                 Geom::Text(nt)
             }
             Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(|p| p + off)),
+            Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
+                insert: br.insert + off,
+                ..*br
+            }),
         }
     }
 
@@ -1589,6 +1678,11 @@ impl Geom {
                 }
                 best
             }
+            // BlockRef — contents live in Document.blocks, which the
+            // kernel can't reach from here (same situation as Hatch).
+            // INFINITY keeps the generic pick loop from matching; the
+            // app resolves block contents in its pick fallback.
+            Geom::BlockRef(_) => f64::INFINITY,
         }
     }
 }
@@ -1706,6 +1800,11 @@ impl Geom {
             // and extension lines can fall slightly outside this; v1
             // accepts the loose bbox.
             Geom::Dimension(d) => d.bbox(),
+            // BlockRef — placeholder (can't resolve contents without the
+            // Document). `is_view_independent_bbox()` returns true so
+            // spatial indexes never cull on this; the app computes the
+            // real resolved bbox where it matters (window selection).
+            Geom::BlockRef(br) => (br.insert, br.insert),
         }
     }
 
@@ -1726,7 +1825,11 @@ impl Geom {
     /// rather than vertices will override this the same way Hatch
     /// does today.
     pub fn is_view_independent_bbox(&self) -> bool {
-        matches!(self, Geom::Hatch(_))
+        // Hatch and BlockRef both resolve their real extent through the
+        // Document (boundary handles / block table), so their kernel
+        // bboxes are placeholders and spatial indexes must keep them in
+        // every candidate set.
+        matches!(self, Geom::Hatch(_) | Geom::BlockRef(_))
     }
 }
 
@@ -1914,15 +2017,101 @@ mod transform_tests {
     }
 
     #[test]
-    fn offset_polyline_errors_politely() {
+    fn offset_closed_rectangle_inward_shrinks() {
+        // 10×6 rectangle, CCW. Click INSIDE → offset shrinks it by `dist`
+        // on every edge (8×4, same 4 corners pulled in).
         let g = Geom::Polyline(Polyline {
             vertices: vec![
-                PolyVertex { pos: Vec2::ZERO, bulge: 0.0 },
-                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+            ],
+            closed: true,
+        });
+        let out = g.offset(1.0, Vec2::new(5.0, 3.0)).expect("offset ok");
+        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        assert!(pl.closed);
+        assert_eq!(pl.vertices.len(), 4);
+        let corners: Vec<Vec2> = pl.vertices.iter().map(|x| x.pos).collect();
+        // Expect the inset rectangle (1,1)-(9,5).
+        let want = [
+            Vec2::new(1.0, 1.0), Vec2::new(9.0, 1.0),
+            Vec2::new(9.0, 5.0), Vec2::new(1.0, 5.0),
+        ];
+        for w in &want {
+            assert!(corners.iter().any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
+                "missing inset corner {:?} in {:?}", w, corners);
+        }
+    }
+
+    #[test]
+    fn offset_closed_rectangle_outward_grows() {
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 6.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 6.0), bulge: 0.0 },
+            ],
+            closed: true,
+        });
+        // Click OUTSIDE (below the bottom edge) → grow.
+        let out = g.offset(1.0, Vec2::new(5.0, -3.0)).expect("offset ok");
+        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        let corners: Vec<Vec2> = pl.vertices.iter().map(|x| x.pos).collect();
+        let want = [
+            Vec2::new(-1.0, -1.0), Vec2::new(11.0, -1.0),
+            Vec2::new(11.0, 7.0), Vec2::new(-1.0, 7.0),
+        ];
+        for w in &want {
+            assert!(corners.iter().any(|c| approx_eq(c.x, w.x) && approx_eq(c.y, w.y)),
+                "missing grown corner {:?} in {:?}", w, corners);
+        }
+    }
+
+    #[test]
+    fn offset_polyline_arc_segment_concentric() {
+        // Single arc segment: quarter circle (1,0)→(0,1), centre origin,
+        // CCW (bulge = tan(22.5°)). Offset OUTWARD → concentric radius 2,
+        // same bulge.
+        let b = (std::f64::consts::FRAC_PI_8).tan();   // tan(22.5°)
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(1.0, 0.0), bulge: b },
+                PolyVertex { pos: Vec2::new(0.0, 1.0), bulge: 0.0 },
             ],
             closed: false,
         });
-        assert!(g.offset(1.0, Vec2::ZERO).is_err());
+        let out = g.offset(1.0, Vec2::new(1.0, 1.0)).expect("offset ok");
+        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        assert_eq!(pl.vertices.len(), 2);
+        assert!(approx_eq(pl.vertices[0].pos.x, 2.0) && approx_eq(pl.vertices[0].pos.y, 0.0),
+            "arc start {:?} should scale to (2,0)", pl.vertices[0].pos);
+        assert!(approx_eq(pl.vertices[1].pos.x, 0.0) && approx_eq(pl.vertices[1].pos.y, 2.0),
+            "arc end {:?} should scale to (0,2)", pl.vertices[1].pos);
+        assert!(approx_eq(pl.vertices[0].bulge, b), "bulge preserved (concentric)");
+    }
+
+    #[test]
+    fn offset_open_polyline_two_segments() {
+        // L-shape (open): (0,0)-(10,0)-(10,10). Offset to the +Y/-X inside.
+        let g = Geom::Polyline(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+            ],
+            closed: false,
+        });
+        let out = g.offset(1.0, Vec2::new(5.0, 1.0)).expect("offset ok");
+        let Geom::Polyline(pl) = out else { panic!("not a polyline") };
+        assert!(!pl.closed);
+        assert_eq!(pl.vertices.len(), 3);
+        // The miter corner moves from (10,0) to (9,1).
+        let mid = pl.vertices[1].pos;
+        assert!(approx_eq(mid.x, 9.0) && approx_eq(mid.y, 1.0),
+            "miter corner {:?} should be (9,1)", mid);
     }
 
     #[test]
@@ -2368,6 +2557,9 @@ pub enum GripRole {
     EllipseArcCenter,
     PolyVertex(usize),
     PointLoc,
+    /// Block instance insertion point — dragging it translates the
+    /// whole instance.
+    BlockInsert,
     /// Control point of a NURBS spline at the given index. Dragging
     /// reshapes the curve via control-point edit (the dragged point
     /// stays put; the curve bends towards it).
@@ -2482,6 +2674,9 @@ impl Geom {
                     ],
                 }
             }
+            // BlockRef — one grip at the insertion point; dragging it
+            // translates the whole instance.
+            Geom::BlockRef(br) => vec![(br.insert, GripRole::BlockInsert)],
         }
     }
 
@@ -2730,6 +2925,12 @@ impl Geom {
                     kind: new_kind, style: d.style, text_override: d.text_override.clone(),
                 })
             }
+            // BlockRef — the insertion grip carries the whole instance.
+            (Geom::BlockRef(br), GripRole::BlockInsert) => {
+                Geom::BlockRef(crate::block::BlockRef {
+                    insert: new_pos, ..*br
+                })
+            }
             // Mismatched (role, geom) — return unchanged.
             (g, _) => g.clone(),
         }
@@ -2786,6 +2987,115 @@ pub fn polyline_segments(p: &Polyline) -> Vec<Geom> {
 // local outward normal. Sign chosen from `side` projected onto the normal
 // at the first sample.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Polyline offset — segment-offset + corner-intersection (AutoCAD OFFSET).
+//
+// Each segment is offset to ONE consistent hand (left/right of the directed
+// polyline, decided from where the user clicked). Straight segments shift
+// along their normal; arc (bulge) segments become CONCENTRIC arcs (radius
+// ±dist, same swept angle → same bulge). Adjacent straight offsets are
+// joined at their true line-line intersection (miter); joints touching an
+// arc fall back to the midpoint of the two offset ends (exact for tangent
+// joints, close otherwise). Self-intersection trimming is NOT done (matches
+// a plain OFFSET — the user trims afterwards if needed).
+// ---------------------------------------------------------------------------
+
+/// Point-to-segment distance — used only to find the nearest segment when
+/// resolving which hand the click is on.
+fn point_seg_dist(p: Vec2, a: Vec2, b: Vec2) -> f64 {
+    let d = b - a;
+    let l2 = d.len_sq();
+    if l2 < EPS { return p.dist(a); }
+    let t = ((p - a).dot(d) / l2).clamp(0.0, 1.0);
+    p.dist(a + d * t)
+}
+
+/// Intersection of the infinite lines (p0 + t·d0) and (p1 + s·d1). `None`
+/// when (near-)parallel.
+fn line_line_inf(p0: Vec2, d0: Vec2, p1: Vec2, d1: Vec2) -> Option<Vec2> {
+    let denom = d0.x * d1.y - d0.y * d1.x;
+    if denom.abs() < 1e-12 { return None; }
+    let dp = p1 - p0;
+    let t = (dp.x * d1.y - dp.y * d1.x) / denom;
+    Some(p0 + d0 * t)
+}
+
+fn offset_polyline(p: &Polyline, dist: f64, side: Vec2) -> Result<Geom, &'static str> {
+    let v = &p.vertices;
+    let n = v.len();
+    if n < 2 { return Err("offset: polyline needs ≥ 2 vertices"); }
+    let seg_count = if p.closed { n } else { n - 1 };
+    let amt = dist.abs();
+
+    // --- 1. global hand from the nearest segment's chord ---
+    let mut best = (f64::INFINITY, 0usize);
+    for i in 0..seg_count {
+        let a = v[i].pos;
+        let b = v[(i + 1) % n].pos;
+        let d = point_seg_dist(side, a, b);
+        if d < best.0 { best = (d, i); }
+    }
+    let na = v[best.1].pos;
+    let nb = v[(best.1 + 1) % n].pos;
+    if (nb - na).len() < EPS { return Err("offset: zero-length polyline segment"); }
+    let left = (nb - na).perp().normalized();
+    let mid  = (na + nb) * 0.5;
+    let hand = if (side - mid).dot(left) >= 0.0 { 1.0 } else { -1.0 };
+    let off  = amt * hand;   // signed offset toward the clicked hand (+ = left)
+
+    // --- 2. per-segment offset geometry ---
+    struct OffSeg { a: Vec2, b: Vec2, bulge: f64, line: bool, dir: Vec2 }
+    let mut segs: Vec<OffSeg> = Vec::with_capacity(seg_count);
+    for i in 0..seg_count {
+        let a = v[i].pos;
+        let b = v[(i + 1) % n].pos;
+        let bulge = v[i].bulge;
+        if bulge.abs() < 1e-9 {
+            let dir = b - a;
+            if dir.len() < EPS { return Err("offset: zero-length polyline segment"); }
+            let shift = dir.perp().normalized() * off;
+            segs.push(OffSeg { a: a + shift, b: b + shift, bulge: 0.0,
+                               line: true, dir: dir.normalized() });
+        } else {
+            let Some((c, r, _sa, sweep)) = bulge_arc(a, b, bulge) else {
+                return Err("offset: degenerate arc segment");
+            };
+            let s_arc = if sweep >= 0.0 { 1.0 } else { -1.0 };
+            let rp = r - hand * s_arc * amt;   // concentric radius
+            if rp <= EPS { return Err("offset: arc segment collapses"); }
+            let scale = rp / r;
+            segs.push(OffSeg {
+                a: c + (a - c) * scale,
+                b: c + (b - c) * scale,
+                bulge,                 // same swept angle → same bulge
+                line: false, dir: Vec2::ZERO,
+            });
+        }
+    }
+
+    // --- 3. join into a vertex list ---
+    let join = |s0: &OffSeg, s1: &OffSeg| -> Vec2 {
+        if s0.line && s1.line {
+            if let Some(p) = line_line_inf(s0.a, s0.dir, s1.a, s1.dir) { return p; }
+        }
+        (s0.b + s1.a) * 0.5
+    };
+    let mut out: Vec<PolyVertex> = Vec::with_capacity(n);
+    if p.closed {
+        for i in 0..seg_count {
+            let prev = (i + seg_count - 1) % seg_count;
+            out.push(PolyVertex { pos: join(&segs[prev], &segs[i]), bulge: segs[i].bulge });
+        }
+    } else {
+        out.push(PolyVertex { pos: segs[0].a, bulge: segs[0].bulge });
+        for i in 1..seg_count {
+            out.push(PolyVertex { pos: join(&segs[i - 1], &segs[i]), bulge: segs[i].bulge });
+        }
+        out.push(PolyVertex { pos: segs[seg_count - 1].b, bulge: 0.0 });
+    }
+    Ok(Geom::Polyline(Polyline { vertices: out, closed: p.closed }))
+}
+
 fn offset_ellipse_samples(
     el: Ellipse,
     t_start: f64,
@@ -2908,26 +3218,28 @@ pub fn fillet_lines(
     let bis = bis_raw / bis_raw.len();
     let center = i_pt + bis * (radius / (theta / 2.0).sin());
 
-    // Pick start_angle / sweep so that the midpoint of the arc lies on the
-    // bisector between I and `center` (i.e. on the corner side, not the far
-    // side). Both CCW candidates have the same magnitude (π - θ); only the
-    // start endpoint differs.
+    // The fillet arc is the MINOR arc between the two tangent points
+    // (central angle π − θ). Because I lies OUTSIDE the circle (its distance
+    // r/sin(θ/2) > r), the minor arc is the one whose chord faces I — i.e.
+    // it always bulges toward the corner vertex, giving the rounded inside
+    // corner. We render arcs CCW (positive sweep), so the only decision is
+    // which tangent point is the START such that a CCW sweep of π − θ stays
+    // on that minor arc:
+    //   d_ccw = CCW angle from tp1 to tp2. If d_ccw ≤ π the minor arc runs
+    //   CCW from tp1; otherwise it runs CCW from tp2 (CW from tp1), so start
+    //   there. sweep is always the minor magnitude π − θ.
+    //
+    // (The previous heuristic rotated v1 toward the I-direction and accepted
+    // on `dot > 0` — a 90°-wide window that mis-fired for non-right corners,
+    // e.g. θ = 120°, rendering the arc sweeping the wrong way out of the
+    // corner. It only happened to be correct at θ = 90°.)
     let arc_angle = std::f64::consts::PI - theta;
     let v1 = tp1 - center;
     let v2 = tp2 - center;
-    let mid_dir_expected = (i_pt - center) / (i_pt - center).len();
-    // Rotate v1 CCW by arc_angle/2 and see if it lines up with expected mid.
-    let s = arc_angle * 0.5;
-    let mid_v_ccw_from_1 = Vec2::new(
-        v1.x * s.cos() - v1.y * s.sin(),
-        v1.x * s.sin() + v1.y * s.cos(),
-    );
-    let dot_from_1 = (mid_v_ccw_from_1 / mid_v_ccw_from_1.len()).dot(mid_dir_expected);
-    let start_angle = if dot_from_1 > 0.0 {
-        v1.angle().rem_euclid(std::f64::consts::TAU)
-    } else {
-        v2.angle().rem_euclid(std::f64::consts::TAU)
-    };
+    let a1 = v1.angle().rem_euclid(std::f64::consts::TAU);
+    let a2 = v2.angle().rem_euclid(std::f64::consts::TAU);
+    let d_ccw = (a2 - a1).rem_euclid(std::f64::consts::TAU);
+    let start_angle = if d_ccw <= std::f64::consts::PI { a1 } else { a2 };
     let arc = Geom::Arc(Arc {
         center,
         radius,
@@ -3319,6 +3631,53 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(a.center.y, 1.0));
             assert!(approx_eq(a.sweep_angle, std::f64::consts::FRAC_PI_2));
         } else { panic!("arc not an Arc") }
+    }
+
+    #[test]
+    fn fillet_obtuse_120deg_arc_bulges_toward_corner() {
+        // L1 along +X, L2 along 120° — an obtuse (θ = 120°) corner at the
+        // origin. Regression for the arc-DIRECTION bug: the rounded corner
+        // must bulge TOWARD the corner vertex I, not sweep out the far side.
+        // The old `dot > 0` start-angle heuristic mis-fired here and rendered
+        // the arc on the wrong side (only θ = 90° happened to be correct).
+        use std::f64::consts::PI;
+        let theta = 2.0 * PI / 3.0;                       // 120°
+        let dir2  = Vec2::new(theta.cos(), theta.sin());
+        let l1 = ln(0.0, 0.0, 10.0, 0.0);
+        let l2 = Line { a: Vec2::new(0.0, 0.0), b: dir2 * 10.0 };
+        let p1 = Vec2::new(8.0, 0.0);
+        let p2 = dir2 * 8.0;
+        let r  = 2.0;
+        let out = fillet_lines(&l1, p1, &l2, p2, r).unwrap();
+
+        // Expected geometry from first principles.
+        let t      = r / (theta / 2.0).tan();
+        let tp1    = Vec2::new(t, 0.0);
+        let tp2    = dir2 * t;
+        let bis    = Vec2::new(1.0, 0.0) + dir2;
+        let center = bis / bis.len() * (r / (theta / 2.0).sin());
+        let i_pt   = Vec2::new(0.0, 0.0);
+        let mid_exp = center + (i_pt - center) / (i_pt - center).len() * r;
+
+        let Geom::Arc(a) = out.arc.expect("expected an arc") else { panic!("not an arc") };
+        let pt = |ang: f64| Vec2::new(
+            a.center.x + a.radius * ang.cos(),
+            a.center.y + a.radius * ang.sin());
+        let start = pt(a.start_angle);
+        let end   = pt(a.start_angle + a.sweep_angle);
+        let mid   = pt(a.start_angle + a.sweep_angle * 0.5);
+        let close = |p: Vec2, q: Vec2| approx_eq(p.x, q.x) && approx_eq(p.y, q.y);
+
+        assert!(approx_eq(a.sweep_angle, PI - theta), "sweep should be π−θ (60°)");
+        assert!(close(a.center, center), "center {:?} != {:?}", a.center, center);
+        // Endpoints land on the two tangent points (either traversal order).
+        assert!(
+            (close(start, tp1) && close(end, tp2)) ||
+            (close(start, tp2) && close(end, tp1)),
+            "arc endpoints {:?},{:?} should be tangent pts {:?},{:?}", start, end, tp1, tp2);
+        // Midpoint bulges toward the corner vertex I (the bug put it on the
+        // opposite side of the circle).
+        assert!(close(mid, mid_exp), "arc mid {:?} should bulge toward I ({:?})", mid, mid_exp);
     }
 
     #[test]
@@ -3768,6 +4127,32 @@ mod fillet_chamfer_join_tests {
         assert!(min.y > 3.0, "bottom NOT swept → min.y ~3.54 (not -5), got {}", min.y);
         assert!((max.x - 3.5355).abs() < 1e-3, "max.x from endpoint, got {}", max.x);
         assert!((min.x + 3.5355).abs() < 1e-3, "min.x from endpoint, got {}", min.x);
+    }
+
+    #[test]
+    fn curved_wall_faces_meet_tangent_straight_wall_exactly() {
+        // Straight wall along +x ending at (10,0); tangent CCW quarter-arc
+        // wall (10,0) → (15,5), centre (10,5), r=5 (bulge = tan(90°/4)).
+        // This is exactly the configuration `fillet r>0` on two walls
+        // produces. The curved wall's FIRST face points must coincide with
+        // the straight wall's END face points — the old chord-normal
+        // offsetting left a ≈(t/2)·sweep/(2·steps) gap here.
+        let b = (std::f64::consts::FRAC_PI_2 / 4.0).tan();
+        let s = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 0.3, style: 0, bulge: 0.0 };
+        let c = Wall { start: Vec2::new(10.0, 0.0), end: Vec2::new(15.0, 5.0),
+                       thickness: 0.3, style: 0, bulge: b };
+        let (sl, sr) = s.face_polylines(1).unwrap();
+        let (cl, cr) = c.face_polylines(28).unwrap();
+        let gap_l = (sl[1] - cl[0]).len();
+        let gap_r = (sr[1] - cr[0]).len();
+        assert!(gap_l < 1e-9, "left-face gap at tangent joint: {}", gap_l);
+        assert!(gap_r < 1e-9, "right-face gap at tangent joint: {}", gap_r);
+        // Faces must be true concentric arcs: inner radius 5−0.15,
+        // outer 5+0.15, for every sample.
+        let centre = Vec2::new(10.0, 5.0);
+        for p in &cl { assert!(((  *p - centre).len() - 4.85).abs() < 1e-9); }
+        for p in &cr { assert!(((  *p - centre).len() - 5.15).abs() < 1e-9); }
     }
 
     #[test]

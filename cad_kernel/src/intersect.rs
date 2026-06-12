@@ -82,6 +82,10 @@ pub fn intersect(a: &Geom, b: &Geom) -> Vec<Vec2> {
         // Dimension ∩ anything: dimensions are annotations, not
         // boundary curves; no meaningful intersection contribution.
         (Dimension(_), _) | (_, Dimension(_)) => Vec::new(),
+
+        // BlockRef ∩ anything: contents resolve through the Document,
+        // which intersect() can't reach. Empty (explode to intersect).
+        (BlockRef(_), _) | (_, BlockRef(_)) => Vec::new(),
     }
 }
 

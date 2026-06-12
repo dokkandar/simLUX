@@ -209,7 +209,7 @@ impl Dim {
 // cryptic short-name convention is reserved for app-level settings
 // (UserEnv); per-entity style data uses readable names.
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct DimStyle {
     pub name:                String,
 

@@ -60,7 +60,11 @@ use cad_kernel::{
 };
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
-const VERSION: u16  = 1;
+// v2: + blocks table (after dobjects) and geom tag 12 = BlockRef. The
+// reader accepts ANY version <= VERSION and skips sections newer files
+// would have — old drawings keep loading.
+// v3: + block `smart` flag, + text/dim/wall style tables (after blocks).
+const VERSION: u16  = 3;
 
 // =============================================================================
 //   WRITER
@@ -76,8 +80,159 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_layer_table(&mut w, &doc.layers, &doc.truecolors);
     write_pen_table(&mut w, &doc.pens, &doc.truecolors);
     write_dobjects(&mut w, &doc.dobjects, &doc.truecolors);
+    write_block_table(&mut w, &doc.blocks, &doc.truecolors);   // v2
+    // v3 — full style tables so a re-opened drawing keeps its wall poché
+    // fill, dim styling, and text styles (previously reset to defaults).
+    write_text_style_table(&mut w, &doc.text_styles);
+    write_dim_style_table(&mut w, &doc.dim_styles);
+    write_wall_style_table(&mut w, &doc.wall_styles);
 
     w
+}
+
+/// v2 — block definitions. Per block: name, base point, then the
+/// contained dobjects in the SAME framing as the document list (so the
+/// dobject reader/writer is reused verbatim, nested blocks included).
+fn write_block_table(
+    w: &mut Vec<u8>,
+    blocks: &cad_kernel::BlockTable,
+    tc: &cad_kernel::TrueColorTable,
+) {
+    write_u32(w, blocks.blocks.len() as u32);
+    for b in &blocks.blocks {
+        write_str(w, &b.name);
+        write_vec2(w, b.base);
+        write_u8(w, b.smart as u8);          // v3
+        write_dobjects(w, &b.dobjects, tc);
+    }
+}
+
+// =============================================================================
+//   v3 STYLE TABLES — text / dim / wall
+//
+// DimStyle has ~75 fields, so the field list lives in ONE place (the
+// `dim_style_fields!` macro) and drives BOTH the writer and the reader.
+// That makes a read/write order mismatch impossible — add a field once and
+// both sides pick it up. Type tag legend: str / f64 / bool / i32 / u32 /
+// i16 / char.
+// =============================================================================
+
+macro_rules! dim_style_fields {
+    ($m:ident, $a:expr, $b:expr) => {
+        $m!($a, $b, name, str);
+        $m!($a, $b, arrow_size, f64);
+        $m!($a, $b, arrow_block, str);
+        $m!($a, $b, arrow_block_1, str);
+        $m!($a, $b, arrow_block_2, str);
+        $m!($a, $b, separate_arrows, bool);
+        $m!($a, $b, leader_block, str);
+        $m!($a, $b, tick_size, f64);
+        $m!($a, $b, arrow_filled, bool);
+        $m!($a, $b, text_height, f64);
+        $m!($a, $b, text_gap, f64);
+        $m!($a, $b, text_style_name, str);
+        $m!($a, $b, text_vert_pos, i32);
+        $m!($a, $b, text_horiz_just, i32);
+        $m!($a, $b, text_vert_offset, f64);
+        $m!($a, $b, text_inside_horiz, bool);
+        $m!($a, $b, text_outside_horiz, bool);
+        $m!($a, $b, text_force_inside, bool);
+        $m!($a, $b, text_force_dimline, bool);
+        $m!($a, $b, text_user_positioned, bool);
+        $m!($a, $b, text_move_rule, i32);
+        $m!($a, $b, linear_unit_format, i32);
+        $m!($a, $b, decimal_places, i32);
+        $m!($a, $b, rounding, f64);
+        $m!($a, $b, zero_suppress, i32);
+        $m!($a, $b, fraction_format, i32);
+        $m!($a, $b, decimal_separator, char);
+        $m!($a, $b, linear_scale, f64);
+        $m!($a, $b, linear_post, str);
+        $m!($a, $b, alt_units_enabled, bool);
+        $m!($a, $b, alt_unit_format, i32);
+        $m!($a, $b, alt_decimal_places, i32);
+        $m!($a, $b, alt_scale, f64);
+        $m!($a, $b, alt_rounding, f64);
+        $m!($a, $b, alt_zero_suppress, i32);
+        $m!($a, $b, alt_post, str);
+        $m!($a, $b, arc_length_symbol, i32);
+        $m!($a, $b, angular_unit_format, i32);
+        $m!($a, $b, angular_decimal_places, i32);
+        $m!($a, $b, angular_zero_suppress, i32);
+        $m!($a, $b, tolerance_enabled, bool);
+        $m!($a, $b, tolerance_plus, f64);
+        $m!($a, $b, tolerance_minus, f64);
+        $m!($a, $b, tolerance_decimal_places, i32);
+        $m!($a, $b, tolerance_text_scale, f64);
+        $m!($a, $b, tolerance_vert_just, i32);
+        $m!($a, $b, tolerance_zero_suppress, i32);
+        $m!($a, $b, limits_enabled, bool);
+        $m!($a, $b, alt_tolerance_decimal_places, i32);
+        $m!($a, $b, alt_tolerance_zero_suppress, i32);
+        $m!($a, $b, ext_line_extend, f64);
+        $m!($a, $b, ext_line_offset, f64);
+        $m!($a, $b, ext_suppress_1, bool);
+        $m!($a, $b, ext_suppress_2, bool);
+        $m!($a, $b, ext_fixed_length, f64);
+        $m!($a, $b, ext_fixed_length_on, bool);
+        $m!($a, $b, ext_linetype_1, str);
+        $m!($a, $b, ext_linetype_2, str);
+        $m!($a, $b, dim_line_extend, f64);
+        $m!($a, $b, dim_line_baseline_inc, f64);
+        $m!($a, $b, dim_suppress_1, bool);
+        $m!($a, $b, dim_suppress_2, bool);
+        $m!($a, $b, dim_suppress_outside, bool);
+        $m!($a, $b, dim_linetype, str);
+        $m!($a, $b, color_dim_line, u32);
+        $m!($a, $b, color_ext_line, u32);
+        $m!($a, $b, color_text, u32);
+        $m!($a, $b, text_fill_mode, i32);
+        $m!($a, $b, text_fill_color, u32);
+        $m!($a, $b, lineweight_dim_line, i16);
+        $m!($a, $b, lineweight_ext_line, i16);
+        $m!($a, $b, overall_scale, f64);
+        $m!($a, $b, center_mark_size, f64);
+        $m!($a, $b, jog_angle, f64);
+        $m!($a, $b, arrow_text_fit, i32);
+    };
+}
+
+fn write_text_style_table(w: &mut Vec<u8>, t: &cad_kernel::TextStyleTable) {
+    write_u32(w, t.styles.len() as u32);
+    for s in &t.styles {
+        write_str(w, &s.name);
+        write_str(w, &s.font_name);
+        write_f64(w, s.width_factor);
+        write_f64(w, s.oblique);
+        write_f64(w, s.default_height);
+    }
+}
+
+fn write_wall_style_table(w: &mut Vec<u8>, t: &cad_kernel::WallStyleTable) {
+    write_u32(w, t.styles.len() as u32);
+    for s in &t.styles {
+        write_str(w, &s.name);
+        write_f64(w, s.thickness);
+        write_u32(w, s.fill_color);
+        write_u32(w, s.face_color);
+        write_str(w, &s.description);
+    }
+}
+
+fn write_dim_style_table(w: &mut Vec<u8>, t: &cad_kernel::DimStyleTable) {
+    write_u32(w, t.styles.len() as u32);
+    for s in &t.styles {
+        macro_rules! wf {
+            ($w:expr, $s:expr, $f:ident, str)  => { write_str($w, &$s.$f); };
+            ($w:expr, $s:expr, $f:ident, f64)  => { write_f64($w, $s.$f); };
+            ($w:expr, $s:expr, $f:ident, bool) => { write_u8($w, $s.$f as u8); };
+            ($w:expr, $s:expr, $f:ident, i32)  => { write_u32($w, $s.$f as u32); };
+            ($w:expr, $s:expr, $f:ident, u32)  => { write_u32($w, $s.$f); };
+            ($w:expr, $s:expr, $f:ident, i16)  => { write_u16($w, $s.$f as u16); };
+            ($w:expr, $s:expr, $f:ident, char) => { write_u32($w, $s.$f as u32); };
+        }
+        dim_style_fields!(wf, w, s);
+    }
 }
 
 fn write_u16(w: &mut Vec<u8>, v: u16) { w.extend_from_slice(&v.to_le_bytes()); }
@@ -264,11 +419,15 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             }
         }
         Geom::Wall(wall) => {
-            // tag 9 = Wall; centerline + thickness.
+            // tag 9 = Wall; centerline + thickness + (v3) style + bulge.
+            // Without style the poché-fill wall-style link was lost on
+            // reopen; without bulge curved walls reopened straight.
             write_u8(w, 9);
             write_vec2(w, wall.start);
             write_vec2(w, wall.end);
             write_f64(w, wall.thickness);
+            write_u32(w, wall.style);     // v3
+            write_f64(w, wall.bulge);     // v3
         }
         Geom::Text(t) => {
             // tag 10 = Text.
@@ -325,6 +484,15 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
             }
             write_u32(w, d.style);
             write_str(w, d.text_override.as_deref().unwrap_or(""));
+        }
+        Geom::BlockRef(br) => {
+            // tag 12 = BlockRef (v2): block id + insert + uniform scale
+            // + rotation.
+            write_u8(w, 12);
+            write_u32(w, br.block);
+            write_vec2(w, br.insert);
+            write_f64(w, br.scale);
+            write_f64(w, br.rotation);
         }
     }
 }
@@ -386,28 +554,39 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     let _embedded_ver = magic[3];   // historic; today we read VERSION below
     let ver = r.u16()?;
     let _pad = r.u16()?;
-    if ver != VERSION {
-        return Err(format!("RSM: unsupported version {} (this build only reads v{})", ver, VERSION));
+    if ver > VERSION {
+        return Err(format!(
+            "RSM: file version {} is newer than this build reads (v{})",
+            ver, VERSION));
     }
 
     let linetypes  = read_linetype_table(&mut r)?;
     let mut truecolors = cad_kernel::TrueColorTable::new();
     let layers    = read_layer_table(&mut r, &mut truecolors)?;
     let pens      = read_pen_table(&mut r, &mut truecolors)?;
-    let dobjects  = read_dobjects(&mut r, &mut truecolors)?;
+    let dobjects  = read_dobjects(&mut r, &mut truecolors, ver)?;
+    // v2 — block definitions. v1 files simply have no blocks section.
+    let blocks = if ver >= 2 {
+        read_block_table(&mut r, &mut truecolors, ver)?
+    } else {
+        cad_kernel::BlockTable::default()
+    };
 
-    // text_styles not yet round-tripped in RSM — initialise to defaults.
-    // Whole-table serialisation lands when TextStyle gets DXF mapping.
-    let text_styles = cad_kernel::TextStyleTable::with_defaults();
+    // v3 — full style tables. Older files (v<3) had no style sections, so
+    // synthesize the default tables (which is what those files relied on).
+    let (text_styles, dim_styles, wall_styles) = if ver >= 3 {
+        let t = read_text_style_table(&mut r)?;
+        let d = read_dim_style_table(&mut r)?;
+        let wl = read_wall_style_table(&mut r)?;
+        (t, d, wl)
+    } else {
+        (cad_kernel::TextStyleTable::with_defaults(),
+         cad_kernel::DimStyleTable::default(),
+         cad_kernel::WallStyleTable::default())
+    };
     Ok(Document {
-        dobjects, layers, linetypes, pens, truecolors, text_styles,
-        // dim_styles: not yet round-tripped in the RSM binary format.
-        // Persisting the full ~70-DIMVAR table will land with the DXF
-        // serializer pass.
-        dim_styles: Default::default(),
-        // wall_styles: same — not round-tripped yet; reader synthesizes
-        // the STANDARD table. Walls read below default style=0/bulge=0.
-        wall_styles: Default::default(),
+        dobjects, layers, linetypes, pens, truecolors,
+        text_styles, dim_styles, wall_styles, blocks,
     })
 }
 
@@ -479,7 +658,7 @@ fn read_pen_table(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<PenT
     Ok(PenTable { pens })
 }
 
-fn read_dobjects(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Vec<DObject>, String> {
+fn read_dobjects(r: &mut R, tc: &mut cad_kernel::TrueColorTable, ver: u16) -> Result<Vec<DObject>, String> {
     let n = r.u32()? as usize;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
@@ -490,7 +669,7 @@ fn read_dobjects(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Vec<D
         let lt_scale  = r.f32()?;
         let lineweight= read_lineweight(r)?;
         let visible   = r.u8()? != 0;
-        let geom      = read_geom(r)?;
+        let geom      = read_geom(r, ver)?;
         out.push(DObject {
             handle,
             style: Style {
@@ -503,7 +682,83 @@ fn read_dobjects(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Vec<D
     Ok(out)
 }
 
-fn read_geom(r: &mut R) -> Result<Geom, String> {
+/// v2 — block definitions (mirror of `write_block_table`). `ver` selects
+/// the per-block layout: v3 carries the `smart` flag, v2 doesn't.
+fn read_block_table(
+    r: &mut R,
+    tc: &mut cad_kernel::TrueColorTable,
+    ver: u16,
+) -> Result<cad_kernel::BlockTable, String> {
+    let n = r.u32()? as usize;
+    let mut blocks = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name     = r.str()?;
+        let base     = r.vec2()?;
+        let smart    = if ver >= 3 { r.u8()? != 0 } else { false };
+        let dobjects = read_dobjects(r, tc, ver)?;
+        blocks.push(cad_kernel::Block { name, base, dobjects, smart });
+    }
+    Ok(cad_kernel::BlockTable { blocks })
+}
+
+/// v3 — text style table (mirror of `write_text_style_table`).
+fn read_text_style_table(r: &mut R) -> Result<cad_kernel::TextStyleTable, String> {
+    let n = r.u32()? as usize;
+    let mut styles = Vec::with_capacity(n);
+    for _ in 0..n {
+        styles.push(cad_kernel::TextStyle {
+            name:           r.str()?,
+            font_name:      r.str()?,
+            width_factor:   r.f64()?,
+            oblique:        r.f64()?,
+            default_height: r.f64()?,
+        });
+    }
+    Ok(cad_kernel::TextStyleTable { styles })
+}
+
+/// v3 — wall style table (mirror of `write_wall_style_table`).
+fn read_wall_style_table(r: &mut R) -> Result<cad_kernel::WallStyleTable, String> {
+    let n = r.u32()? as usize;
+    let mut styles = Vec::with_capacity(n);
+    for _ in 0..n {
+        styles.push(cad_kernel::WallStyle {
+            name:        r.str()?,
+            thickness:   r.f64()?,
+            fill_color:  r.u32()?,
+            face_color:  r.u32()?,
+            description: r.str()?,
+        });
+    }
+    Ok(cad_kernel::WallStyleTable { styles })
+}
+
+/// v3 — dim style table (mirror of `write_dim_style_table`; same field
+/// order via the shared `dim_style_fields!` macro). Reads into a STANDARD
+/// base then overwrites every field.
+fn read_dim_style_table(r: &mut R) -> Result<cad_kernel::DimStyleTable, String> {
+    let n = r.u32()? as usize;
+    let mut styles = Vec::with_capacity(n);
+    for _ in 0..n {
+        let mut s = cad_kernel::DimStyle::standard();
+        macro_rules! rf {
+            ($r:expr, $s:expr, $f:ident, str)  => { $s.$f = $r.str()?; };
+            ($r:expr, $s:expr, $f:ident, f64)  => { $s.$f = $r.f64()?; };
+            ($r:expr, $s:expr, $f:ident, bool) => { $s.$f = $r.u8()? != 0; };
+            ($r:expr, $s:expr, $f:ident, i32)  => { $s.$f = $r.u32()? as i32; };
+            ($r:expr, $s:expr, $f:ident, u32)  => { $s.$f = $r.u32()?; };
+            ($r:expr, $s:expr, $f:ident, i16)  => { $s.$f = $r.u16()? as i16; };
+            ($r:expr, $s:expr, $f:ident, char) => {
+                $s.$f = char::from_u32($r.u32()?).unwrap_or('.');
+            };
+        }
+        dim_style_fields!(rf, r, s);
+        styles.push(s);
+    }
+    Ok(cad_kernel::DimStyleTable { styles })
+}
+
+fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
     Ok(match r.u8()? {
         0 => Geom::Line(Line { a: r.vec2()?, b: r.vec2()? }),
         1 => Geom::Circle(Circle { center: r.vec2()?, radius: r.f64()? }),
@@ -560,11 +815,19 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
             for _ in 0..n { weights.push(r.f64()?); }
             Geom::Spline(Spline { degree, control_points, weights })
         }
-        9 => Geom::Wall(Wall {
-            start: r.vec2()?, end: r.vec2()?, thickness: r.f64()?,
-            // style + bulge not yet in the RSM stream — default them.
-            style: 0, bulge: 0.0,
-        }),
+        9 => {
+            let start = r.vec2()?;
+            let end   = r.vec2()?;
+            let thickness = r.f64()?;
+            // v3 added style (wall-style link → poché fill) + bulge
+            // (curved walls). v2 files have neither — default them.
+            let (style, bulge) = if ver >= 3 {
+                (r.u32()?, r.f64()?)
+            } else {
+                (0, 0.0)
+            };
+            Geom::Wall(Wall { start, end, thickness, style, bulge })
+        }
         10 => {
             let position = r.vec2()?;
             let height   = r.f64()?;
@@ -618,6 +881,13 @@ fn read_geom(r: &mut R) -> Result<Geom, String> {
             let text_override = if override_s.is_empty() { None } else { Some(override_s) };
             Geom::Dimension(Dim { kind, style, text_override })
         }
+        12 => {
+            let block    = r.u32()?;
+            let insert   = r.vec2()?;
+            let scale    = r.f64()?;
+            let rotation = r.f64()?;
+            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, rotation })
+        }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
 }
@@ -633,6 +903,144 @@ mod tests {
     fn round_trip(doc: &Document) -> Document {
         let bytes = write_rsm(doc);
         read_rsm(&bytes).expect("rsm round-trip")
+    }
+
+    #[test]
+    fn blocks_round_trip() {
+        // A block definition (line + circle), one instance with a full
+        // similarity transform, plus a NESTED instance inside a second
+        // block — name/base/contents and every BlockRef field must
+        // survive the v2 save/load.
+        let mut doc = Document::default();
+        let contents = vec![
+            cad_kernel::DObject::new(Geom::Line(Line {
+                a: Vec2::new(0.0, 0.0), b: Vec2::new(4.0, 0.0) })),
+            cad_kernel::DObject::new(Geom::Circle(Circle {
+                center: Vec2::new(2.0, 1.0), radius: 0.5 })),
+        ];
+        let id = doc.blocks.add(cad_kernel::Block {
+            name: "CHAIR".into(), base: Vec2::new(2.0, 0.0),
+            dobjects: contents, smart: false,
+        });
+        let inner = vec![cad_kernel::DObject::new(Geom::BlockRef(
+            cad_kernel::BlockRef {
+                block: id, insert: Vec2::new(1.0, 1.0),
+                scale: 0.5, rotation: 0.25,
+            }))];
+        doc.blocks.add(cad_kernel::Block {
+            name: "DESK_SET".into(), base: Vec2::ZERO, dobjects: inner, smart: false,
+        });
+        doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
+            block: id, insert: Vec2::new(10.0, -3.0),
+            scale: 2.0, rotation: std::f64::consts::FRAC_PI_4,
+        })));
+
+        let back = round_trip(&doc);
+        assert_eq!(back.blocks.len(), 2);
+        let blk = back.blocks.get(0).expect("block 0");
+        assert_eq!(blk.name, "CHAIR");
+        assert!((blk.base - Vec2::new(2.0, 0.0)).len() < 1e-12);
+        assert_eq!(blk.dobjects.len(), 2);
+        let nested = back.blocks.get(1).expect("block 1");
+        let Geom::BlockRef(nb) = &nested.dobjects[0].geom else {
+            panic!("nested blockref lost") };
+        assert_eq!(nb.block, id);
+        assert!((nb.scale - 0.5).abs() < 1e-12);
+        let Geom::BlockRef(br) = &back.dobjects[0].geom else {
+            panic!("instance lost") };
+        assert_eq!(br.block, id);
+        assert!((br.insert - Vec2::new(10.0, -3.0)).len() < 1e-12);
+        assert!((br.scale - 2.0).abs() < 1e-12);
+        assert!((br.rotation - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+    }
+
+    #[test]
+    fn style_tables_round_trip() {
+        // Regression for "saved wall poché fill lost on reopen": the wall
+        // style table (incl. fill_color), dim styles, text styles, and the
+        // block `smart` flag must all survive a v3 save/load.
+        let mut doc = Document::default();
+
+        // Wall style WITH a solid fill (the reported bug), + a wall on it.
+        let ws_id = doc.wall_styles.add(cad_kernel::WallStyle {
+            name: "STRUCTURAL".into(), thickness: 0.35,
+            fill_color: 8, face_color: 7, description: "load-bearing".into(),
+        });
+        doc.push(DObject::new(Geom::Wall(cad_kernel::Wall {
+            start: Vec2::new(0.0, 0.0), end: Vec2::new(5.0, 0.0),
+            thickness: 0.35, style: ws_id, bulge: 0.0,
+        })));
+        // A CURVED wall (bulge ≠ 0) — must reopen curved, not straight.
+        doc.push(DObject::new(Geom::Wall(cad_kernel::Wall {
+            start: Vec2::new(0.0, 5.0), end: Vec2::new(5.0, 5.0),
+            thickness: 0.2, style: ws_id, bulge: 0.55,
+        })));
+
+        // Text style with distinct fields.
+        doc.text_styles.styles.push(cad_kernel::TextStyle {
+            name: "NOTES".into(), font_name: "romans".into(),
+            width_factor: 0.8, oblique: 0.15, default_height: 2.5,
+        });
+
+        // Dim style: STANDARD + a spread of distinct values across types so
+        // a read/write ORDER mismatch can't slip through (whole-struct eq).
+        let mut ds = cad_kernel::DimStyle::standard();
+        ds.name = "ARCH".into();
+        ds.arrow_size = 1.23;
+        ds.tick_size = 0.45;
+        ds.arrow_filled = false;
+        ds.text_height = 2.75;
+        ds.decimal_separator = ',';
+        ds.color_dim_line = 5;
+        ds.color_ext_line = 6;
+        ds.color_text = 7;
+        ds.lineweight_dim_line = -2;
+        ds.lineweight_ext_line = 35;
+        ds.ext_suppress_1 = true;
+        ds.linear_post = " mm".into();
+        ds.overall_scale = 50.0;
+        ds.text_move_rule = 2;
+        let ds_clone = ds.clone();
+        doc.dim_styles.add(ds);
+
+        // A smart block (v3 flag).
+        doc.blocks.add(cad_kernel::Block {
+            name: "SMART1".into(), base: Vec2::ZERO,
+            dobjects: vec![DObject::new(Geom::Line(Line {
+                a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) }))],
+            smart: true,
+        });
+
+        let back = round_trip(&doc);
+
+        // Wall style + fill survived; the wall still points at it.
+        let wb = back.wall_styles.get(ws_id).expect("wall style");
+        assert_eq!(wb.name, "STRUCTURAL");
+        assert_eq!(wb.fill_color, 8);
+        assert_eq!(wb.face_color, 7);
+        assert!((wb.thickness - 0.35).abs() < 1e-12);
+        let Geom::Wall(w) = &back.dobjects[0].geom else { panic!("wall lost") };
+        assert_eq!(w.style, ws_id);
+        // Curved wall kept its bulge + style.
+        let Geom::Wall(cw) = &back.dobjects[1].geom else { panic!("curved wall lost") };
+        assert!((cw.bulge - 0.55).abs() < 1e-12, "wall bulge lost");
+        assert_eq!(cw.style, ws_id);
+
+        // Text style survived.
+        let ts = back.text_styles.styles.iter()
+            .find(|s| s.name == "NOTES").expect("text style");
+        assert!((ts.width_factor - 0.8).abs() < 1e-12);
+        assert!((ts.default_height - 2.5).abs() < 1e-12);
+
+        // Dim style survived field-for-field (PartialEq catches order bugs).
+        let db = back.dim_styles.styles.iter()
+            .find(|s| s.name == "ARCH").expect("dim style");
+        assert_eq!(*db, ds_clone);
+
+        // Smart-block flag survived.
+        let sb = back.blocks.blocks.iter()
+            .find(|b| b.name == "SMART1").expect("smart block");
+        assert!(sb.smart);
     }
 
     #[test]

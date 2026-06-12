@@ -381,6 +381,9 @@ fn candidate_points(
             Geom::Text(t) => plain([t.position]),
             // Dimension — its three def points act as snap endpoints.
             Geom::Dimension(d) => plain(d.grip_points()),
+            // BlockRef — insertion point only (v1; snap-through to the
+            // contained geometry needs Document access — deferred).
+            Geom::BlockRef(br) => plain([br.insert]),
         },
         SnapKind::Mid => match e {
             Geom::Line(l) => plain([(l.a + l.b) * 0.5]),
@@ -419,6 +422,7 @@ fn candidate_points(
                 let g = d.grip_points();
                 if g.len() >= 2 { plain([(g[0] + g[1]) * 0.5]) } else { Vec::new() }
             }
+            Geom::BlockRef(_) => Vec::new(),
         },
         SnapKind::Cen => match e {
             Geom::Line(_)        => Vec::new(),
@@ -441,13 +445,16 @@ fn candidate_points(
                     DimKind::Linear { .. } => Vec::new(),
                 }
             }
+            // BlockRef CEN — the insertion point (mirrors AutoCAD's INS
+            // snap until a dedicated SnapKind::Ins exists).
+            Geom::BlockRef(br) => plain([br.insert]),
         },
         // QUA — for circles & arcs, four cardinal compass points; for
         // ellipses & elliptical arcs, the FOUR AXIS-END POINTS (ends of
         // the semi-major axis × 2 and the semi-minor axis × 2). These
         // ROTATE with the ellipse — they are NOT compass E/N/W/S.
         SnapKind::Qua => match e {
-            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) | Geom::Text(_) | Geom::Dimension(_) => Vec::new(),
+            Geom::Line(_) | Geom::Point(_) | Geom::Polyline(_) | Geom::Hatch(_) | Geom::Spline(_) | Geom::Wall(_) | Geom::Text(_) | Geom::Dimension(_) | Geom::BlockRef(_) => Vec::new(),
             Geom::Circle(c) => plain([
                 c.center + Vec2::new( c.radius, 0.0),    //   0°  east
                 c.center + Vec2::new(0.0,  c.radius),    //  90°  north
@@ -607,6 +614,8 @@ pub fn nearest_point_on(e: &Geom, p: Vec2) -> Option<Vec2> {
             }
             best.map(|(pt, _)| pt)
         }
+        // BlockRef — insertion point (contents need Document access).
+        Geom::BlockRef(br) => Some(br.insert),
     }
 }
 
@@ -727,6 +736,8 @@ pub fn perpendicular_extended(from: Vec2, geom: &Geom)
         Geom::Text(t) => vec![(t.position, None)],
         // Dimension PER — def points (anchor-less, since they're discrete).
         Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
+        // BlockRef PER — insertion point only (v1).
+        Geom::BlockRef(br) => vec![(br.insert, None)],
     }
 }
 
@@ -863,6 +874,8 @@ pub fn tangent_points_extended(from: Vec2, e: &Geom, _cursor: Vec2)
         Geom::Text(t) => vec![(t.position, None)],
         // Dimension — no tangent concept; def points as candidates.
         Geom::Dimension(d) => d.grip_points().into_iter().map(|p| (p, None)).collect(),
+        // BlockRef — no tangent concept; insertion point as candidate.
+        Geom::BlockRef(br) => vec![(br.insert, None)],
     }
 }
 

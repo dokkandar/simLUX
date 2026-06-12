@@ -123,7 +123,7 @@ pub struct UserEnv {
     /// equivalent; LibreCAD's grip "hot radius" defaults to ~20 px.
     pub GrpHvR: u8,
 
-    // ---- grid + ortho ----
+    // ---- grid + CARD ----
     /// Background grid display (AutoCAD GRIDMODE). ON = render the grid
     /// overlay; OFF = clean canvas. F7 toggles.
     pub GrdEnb: bool,
@@ -135,12 +135,15 @@ pub struct UserEnv {
     /// Grid spacing in world units (AutoCAD GRIDUNIT). Same value used
     /// for the display grid AND for snap-to-grid rounding.
     pub GrdSpc: f64,
-    /// Lock drafting orientation — AutoCAD's ORTHO mode. When ON and a
+    /// **CARD** — cardinal-directions drafting lock. When ON and a
     /// "from" point exists (line's first endpoint, move base, copy
     /// base, …), the cursor's world position is projected onto whichever
-    /// of the two axes from that anchor is closer, so the result is a
-    /// pure horizontal or vertical move. F8 toggles.
-    pub OrtEnb: bool,
+    /// of the two axes from that anchor is closer, so the result is ONLY
+    /// horizontal or vertical. Toggles: F8, the CARD status badge, or
+    /// the `card` command (`card on` / `card off`). Settings files
+    /// written before the rename used the key `OrtEnb`; the loader still
+    /// accepts it (the one permitted occurrence of the legacy name).
+    pub CrdEnb: bool,
 
     // ---- UCS indicator (origin marker) ----
     /// User Coordinate System indicator on/off (AutoCAD `UCSICON`).
@@ -224,7 +227,7 @@ impl Default for UserEnv {
             GrdEnb: true,
             GrdSnp: false,
             GrdSpc: 10.0,
-            OrtEnb: false,
+            CrdEnb: false,
             UcsIcn: true,
             UcsMod: 0,                  // corner by default
             UcsAvP: String::new(),
@@ -307,7 +310,7 @@ impl UserEnv {
         push_bool(&mut s, "GrdEnb", self.GrdEnb);
         push_bool(&mut s, "GrdSnp", self.GrdSnp);
         push_f64(&mut s, "GrdSpc", self.GrdSpc);
-        push_bool(&mut s, "OrtEnb", self.OrtEnb);
+        push_bool(&mut s, "CrdEnb", self.CrdEnb);
         let push_u16_dec = |s: &mut String, k: &str, v: u16| s.push_str(&format!("{} = {}\n", k, v));
         push_bool(&mut s, "UcsIcn", self.UcsIcn);
         push_u8(&mut s, "UcsMod", self.UcsMod);
@@ -370,7 +373,9 @@ impl UserEnv {
             "GrdEnb" => if let Some(v) = parse_bool(val) { self.GrdEnb = v; }
             "GrdSnp" => if let Some(v) = parse_bool(val) { self.GrdSnp = v; }
             "GrdSpc" => if let Ok(v) = val.parse() { self.GrdSpc = v; }
-            "OrtEnb" => if let Some(v) = parse_bool(val) { self.OrtEnb = v; }
+            // "OrtEnb" = legacy key from before the CARD rename — still
+            // accepted so old user_env.txt files keep their setting.
+            "CrdEnb" | "OrtEnb" => if let Some(v) = parse_bool(val) { self.CrdEnb = v; }
             "UcsIcn" => if let Some(v) = parse_bool(val) { self.UcsIcn = v; }
             "UcsMod" => if let Ok(v) = val.parse() { self.UcsMod = v; }
             "UcsAvP" => self.UcsAvP = val.to_string(),

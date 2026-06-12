@@ -124,7 +124,7 @@ impl Text {
 /// lives outside the kernel for v1 since rendering uses egui's bundled
 /// font; the field is preserved so DXF round-trip later round-trips the
 /// name even if we render with a different font).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TextStyle {
     pub name:           String,
     /// Font reference. For v1 just a name string ("standard"); the

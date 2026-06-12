@@ -39,6 +39,7 @@ pub mod snap;
 pub mod text;
 pub mod dim;
 pub mod wallstyle;
+pub mod block;
 
 // Convenience re-exports
 pub use math::{approx_eq, approx_zero, norm_angle, Vec2, EPS};
@@ -46,6 +47,7 @@ pub use geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Hatch, HatchPattern, Line
 pub use text::{HAlign as TextHAlign, Text, TextStyle, TextStyleTable, VAlign as TextVAlign};
 pub use dim::{Dim, DimKind, DimStyle, DimStyleTable, LinearOrtho};
 pub use wallstyle::{WallStyle, WallStyleTable};
+pub use block::{Block, BlockRef, BlockTable};
 pub use geom::{bulge_arc, bulge_from_arc};
 pub mod patterns;
 pub use geom::{ChamferOut, FilletOut, GripRole, JoinOut, chamfer_lines, fillet_lines, join_geoms};

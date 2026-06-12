@@ -139,6 +139,20 @@ pub enum Command {
     /// Open the Wall Style Manager (Dry Wall / Structural / …). With a name,
     /// pre-select / edit that wall style.
     WallStyle(Option<String>),
+    /// Create a block definition from the current selection: `block <name>`.
+    /// App flow: select (universal model) → click base point → definition
+    /// stored + selection replaced by one BlockRef instance.
+    BlockDef(Option<String>),
+    /// Place an instance of a named block: `insert <name>` → click point.
+    Insert(Option<String>),
+    /// Replace selected BlockRefs with transformed copies of their
+    /// contents (select-first like erase).
+    Explode,
+    /// CARD — cardinal-directions drafting lock (cursor constrained to
+    /// ONLY horizontal or vertical from the anchor). `card` toggles;
+    /// `card on` / `card off` set explicitly. Also on F8 and the
+    /// status-strip badge.
+    Card(Option<bool>),
     /// Lengthen every selected Line / Arc / EllipseArc by a signed delta.
     /// App captures a click on the end to extend.
     Lengthen(f64),
@@ -221,6 +235,10 @@ impl Command {
             Command::Dim                => "Dim",
             Command::DimStyle(_)        => "DimStyle",
             Command::WallStyle(_)       => "WallStyle",
+            Command::BlockDef(_)        => "BlockDef",
+            Command::Insert(_)          => "Insert",
+            Command::Explode            => "Explode",
+            Command::Card(_)            => "Card",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
             Command::ChProp(_)          => "ChProp",
@@ -255,6 +273,11 @@ pub enum ToolKind {
     Spline,
     Wall,
     Text,
+    /// Axis-aligned rectangle. The app captures two opposite corners by
+    /// click, OR — after the first corner — accepts a typed `width height`
+    /// (signed; negatives extend left/down). Committed as a CLOSED 4-vertex
+    /// Polyline (one LWPOLYLINE, matching AutoCAD RECTANG).
+    Rectangle,
 }
 
 pub fn parse(line: &str) -> Result<Command, String> {
@@ -278,6 +301,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "point"   | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
         "spline"   | "spl"          => Ok(Command::SetTool(ToolKind::Spline)),
+        "rectangle" | "rectang" | "rec" => Ok(Command::SetTool(ToolKind::Rectangle)),
         "arc"    | "a"  => parse_arc(&toks[1..]),
         "arc3p"         => parse_arc_3p(&toks[1..]),
         "arcse"         => parse_arc_se(&toks[1..]),
@@ -368,7 +392,9 @@ pub fn parse(line: &str) -> Result<Command, String> {
                 Some(s) => Ok(Command::Linetype(Some((*s).to_string()))),
             }
         }
-        "dbg" | "rec" | "recorder" => Ok(Command::DbgRecorder),
+        // NOTE: `rec` now means RECTANGLE (see above). The session recorder
+        // keeps `recorder` / `dbg`.
+        "dbg" | "recorder" => Ok(Command::DbgRecorder),
         "style" | "txtstyle" | "textstyle" => {
             // `style`        → open dialog for a NEW style
             // `style <name>` → open dialog editing the named style
@@ -386,6 +412,23 @@ pub fn parse(line: &str) -> Result<Command, String> {
         }
         "wallstyle" | "wstyle" => {
             Ok(Command::WallStyle(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "block" | "b" => {
+            Ok(Command::BlockDef(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "insert" | "i" => {
+            Ok(Command::Insert(toks.get(1).map(|s| (*s).to_string())))
+        }
+        "explode" | "xp" => Ok(Command::Explode),
+        "card" => {
+            // `card` → toggle; `card on` / `card off` → set.
+            match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {
+                None         => Ok(Command::Card(None)),
+                Some("on")  | Some("1") => Ok(Command::Card(Some(true))),
+                Some("off") | Some("0") => Ok(Command::Card(Some(false))),
+                Some(other) => Err(format!(
+                    "card: expected `on` or `off`, got '{}'", other)),
+            }
         }
         "text" | "tx" => {
             // `text`              → click position, then prompt for string
@@ -427,7 +470,7 @@ pub fn parse(line: &str) -> Result<Command, String> {
         }
         "break" | "br"    => Ok(Command::Break),
         "align"           => Ok(Command::Align),
-        "stretch" | "s"   => Ok(Command::Stretch),
+        "stretch" | "st" | "s"   => Ok(Command::Stretch),
         "trim" | "tr"     => Ok(Command::Trim),
         "extend" | "ex"   => Ok(Command::Extend),
         "fillet" | "flt" | "f" => {

@@ -594,6 +594,25 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
                 .unwrap_or(doc.dim_styles.get(0).unwrap());
             pair(s, 1, &d.formatted_text(st));
         }
+        Geom::BlockRef(br) => {
+            // V1 DXF POLICY (documented interop debt): block instances
+            // are written EXPLODED — each contained dobject transformed
+            // into world space and emitted as a plain entity. The block
+            // identity is lost in DXF (RSM keeps it); BLOCK/INSERT
+            // round-trip is the "DXF parity" roadmap item. Recursion
+            // handles nested blocks; cycles can't exist (see block.rs).
+            if let Some(blk) = doc.blocks.get(br.block) {
+                for cd in &blk.dobjects {
+                    let mut inst = cd.clone();
+                    inst.geom = br.transform_geom(&cd.geom, blk.base);
+                    // ByBlock content takes the instance's color.
+                    if matches!(inst.style.color, Color::ByBlock) {
+                        inst.style.color = d.style.color;
+                    }
+                    write_entity(s, &inst, doc);
+                }
+            }
+        }
     }
 }
 

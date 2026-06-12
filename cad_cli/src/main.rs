@@ -89,6 +89,8 @@ fn main() {
             | Ok(Command::Linetype(_)) | Ok(Command::ChProp(_)) | Ok(Command::Text(_))
             | Ok(Command::TextStyle(_)) | Ok(Command::DbgRecorder)
             | Ok(Command::Dim) | Ok(Command::DimStyle(_)) | Ok(Command::WallStyle(_))
+            | Ok(Command::BlockDef(_)) | Ok(Command::Insert(_)) | Ok(Command::Explode)
+            | Ok(Command::Card(_))
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)
@@ -173,5 +175,8 @@ fn describe(g: &Geom) -> String {
             format!("dim {} value={:.4} style={}",
                 kind_name, d.measured_value(), d.style)
         }
+        Geom::BlockRef(br) => format!(
+            "blockref #{} at ({:.4},{:.4}) scale={:.3} rot={:.4}",
+            br.block, br.insert.x, br.insert.y, br.scale, br.rotation),
     }
 }
