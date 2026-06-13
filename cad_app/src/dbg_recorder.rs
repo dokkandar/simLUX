@@ -468,6 +468,13 @@ pub struct WatchedState {
     pub stretch_state:       String,
     pub break_state:         String,
     pub lengthen_state:      String,
+    /// Block / insert POINT-PICK phases. These capture a coordinate on a
+    /// single click; if a pick "catches grips" or selects instead, the
+    /// transition here vs. the click that fired is the smoking gun.
+    pub block_def_state:     String,
+    pub insert_state:        String,
+    /// Block dialog "Pick ⊕" base-point capture in progress.
+    pub block_pick_base:     bool,
     pub grip_drag:           bool,
     pub selection:           Vec<usize>,
     /// Queued select-mode follow-up op (erase, move, hatch, …). When
@@ -587,6 +594,17 @@ pub fn diff_watched(
     diff_field!("stretch_state",     stretch_state);
     diff_field!("break_state",       break_state);
     diff_field!("lengthen_state",    lengthen_state);
+    diff_field!("block_def_state",   block_def_state);
+    diff_field!("insert_state",      insert_state);
+    if prev.block_pick_base != curr.block_pick_base {
+        rec.push(DbgEvent::StateChange {
+            state_name: "block_pick_base".into(),
+            before:     prev.block_pick_base.to_string(),
+            after:      curr.block_pick_base.to_string(),
+            cause:      "state poll (frame end)".into(),
+        }, loc);
+        n += 1;
+    }
     diff_field!("queued_op",           queued_op);
     diff_field!("armed_window_inside", armed_window_inside);
     diff_field!("window_first",        window_first);

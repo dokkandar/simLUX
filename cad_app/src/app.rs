@@ -162,10 +162,35 @@ fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
         }),
         Geom::Circle(c) if inside(c.center) =>
             Geom::Circle(Circle { center: c.center + v, radius: c.radius }),
-        Geom::Arc(a) if inside(a.center) => Geom::Arc(Arc {
-            center: a.center + v, radius: a.radius,
-            start_angle: a.start_angle, sweep_angle: a.sweep_angle,
-        }),
+        Geom::Arc(a) => {
+            let (start_pt, end_pt) = a.endpoints();
+            let c_in = inside(a.center);
+            let s_in = inside(start_pt);
+            let e_in = inside(end_pt);
+            if c_in {
+                // Center in window → translate the whole arc (shape kept).
+                Geom::Arc(Arc { center: a.center + v, ..*a })
+            } else if s_in || e_in {
+                // An ENDPOINT is in the window → it must land at end+v.
+                // Rebuild the arc through the (possibly moved) endpoints,
+                // preserving the bulge (curvature + CCW direction). Both
+                // endpoints in → both move = a pure translation.
+                let bulge = (a.sweep_angle * 0.25).tan();
+                let ns = if s_in { start_pt + v } else { start_pt };
+                let ne = if e_in { end_pt + v } else { end_pt };
+                match cad_kernel::bulge_arc(ns, ne, bulge) {
+                    Some((c, r, a0, sw)) => Geom::Arc(Arc {
+                        center: c, radius: r,
+                        start_angle: a0.rem_euclid(std::f64::consts::TAU),
+                        sweep_angle: sw,
+                    }),
+                    // Degenerate (coincident endpoints / ~straight) → leave as-is.
+                    None => g.clone(),
+                }
+            } else {
+                g.clone()
+            }
+        }
         Geom::Ellipse(e) if inside(e.center) =>
             Geom::Ellipse(Ellipse { center: e.center + v, major: e.major, ratio: e.ratio }),
         Geom::EllipseArc(ea) if inside(ea.ellipse.center) => Geom::EllipseArc(EllipseArc {
@@ -399,6 +424,9 @@ pub struct CadApp {
     /// HTML at `~/workspace/RUST_CAD/ACI_Picker_UI.html`.
     aci_picker:           crate::aci_picker::AciPickerState,
     aci_pick_request:     Option<AciPickRequest>,
+    /// Target indices for `AciPickRequest::DobjectMany` (Properties dialog
+    /// group color). Kept off the enum so `AciPickRequest` stays `Copy`.
+    aci_pick_many:        Vec<usize>,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -593,6 +621,10 @@ pub struct CadApp {
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
     dist_state:     DistState,
+    /// Properties dialog: true while a numeric/text field edit GESTURE is
+    /// in progress, so the per-change `snapshot_doc` fires once at the
+    /// start of a drag/type (one undo step per gesture, not per frame).
+    props_edit_gesture: bool,
     /// Text drafting state. While `WaitingForString`, the next cmd-line
     /// input is captured as the text body (NOT parsed as a command).
     text_draft:     TextDraftState,
@@ -1413,6 +1445,10 @@ pub enum AciPickRequest {
     Layer(LayerId),
     /// Picker is editing a dobject's color (Info palette dobject edit).
     Dobject(usize),
+    /// Picker is editing the color of MANY dobjects at once (Properties
+    /// dialog, group selection). The index list lives in
+    /// `CadApp.aci_pick_many` so this enum stays `Copy`.
+    DobjectMany,
     /// Picker is editing one of the Dim Style add/edit form's element
     /// colors (`dim_style_dialog`). The slot says which one.
     DimStyleForm(DimColorSlot),
@@ -1456,6 +1492,7 @@ impl Default for CadApp {
                 p
             },
             aci_pick_request:    None,
+            aci_pick_many:       Vec::new(),
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -1540,6 +1577,7 @@ impl Default for CadApp {
             block_dialog:    None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
+            props_edit_gesture: false,
             text_draft:     TextDraftState::Off,
             dim_draft:      DimDraftState::Off,
             pending_text:   None,
@@ -1873,6 +1911,8 @@ impl CadApp {
                     Some(base)
                 } else if let CopyState::WaitingForDest(base) = self.copy_state {
                     Some(base)
+                } else if let StretchState::WaitingForDest(_, _, base) = self.stretch_state {
+                    Some(base)
                 } else { None };
             if let Some(anchor) = dde_anchor {
                 if let Ok(dist) = trimmed.parse::<f64>() {
@@ -1896,6 +1936,12 @@ impl CadApp {
                                 {
                                     self.apply_copy(p - base);
                                     self.copy_state = CopyState::Off;
+                                    self.clear_prompt();
+                                } else if let StretchState::WaitingForDest(wmin, wmax, base)
+                                    = self.stretch_state
+                                {
+                                    self.apply_stretch(wmin, wmax, base, p);
+                                    self.stretch_state = StretchState::Off;
                                     self.clear_prompt();
                                 }
                             } else {
@@ -2763,14 +2809,19 @@ impl CadApp {
             Ok(Command::ChProp(arg)) => {
                 match arg {
                     None => {
-                        self.history.push(
-                            "  chprop — usage:".into());
-                        self.history.push(
-                            "    chprop layer <name>     change layer of selected".into());
-                        self.history.push(
-                            "    chprop color <aci>      ACI 0-256, 'bylayer', 'byblock'".into());
-                        self.history.push(
-                            "    chprop linetype <name>  Continuous / Dash / Dot / Center / …".into());
+                        // Bare `props` / `properties` / `chprop` → open the
+                        // DObject Properties dialog (edits the current
+                        // selection — single or group). The `chprop <what>
+                        // <val>` CLI form below still does a scripted set.
+                        self.info_window_open = true;
+                        let n = if !self.selection.is_empty() {
+                            self.selection.len()
+                        } else if self.selected.is_some() { 1 } else { 0 };
+                        self.history.push(if n == 0 {
+                            "  Properties — select dobject(s) to edit".into()
+                        } else {
+                            format!("  Properties — editing {} dobject(s)", n)
+                        });
                     }
                     Some((prop, val)) => {
                         if self.selection.is_empty() {
@@ -6645,6 +6696,9 @@ impl CadApp {
             stretch_state:      format!("{:?}", self.stretch_state),
             break_state:        format!("{:?}", self.break_state),
             lengthen_state:     format!("{:?}", self.lengthen_state),
+            block_def_state:    format!("{:?}", self.block_def_state),
+            insert_state:       format!("{:?}", self.insert_state),
+            block_pick_base:    self.block_dialog_pick_base,
             grip_drag:          self.grip_drag.is_some(),
             selection:          self.selection.clone(),
             queued_op:          format!("{:?}", self.queued_op),
@@ -7740,6 +7794,9 @@ impl CadApp {
                     .unwrap_or_else(|| "dobject".to_string());
                 format!("ACI color — {} #{}", kind, ix)
             }
+            AciPickRequest::DobjectMany => {
+                format!("ACI color — {} dobjects", self.aci_pick_many.len())
+            }
             AciPickRequest::DimStyleForm(slot) => {
                 let which = match slot {
                     DimColorSlot::DimLine => "dim line",
@@ -7869,6 +7926,12 @@ impl CadApp {
                         d.style.color = Color::Aci(aci);
                     }
                     self.gpu_dirty = true;
+                }
+                AciPickRequest::DobjectMany => {
+                    let targets = std::mem::take(&mut self.aci_pick_many);
+                    self.props_apply(&targets, true, |d| {
+                        d.style.color = Color::Aci(aci);
+                    });
                 }
                 AciPickRequest::DimStyleForm(slot) => {
                     // The Dim Style form is restored to `Some` by the time
@@ -8038,303 +8101,596 @@ impl CadApp {
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
         let mut open = self.info_window_open;
-        let win = egui::Window::new("Info / Properties")
+        let win = egui::Window::new("DObject Properties")
             .open(&mut open)
             .default_pos(egui::pos2(640.0, 70.0))
-            .default_size(egui::vec2(300.0, 520.0))
-            .min_width(240.0)
+            .default_size(egui::vec2(320.0, 560.0))
+            .min_width(260.0)
             .resizable(true)
             .collapsible(true);
-        let win = self.apply_dock_pos("Info / Properties", ctx, win);
+        let win = self.apply_dock_pos("DObject Properties", ctx, win);
         let resp = win.show(ctx, |ui| {
+                // Target set: the basket (group) takes priority; otherwise
+                // the single click-selected dobject. Deduped + sorted so the
+                // "shared value / *VARIES*" scan and the apply loop agree.
+                let mut targets: Vec<usize> = if !self.selection.is_empty() {
+                    self.selection.clone()
+                } else if let Some(i) = self.selected {
+                    vec![i]
+                } else {
+                    Vec::new()
+                };
+                targets.retain(|&i| i < self.doc.dobjects.len());
+                targets.sort_unstable();
+                targets.dedup();
+
                 ui.separator();
-
-                // Decide which mode we're in.
-                let n_sel = self.selection.len();
-                let single = self.selected;
-
-                match (single, n_sel) {
-                    (None, 0) => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(180, 180, 200),
-                            "(no selection — click a dobject in the right panel, or use `select`)",
-                        );
-                    }
-                    (Some(i), _) if i < self.doc.dobjects.len() => {
-                        self.render_info_single(ui, i);
-                    }
-                    (_, n) if n > 0 => {
-                        self.render_info_multi(ui, n);
-                    }
-                    _ => {
-                        ui.colored_label(
-                            egui::Color32::from_rgb(180, 180, 200),
-                            "(no selection)",
-                        );
-                    }
+                if targets.is_empty() {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(180, 180, 200),
+                        "(no selection — click a dobject, or use `select` / `props`)",
+                    );
+                } else {
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        self.render_props_body(ui, &targets);
+                    });
                 }
             });
-        self.process_dock_after_show("Info / Properties", ctx, resp);
+        self.process_dock_after_show("DObject Properties", ctx, resp);
         self.info_window_open = open;
     }
 
-    fn render_info_single(&mut self, ui: &mut egui::Ui, idx: usize) {
-        ui.label(format!("Single dobject #{}", idx));
-        ui.separator();
+    // ---- helpers shared by the Properties dialog ----------------------
 
-        // ---- Geometry (read-only) ----
-        let geom_desc = describe(&self.doc.dobjects[idx].geom);
-        ui.label("Geometry");
-        ui.add_space(2.0);
-        ui.monospace(geom_desc);
-        ui.add_space(8.0);
-
-        // ---- Style (editable) ----
-        ui.label("Style");
-        ui.add_space(2.0);
-        egui::Grid::new("info_single_style")
-            .num_columns(2)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                ui.label("Handle"); ui.monospace(format!("0x{:X}", self.doc.dobjects[idx].handle));
-                ui.end_row();
-
-                // Layer — combo of all layers in the doc
-                ui.label("Layer");
-                let layer_id = self.doc.dobjects[idx].style.layer;
-                let cur_name = self.doc.layers.get(layer_id)
-                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
-                let mut new_layer: Option<LayerId> = None;
-                egui::ComboBox::new(("info_layer", idx), "")
-                    .selected_text(cur_name)
-                    .show_ui(ui, |ui| {
-                        for lid in 0..(self.doc.layers.len() as LayerId) {
-                            let name = match self.doc.layers.get(lid) {
-                                Some(l) => l.name.clone(), None => continue,
-                            };
-                            if ui.selectable_label(lid == layer_id, name).clicked() {
-                                new_layer = Some(lid);
-                            }
-                        }
-                    });
-                if let Some(lid) = new_layer {
-                    self.doc.dobjects[idx].style.layer = lid;
-                    self.gpu_dirty = true;
-                }
-                ui.end_row();
-
-                // Visibility
-                ui.label("Visible");
-                let mut v = self.doc.dobjects[idx].style.visible;
-                if ui.checkbox(&mut v, "").changed() {
-                    self.doc.dobjects[idx].style.visible = v;
-                }
-                ui.end_row();
-
-                // Color — ACI palette is the primary picker (8-bit);
-                // TrueColor is the secondary fallback. See memo
-                // `feedback_rust_cad_color_aci_primary`.
-                ui.label("Color");
-                let mut col = self.doc.dobjects[idx].style.color;
-                let mut wants_pick = false;
-                if aci_color_picker(ui, ("info_color", idx), &mut col,
-                                    &mut self.doc.truecolors, &mut wants_pick) {
-                    self.doc.dobjects[idx].style.color = col;
-                    self.gpu_dirty = true;
-                }
-                if wants_pick {
-                    self.aci_pick_request = Some(AciPickRequest::Dobject(idx));
-                }
-                ui.end_row();
-
-                // Linetype (combo)
-                ui.label("Linetype");
-                let lt_id = self.doc.dobjects[idx].style.linetype;
-                let cur = self.doc.linetypes.get(lt_id)
-                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into());
-                let mut new_lt: Option<u32> = None;
-                egui::ComboBox::new(("info_lt", idx), "")
-                    .selected_text(cur)
-                    .show_ui(ui, |ui| {
-                        for ltid in 0..(self.doc.linetypes.len() as u32) {
-                            let name = match self.doc.linetypes.get(ltid) {
-                                Some(l) => l.name.clone(), None => continue,
-                            };
-                            if ui.selectable_label(ltid == lt_id, name).clicked() {
-                                new_lt = Some(ltid);
-                            }
-                        }
-                    });
-                if let Some(ltid) = new_lt {
-                    self.doc.dobjects[idx].style.linetype = ltid;
-                    self.gpu_dirty = true;
-                }
-                ui.end_row();
-
-                // Linetype scale (editable)
-                ui.label("Lt Scale");
-                let mut scale = self.doc.dobjects[idx].style.linetype_scale;
-                if ui.add(egui::DragValue::new(&mut scale).speed(0.05).range(0.01..=100.0)).changed() {
-                    self.doc.dobjects[idx].style.linetype_scale = scale;
-                }
-                ui.end_row();
-
-                // Lineweight (combo)
-                ui.label("Lineweight");
-                let lw = self.doc.dobjects[idx].style.lineweight;
-                let lw_text = match lw {
-                    Lineweight::ByLayer    => "ByLayer".to_string(),
-                    Lineweight::ByBlock    => "ByBlock".to_string(),
-                    Lineweight::Default    => "Default".to_string(),
-                    Lineweight::Custom(mm) => format!("{:.2} mm", mm),
-                };
-                let mut new_lw: Option<Lineweight> = None;
-                egui::ComboBox::new(("info_lw", idx), "")
-                    .selected_text(lw_text)
-                    .show_ui(ui, |ui| {
-                        if ui.selectable_label(matches!(lw, Lineweight::ByLayer), "ByLayer").clicked() {
-                            new_lw = Some(Lineweight::ByLayer);
-                        }
-                        if ui.selectable_label(matches!(lw, Lineweight::ByBlock), "ByBlock").clicked() {
-                            new_lw = Some(Lineweight::ByBlock);
-                        }
-                        if ui.selectable_label(matches!(lw, Lineweight::Default), "Default").clicked() {
-                            new_lw = Some(Lineweight::Default);
-                        }
-                        for mm in [0.05_f32, 0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0] {
-                            let is_this = matches!(lw, Lineweight::Custom(x) if (x - mm).abs() < 1e-3);
-                            if ui.selectable_label(is_this, format!("{:.2} mm", mm)).clicked() {
-                                new_lw = Some(Lineweight::Custom(mm));
-                            }
-                        }
-                    });
-                if let Some(v) = new_lw {
-                    self.doc.dobjects[idx].style.lineweight = v;
-                }
-                ui.end_row();
-            });
+    /// Shared value of a `Style` getter across `targets`, or `None` when
+    /// they disagree (rendered as `*VARIES*`). `targets` is assumed
+    /// non-empty (the caller guards that).
+    fn shared_style<T: PartialEq + Copy>(
+        &self, targets: &[usize], get: impl Fn(&Style) -> T,
+    ) -> Option<T> {
+        let mut it = targets.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i))
+            .map(|d| get(&d.style));
+        let first = it.next()?;
+        if it.all(|v| v == first) { Some(first) } else { None }
     }
 
-    fn render_info_multi(&mut self, ui: &mut egui::Ui, n: usize) {
-        ui.label(format!("Multi-selection: {} dobject(s)", n));
+    /// Apply a mutation to every target dobject, optionally taking ONE
+    /// undo snapshot first, and flag the caches dirty. Used for every
+    /// Properties-dialog edit so a single change = a single undo step.
+    fn props_apply(
+        &mut self, targets: &[usize], snapshot: bool,
+        mut f: impl FnMut(&mut DObject),
+    ) {
+        if snapshot { self.snapshot_doc(); }
+        for &i in targets {
+            if let Some(d) = self.doc.dobjects.get_mut(i) { f(d); }
+        }
+        self.intersections.clear();
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+    }
+
+    /// Small integer tag for a Geom variant, used to decide whether the
+    /// selection is homogeneous (and therefore shows type-specific
+    /// "respected style" + non-coordinate properties).
+    fn geom_tag(g: &Geom) -> u8 {
+        match g {
+            Geom::Line(_)       => 0,  Geom::Circle(_)     => 1,
+            Geom::Arc(_)        => 2,  Geom::Ellipse(_)    => 3,
+            Geom::EllipseArc(_) => 4,  Geom::Point(_)      => 5,
+            Geom::Polyline(_)   => 6,  Geom::Hatch(_)      => 7,
+            Geom::Spline(_)     => 8,  Geom::Wall(_)       => 9,
+            Geom::Text(_)       => 10, Geom::Dimension(_)  => 11,
+            Geom::BlockRef(_)   => 12,
+        }
+    }
+
+    /// `Some(tag)` when every target shares one Geom variant; `None` for a
+    /// mixed-type selection (only general properties apply then).
+    fn targets_uniform_tag(&self, targets: &[usize]) -> Option<u8> {
+        let mut it = targets.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i))
+            .map(|d| Self::geom_tag(&d.geom));
+        let first = it.next()?;
+        if it.all(|t| t == first) { Some(first) } else { None }
+    }
+
+    /// Snapshot-once-per-gesture guard for numeric/text fields: snapshots
+    /// on the FIRST changed frame of a drag/type, resets when the gesture
+    /// ends (drag_stopped / lost_focus). Returns true if a snapshot was
+    /// just taken (so the caller doesn't double-snapshot).
+    fn props_gesture_snapshot(&mut self, resp: &egui::Response) {
+        if resp.changed() && !self.props_edit_gesture {
+            self.snapshot_doc();
+            self.props_edit_gesture = true;
+        }
+        if resp.drag_stopped() || resp.lost_focus() {
+            self.props_edit_gesture = false;
+        }
+    }
+
+    /// The whole Properties body for a non-empty target set. Single = one
+    /// target (all non-coordinate props + respected style + read-only
+    /// geometry); group = N targets (common General props with `*VARIES*`,
+    /// plus respected style when the selection is homogeneous).
+    fn render_props_body(&mut self, ui: &mut egui::Ui, targets: &[usize]) {
+        let n = targets.len();
+        let uniform = self.targets_uniform_tag(targets);
+
+        // ---- Header --------------------------------------------------
+        if n == 1 {
+            let idx = targets[0];
+            let kind = self.doc.dobjects.get(idx)
+                .map(|d| dobject_kind_name(&d.geom)).unwrap_or("dobject");
+            ui.label(egui::RichText::new(format!("{} · #{}", kind, idx)).strong());
+            let handle = self.doc.dobjects.get(idx).map(|d| d.handle).unwrap_or(0);
+            ui.monospace(format!("handle 0x{:X}", handle));
+        } else {
+            ui.label(egui::RichText::new(format!("{} dobjects selected", n)).strong());
+            ui.monospace(self.props_kind_breakdown(targets));
+        }
         ui.separator();
 
-        // Count by Geom variant.
-        let (mut nl, mut nc, mut na, mut ne, mut nea, mut npt, mut npl, mut nh, mut nsp) =
-            (0, 0, 0, 0, 0, 0, 0, 0, 0);
-        let mut nw = 0_usize;
-        let mut ntx = 0_usize;
-        let mut ndim = 0_usize;
-        let mut nblk = 0_usize;
-        for &i in &self.selection {
+        // ---- General (common Style) ----------------------------------
+        ui.label(egui::RichText::new("General").strong());
+        ui.add_space(2.0);
+        self.render_props_general(ui, targets);
+
+        // ---- Respected style + type-specific (homogeneous only) ------
+        if let Some(tag) = uniform {
+            if matches!(tag, 5 | 6 | 7 | 9 | 10 | 11 | 12) {
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Type properties").strong());
+                ui.add_space(2.0);
+                self.render_props_type_specific(ui, targets, tag);
+            }
+        } else {
+            ui.add_space(6.0);
+            ui.colored_label(egui::Color32::from_rgb(150, 165, 185),
+                "(mixed types — only general properties apply)");
+        }
+
+        // ---- Geometry (read-only; coordinates edited via grips) ------
+        if n == 1 {
+            ui.add_space(6.0);
+            ui.label(egui::RichText::new("Geometry (read-only)").strong());
+            ui.add_space(2.0);
+            let desc = describe(&self.doc.dobjects[targets[0]].geom);
+            ui.monospace(desc);
+            ui.small("Coordinates are edited on-canvas with grips, not here.");
+        }
+    }
+
+    /// Per-Geom-variant count, e.g. "lines: 3  circles: 1".
+    fn props_kind_breakdown(&self, targets: &[usize]) -> String {
+        let mut counts: std::collections::BTreeMap<&'static str, usize> =
+            std::collections::BTreeMap::new();
+        for &i in targets {
             if let Some(d) = self.doc.dobjects.get(i) {
-                match &d.geom {
-                    Geom::Line(_)       => nl  += 1,
-                    Geom::Circle(_)     => nc  += 1,
-                    Geom::Arc(_)        => na  += 1,
-                    Geom::Ellipse(_)    => ne  += 1,
-                    Geom::EllipseArc(_) => nea += 1,
-                    Geom::Point(_)      => npt += 1,
-                    Geom::Polyline(_)   => npl += 1,
-                    Geom::Hatch(_)      => nh  += 1,
-                    Geom::Spline(_)     => nsp += 1,
-                    Geom::Wall(_)       => nw  += 1,
-                    Geom::Text(_)       => ntx += 1,
-                    Geom::Dimension(_)  => ndim += 1,
-                    Geom::BlockRef(_)   => nblk += 1,
-                }
+                *counts.entry(dobject_kind_name(&d.geom)).or_default() += 1;
             }
         }
-        ui.monospace(format!(
-            "  lines: {}\n  circles: {}\n  arcs: {}\n  ellipses: {}\n  \
-             ellipse-arcs: {}\n  points: {}\n  polylines: {}\n  hatches: {}\n  splines: {}\n  walls: {}\n  texts: {}\n  dims: {}\n  blocks: {}",
-            nl, nc, na, ne, nea, npt, npl, nh, nsp, nw, ntx, ndim, nblk
-        ));
-        ui.add_space(8.0);
+        counts.into_iter()
+            .map(|(k, v)| format!("{}: {}", k, v))
+            .collect::<Vec<_>>().join("   ")
+    }
 
-        ui.label("Bulk edit");
-        ui.add_space(2.0);
-        egui::Grid::new("info_multi_bulk")
-            .num_columns(2)
-            .spacing([12.0, 4.0])
-            .show(ui, |ui| {
-                // Move all selected to a chosen layer
-                ui.label("Layer →");
-                let mut chosen: Option<LayerId> = None;
-                egui::ComboBox::new("info_multi_layer", "")
-                    .selected_text("(set all…)")
-                    .show_ui(ui, |ui| {
-                        for lid in 0..(self.doc.layers.len() as LayerId) {
-                            let name = match self.doc.layers.get(lid) {
-                                Some(l) => l.name.clone(), None => continue,
-                            };
-                            if ui.selectable_label(false, name).clicked() {
-                                chosen = Some(lid);
-                            }
-                        }
-                    });
-                if let Some(lid) = chosen {
-                    let count = self.selection.len();
-                    for &i in &self.selection {
-                        if let Some(d) = self.doc.dobjects.get_mut(i) {
-                            d.style.layer = lid;
+    /// The common-Style editor (layer / color / linetype / lt-scale /
+    /// lineweight / visible). Each control shows the shared value or
+    /// `*VARIES*`; editing writes to EVERY target with one undo step.
+    fn render_props_general(&mut self, ui: &mut egui::Ui, targets: &[usize]) {
+        egui::Grid::new("props_general")
+            .num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
+            // Layer
+            ui.label("Layer");
+            let shared_layer = self.shared_style(targets, |s| s.layer);
+            let cur = match shared_layer {
+                Some(lid) => self.doc.layers.get(lid)
+                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into()),
+                None => "*VARIES*".into(),
+            };
+            let mut new_layer: Option<LayerId> = None;
+            egui::ComboBox::from_id_salt("props_layer").selected_text(cur)
+                .show_ui(ui, |ui| {
+                    for lid in 0..(self.doc.layers.len() as LayerId) {
+                        let name = match self.doc.layers.get(lid) {
+                            Some(l) => l.name.clone(), None => continue,
+                        };
+                        if ui.selectable_label(shared_layer == Some(lid), name).clicked() {
+                            new_layer = Some(lid);
                         }
                     }
-                    let lname = self.doc.layers.get(lid)
-                        .map(|l| l.name.clone()).unwrap_or_default();
-                    self.history.push(format!(
-                        "  {} dobject(s) moved to layer '{}'", count, lname
-                    ));
-                    self.gpu_dirty = true;
+                });
+            if let Some(lid) = new_layer {
+                self.props_apply(targets, true, |d| d.style.layer = lid);
+            }
+            ui.end_row();
+
+            // Color (ACI primary; ByLayer/ByBlock/TrueColor secondary)
+            ui.label("Color");
+            let shared_color = self.shared_style(targets, |s| s.color);
+            ui.vertical(|ui| {
+                if shared_color.is_none() {
+                    ui.colored_label(egui::Color32::from_rgb(210, 180, 120), "*VARIES*");
                 }
-                ui.end_row();
-
-                // Visibility toggle for the whole selection
-                ui.label("Visibility");
-                ui.horizontal(|ui| {
-                    if ui.small_button("show all").clicked() {
-                        let count = self.selection.len();
-                        for &i in &self.selection {
-                            if let Some(d) = self.doc.dobjects.get_mut(i) {
-                                d.style.visible = true;
-                            }
-                        }
-                        self.history.push(format!("  shown: {} dobject(s)", count));
-                        self.gpu_dirty = true;
-                    }
-                    if ui.small_button("hide all").clicked() {
-                        let count = self.selection.len();
-                        for &i in &self.selection {
-                            if let Some(d) = self.doc.dobjects.get_mut(i) {
-                                d.style.visible = false;
-                            }
-                        }
-                        self.history.push(format!("  hidden: {} dobject(s)", count));
-                        self.gpu_dirty = true;
-                    }
-                });
-                ui.end_row();
-
-                // ByLayer reset
-                ui.label("Reset to");
-                ui.horizontal(|ui| {
-                    if ui.small_button("ByLayer (all)").clicked() {
-                        let count = self.selection.len();
-                        for &i in &self.selection {
-                            if let Some(d) = self.doc.dobjects.get_mut(i) {
-                                d.style.color      = Color::ByLayer;
-                                d.style.linetype   = LinetypeTable::CONTINUOUS;
-                                d.style.lineweight = Lineweight::ByLayer;
-                            }
-                        }
-                        self.history.push(format!(
-                            "  {} dobject(s) reset to ByLayer", count
-                        ));
-                        self.gpu_dirty = true;
-                    }
-                });
-                ui.end_row();
+                let mut col = shared_color.unwrap_or(Color::ByLayer);
+                let mut wants_pick = false;
+                let before = col;
+                if aci_color_picker(ui, "props_color", &mut col,
+                                    &mut self.doc.truecolors, &mut wants_pick)
+                    && col != before
+                {
+                    self.props_apply(targets, true, |d| d.style.color = col);
+                }
+                if wants_pick {
+                    // Defer to the polar ACI wheel; commit applies to all.
+                    self.aci_pick_many = targets.to_vec();
+                    self.aci_pick_request = Some(AciPickRequest::DobjectMany);
+                }
             });
+            ui.end_row();
+
+            // Linetype
+            ui.label("Linetype");
+            let shared_lt = self.shared_style(targets, |s| s.linetype);
+            let cur = match shared_lt {
+                Some(id) => self.doc.linetypes.get(id)
+                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into()),
+                None => "*VARIES*".into(),
+            };
+            let mut new_lt: Option<u32> = None;
+            egui::ComboBox::from_id_salt("props_lt").selected_text(cur)
+                .show_ui(ui, |ui| {
+                    for id in 0..(self.doc.linetypes.len() as u32) {
+                        let name = match self.doc.linetypes.get(id) {
+                            Some(l) => l.name.clone(), None => continue,
+                        };
+                        if ui.selectable_label(shared_lt == Some(id), name).clicked() {
+                            new_lt = Some(id);
+                        }
+                    }
+                });
+            if let Some(id) = new_lt {
+                self.props_apply(targets, true, |d| d.style.linetype = id);
+            }
+            ui.end_row();
+
+            // Linetype scale
+            ui.label("Lt Scale");
+            let shared_sc = self.shared_style(targets, |s| s.linetype_scale);
+            let mut sc = shared_sc.unwrap_or(1.0);
+            let resp = ui.add(egui::DragValue::new(&mut sc)
+                .speed(0.05).range(0.01..=1000.0)
+                .prefix(if shared_sc.is_none() { "≠ " } else { "" }));
+            if resp.changed() {
+                self.props_gesture_snapshot(&resp);
+                self.props_apply(targets, false, |d| d.style.linetype_scale = sc);
+            } else {
+                self.props_gesture_snapshot(&resp);
+            }
+            ui.end_row();
+
+            // Lineweight
+            ui.label("Lineweight");
+            let shared_lw = self.shared_style(targets, |s| s.lineweight);
+            let lw_text = match shared_lw {
+                None => "*VARIES*".to_string(),
+                Some(Lineweight::ByLayer) => "ByLayer".to_string(),
+                Some(Lineweight::ByBlock) => "ByBlock".to_string(),
+                Some(Lineweight::Default) => "Default".to_string(),
+                Some(Lineweight::Custom(mm)) => format!("{:.2} mm", mm),
+            };
+            let mut new_lw: Option<Lineweight> = None;
+            egui::ComboBox::from_id_salt("props_lw").selected_text(lw_text)
+                .show_ui(ui, |ui| {
+                    if ui.selectable_label(shared_lw == Some(Lineweight::ByLayer), "ByLayer").clicked() {
+                        new_lw = Some(Lineweight::ByLayer);
+                    }
+                    if ui.selectable_label(shared_lw == Some(Lineweight::ByBlock), "ByBlock").clicked() {
+                        new_lw = Some(Lineweight::ByBlock);
+                    }
+                    if ui.selectable_label(shared_lw == Some(Lineweight::Default), "Default").clicked() {
+                        new_lw = Some(Lineweight::Default);
+                    }
+                    for mm in [0.05_f32, 0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0] {
+                        let is_this = matches!(shared_lw, Some(Lineweight::Custom(x)) if (x - mm).abs() < 1e-3);
+                        if ui.selectable_label(is_this, format!("{:.2} mm", mm)).clicked() {
+                            new_lw = Some(Lineweight::Custom(mm));
+                        }
+                    }
+                });
+            if let Some(v) = new_lw {
+                self.props_apply(targets, true, |d| d.style.lineweight = v);
+            }
+            ui.end_row();
+
+            // Visible
+            ui.label("Visible");
+            let shared_vis = self.shared_style(targets, |s| s.visible);
+            ui.horizontal(|ui| {
+                let mut v = shared_vis.unwrap_or(true);
+                let label = if shared_vis.is_none() { "(varies)" }
+                    else if v { "shown" } else { "hidden" };
+                let resp = ui.checkbox(&mut v, label);
+                if resp.changed() {
+                    self.props_apply(targets, true, |d| d.style.visible = v);
+                }
+            });
+            ui.end_row();
+        });
+    }
+
+    /// Type-specific "respected style" + non-coordinate properties for a
+    /// homogeneous selection (`tag` from `geom_tag`). Coordinates are
+    /// excluded — only the editable non-geometry fields per variant.
+    fn render_props_type_specific(&mut self, ui: &mut egui::Ui, targets: &[usize], tag: u8) {
+        egui::Grid::new("props_type")
+            .num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
+            match tag {
+                // ---- Point: PDMODE style + size ----
+                5 => {
+                    ui.label("Point style");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Point(p) = g { Some(p.style as i64) } else { None } });
+                    let mut v = shared.unwrap_or(0) as u8;
+                    let resp = ui.add(egui::DragValue::new(&mut v).range(0..=99)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Point(p) = &mut d.geom { p.style = v; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+
+                    ui.label("Point size");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Point(p) = g { Some((p.size * 1000.0) as i64) } else { None } });
+                    let mut sz = shared.map(|x| x as f32 / 1000.0).unwrap_or(0.0);
+                    let resp = ui.add(egui::DragValue::new(&mut sz).speed(0.1).range(0.0..=1e6)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Point(p) = &mut d.geom { p.size = sz; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+                }
+                // ---- Polyline: closed flag ----
+                6 => {
+                    ui.label("Closed");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Polyline(p) = g { Some(p.closed as i64) } else { None } });
+                    let mut closed = shared.map(|x| x != 0).unwrap_or(false);
+                    let label = if shared.is_none() { "(varies)" }
+                        else if closed { "closed" } else { "open" };
+                    let resp = ui.checkbox(&mut closed, label);
+                    if resp.changed() {
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Polyline(p) = &mut d.geom { p.closed = closed; } });
+                    }
+                    ui.end_row();
+                }
+                // ---- Hatch: pattern name + scale + angle ----
+                7 => {
+                    ui.label("Pattern");
+                    let cur = self.props_first_geom_string(targets, |g| {
+                        if let Geom::Hatch(h) = g {
+                            Some(match &h.pattern {
+                                cad_kernel::HatchPattern::Solid => "Solid".to_string(),
+                                cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
+                            })
+                        } else { None }
+                    });
+                    ui.monospace(cur.unwrap_or_else(|| "—".into()));
+                    ui.end_row();
+                    ui.label("");
+                    ui.small("Pattern/scale/angle: use the `hatch` dialog.");
+                    ui.end_row();
+                }
+                // ---- Wall: wall style + thickness ----
+                9 => {
+                    ui.label("Wall style");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Wall(w) = g { Some(w.style as i64) } else { None } });
+                    let cur = match shared {
+                        Some(id) => self.doc.wall_styles.get(id as u32)
+                            .map(|s| s.name.clone()).unwrap_or_else(|| "?".into()),
+                        None => "*VARIES*".into(),
+                    };
+                    let mut pick: Option<u32> = None;
+                    egui::ComboBox::from_id_salt("props_wallstyle").selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for id in 0..(self.doc.wall_styles.len() as u32) {
+                                let name = match self.doc.wall_styles.get(id) {
+                                    Some(s) => s.name.clone(), None => continue };
+                                if ui.selectable_label(shared == Some(id as i64), name).clicked() {
+                                    pick = Some(id);
+                                }
+                            }
+                        });
+                    if let Some(id) = pick {
+                        let thick = self.doc.wall_styles.get(id).map(|s| s.thickness);
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Wall(w) = &mut d.geom {
+                                w.style = id;
+                                if let Some(t) = thick { if t > 0.0 { w.thickness = t; } }
+                            }
+                        });
+                    }
+                    ui.end_row();
+
+                    ui.label("Thickness");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Wall(w) = g { Some((w.thickness * 1e6) as i64) } else { None } });
+                    let mut th = shared.map(|x| x as f64 / 1e6).unwrap_or(0.0);
+                    let resp = ui.add(egui::DragValue::new(&mut th).speed(0.1).range(0.001..=1e9)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Wall(w) = &mut d.geom { w.thickness = th; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+                }
+                // ---- Text: text style + height + angle + align + content ----
+                10 => {
+                    ui.label("Text style");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Text(t) = g { Some(t.style as i64) } else { None } });
+                    let cur = match shared {
+                        Some(id) => self.doc.text_styles.get(id as u32)
+                            .map(|s| s.name.clone()).unwrap_or_else(|| "?".into()),
+                        None => "*VARIES*".into(),
+                    };
+                    let mut pick: Option<u32> = None;
+                    egui::ComboBox::from_id_salt("props_textstyle").selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for id in 0..(self.doc.text_styles.len() as u32) {
+                                let name = match self.doc.text_styles.get(id) {
+                                    Some(s) => s.name.clone(), None => continue };
+                                if ui.selectable_label(shared == Some(id as i64), name).clicked() {
+                                    pick = Some(id);
+                                }
+                            }
+                        });
+                    if let Some(id) = pick {
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.style = id; } });
+                    }
+                    ui.end_row();
+
+                    ui.label("Height");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Text(t) = g { Some((t.height * 1e6) as i64) } else { None } });
+                    let mut h = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
+                    let resp = ui.add(egui::DragValue::new(&mut h).speed(0.1).range(0.001..=1e9)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.height = h; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+
+                    ui.label("Angle°");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Text(t) = g { Some((t.angle.to_degrees() * 1e3) as i64) } else { None } });
+                    let mut a = shared.map(|x| x as f64 / 1e3).unwrap_or(0.0);
+                    let resp = ui.add(egui::DragValue::new(&mut a).speed(1.0).range(-360.0..=360.0)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        let rad = a.to_radians();
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::Text(t) = &mut d.geom { t.angle = rad; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+
+                    // Content — only when a SINGLE text is selected.
+                    if targets.len() == 1 {
+                        ui.label("Text");
+                        let idx = targets[0];
+                        let mut s = if let Some(Geom::Text(t)) =
+                            self.doc.dobjects.get(idx).map(|d| &d.geom)
+                        { t.text.clone() } else { String::new() };
+                        let resp = ui.text_edit_singleline(&mut s);
+                        if resp.changed() {
+                            self.props_gesture_snapshot(&resp);
+                            self.props_apply(targets, false, |d| {
+                                if let Geom::Text(t) = &mut d.geom { t.text = s.clone(); } });
+                        } else { self.props_gesture_snapshot(&resp); }
+                        ui.end_row();
+                    }
+                }
+                // ---- Dimension: dim style ----
+                11 => {
+                    ui.label("Dim style");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::Dimension(d) = g { Some(d.style as i64) } else { None } });
+                    let cur = match shared {
+                        Some(id) => self.doc.dim_styles.get(id as u32)
+                            .map(|s| s.name.clone()).unwrap_or_else(|| "?".into()),
+                        None => "*VARIES*".into(),
+                    };
+                    let mut pick: Option<u32> = None;
+                    egui::ComboBox::from_id_salt("props_dimstyle").selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for id in 0..(self.doc.dim_styles.len() as u32) {
+                                let name = match self.doc.dim_styles.get(id) {
+                                    Some(s) => s.name.clone(), None => continue };
+                                if ui.selectable_label(shared == Some(id as i64), name).clicked() {
+                                    pick = Some(id);
+                                }
+                            }
+                        });
+                    if let Some(id) = pick {
+                        self.props_apply(targets, true, |d| {
+                            if let Geom::Dimension(dd) = &mut d.geom { dd.style = id; } });
+                    }
+                    ui.end_row();
+                }
+                // ---- BlockRef: scale + rotation ----
+                12 => {
+                    ui.label("Block");
+                    let bname = targets.iter().filter_map(|&i| self.doc.dobjects.get(i))
+                        .find_map(|d| if let Geom::BlockRef(b) = &d.geom {
+                            self.doc.blocks.get(b.block).map(|blk| blk.name.clone())
+                        } else { None }).unwrap_or_else(|| "?".into());
+                    ui.monospace(bname);
+                    ui.end_row();
+
+                    ui.label("Scale");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::BlockRef(b) = g { Some((b.scale * 1e6) as i64) } else { None } });
+                    let mut sc = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
+                    let resp = ui.add(egui::DragValue::new(&mut sc).speed(0.05).range(0.0001..=1e9)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::BlockRef(b) = &mut d.geom { b.scale = sc; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+
+                    ui.label("Rotation°");
+                    let shared = self.props_shared_geom(targets, |g| {
+                        if let Geom::BlockRef(b) = g { Some((b.rotation.to_degrees() * 1e3) as i64) } else { None } });
+                    let mut rot = shared.map(|x| x as f64 / 1e3).unwrap_or(0.0);
+                    let resp = ui.add(egui::DragValue::new(&mut rot).speed(1.0).range(-360.0..=360.0)
+                        .prefix(if shared.is_none() { "≠ " } else { "" }));
+                    if resp.changed() {
+                        self.props_gesture_snapshot(&resp);
+                        let rad = rot.to_radians();
+                        self.props_apply(targets, false, |d| {
+                            if let Geom::BlockRef(b) = &mut d.geom { b.rotation = rad; } });
+                    } else { self.props_gesture_snapshot(&resp); }
+                    ui.end_row();
+                }
+                _ => {}
+            }
+        });
+    }
+
+    /// Shared integer-encoded geom property across targets, or `None` for
+    /// varies. Callers encode f64/bool to a stable i64 so the equality
+    /// check is exact (floats are scaled then truncated).
+    fn props_shared_geom(
+        &self, targets: &[usize], get: impl Fn(&Geom) -> Option<i64>,
+    ) -> Option<i64> {
+        let mut it = targets.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i))
+            .filter_map(|d| get(&d.geom));
+        let first = it.next()?;
+        if it.all(|v| v == first) { Some(first) } else { None }
+    }
+
+    /// First non-None string property among targets (for read-only labels).
+    fn props_first_geom_string(
+        &self, targets: &[usize], get: impl Fn(&Geom) -> Option<String>,
+    ) -> Option<String> {
+        targets.iter().filter_map(|&i| self.doc.dobjects.get(i))
+            .find_map(|d| get(&d.geom))
     }
 
     // ===================================================================
@@ -9597,6 +9953,48 @@ impl CadApp {
     /// when the doc didn't change corrupts the list silently (the bug
     /// the user caught in commit ae54eef's debug log).
     #[track_caller]
+    /// Flatten a dobject's geom into the EFFECTIVE cutting/boundary
+    /// geometry the intersection math can actually use. A `BlockRef` has
+    /// an empty `intersect`, so a block picked as a cutter/boundary would
+    /// never cut anything; instead we explode it IN MEMORY ONLY —
+    /// transform each contained dobject into world space (recursively for
+    /// nested blocks) and push the real lines/arcs/… The document is never
+    /// modified; this is the user's "background explode → temp memo → do
+    /// the math" algorithm. Everything else passes through as itself.
+    fn expand_cutter_geoms(&self, g: &Geom, out: &mut Vec<Geom>, depth: u8) {
+        if depth > 8 { return; }   // matches draw_blockref's cycle/depth cap
+        match g {
+            Geom::BlockRef(br) => {
+                if let Some(blk) = self.doc.blocks.get(br.block) {
+                    for cd in &blk.dobjects {
+                        let tg = br.transform_geom(&cd.geom, blk.base);
+                        self.expand_cutter_geoms(&tg, out, depth + 1);
+                    }
+                }
+            }
+            other => out.push(other.clone()),
+        }
+    }
+
+    /// Temporary DObjects for the geometry INSIDE every visible block
+    /// instance, so object-snap finds END / MID / CEN / … on block
+    /// contents (snap-through). Same in-memory explode as trim's
+    /// `expand_cutter_geoms`; the document is never touched. Expands all
+    /// visible blocks each hover frame — fine for normal drawings;
+    /// viewport-gate if it ever shows up in a profile.
+    fn block_snap_phantoms(&self) -> Vec<DObject> {
+        let mut geoms: Vec<Geom> = Vec::new();
+        for d in &self.doc.dobjects {
+            if matches!(d.geom, Geom::BlockRef(_))
+                && d.style.visible
+                && self.doc.layers.renders(d.style.layer)
+            {
+                self.expand_cutter_geoms(&d.geom, &mut geoms, 0);
+            }
+        }
+        geoms.into_iter().map(DObject::new).collect()
+    }
+
     fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
         let before_dobj_count = self.doc.dobjects.len();
         let _trim_pick_dbg = (cutters.to_vec(), target_idx, pick);
@@ -9607,10 +10005,14 @@ impl CadApp {
         // never cuts itself (self-intersection = 0). This is what allows
         // trimming a cutter dobject in the basket: it's still a valid
         // target, just doesn't intersect with itself for cut math.
-        let cutter_geoms: Vec<Geom> = cutters.iter()
-            .filter(|&&i| i != target_idx)
-            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
-            .collect();
+        // BlockRef cutters are exploded in-memory into their real contents
+        // (see `expand_cutter_geoms`) so geometry INSIDE a block can cut.
+        let mut cutter_geoms: Vec<Geom> = Vec::new();
+        for &i in cutters.iter().filter(|&&i| i != target_idx) {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                self.expand_cutter_geoms(&d.geom, &mut cutter_geoms, 0);
+            }
+        }
         if cutter_geoms.is_empty() {
             // No OTHER dobjects to cut against → roll back, fail.
             if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
@@ -9696,11 +10098,14 @@ impl CadApp {
     fn apply_extend_pick(&mut self, bounds: &[usize], target_idx: usize, pick: Vec2) -> bool {
         self.snapshot_doc();
         let edge_mode = self.env.EdgMod;
-        // Same self-exclusion rule as trim.
-        let boundary_geoms: Vec<Geom> = bounds.iter()
-            .filter(|&&i| i != target_idx)
-            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.geom.clone()))
-            .collect();
+        // Same self-exclusion rule as trim. BlockRef boundaries are
+        // exploded in-memory so geometry INSIDE a block can be a boundary.
+        let mut boundary_geoms: Vec<Geom> = Vec::new();
+        for &i in bounds.iter().filter(|&&i| i != target_idx) {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                self.expand_cutter_geoms(&d.geom, &mut boundary_geoms, 0);
+            }
+        }
         if boundary_geoms.is_empty() {
             if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
             self.history.push(format!(
@@ -10646,6 +11051,9 @@ impl CadApp {
         if let CopyState::WaitingForDest(base) = self.copy_state { return Some(base); }
         if let MirrorState::WaitingForB(a)    = self.mirror_state { return Some(a); }
         if let StretchState::WaitingForDest(_, _, base) = self.stretch_state { return Some(base); }
+        // Dist — the second point measures from the first, so CARD locks
+        // the measurement to H/V and PER/TAN anchor on P1.
+        if let DistState::WaitingForP2(p1) = self.dist_state { return Some(p1); }
         // Rotate — the angle / reference picks pivot about the pivot point,
         // so CARD snaps the rotation to the cardinal directions (0/90/…).
         match self.rotate_state {
@@ -10653,6 +11061,15 @@ impl CadApp {
             | RotateState::WaitingForRefSrc1(pivot)
             | RotateState::WaitingForRefSrc2(pivot, _)
             | RotateState::WaitingForRefTgt(pivot, _) => return Some(pivot),
+            _ => {}
+        }
+        // Scale — the factor / new-length clicks measure distance from the
+        // pivot, and the reference end measures from the reference start;
+        // CARD locks each to H/V from its measurement anchor.
+        match self.scale_state {
+            ScaleState::WaitingForFactor(pivot)
+            | ScaleState::WaitingForNewLength(pivot, _) => return Some(pivot),
+            ScaleState::WaitingForRefEnd(_, ref_start) => return Some(ref_start),
             _ => {}
         }
         // Polyline / Line / Arc draw tools: the last captured point is
@@ -12266,6 +12683,18 @@ fn cmd_button(
     glyph_kind: GlyphKind,
     tip: &'static str,
 ) -> bool {
+    cmd_button_resp(ui, label, glyph_kind, tip).clicked()
+}
+
+/// Same painted icon button as `cmd_button` but returns the full
+/// `egui::Response` — used when the caller needs to attach a popup
+/// (e.g. the Insert button's block-name dropdown).
+fn cmd_button_resp(
+    ui: &mut egui::Ui,
+    label: &str,
+    glyph_kind: GlyphKind,
+    tip: &'static str,
+) -> egui::Response {
     let (resp, painter) =
         ui.allocate_painter(egui::vec2(56.0, 52.0), egui::Sense::click());
     let rect = resp.rect;
@@ -12291,8 +12720,7 @@ fn cmd_button(
         egui::FontId::proportional(9.5),
         ink,
     );
-    let resp = resp.on_hover_text(tip);
-    resp.clicked()
+    resp.on_hover_text(tip)
 }
 
 /// Placeholder glyphs for `cmd_button`. Each variant is a few
@@ -12304,6 +12732,7 @@ enum GlyphKind {
     Erase, MatchProps, ChangeLayer, ArrayGrid, Reverse,
     Dist, List,
     Undo, Redo,
+    Block, Insert, Explode,
 }
 
 fn draw_cmd_glyph(
@@ -12540,6 +12969,36 @@ fn draw_cmd_glyph(
             let tip = v(9.0, 0.0);
             p.line_segment([tip, tip + vec2(-4.0,-3.0)], pen);
             p.line_segment([tip, tip + vec2(-4.0, 3.0)], pen);
+        }
+        GlyphKind::Block => {
+            // outer frame holding contained geometry + a base-point grip
+            // at the lower-left corner (the handle an instance carries).
+            let thin = egui::Stroke::new(0.9, ink);
+            p.rect_stroke(egui::Rect::from_min_max(v(-10.0,-9.0), v(8.0,7.0)),
+                1.0, pen);
+            // contained-geometry hint: a small circle + diagonal line.
+            p.circle_stroke(v(-1.0,-1.0), 4.0, thin);
+            p.line_segment([v(-7.0,5.0), v(5.0,-6.0)], thin);
+            dot(v(-10.0, 7.0));   // base point grip
+        }
+        GlyphKind::Insert => {
+            // a block (small square) dropping onto an insertion node:
+            // square top-left, arrow down-right to a target dot.
+            p.rect_stroke(egui::Rect::from_min_max(v(-12.0,-11.0), v(-2.0,-1.0)),
+                1.0, pen);
+            p.line_segment([v(-2.0,-1.0), v(7.0,8.0)], pen);
+            p.line_segment([v(7.0,8.0), v(1.0,7.0)], pen);
+            p.line_segment([v(7.0,8.0), v(6.0,2.0)], pen);
+            dot(v(9.0, 10.0));    // insertion point
+        }
+        GlyphKind::Explode => {
+            // a core square bursting into outward shards (scatter).
+            p.rect_stroke(egui::Rect::from_min_max(v(-4.0,-4.0), v(4.0,4.0)),
+                0.0, pen);
+            for (dx, dy) in [(1.0,0.8), (-1.0,0.8), (1.0,-0.8), (-1.0,-0.8),
+                             (0.0,1.25), (0.0,-1.25)] {
+                p.line_segment([v(6.0*dx, 6.0*dy), v(11.0*dx, 11.0*dy)], pen);
+            }
         }
     }
 }
@@ -13690,6 +14149,23 @@ impl eframe::App for CadApp {
                         self.array_open = true;
                         ui.close_menu();
                     }
+                    if ui.button("Explode")
+                        .on_hover_text("Break selected block instances back \
+                                        into their component dobjects")
+                        .clicked()
+                    {
+                        self.run_command("explode");
+                        ui.close_menu();
+                    }
+                    if ui.button("Properties…")
+                        .on_hover_text("Edit common properties of the selected \
+                                        dobject(s) — layer, color, linetype, \
+                                        lineweight, and type-specific style")
+                        .clicked()
+                    {
+                        self.run_command("props");
+                        ui.close_menu();
+                    }
                     for (label, cmd) in [
                         ("Match Properties", "matchprop"),
                         ("Change Layer to Current", "chlayer"),
@@ -14158,6 +14634,50 @@ impl eframe::App for CadApp {
                 if cmd_button(ui, "list", GlyphKind::List,
                     "List full properties of the selected dobjects") {
                     self.run_command("list");
+                }
+                ui.add_space(20.0);
+                // ---- Blocks group: define / insert / explode -------------
+                if cmd_button(ui, "block", GlyphKind::Block,
+                    "Create a block from the selection (opens the Block dialog)")
+                {
+                    self.run_command("block");
+                }
+                // Insert: dropdown of defined blocks. No blocks → the bare
+                // `insert` command prints a helpful hint instead.
+                let block_names: Vec<String> = self.doc.blocks.blocks.iter()
+                    .map(|b| b.name.clone()).collect();
+                let insert_resp = cmd_button_resp(ui, "insert", GlyphKind::Insert,
+                    "Place an instance of a defined block (pick from the list)");
+                let insert_popup = ui.make_persistent_id("toolbar_insert_popup");
+                if insert_resp.clicked() {
+                    if block_names.is_empty() {
+                        self.run_command("insert");   // prints "no blocks defined"
+                    } else {
+                        ui.memory_mut(|m| m.toggle_popup(insert_popup));
+                    }
+                }
+                let mut insert_pick: Option<String> = None;
+                egui::popup_below_widget(
+                    ui, insert_popup, &insert_resp,
+                    egui::PopupCloseBehavior::CloseOnClick,
+                    |ui| {
+                        ui.set_min_width(120.0);
+                        ui.label(egui::RichText::new("Insert block").small().color(
+                            egui::Color32::from_rgb(150, 165, 185)));
+                        for n in &block_names {
+                            if ui.button(n).clicked() {
+                                insert_pick = Some(n.clone());
+                            }
+                        }
+                    },
+                );
+                if let Some(n) = insert_pick {
+                    self.run_command(&format!("insert {}", n));
+                }
+                if cmd_button(ui, "explode", GlyphKind::Explode,
+                    "Explode selected block instances into their dobjects")
+                {
+                    self.run_command("explode");
                 }
             });
             ui.add_space(4.0);
@@ -15082,7 +15602,15 @@ impl eframe::App for CadApp {
                 || self.mirror_state     != MirrorState::Off
                 || self.align_state      != AlignState::Off
                 || self.stretch_state    != StretchState::Off
-                || self.break_state      != BreakState::Off;
+                || self.break_state      != BreakState::Off
+                // Point-pick phases that commit a precise coordinate via
+                // `click_world` — they need running osnap exactly like the
+                // transform ops above. `dist` measures point→point;
+                // `insert` places a block at a point; `block` picks the
+                // definition's base point. All were silently snap-dead.
+                || self.dist_state       != DistState::Off
+                || self.insert_state     != InsertState::Off
+                || self.block_def_state  != BlockDefState::Off;
             // Phantom dobject for the in-progress polyline so snap kinds
             // (END / MID / CEN / …) work against vertices the user has
             // just clicked but hasn't committed yet. Cheap — only built
@@ -15115,6 +15643,7 @@ impl eframe::App for CadApp {
                             &self.doc.dobjects, grid,
                         )
                     };
+                    let mut merged_extra = false;
                     if let Some(ref phantom) = pline_phantom {
                         let phantom_slice = std::slice::from_ref(phantom);
                         let phantom_hits = find_all_snaps(
@@ -15124,8 +15653,27 @@ impl eframe::App for CadApp {
                             phantom_slice, None,
                         );
                         hits.extend(phantom_hits);
+                        merged_extra = true;
+                    }
+                    // Block snap-through: explode every visible block's
+                    // contents in-memory and snap against the real geometry,
+                    // so END/MID/CEN/… land on lines/arcs INSIDE a block
+                    // (the kernel's BlockRef snap only offers the insertion
+                    // point — it can't reach the block table).
+                    let block_phantoms = self.block_snap_phantoms();
+                    if !block_phantoms.is_empty() {
+                        let block_hits = find_all_snaps(
+                            world, world_radius,
+                            self.snap_enabled, self.snap_override,
+                            snap_anchor,
+                            &block_phantoms, None,
+                        );
+                        hits.extend(block_hits);
+                        merged_extra = true;
+                    }
+                    if merged_extra {
                         // Re-sort merged list by (priority, distance) so the
-                        // closest snap across both sources wins.
+                        // closest snap across all sources wins.
                         hits.sort_by(|a, b| {
                             a.kind.priority().cmp(&b.kind.priority())
                                 .then(a.point.dist(world).partial_cmp(&b.point.dist(world))
@@ -15363,6 +15911,14 @@ impl eframe::App for CadApp {
                 || self.fillet_state     != FilletState::Off
                 || self.chamfer_state    != ChamferState::Off
                 || self.dist_state       != DistState::Off
+                // Block/insert POINT-PICK phases: a single click captures a
+                // coordinate (block base point, insert insertion point), so
+                // they must be click-only — otherwise grips on the still-
+                // selected source dobjects steal the press (`grip_drag`) and
+                // the point is never captured.
+                || self.block_dialog_pick_base
+                || self.block_def_state != BlockDefState::Off
+                || self.insert_state    != InsertState::Off
                 || self.picking_source
                 || self.intersect_pending_click;
             // Pointer mode (Tool::None, no edit phase, no active select
@@ -15429,8 +15985,17 @@ impl eframe::App for CadApp {
                 // (a) Drag-grab: a primary-button drag begins near a grip.
                 // (b) Click-grab: a clicked() event lands near a grip AND
                 //     no grip is currently held.
-                let try_grab = drag_started
-                    || (click_now && self.grip_drag.is_none());
+                //
+                // BUT NOT on the RELEASE tail of a press-fires-click gesture:
+                // a point-pick phase (block base / insert point) captures on
+                // PRESS and clears its phase flag, so by the release frame
+                // `pointer_mode_idle` has flipped back true and the release's
+                // `clicked()` would spuriously grab a grip. `pending_release_
+                // swallow` (set on the press, still set here on the release
+                // since the swallow bookkeeping runs LATER this frame) marks
+                // exactly that tail — the same guard the click cascade uses.
+                let try_grab = !self.pending_release_swallow
+                    && (drag_started || (click_now && self.grip_drag.is_none()));
                 if try_grab && self.grip_drag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let cur_world = self.s2w(pos, rect);
@@ -16607,7 +17172,16 @@ impl eframe::App for CadApp {
                             drawn += 1;
                             continue;
                         }
-                        let (emin, emax) = e.bbox();
+                        // BlockRefs resolve their real extent through the
+                        // block table — the kernel bbox is just the insertion
+                        // point (0×0), which would BOTH pass the viewport cull
+                        // spuriously AND trip the sub-pixel micro-cull below,
+                        // making every instance invisible (same reason Hatch
+                        // is short-circuited above).
+                        let (emin, emax) = match &e.geom {
+                            Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                            _ => e.bbox(),
+                        };
                         if emax.x < v_min.x || emin.x > v_max.x
                         || emax.y < v_min.y || emin.y > v_max.y {
                             continue;
@@ -16739,7 +17313,14 @@ impl eframe::App for CadApp {
                     let sel_col  = egui::Color32::from_rgb(255, 200, 80);
                     for i in candidate_iter {
                         let e = &self.doc.dobjects[i];
-                        let (emin, emax) = e.bbox();
+                        // BlockRef: resolve the real extent (kernel bbox is
+                        // just the insertion point), else a block whose
+                        // insertion point scrolls off-screen vanishes even
+                        // when its body is still in view.
+                        let (emin, emax) = match &e.geom {
+                            Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                            _ => e.bbox(),
+                        };
                         if emax.x < v_min.x || emin.x > v_max.x
                         || emax.y < v_min.y || emin.y > v_max.y {
                             continue;
@@ -17468,11 +18049,16 @@ impl eframe::App for CadApp {
                         [pivot_s + egui::vec2(0.0, -9.0), pivot_s + egui::vec2(0.0, 9.0)],
                         egui::Stroke::new(0.8, mark));
                     if let Some(cur) = resp.hover_pos() {
-                        let cur_world = self.s2w(cur, rect);
+                        // Constrained cursor so CARD-locked H/V scaling
+                        // previews exactly what the click commits.
+                        let cur_world = self.cursor_world_constrained(
+                            Some(cur), rect, snap_hit.map(|h| h.point))
+                            .unwrap_or_else(|| self.s2w(cur, rect));
+                        let cur_s     = self.w2s(cur_world, rect);
                         let factor    = pivot.dist(cur_world);
                         // Baseline pivot→cursor.
                         painter.line_segment(
-                            [pivot_s, cur],
+                            [pivot_s, cur_s],
                             egui::Stroke::new(1.0,
                                 egui::Color32::from_rgba_unmultiplied(255, 200, 80, 180)));
                         // Ghost of the scaled selection.
@@ -17483,7 +18069,7 @@ impl eframe::App for CadApp {
                             draw_dobject(&painter, rect, self, &g, ghost);
                         }
                         painter.text(
-                            cur + egui::vec2(12.0, -12.0),
+                            cur_s + egui::vec2(12.0, -12.0),
                             egui::Align2::LEFT_BOTTOM,
                             format!("×{:.3}{}", factor,
                                 if self.scale_copy { "  (copy)" } else { "" }),
