@@ -26,6 +26,10 @@ use crate::dobject::DObject;
 use crate::geom::Geom;
 use crate::math::Vec2;
 
+/// Maximum number of parametric parameters a (parametric) block may carry.
+/// Kept small + fixed so `BlockRef` stays `Copy` (no heap per instance).
+pub const MAX_BLOCK_PARAMS: usize = 8;
+
 /// A placed instance of a block definition.
 #[derive(Clone, Copy, Debug)]
 pub struct BlockRef {
@@ -37,6 +41,39 @@ pub struct BlockRef {
     pub scale:    f64,
     /// Rotation in radians, CCW.
     pub rotation: f64,
+    /// Per-instance values for the block's parametric `params` (parallel by
+    /// index; unused slots ignored). Empty/non-parametric blocks ignore
+    /// this. Fixed array so `BlockRef` stays `Copy`. Defaults to 0.0;
+    /// the inserter sets each to the param's `source_value`.
+    pub param_values: [f64; MAX_BLOCK_PARAMS],
+}
+
+/// One MODIFIER VECTOR of a parametric block — a stretch window + a unit
+/// direction (taken from the source→target diff). A named `BlockParam`
+/// (variable) drives one or more of these. The displacement applied to a
+/// vector at a variable value `V` is `dir * (V - original)` — i.e. the
+/// value is in the SAME units as the geometry (1 unit of value = 1 unit of
+/// displacement along `dir`).
+#[derive(Clone, Copy, Debug)]
+pub struct ParamVector {
+    /// Stretch window (definition/base-relative space) this vector moves.
+    pub win_min: Vec2,
+    pub win_max: Vec2,
+    /// Unit direction of the displacement.
+    pub dir:     Vec2,
+}
+
+/// One named parametric VARIABLE of a (semi-smart) block — e.g. `width`.
+/// It owns one or more `vectors` (LINKED P's that move together). `original`
+/// is the value the SOURCE block represents; at insert the user enters a
+/// value `V` and every linked vector displaces by `dir * (V - original)`.
+#[derive(Clone, Debug)]
+pub struct BlockParam {
+    pub name:     String,
+    /// The value the SOURCE block represents (displacement 0 here).
+    pub original: f64,
+    /// The modifier vectors this variable drives together (≥1).
+    pub vectors:  Vec<ParamVector>,
 }
 
 impl BlockRef {
@@ -68,6 +105,11 @@ pub struct Block {
     /// hook in later. NOT yet persisted to RSM (reader defaults it false,
     /// like the dim/wall style tables — see rsm.rs).
     pub smart:    bool,
+    /// Parametric parameters (named modifier vectors). Empty = a plain
+    /// static block. Populated by the block-diff "Set parameters" flow;
+    /// each instance carries values in `BlockRef.param_values`. NOT yet
+    /// persisted to RSM (reader defaults it empty).
+    pub params:   Vec<BlockParam>,
 }
 
 /// Table of block definitions on the Document. Unlike the style tables
@@ -80,6 +122,9 @@ pub struct BlockTable {
 impl BlockTable {
     pub fn get(&self, id: u32) -> Option<&Block> {
         self.blocks.get(id as usize)
+    }
+    pub fn get_mut(&mut self, id: u32) -> Option<&mut Block> {
+        self.blocks.get_mut(id as usize)
     }
     pub fn add(&mut self, b: Block) -> u32 {
         let id = self.blocks.len() as u32;
@@ -111,6 +156,7 @@ mod tests {
             insert: Vec2::new(10.0, 10.0),
             scale: 2.0,
             rotation: std::f64::consts::FRAC_PI_2,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
         };
         let g = Geom::Line(Line { a: Vec2::new(1.0, 0.0), b: Vec2::new(2.0, 0.0) });
         let out = br.transform_geom(&g, Vec2::new(1.0, 0.0));
@@ -127,6 +173,7 @@ mod tests {
             insert: Vec2::new(5.0, 0.0),
             scale: 3.0,
             rotation: 1.234,
+            param_values: [0.0; MAX_BLOCK_PARAMS],
         };
         let g = Geom::Circle(Circle { center: Vec2::new(0.0, 0.0), radius: 2.0 });
         let out = br.transform_geom(&g, Vec2::new(0.0, 0.0));

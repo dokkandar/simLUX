@@ -148,6 +148,17 @@ pub enum Command {
     /// Replace selected BlockRefs with transformed copies of their
     /// contents (select-first like erase).
     Explode,
+    /// Compare two block definitions and report the candidate parametric
+    /// rule (which geometry moves, by what vector). `blockdiff <A> <B>` by
+    /// name, or bare `blockdiff` to PICK the two blocks on screen.
+    /// Step 1 of programming-by-demonstration parametric blocks.
+    BlockDiff(Option<(String, String)>),
+    /// Block Task Recorder: explode the selected block into a temp sandbox
+    /// and RECORD each stretch the user demonstrates as a parametric task
+    /// (the reversible, intent-capturing alternative to `blockdiff`).
+    BlockTaskRecorder,
+    /// Finish the active Block Task Recorder → name the recorded tasks.
+    BlockTaskFinish,
     /// CARD — cardinal-directions drafting lock (cursor constrained to
     /// ONLY horizontal or vertical from the anchor). `card` toggles;
     /// `card on` / `card off` set explicitly. Also on F8 and the
@@ -238,6 +249,9 @@ impl Command {
             Command::BlockDef(_)        => "BlockDef",
             Command::Insert(_)          => "Insert",
             Command::Explode            => "Explode",
+            Command::BlockDiff(_)       => "BlockDiff",
+            Command::BlockTaskRecorder  => "BlockTaskRecorder",
+            Command::BlockTaskFinish    => "BlockTaskFinish",
             Command::Card(_)            => "Card",
             Command::DbgRecorder        => "DbgRecorder",
             Command::Linetype(_)        => "Linetype",
@@ -420,6 +434,16 @@ pub fn parse(line: &str) -> Result<Command, String> {
             Ok(Command::Insert(toks.get(1).map(|s| (*s).to_string())))
         }
         "explode" | "xp" => Ok(Command::Explode),
+        "blockdiff" | "bdiff" => {
+            match (toks.get(1), toks.get(2)) {
+                (Some(a), Some(b)) =>
+                    Ok(Command::BlockDiff(Some(((*a).to_string(), (*b).to_string())))),
+                (None, None) => Ok(Command::BlockDiff(None)),   // pick on screen
+                _ => Err("usage: blockdiff   (pick on screen)   OR   blockdiff <A> <B>".into()),
+            }
+        }
+        "btr" | "blocktask" | "taskrec" => Ok(Command::BlockTaskRecorder),
+        "finish" | "endrec" => Ok(Command::BlockTaskFinish),
         "card" => {
             // `card` → toggle; `card on` / `card off` → set.
             match toks.get(1).map(|s| s.to_ascii_lowercase()).as_deref() {

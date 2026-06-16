@@ -696,7 +696,7 @@ fn read_block_table(
         let base     = r.vec2()?;
         let smart    = if ver >= 3 { r.u8()? != 0 } else { false };
         let dobjects = read_dobjects(r, tc, ver)?;
-        blocks.push(cad_kernel::Block { name, base, dobjects, smart });
+        blocks.push(cad_kernel::Block { name, base, dobjects, smart, params: Vec::new() });
     }
     Ok(cad_kernel::BlockTable { blocks })
 }
@@ -886,7 +886,8 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             let insert   = r.vec2()?;
             let scale    = r.f64()?;
             let rotation = r.f64()?;
-            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, rotation })
+            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, rotation,
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS] })
         }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
@@ -920,19 +921,22 @@ mod tests {
         ];
         let id = doc.blocks.add(cad_kernel::Block {
             name: "CHAIR".into(), base: Vec2::new(2.0, 0.0),
-            dobjects: contents, smart: false,
+            dobjects: contents, smart: false, params: Vec::new(),
         });
         let inner = vec![cad_kernel::DObject::new(Geom::BlockRef(
             cad_kernel::BlockRef {
                 block: id, insert: Vec2::new(1.0, 1.0),
                 scale: 0.5, rotation: 0.25,
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             }))];
         doc.blocks.add(cad_kernel::Block {
             name: "DESK_SET".into(), base: Vec2::ZERO, dobjects: inner, smart: false,
+            params: Vec::new(),
         });
         doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
             block: id, insert: Vec2::new(10.0, -3.0),
             scale: 2.0, rotation: std::f64::consts::FRAC_PI_4,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         })));
 
         let back = round_trip(&doc);
@@ -1008,7 +1012,7 @@ mod tests {
             name: "SMART1".into(), base: Vec2::ZERO,
             dobjects: vec![DObject::new(Geom::Line(Line {
                 a: Vec2::ZERO, b: Vec2::new(1.0, 0.0) }))],
-            smart: true,
+            smart: true, params: Vec::new(),
         });
 
         let back = round_trip(&doc);

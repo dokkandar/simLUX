@@ -146,6 +146,20 @@ fn rect_polyline(a: Vec2, b: Vec2) -> Geom {
 /// logic in `apply_stretch`): any vertex / centre inside the box moves by
 /// `v`, the rest stay. Returns the moved geom (an unchanged clone when
 /// nothing in this dobject is inside).
+/// Defining points of a geom (for the Block Task Recorder's affected-point
+/// capture) — the same set `stretch_one` would move. Mirrors blockdiff's
+/// feature points; bbox corners for variants not modelled here.
+fn geom_def_points(g: &Geom) -> Vec<Vec2> {
+    match g {
+        Geom::Line(l)     => vec![l.a, l.b],
+        Geom::Polyline(p) => p.vertices.iter().map(|v| v.pos).collect(),
+        Geom::Circle(c)   => vec![c.center],
+        Geom::Arc(a)      => { let (s, e) = a.endpoints(); vec![s, e] }
+        Geom::Point(pt)   => vec![pt.location],
+        other             => { let (mn, mx) = other.bbox(); vec![mn, mx] }
+    }
+}
+
 fn stretch_one(g: &Geom, win_min: Vec2, win_max: Vec2, v: Vec2) -> Geom {
     let inside = |p: Vec2| p.x >= win_min.x && p.x <= win_max.x
                         && p.y >= win_min.y && p.y <= win_max.y;
@@ -427,6 +441,19 @@ pub struct CadApp {
     /// Target indices for `AciPickRequest::DobjectMany` (Properties dialog
     /// group color). Kept off the enum so `AciPickRequest` stays `Copy`.
     aci_pick_many:        Vec<usize>,
+    /// Highlight overlay for the parametric points found by `blockdiff` —
+    /// drawn on every instance of the two compared blocks. Cleared on Esc,
+    /// `clear`, or a new compare. See `BlockDiffOverlay`.
+    blockdiff_overlay:    Option<BlockDiffOverlay>,
+    /// Pick-two-blocks-on-screen flow for compare (see `BlockDiffPick`).
+    blockdiff_pick:       BlockDiffPick,
+    /// "Set parameters on block" dialog (opens after the pick). See
+    /// `ParamNameDialog`.
+    param_name_dialog:    Option<ParamNameDialog>,
+    /// Insert-time value prompt for a parametric block. See `InsertParamPrompt`.
+    insert_param_prompt:  Option<InsertParamPrompt>,
+    /// Active Block Task Recorder session. See `BlockTaskRec`.
+    block_task_rec:       Option<BlockTaskRec>,
     selected:      Option<usize>,
 
     tool:          Tool,
@@ -939,6 +966,15 @@ pub enum InsertState {
     WaitingForPoint { block: u32 },
 }
 
+/// Pick-two-blocks-on-screen flow for `blockdiff` / the dialog Compare
+/// button. Click the BASE block, then the variant; runs the diff.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum BlockDiffPick {
+    Off,
+    WaitingForA,
+    WaitingForB(u32),   // base block id already picked
+}
+
 /// Block dialog — opened by bare `block` (no name) and the Draw menu.
 /// Collects everything needed to define a block: name, the contents
 /// (Select objects round-trips to the canvas), insertion/base point
@@ -977,6 +1013,79 @@ impl BlockDialog {
             self.base_y.trim().parse().unwrap_or(0.0),
         )
     }
+}
+
+/// Highlight overlay produced by `blockdiff`: the parametric (moved)
+/// points, drawn on every placed instance of the two compared blocks so
+/// the user SEES which points are parametric. Points are base-relative
+/// (block-definition space); the renderer maps them through each
+/// instance's transform.
+pub struct BlockDiffOverlay {
+    /// BASE block id — the highlight draws on this block's instances (the
+    /// moved points are base-relative to it).
+    pub block_a: u32,
+    /// One entry per STRONG cluster (candidate parameter): the cluster's
+    /// base-relative before-points and its displacement direction (for the
+    /// arrow). Drawn in a per-cluster colour.
+    pub clusters: Vec<(Vec<Vec2>, Vec2)>,
+}
+
+/// One extracted modifier vector (block-diff cluster) awaiting a name +
+/// value mapping, shown as a row in the "Set parameters on block" dialog.
+pub struct ParamRow {
+    pub win_min:      Vec2,
+    pub win_max:      Vec2,
+    pub dir:          Vec2,
+    pub magnitude:    f64,
+    pub dx:           f64,
+    pub dy:           f64,
+    pub points:       Vec<Vec2>,
+    /// Editable fields.
+    pub name:         String,
+    /// The value the SOURCE block represents (displacement 0). Insert
+    /// displacement = (entered value − original) along `dir`.
+    pub original:     String,
+}
+
+/// "Set parameters on block" dialog — opens after picking source + target
+/// blocks. Each extracted modifier vector becomes a row; the user names it
+/// (`width`, `thickness`, …) and sets its source/target values; Save writes
+/// the params onto the SOURCE block, making it a parametric block.
+pub struct ParamNameDialog {
+    pub source_id:   u32,
+    pub source_name: String,
+    pub target_name: String,
+    pub rows:        Vec<ParamRow>,
+}
+
+/// Insert-time value prompt for a parametric block: after the insertion
+/// point is clicked, the command line asks for each variable in turn
+/// ("set width [1000]:"); on the last, the instance is placed.
+pub struct InsertParamPrompt {
+    pub block:    u32,
+    pub insert:   Vec2,
+    pub names:    Vec<String>,
+    pub defaults: Vec<f64>,
+    pub values:   Vec<f64>,   // collected so far (len = current index)
+}
+
+/// Block Task Recorder session — the block is exploded into a TEMP sandbox
+/// (tracked by handle); each stretch the user demonstrates is recorded as a
+/// `ParamRow` (base-relative). On Finish the sandbox is deleted and the
+/// recorded tasks are named in the "Set parameters on block" dialog, then
+/// attached as parameters to the original block. Forward-recording =
+/// reversible (each task IS the function), unlike the block-diff.
+pub struct BlockTaskRec {
+    pub source_block: u32,
+    pub source_name:  String,
+    /// World offset to subtract from recorded world windows to get the
+    /// base-relative ones (= the sandbox instance's insert point). `save_
+    /// block_params` re-adds the block base for definition space.
+    pub world_offset: Vec2,
+    /// Handles of the temp sandbox dobjects (deleted on Finish/cancel).
+    pub temp_handles: Vec<u64>,
+    /// Recorded tasks (one per demonstrated stretch).
+    pub recorded:     Vec<ParamRow>,
 }
 
 /// Open vs Save As for the in-app file browser.
@@ -1493,6 +1602,11 @@ impl Default for CadApp {
             },
             aci_pick_request:    None,
             aci_pick_many:       Vec::new(),
+            blockdiff_overlay:   None,
+            blockdiff_pick:      BlockDiffPick::Off,
+            param_name_dialog:   None,
+            insert_param_prompt: None,
+            block_task_rec:      None,
             selected:      None,
             tool:          Tool::None,
             arc_method:    ArcMethod::ThreePoints,
@@ -1955,6 +2069,39 @@ impl CadApp {
                     return;
                 }
             }
+        }
+
+        // ---- Insert-time parametric value prompt (must run FIRST) ----
+        // While placing a parametric block, each typed line is the value
+        // for the current variable (empty = its default). On the last one,
+        // the instance is placed.
+        if let Some(mut p) = self.insert_param_prompt.take() {
+            let idx = p.values.len();
+            let val = if trimmed.is_empty() {
+                p.defaults[idx]
+            } else {
+                match trimmed.parse::<f64>() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        self.history.push(format!(
+                            "  ! insert: '{}' is not a number — set {} [{}] or Esc",
+                            trimmed, p.names[idx], p.defaults[idx]));
+                        self.insert_param_prompt = Some(p);
+                        return;
+                    }
+                }
+            };
+            p.values.push(val);
+            if p.values.len() < p.names.len() {
+                let i = p.values.len();
+                self.set_prompt(format!(
+                    "insert: set {} [{}]  (Enter=default)  [Esc=cancel]",
+                    p.names[i], p.defaults[i]));
+                self.insert_param_prompt = Some(p);
+            } else {
+                self.place_parametric_insert(p);
+            }
+            return;
         }
 
         // ---- Pending-sub-arg intercepts (must run FIRST) ----------
@@ -3042,6 +3189,12 @@ impl CadApp {
                     self.apply_explode();
                 }
             }
+            Ok(Command::BlockDiff(arg)) => match arg {
+                Some((name_a, name_b)) => self.run_block_diff(&name_a, &name_b),
+                None => self.begin_block_diff_pick(),
+            },
+            Ok(Command::BlockTaskRecorder) => self.begin_block_task_recorder(),
+            Ok(Command::BlockTaskFinish)   => self.finish_block_task_recorder(),
             Ok(Command::Wall(t_opt)) => {
                 // Persist thickness if user supplied one, then enter
                 // the Wall drafting tool. Two clicks → two side lines
@@ -3270,6 +3423,9 @@ impl CadApp {
     fn clear_all(&mut self) {
         self.doc.dobjects.clear();
         self.intersections.clear();
+        self.blockdiff_overlay = None;
+        self.param_name_dialog = None;
+        self.block_task_rec = None;
         self.pending.clear();
         self.selected      = None;
         self.snap_override = None;
@@ -8690,6 +8846,40 @@ impl CadApp {
                             if let Geom::BlockRef(b) = &mut d.geom { b.rotation = rad; } });
                     } else { self.props_gesture_snapshot(&resp); }
                     ui.end_row();
+
+                    // Parametric PARAMETERS (single instance) — edit a value
+                    // and the geometry derives live. This is the parametric
+                    // block's payoff: set `width`, see the door resize.
+                    if targets.len() == 1 {
+                        let idx = targets[0];
+                        let param_info: Vec<(String, f64)> =
+                            if let Some(Geom::BlockRef(br)) =
+                                self.doc.dobjects.get(idx).map(|d| &d.geom)
+                            {
+                                self.doc.blocks.get(br.block).map(|blk|
+                                    blk.params.iter().enumerate().map(|(k, p)|
+                                        (p.name.clone(),
+                                         br.param_values.get(k).copied()
+                                            .unwrap_or(p.original))
+                                    ).collect()).unwrap_or_default()
+                            } else { Vec::new() };
+                        for (k, (pname, curval)) in param_info.into_iter().enumerate() {
+                            ui.label(format!("◉ {}", pname));
+                            let mut v = curval;
+                            let resp = ui.add(egui::DragValue::new(&mut v).speed(1.0));
+                            if resp.changed() {
+                                self.props_gesture_snapshot(&resp);
+                                self.props_apply(targets, false, move |d| {
+                                    if let Geom::BlockRef(b) = &mut d.geom {
+                                        if k < cad_kernel::MAX_BLOCK_PARAMS {
+                                            b.param_values[k] = v;
+                                        }
+                                    }
+                                });
+                            } else { self.props_gesture_snapshot(&resp); }
+                            ui.end_row();
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -9236,6 +9426,70 @@ impl CadApp {
         }
     }
 
+    /// "Set parameters on block" dialog — opened after picking source +
+    /// target blocks. Name each modifier vector + set its source/target
+    /// value; Save makes the source block parametric.
+    fn render_param_name_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.param_name_dialog.take() else { return; };
+        let mut open      = true;
+        let mut do_save   = false;
+        let mut do_cancel = false;
+        egui::Window::new("Set parameters on block")
+            .id(egui::Id::new("param_name_dialog"))
+            .open(&mut open)
+            .resizable(false)
+            .collapsible(false)
+            .default_pos(egui::pos2(300.0, 130.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new(format!(
+                    "base '{}'  →  variant '{}'", dlg.source_name, dlg.target_name)).strong());
+                ui.small("Name each modifier vector (P) and set what value the \
+                          source / target represent. Highlighted on the base block. \
+                          Leave a name blank to skip a vector. Give two rows the \
+                          SAME name to LINK them into one variable (asked once at insert).");
+                ui.add_space(4.0);
+                egui::Grid::new("param_rows_grid")
+                    .num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label(egui::RichText::new("P").strong());
+                    ui.label(egui::RichText::new("Δx, Δy").strong());
+                    ui.label(egui::RichText::new("name (variable)").strong());
+                    ui.label(egui::RichText::new("original").strong());
+                    ui.end_row();
+                    for (i, r) in dlg.rows.iter_mut().enumerate() {
+                        ui.label(format!("P{}", i + 1));
+                        ui.monospace(format!("{:.1}, {:.1}", r.dx, r.dy));
+                        ui.add(egui::TextEdit::singleline(&mut r.name)
+                            .desired_width(110.0).hint_text("width / thickness"));
+                        ui.add(egui::TextEdit::singleline(&mut r.original)
+                            .desired_width(64.0).hint_text("e.g. 1000"));
+                        ui.end_row();
+                    }
+                });
+                ui.small("At insert the app asks \"set <name>\"; displacement = \
+                          (entered value − original) along the vector.");
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.with_layout(
+                        egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.button(egui::RichText::new("Save parametric block").strong())
+                            .clicked() { do_save = true; }
+                    });
+                });
+            });
+        if do_save {
+            self.save_block_params(dlg.source_id, &dlg.rows);
+            self.blockdiff_overlay = None;
+            return;   // dialog closes
+        }
+        if !open || do_cancel {
+            self.history.push("  set parameters: cancelled".into());
+            return;
+        }
+        self.param_name_dialog = Some(dlg);   // keep open
+    }
+
     /// Block dialog — bare `block` / Draw menu. Full define-a-block form:
     /// name, live PREVIEW of the selection, "Select objects" (round-trips
     /// to canvas), insertion point (typed X/Y or "Pick ⊕"), instance COLOR
@@ -9251,6 +9505,8 @@ impl CadApp {
         let mut do_pick_color = false; // open ACI wheel
         let mut clear_color = false;   // reset to inherit/ByLayer
         let mut insert_id: Option<u32> = None;
+        let mut do_compare  = false;   // diff the two chosen blocks
+        let mut do_task_record = false; // start the Block Task Recorder
 
         let existing: Vec<(u32, String, usize, bool)> = self.doc.blocks.blocks.iter()
             .enumerate()
@@ -9426,9 +9682,48 @@ impl CadApp {
                             }
                         });
                 }
+
+                // ---- Set parameters on block ----------------------------
+                if existing.len() >= 2 {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Set parameters on block").strong());
+                    ui.small("RECORD (recommended): select a block instance, close this \
+                              dialog, run `btr`, demonstrate each stretch, then `finish`. \
+                              Each stretch IS a parameter (reversible).");
+                    if ui.add(egui::Button::new(
+                        egui::RichText::new("Block Task Recorder (record stretches) ▶").strong()))
+                        .on_hover_text("Needs a block instance SELECTED. Closes this dialog, \
+                                        explodes it to a sandbox; stretch to demonstrate each \
+                                        parameter, then type `finish`.")
+                        .clicked()
+                    {
+                        do_task_record = true;
+                    }
+                    ui.add_space(2.0);
+                    ui.small("…or COMPARE two finished blocks (lossy for arcs/rotations):");
+                    if ui.add(egui::Button::new("Compare source & target on screen ▶"))
+                        .on_hover_text("Click the SOURCE block then the TARGET block; the \
+                                        diff is extracted (can include side-effect vectors).")
+                        .clicked()
+                    {
+                        do_compare = true;
+                    }
+                }
             });
 
         // ---- post-frame actions ------------------------------------------
+        if do_task_record {
+            // Close the dialog and start the Block Task Recorder on the
+            // currently-selected block instance.
+            self.begin_block_task_recorder();
+            return;
+        }
+        if do_compare {
+            // Close the dialog and start the on-screen 2-block pick.
+            self.begin_block_diff_pick();
+            return;
+        }
         if let Some(id) = insert_id {
             let name = existing.iter()
                 .find(|(i, _, _, _)| *i == id)
@@ -9521,6 +9816,7 @@ impl CadApp {
         let inst_style = contents.first().map(|d| d.style);
         let id = self.doc.blocks.add(cad_kernel::Block {
             name: name.to_string(), base, dobjects: contents, smart,
+            params: Vec::new(),
         });
         for &i in sel.iter().rev() {
             self.doc.dobjects.remove(i);
@@ -9528,6 +9824,7 @@ impl CadApp {
         self.selection.clear();
         let geom = Geom::BlockRef(cad_kernel::BlockRef {
             block: id, insert: base, scale: 1.0, rotation: 0.0,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         });
         let mut d = match inst_style {
             Some(st) => DObject::with_style(geom, st),
@@ -9545,13 +9842,383 @@ impl CadApp {
         self.gpu_dirty = true;
     }
 
-    /// `insert <name>` final step — place one instance (scale 1, rot 0;
-    /// scale/rotation sub-options are a follow-up).
-    fn apply_insert(&mut self, block: u32, insert: Vec2) {
+    /// Start the pick-two-blocks-on-screen compare flow (bare `blockdiff`
+    /// or the dialog's Compare button). Click the BASE block, then the
+    /// variant.
+    fn begin_block_diff_pick(&mut self) {
+        if self.doc.blocks.is_empty() {
+            self.history.push("  ! compare: no blocks defined yet".into());
+            return;
+        }
+        self.blockdiff_pick = BlockDiffPick::WaitingForA;
+        self.set_prompt("compare: click the BASE block instance  [Esc=cancel]");
+    }
+
+    /// Handle a canvas click while picking blocks to compare. Returns true
+    /// if the click was consumed by the pick flow.
+    fn block_diff_pick_click(&mut self, world: Vec2) -> bool {
+        let state = self.blockdiff_pick;
+        if state == BlockDiffPick::Off { return false; }
+        let tol = 10.0 / self.scale as f64;
+        let hit = self.nearest_entity_under(world, tol)
+            .and_then(|i| match &self.doc.dobjects.get(i)?.geom {
+                Geom::BlockRef(br) => Some(br.block),
+                _ => None,
+            });
+        let Some(block_id) = hit else {
+            self.history.push("  compare: that's not a block — click a block instance  [Esc=cancel]".into());
+            return true;
+        };
+        match state {
+            BlockDiffPick::WaitingForA => {
+                let name = self.doc.blocks.get(block_id).map(|b| b.name.clone())
+                    .unwrap_or_default();
+                self.blockdiff_pick = BlockDiffPick::WaitingForB(block_id);
+                self.set_prompt(format!(
+                    "compare: base = '{}' — click the SECOND (variant) block  [Esc=cancel]", name));
+            }
+            BlockDiffPick::WaitingForB(a) => {
+                self.blockdiff_pick = BlockDiffPick::Off;
+                self.clear_prompt();
+                if block_id == a {
+                    self.history.push("  ! compare: pick a DIFFERENT block for the variant".into());
+                    self.blockdiff_pick = BlockDiffPick::WaitingForA;
+                    self.set_prompt("compare: click the BASE block instance  [Esc=cancel]");
+                } else {
+                    // Extract the modifier vectors, highlight them, and open
+                    // the "Set parameters on block" dialog to name them.
+                    self.open_param_name_dialog(a, block_id);
+                }
+            }
+            BlockDiffPick::Off => {}
+        }
+        true
+    }
+
+    /// Coordinate tolerance for diffing two blocks — a fraction of the
+    /// bigger block's largest-dobject extent, floored.
+    fn block_diff_eps(&self, ia: u32, ib: u32) -> f64 {
+        let span = |id: u32| self.doc.blocks.get(id).map(|blk|
+            blk.dobjects.iter().fold(0.0_f64, |m, d| {
+                let (mn, mx) = d.bbox(); m.max((mx - mn).len())
+            })).unwrap_or(0.0);
+        (span(ia).max(span(ib)) * 1e-4).max(1e-6)
+    }
+
+    /// Extract the modifier vectors between two blocks, highlight them on
+    /// the BASE block, and open the "Set parameters on block" dialog so the
+    /// user can name each + set its source/target values, then Save.
+    fn open_param_name_dialog(&mut self, ia: u32, ib: u32) {
+        if ia == ib {
+            self.history.push("  ! compare: pick TWO different blocks".into());
+            return;
+        }
+        let (Some(ba), Some(bb)) = (self.doc.blocks.get(ia), self.doc.blocks.get(ib))
+        else { return; };
+        let source_name = ba.name.clone();
+        let target_name = bb.name.clone();
+        let eps = self.block_diff_eps(ia, ib);
+        let diff = cad_kernel::diff_blocks(&ba.dobjects, ba.base, &bb.dobjects, bb.base, eps);
+        let rows: Vec<ParamRow> = diff.clusters.iter()
+            .filter(|c| c.point_count >= 2)
+            .map(|c| ParamRow {
+                win_min: c.win_min, win_max: c.win_max,
+                dir: c.dir, magnitude: c.magnitude,
+                dx: c.dir.x * c.magnitude, dy: c.dir.y * c.magnitude,
+                points: c.points.clone(),
+                name: String::new(),
+                original: "0".into(),
+            }).collect();
+        // Highlight on the base block.
+        let oc: Vec<(Vec<Vec2>, Vec2)> = rows.iter()
+            .map(|r| (r.points.clone(), r.dir)).collect();
+        self.blockdiff_overlay = if oc.is_empty() { None }
+            else { Some(BlockDiffOverlay { block_a: ia, clusters: oc }) };
+        if rows.is_empty() {
+            self.history.push(format!(
+                "  compare '{}' → '{}': no strong modifier vectors (try the ✂ recorder)",
+                source_name, target_name));
+            return;
+        }
+        self.history.push(format!(
+            "  ◉ {} modifier vector(s) — name them in 'Set parameters on block'", rows.len()));
+        self.param_name_dialog = Some(ParamNameDialog {
+            source_id: ia, source_name, target_name, rows });
+    }
+
+    /// Save the named modifier vectors as the SOURCE block's parametric
+    /// params (making it a parametric block). Existing instances are reset
+    /// to the params' source values so they look unchanged.
+    fn save_block_params(&mut self, source_id: u32, rows: &[ParamRow]) {
+        // Rows carry BASE-RELATIVE windows; the derive applies them to the
+        // block's DEFINITION-space geometry, so add the base back here.
+        let base = self.doc.blocks.get(source_id).map(|b| b.base).unwrap_or(Vec2::ZERO);
+        // Group rows by name → one VARIABLE per distinct name; rows sharing
+        // a name are LINKED (their vectors move together). First-seen order
+        // preserved (= the param_values slot order).
+        let mut params: Vec<cad_kernel::BlockParam> = Vec::new();
+        for r in rows.iter().filter(|r| !r.name.trim().is_empty()) {
+            let name = r.name.trim().to_string();
+            let vec = cad_kernel::ParamVector {
+                win_min: r.win_min + base, win_max: r.win_max + base, dir: r.dir };
+            if let Some(p) = params.iter_mut().find(|p| p.name == name) {
+                p.vectors.push(vec);   // link into the existing variable
+            } else if params.len() < cad_kernel::MAX_BLOCK_PARAMS {
+                let original = r.original.trim().parse().unwrap_or(0.0);
+                params.push(cad_kernel::BlockParam {
+                    name, original, vectors: vec![vec] });
+            }
+        }
+        if params.is_empty() {
+            self.history.push("  ! set parameters: name at least one vector first".into());
+            return;
+        }
+        let n = params.len();
+        let src_defaults: Vec<f64> = params.iter().map(|p| p.original).collect();
+        let name = self.doc.blocks.get(source_id).map(|b| b.name.clone()).unwrap_or_default();
+        if let Some(blk) = self.doc.blocks.get_mut(source_id) {
+            blk.params = params;
+            blk.smart = true;
+        }
+        // Keep existing instances looking unchanged: set their values to the
+        // source defaults.
+        for d in &mut self.doc.dobjects {
+            if let Geom::BlockRef(br) = &mut d.geom {
+                if br.block == source_id {
+                    for (k, v) in src_defaults.iter().enumerate() {
+                        if k < cad_kernel::MAX_BLOCK_PARAMS { br.param_values[k] = *v; }
+                    }
+                }
+            }
+        }
+        self.gpu_dirty = true;
+        self.index_dirty = true;
+        self.history.push(format!(
+            "  ✔ block '{}' is now parametric — {} param(s). Insert it, then set values in Properties.",
+            name, n));
+    }
+
+    /// Start a Block Task Recorder on the selected block instance — explode
+    /// it into a temp sandbox the user stretches to demonstrate parameters.
+    fn begin_block_task_recorder(&mut self) {
+        // Find a selected block instance (basket or single).
+        let br = self.selection.iter().copied()
+            .chain(self.selected)
+            .filter_map(|i| match self.doc.dobjects.get(i).map(|d| &d.geom) {
+                Some(Geom::BlockRef(b)) => Some(*b),
+                _ => None,
+            })
+            .next();
+        let Some(br) = br else {
+            self.history.push(
+                "  ! block task recorder: select a BLOCK instance first, then `btr`".into());
+            return;
+        };
+        let Some(blk) = self.doc.blocks.get(br.block) else { return; };
+        let source_block = br.block;
+        let source_name  = blk.name.clone();
+        let off          = br.insert - blk.base;        // place at the instance
+        let temps: Vec<DObject> = blk.dobjects.iter()
+            .map(|cd| DObject::with_style(cd.geom.translated(off), cd.style))
+            .collect();
+        // (blk borrow ends here — `temps` owns clones.)
         self.snapshot_doc();
+        let mut temp_handles = Vec::new();
+        for t in temps { temp_handles.push(t.handle); self.doc.push(t); }
+        self.selection.clear();
+        self.selected = None;
+        self.block_task_rec = Some(BlockTaskRec {
+            source_block, source_name: source_name.clone(),
+            world_offset: br.insert, temp_handles, recorded: Vec::new() });
+        self.index_dirty = true;
+        self.gpu_dirty   = true;
+        self.set_prompt(
+            "Block Task Recorder: STRETCH the geometry to demonstrate each parameter; \
+             type `finish` when done  [Esc=cancel]");
+        self.history.push(format!(
+            "  ◉ Block Task Recorder: '{}' exploded to a sandbox — demonstrate stretches, then `finish`",
+            source_name));
+    }
+
+    /// Finish the Block Task Recorder: delete the sandbox and open the
+    /// "Set parameters on block" dialog with the recorded tasks (or just
+    /// clean up if none were recorded). Esc-cancel calls the cleanup half.
+    fn finish_block_task_recorder(&mut self) {
+        let Some(rec) = self.block_task_rec.take() else {
+            self.history.push("  ! finish: no Block Task Recorder active".into());
+            return;
+        };
+        self.doc.dobjects.retain(|d| !rec.temp_handles.contains(&d.handle));
+        self.selection.clear();
+        self.selected = None;
+        self.index_dirty = true;
+        self.gpu_dirty   = true;
+        self.clear_prompt();
+        if rec.recorded.is_empty() {
+            self.history.push("  Block Task Recorder: no stretches recorded — nothing to save".into());
+            return;
+        }
+        let oc: Vec<(Vec<Vec2>, Vec2)> = rec.recorded.iter()
+            .map(|r| (r.points.clone(), r.dir)).collect();
+        self.blockdiff_overlay = Some(BlockDiffOverlay {
+            block_a: rec.source_block, clusters: oc });
+        self.history.push(format!(
+            "  ◉ {} task(s) recorded — name them in 'Set parameters on block'",
+            rec.recorded.len()));
+        self.param_name_dialog = Some(ParamNameDialog {
+            source_id: rec.source_block,
+            source_name: rec.source_name,
+            target_name: "(recorded)".into(),
+            rows: rec.recorded,
+        });
+    }
+
+    /// `blockdiff <A> <B>` — resolve two block names, then diff. The
+    /// pick-on-screen flow calls `run_block_diff_ids` directly.
+    fn run_block_diff(&mut self, name_a: &str, name_b: &str) {
+        let (Some(ia), Some(ib)) =
+            (self.doc.blocks.find(name_a), self.doc.blocks.find(name_b))
+        else {
+            let names: Vec<String> = self.doc.blocks.blocks.iter()
+                .map(|b| b.name.clone()).collect();
+            self.history.push(format!(
+                "  ! blockdiff: need two existing blocks — have: {}",
+                if names.is_empty() { "none".into() } else { names.join(", ") }));
+            return;
+        };
+        self.run_block_diff_ids(ia, ib);
+    }
+
+    /// Compare two block definitions by id (`ia` = BASE block) and report
+    /// the parametric rule: a base block + one MODIFIER VECTOR per cluster,
+    /// each shown as (Δx, Δy). Highlights the moved points on the BASE
+    /// block's instances. Objective 2, Slice 1 (extraction only).
+    fn run_block_diff_ids(&mut self, ia: u32, ib: u32) {
+        if ia == ib {
+            self.history.push("  ! blockdiff: pick TWO different blocks".into());
+            return;
+        }
+        let (Some(ba), Some(bb)) = (self.doc.blocks.get(ia), self.doc.blocks.get(ib))
+        else {
+            self.history.push("  ! blockdiff: block not found".into());
+            return;
+        };
+        let name_a = ba.name.clone();
+        let name_b = bb.name.clone();
+        // Tolerance ~ a fraction of the bigger block's extent (robust to
+        // unit scale); floor so tiny drawings still work.
+        let eps = {
+            let span = |blk: &cad_kernel::Block| {
+                blk.dobjects.iter().fold(0.0_f64, |m, d| {
+                    let (mn, mx) = d.bbox();
+                    m.max((mx - mn).len())
+                })
+            };
+            (span(ba).max(span(bb)) * 1e-4).max(1e-6)
+        };
+        let diff = cad_kernel::diff_blocks(
+            &ba.dobjects, ba.base, &bb.dobjects, bb.base, eps);
+
+        let mut lines: Vec<String> = Vec::new();
+        lines.push(format!(
+            "  blockdiff: base '{}' → '{}':  {} matched ({} unchanged, {} changed), {} added, {} removed  (eps={:.4})",
+            name_a, name_b, diff.matched, diff.unchanged, diff.changed,
+            diff.added, diff.removed, eps));
+        // Split STRONG modifier vectors (≥2 moved points, sorted first)
+        // from 1-point OUTLIERS (arc reshape / rotation / mis-match noise).
+        let strong: Vec<_> = diff.clusters.iter().filter(|c| c.point_count >= 2).collect();
+        let outliers = diff.clusters.len() - strong.len();
+        if strong.is_empty() && outliers == 0 {
+            lines.push("    → no point displacements found (identical, or only bulge/topology changed)".into());
+        } else {
+            if strong.is_empty() {
+                lines.push("    → 0 strong modifier vectors; only 1-point outliers (see below)".into());
+            } else {
+                lines.push(format!(
+                    "    → base block '{}' + {} modifier vector(s):", name_a, strong.len()));
+            }
+            for (k, c) in strong.iter().enumerate() {
+                // Report the displacement as Δx, Δy components.
+                let dx = c.dir.x * c.magnitude;
+                let dy = c.dir.y * c.magnitude;
+                lines.push(format!(
+                    "       [P{}] Δx={:.3}  Δy={:.3}   window=({:.3},{:.3})→({:.3},{:.3})  {} point(s)",
+                    k + 1, dx, dy,
+                    c.win_min.x, c.win_min.y, c.win_max.x, c.win_max.y,
+                    c.point_count));
+            }
+            if outliers > 0 {
+                lines.push(format!(
+                    "    ⚠ {} single-point outlier(s) ignored — usually the swing arc reshaping, \
+                     rotated parts, or a mis-match. If a block has many, the two blocks aren't a \
+                     clean copy+stretch — use the ✂ stretch recorder instead.", outliers));
+            }
+            if !strong.is_empty() {
+                lines.push("    (next: name each modifier vector — typed or pick a point on screen)".into());
+            }
+        }
+        for l in &lines { self.history.push(l.clone()); }
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note {
+            message: lines.join("\n").trim_start().to_string(),
+        });
+
+        // Highlight overlay: the STRONG modifier vectors' points, drawn on
+        // the BASE block's instances only (block A). Lets the user SEE the
+        // parametric points where they actually live.
+        let overlay_clusters: Vec<(Vec<Vec2>, Vec2)> = diff.clusters.iter()
+            .filter(|c| c.point_count >= 2)
+            .map(|c| (c.points.clone(), c.dir))
+            .collect();
+        self.blockdiff_overlay = if overlay_clusters.is_empty() {
+            None
+        } else {
+            self.history.push(
+                "    ◉ parametric points highlighted on the BASE block (Esc clears)".into());
+            Some(BlockDiffOverlay { block_a: ia, clusters: overlay_clusters })
+        };
+    }
+
+    /// `insert <name>` final step. A PLAIN block is placed immediately. A
+    /// PARAMETRIC block instead starts the insert-time value prompt — the
+    /// command line asks for each variable ("set width [1000]:") and the
+    /// instance is placed once every value is entered.
+    fn apply_insert(&mut self, block: u32, insert: Vec2) {
+        let (names, defaults): (Vec<String>, Vec<f64>) =
+            match self.doc.blocks.get(block) {
+                Some(blk) if !blk.params.is_empty() => (
+                    blk.params.iter().map(|p| p.name.clone()).collect(),
+                    blk.params.iter().map(|p| p.original).collect(),
+                ),
+                _ => (Vec::new(), Vec::new()),
+            };
+        if names.is_empty() {
+            // Plain block — place now.
+            self.snapshot_doc();
+            self.add_dobject(Geom::BlockRef(cad_kernel::BlockRef {
+                block, insert, scale: 1.0, rotation: 0.0,
+                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            }), "insert");
+            return;
+        }
+        // Parametric — prompt for each variable, starting with the first.
+        self.set_prompt(format!(
+            "insert: set {} [{}]  (Enter=default)  [Esc=cancel]", names[0], defaults[0]));
+        self.insert_param_prompt = Some(InsertParamPrompt {
+            block, insert, names, defaults, values: Vec::new() });
+        self.refocus_cmd = true;
+    }
+
+    /// Place the parametric instance once all variable values are collected.
+    fn place_parametric_insert(&mut self, p: InsertParamPrompt) {
+        self.snapshot_doc();
+        let mut param_values = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
+        for (k, v) in p.values.iter().enumerate() {
+            if k < cad_kernel::MAX_BLOCK_PARAMS { param_values[k] = *v; }
+        }
         self.add_dobject(Geom::BlockRef(cad_kernel::BlockRef {
-            block, insert, scale: 1.0, rotation: 0.0,
+            block: p.block, insert: p.insert, scale: 1.0, rotation: 0.0, param_values,
         }), "insert");
+        self.clear_prompt();
     }
 
     /// Explode: replace each selected BlockRef with transformed copies of
@@ -9574,13 +10241,16 @@ impl CadApp {
             let Some(d) = self.doc.dobjects.get(i) else { continue };
             if let Geom::BlockRef(br) = &d.geom {
                 if let Some(blk) = self.doc.blocks.get(br.block) {
-                    for cd in &blk.dobjects {
+                    // Explode the DERIVED geometry (params applied), so a
+                    // parametric instance explodes to what's drawn.
+                    let derived = self.block_derived_geoms(blk, &br.param_values);
+                    for (cd, dg) in blk.dobjects.iter().zip(&derived) {
                         let mut style = cd.style;
                         if matches!(style.color, Color::ByBlock) {
                             style.color = d.style.color;
                         }
                         to_add.push(DObject::with_style(
-                            br.transform_geom(&cd.geom, blk.base), style));
+                            br.transform_geom(dg, blk.base), style));
                     }
                     to_remove.push(i);
                 } else {
@@ -9876,6 +10546,20 @@ impl CadApp {
         // extracted from the dump.
         let recording = self.dbg.recording;
         let mut affected: Vec<String> = Vec::new();
+        // Block Task Recorder: collect the affected points (BEFORE the
+        // stretch, base-relative) so this demonstrated stretch becomes a
+        // recorded parametric task.
+        let btr_off = self.block_task_rec.as_ref().map(|r| r.world_offset);
+        let btr_pts: Vec<Vec2> = if let Some(off) = btr_off {
+            let inside = |p: Vec2| p.x >= win_min.x && p.x <= win_max.x
+                                && p.y >= win_min.y && p.y <= win_max.y;
+            sel.iter()
+                .filter_map(|&i| self.doc.dobjects.get(i))
+                .flat_map(|d| geom_def_points(&d.geom))
+                .filter(|p| inside(*p))
+                .map(|p| p - off)
+                .collect()
+        } else { Vec::new() };
         for &i in &sel {
             if let Some(d) = self.doc.dobjects.get_mut(i) {
                 let before = d.geom.clone();
@@ -9902,6 +10586,21 @@ impl CadApp {
                 total_selected: sel.len(),
                 affected,
             });
+        }
+        // Block Task Recorder: record this stretch as a parametric task.
+        if let Some(off) = btr_off {
+            let dir = if v.len() > 1e-9 { v / v.len() } else { v };
+            let n_pts = btr_pts.len();
+            if let Some(rec) = self.block_task_rec.as_mut() {
+                rec.recorded.push(ParamRow {
+                    win_min: win_min - off, win_max: win_max - off,
+                    dir, magnitude: v.len(), dx: v.x, dy: v.y,
+                    points: btr_pts, name: String::new(), original: "0".into(),
+                });
+            }
+            self.history.push(format!(
+                "  ◉ task recorded: Δ=({:.1},{:.1})  {} point(s) — keep stretching or `finish`",
+                v.x, v.y, n_pts));
         }
         self.history.push(format!(
             "  ↔ stretch by ({:.2},{:.2})  {} dobject(s){}",
@@ -10086,14 +10785,46 @@ impl CadApp {
         match g {
             Geom::BlockRef(br) => {
                 if let Some(blk) = self.doc.blocks.get(br.block) {
-                    for cd in &blk.dobjects {
-                        let tg = br.transform_geom(&cd.geom, blk.base);
+                    // Parametric blocks: derive the contents at this
+                    // instance's values BEFORE transforming, so trim/snap
+                    // see the actual (stretched) geometry.
+                    let derived = self.block_derived_geoms(blk, &br.param_values);
+                    for dg in &derived {
+                        let tg = br.transform_geom(dg, blk.base);
                         self.expand_cutter_geoms(&tg, out, depth + 1);
                     }
                 }
             }
             other => out.push(other.clone()),
         }
+    }
+
+    /// Definition-space geoms of a block with its parametric `params`
+    /// applied for the given per-instance `param_values` — parallel to
+    /// `blk.dobjects` (same order/len). Each param is a `stretch_one` over
+    /// its window by `dir·displacement(value)`. Non-parametric blocks
+    /// (empty `params`) return the geoms unchanged. This is the single
+    /// derive used by render / bbox / trim / snap / explode.
+    fn block_derived_geoms(
+        &self, blk: &cad_kernel::Block,
+        param_values: &[f64; cad_kernel::MAX_BLOCK_PARAMS],
+    ) -> Vec<Geom> {
+        blk.dobjects.iter().map(|cd| {
+            let mut g = cd.geom.clone();
+            for (k, p) in blk.params.iter().enumerate() {
+                let value = param_values.get(k).copied().unwrap_or(p.original);
+                // displacement = dir * (value - original); all linked
+                // vectors move by the same (value - original) amount.
+                let amount = value - p.original;
+                for v in &p.vectors {
+                    let disp = v.dir * amount;
+                    if disp.len() > 1e-12 {
+                        g = stretch_one(&g, v.win_min, v.win_max, disp);
+                    }
+                }
+            }
+            g
+        }).collect()
     }
 
     /// Temporary DObjects for the geometry INSIDE every visible block
@@ -11325,8 +12056,9 @@ impl CadApp {
         let mut min = br.insert;
         let mut max = br.insert;
         if let Some(blk) = self.doc.blocks.get(br.block) {
-            for cd in &blk.dobjects {
-                let g = br.transform_geom(&cd.geom, blk.base);
+            let derived = self.block_derived_geoms(blk, &br.param_values);
+            for dg in &derived {
+                let g = br.transform_geom(dg, blk.base);
                 let (gmin, gmax) = match &g {
                     Geom::BlockRef(nb) => (nb.insert, nb.insert),
                     _ => g.bbox(),
@@ -13718,6 +14450,25 @@ impl eframe::App for CadApp {
             self.block_dialog_pick_base = false;
             // Drop any captured stretch crossing box (e.g. Esc mid-select).
             self.stretch_window_box = None;
+            // Dismiss the block-diff parametric-point highlight + cancel a
+            // compare pick / the Set-parameters dialog in progress.
+            self.blockdiff_overlay = None;
+            self.param_name_dialog = None;
+            if self.insert_param_prompt.is_some() {
+                self.insert_param_prompt = None;
+                self.history.push("  insert cancelled".into());
+            }
+            // Cancel a Block Task Recorder: delete the temp sandbox, discard.
+            if let Some(rec) = self.block_task_rec.take() {
+                self.doc.dobjects.retain(|d| !rec.temp_handles.contains(&d.handle));
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+                self.history.push("  Block Task Recorder cancelled (sandbox discarded)".into());
+            }
+            if self.blockdiff_pick != BlockDiffPick::Off {
+                self.blockdiff_pick = BlockDiffPick::Off;
+                self.history.push("  compare cancelled".into());
+            }
             if let Some(d) = self.file_dialog.take() { self.file_dialog_dir = Some(d.dir); }
             self.intersect_pending_click = false;
             self.intersect_view_pending  = false;
@@ -15227,6 +15978,7 @@ impl eframe::App for CadApp {
         self.render_wall_style_manager(ctx);
         self.render_wall_style_dialog(ctx);
         self.render_block_dialog(ctx);
+        self.render_param_name_dialog(ctx);
         self.render_file_dialog(ctx);
         self.render_dim_style_dialog(ctx);
         self.render_text_input_dialog(ctx);
@@ -16039,6 +16791,7 @@ impl eframe::App for CadApp {
                 || self.block_dialog_pick_base
                 || self.block_def_state != BlockDefState::Off
                 || self.insert_state    != InsertState::Off
+                || self.blockdiff_pick  != BlockDiffPick::Off
                 || self.picking_source
                 || self.intersect_pending_click;
             // Pointer mode (Tool::None, no edit phase, no active select
@@ -16345,6 +17098,12 @@ impl eframe::App for CadApp {
                                 "hatch ({}): click another region OR Enter to finish  [Esc=cancel]",
                                 style));
                         }
+                        return;
+                    }
+
+                    // Compare: picking the two blocks on screen.
+                    if self.block_diff_pick_click(world) {
+                        self.refocus_cmd = true;
                         return;
                     }
 
@@ -17522,6 +18281,70 @@ impl eframe::App for CadApp {
                 if let Some(i) = self.selected {
                     if let Some(e) = self.doc.dobjects.get(i) {
                         draw_grips(&painter, rect, self, &e.geom);
+                    }
+                }
+            }
+
+            // Block-diff parametric-point highlight — drawn on every
+            // instance of the two compared blocks, colour-coded per
+            // candidate parameter, with a direction arrow per cluster.
+            if let Some(ov) = &self.blockdiff_overlay {
+                // Distinct per-parameter colours (P1, P2, …).
+                const PAL: [egui::Color32; 6] = [
+                    egui::Color32::from_rgb(255, 90, 90),    // P1 red
+                    egui::Color32::from_rgb(90, 200, 255),   // P2 cyan
+                    egui::Color32::from_rgb(160, 255, 120),  // P3 green
+                    egui::Color32::from_rgb(255, 200, 70),   // P4 amber
+                    egui::Color32::from_rgb(220, 140, 255),  // P5 violet
+                    egui::Color32::from_rgb(255, 150, 90),   // P6 orange
+                ];
+                for d in &self.doc.dobjects {
+                    let Geom::BlockRef(br) = &d.geom else { continue };
+                    // BASE block only — the moved points are base-relative to
+                    // block A; drawing them on B's instance floats them in
+                    // empty space (B's geometry is the moved result).
+                    if br.block != ov.block_a { continue; }
+                    let to_world = |rel: Vec2| {
+                        let s = rel * br.scale;
+                        let (c, sn) = (br.rotation.cos(), br.rotation.sin());
+                        br.insert + Vec2::new(s.x * c - s.y * sn, s.x * sn + s.y * c)
+                    };
+                    for (ci, (pts, dir)) in ov.clusters.iter().enumerate() {
+                        let col = PAL[ci % PAL.len()];
+                        // Cluster centroid (world) for the direction arrow.
+                        let mut cw = Vec2::ZERO;
+                        for p in pts {
+                            let w = to_world(*p);
+                            cw = cw + w;
+                            let sp = self.w2s(w, rect);
+                            painter.circle_filled(sp, 4.0, col);
+                            painter.circle_stroke(sp, 4.0,
+                                egui::Stroke::new(1.0, egui::Color32::BLACK));
+                        }
+                        if !pts.is_empty() {
+                            cw = cw / (pts.len() as f64);
+                            // Rotate the (base-relative) direction by the
+                            // instance rotation so the arrow points right.
+                            let (c, sn) = (br.rotation.cos(), br.rotation.sin());
+                            let wd = Vec2::new(dir.x * c - dir.y * sn,
+                                               dir.x * sn + dir.y * c);
+                            let a0 = self.w2s(cw, rect);
+                            let tip = a0 + egui::vec2(wd.x as f32, -wd.y as f32) * 26.0;
+                            painter.line_segment([a0, tip], egui::Stroke::new(2.0, col));
+                            // simple arrowhead
+                            let back = egui::vec2(wd.x as f32, -wd.y as f32);
+                            let perp = egui::vec2(-back.y, back.x);
+                            painter.line_segment(
+                                [tip, tip - back * 7.0 + perp * 4.0],
+                                egui::Stroke::new(2.0, col));
+                            painter.line_segment(
+                                [tip, tip - back * 7.0 - perp * 4.0],
+                                egui::Stroke::new(2.0, col));
+                            painter.text(tip + egui::vec2(3.0, -3.0),
+                                egui::Align2::LEFT_BOTTOM,
+                                format!("P{}", ci + 1),
+                                egui::FontId::proportional(12.0), col);
+                        }
                     }
                 }
             }
@@ -19807,8 +20630,10 @@ fn draw_blockref(
             egui::Stroke::new(1.5, egui::Color32::from_rgb(220, 60, 60)));
         return;
     };
-    for cd in &blk.dobjects {
-        let g = br.transform_geom(&cd.geom, blk.base);
+    // Parametric blocks: derive contents at this instance's values first.
+    let derived = app.block_derived_geoms(blk, &br.param_values);
+    for (cd, dg) in blk.dobjects.iter().zip(&derived) {
+        let g = br.transform_geom(dg, blk.base);
         let col = if matches!(cd.style.color, Color::ByBlock) {
             instance_color
         } else {

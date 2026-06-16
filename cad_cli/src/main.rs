@@ -94,7 +94,9 @@ fn main() {
             | Ok(Command::Lengthen(_)) | Ok(Command::Break) | Ok(Command::Align)
             | Ok(Command::Stretch) | Ok(Command::Trim) | Ok(Command::Extend)
             | Ok(Command::Fillet(_)) | Ok(Command::Chamfer(_)) | Ok(Command::Join)
-            | Ok(Command::Dist) | Ok(Command::SetTool(_)) => {
+            | Ok(Command::Dist) | Ok(Command::SetTool(_))
+            | Ok(Command::BlockDiff(_)) | Ok(Command::BlockTaskRecorder)
+            | Ok(Command::BlockTaskFinish) => {
                 writeln!(out, "(editing op ignored — CLI has no interactive selection)").ok();
             }
             Err(e) => { writeln!(out, "! parse error: {}", e).ok(); }
