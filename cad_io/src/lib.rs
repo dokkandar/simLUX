@@ -15,4 +15,7 @@
 //! `&str` (DXF) and let the caller handle I/O.
 
 pub mod dxf;
+pub mod pat;
 pub mod rsm;
+
+pub use pat::{parse_pat, PatLine, PatParse, PatPattern};
