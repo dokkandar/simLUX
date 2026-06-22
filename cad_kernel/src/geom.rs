@@ -148,12 +148,25 @@ pub fn bulge_arc(a: Vec2, b: Vec2, bulge: f64) -> Option<(Vec2, f64, f64, f64)> 
     Some((center, r, start_angle, sweep))
 }
 
-/// The DXF bulge for the arc start→end whose centre is `center`
-/// (= tan(sweep/4), signed: + when the centre is on the LEFT of start→end).
+/// The DXF bulge for traversing the arc start→end about `center`.
+/// Magnitude = tan(sweep/4); sign = + when start→end runs CCW about the centre,
+/// − when CW. The direction is decided by comparing the CCW angle (start→end)
+/// against the actual swept magnitude — NOT by which side of the chord the
+/// centre lies on. The chord-side test is only valid for MINOR arcs (sweep <
+/// π); for a MAJOR arc it flips while tan(sweep/4) already encodes the wider
+/// span, double-counting and inverting the curvature.
 pub fn bulge_from_arc(start: Vec2, end: Vec2, center: Vec2, sweep_abs: f64) -> f64 {
-    let perp = (end - start).perp();
-    let sign = if (center - start).dot(perp) >= 0.0 { 1.0 } else { -1.0 };
-    sign * (sweep_abs * 0.5 * 0.5).tan()
+    let tau = std::f64::consts::TAU;
+    let a0 = (start - center).angle();
+    let a1 = (end - center).angle();
+    let ccw = (a1 - a0).rem_euclid(tau);   // CCW angle start→end, [0, 2π)
+    let mag = sweep_abs.abs();
+    // Circular distance helper (shortest angular gap, accounting for wrap).
+    let circ = |x: f64, y: f64| { let d = (x - y).abs() % tau; d.min(tau - d) };
+    // CCW if the CCW angle matches the swept magnitude better than its CW
+    // complement (τ − mag) does.
+    let sign = if circ(ccw, mag) <= circ(ccw, tau - mag) { 1.0 } else { -1.0 };
+    sign * (mag * 0.25).tan()
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,13 +248,15 @@ pub struct Polyline {
 }
 
 impl Polyline {
-    /// AABB of all vertices (does NOT account for arc bulges beyond the
-    /// vertex positions — conservative bbox is enough for viewport culling
-    /// and the grid index. Tighter bbox is a future optimisation).
+    /// AABB of the polyline, INCLUDING arc-bulge extents. A bulged segment is
+    /// expanded into its true Arc (via `polyline_segments`) so a segment that
+    /// bows outside its chord — e.g. a major arc from a circle join — is fully
+    /// covered. Without this the spatial index would cull clicks on the arc.
     pub fn bbox(&self) -> (Vec2, Vec2) {
         if self.vertices.is_empty() {
             return (Vec2::ZERO, Vec2::ZERO);
         }
+        // Start from the vertices (covers the degenerate / all-straight case).
         let mut min = self.vertices[0].pos;
         let mut max = min;
         for v in &self.vertices[1..] {
@@ -250,29 +265,28 @@ impl Polyline {
             if v.pos.x > max.x { max.x = v.pos.x; }
             if v.pos.y > max.y { max.y = v.pos.y; }
         }
+        // Union in each real segment's bbox so arc bulges are included.
+        for seg in polyline_segments(self) {
+            let (smin, smax) = seg.bbox();
+            min.x = min.x.min(smin.x); min.y = min.y.min(smin.y);
+            max.x = max.x.max(smax.x); max.y = max.y.max(smax.y);
+        }
         (min, max)
     }
 
-    /// Distance from the polyline's piecewise-linear envelope to a point.
-    /// Arc bulges are approximated as straight segments today (acceptable
-    /// for hit-test radius at typical zooms; refine when needed).
+    /// Distance from the polyline to a point, accounting for arc bulges.
+    /// Each bulged segment is tested as its true Arc (via `polyline_segments`),
+    /// not its straight chord — so picking works on the curved part too.
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         if self.vertices.is_empty() { return f64::INFINITY; }
-        let n = self.vertices.len();
         let mut best = f64::INFINITY;
-        let pairs = if self.closed { n } else { n - 1 };
-        for i in 0..pairs {
-            let a = self.vertices[i].pos;
-            let b = self.vertices[(i + 1) % n].pos;
-            let d = b - a;
-            let len_sq = d.len_sq();
-            let dist = if len_sq < EPS {
-                p.dist(a)
-            } else {
-                let t = ((p - a).dot(d) / len_sq).clamp(0.0, 1.0);
-                p.dist(a + d * t)
-            };
-            if dist < best { best = dist; }
+        for seg in polyline_segments(self) {
+            let d = seg.distance_to_point(p);
+            if d < best { best = d; }
+        }
+        // Fallback for a 1-vertex / degenerate polyline (no segments).
+        if best.is_infinite() {
+            for v in &self.vertices { best = best.min(p.dist(v.pos)); }
         }
         best
     }
@@ -1504,23 +1518,14 @@ impl Geom {
     pub fn reversed(&self) -> Geom {
         match self {
             Geom::Line(l) => Geom::Line(Line { a: l.b, b: l.a }),
-            Geom::Arc(a) => {
-                let new_start = (a.start_angle + a.sweep_angle)
-                    .rem_euclid(std::f64::consts::TAU);
-                Geom::Arc(Arc {
-                    center: a.center, radius: a.radius,
-                    start_angle: new_start, sweep_angle: a.sweep_angle,
-                })
-            }
-            Geom::EllipseArc(ea) => {
-                let new_start = (ea.start_param + ea.sweep_param)
-                    .rem_euclid(std::f64::consts::TAU);
-                Geom::EllipseArc(EllipseArc {
-                    ellipse: ea.ellipse,
-                    start_param: new_start,
-                    sweep_param: ea.sweep_param,
-                })
-            }
+            // An Arc stores only a POSITIVE CCW sweep, so it cannot encode a
+            // traversal direction — the reversed arc occupies the IDENTICAL
+            // set of points. Return it unchanged. (The old code set
+            // start = start+sweep while KEEPING the positive sweep, which is a
+            // DIFFERENT arc, P(start+2·sweep) — it relocated the arc and broke
+            // both the `reverse` command and polyline joining.)
+            Geom::Arc(a) => Geom::Arc(*a),
+            Geom::EllipseArc(ea) => Geom::EllipseArc(*ea),
             Geom::Polyline(p) => {
                 // Bulge belongs to the segment FROM this vertex to the next.
                 // After reversing the vertex order, new segment `i` (verts
@@ -1959,16 +1964,21 @@ mod transform_tests {
     }
 
     #[test]
-    fn arc_reversed_swaps_endpoint_param() {
-        // Arc from 0° to 90°. Reversing puts start at 90° with same sweep.
+    fn arc_reversed_preserves_geometry() {
+        // An Arc stores only positive CCW sweep, so it can't encode direction.
+        // Reversing must leave the SAME geometric arc (identical endpoints),
+        // NOT relocate it. Arc from 0°→90°, radius 5: endpoints (5,0)→(0,5).
         let g = Geom::Arc(Arc {
             center: Vec2::ZERO, radius: 5.0,
             start_angle: 0.0,
             sweep_angle: std::f64::consts::FRAC_PI_2,
         });
         if let Geom::Arc(a) = g.reversed() {
-            assert!(approx_eq(a.start_angle, std::f64::consts::FRAC_PI_2));
+            assert!(approx_eq(a.start_angle, 0.0));
             assert!(approx_eq(a.sweep_angle, std::f64::consts::FRAC_PI_2));
+            let (p1, p2) = a.endpoints();
+            assert!(approx_eq(p1.x, 5.0) && approx_eq(p1.y, 0.0));
+            assert!(approx_eq(p2.x, 0.0) && approx_eq(p2.y, 5.0));
         } else { panic!(); }
     }
 
@@ -3491,17 +3501,30 @@ fn circular_union(intervals: &[(f64, f64)]) -> (Vec<(f64, f64)>, bool) {
 }
 
 const JOIN_EPS: f64 = 1e-6;
+/// Fuzzy endpoint-coincidence tolerance for CHAINING segments into a polyline.
+/// Looser than JOIN_EPS because an arc's endpoint is reconstructed via trig
+/// (`center + r·(cosθ,sinθ)`), so even a perfectly-filleted arc end can sit a
+/// few ×1e-6 off the touching line end. JOIN_EPS stays tight for the
+/// collinear/concentric precision tests.
+const CHAIN_EPS: f64 = 1e-3;
 
 fn find_collinear_line_group(items: &[(usize, Geom)]) -> Vec<usize> {
-    // Returns local indices of the first run of >= 2 collinear Lines we find.
+    // Returns local indices of a run of >= 2 collinear Lines that actually
+    // TOUCH end-to-end (a contiguous, gap-free overlap). Collinear lines with a
+    // GAP between them (e.g. the two stubs a trim leaves when it cuts a line at
+    // a crossing) must NOT merge — bridging that gap would redraw the removed
+    // middle piece. Only touching collinear runs collapse into one clean Line.
     for i in 0..items.len() {
         let li = if let Geom::Line(l) = &items[i].1 { *l } else { continue };
         let dir_i = li.b - li.a;
         let len_i = dir_i.len();
         if len_i < JOIN_EPS { continue; }
         let u_i = dir_i / len_i;
-        let mut group = vec![i];
-        for j in (i + 1)..items.len() {
+        let perp = u_i.perp();
+        let proj = |p: Vec2| (p - li.a).dot(u_i);
+        // Collect every collinear line with its projected [tmin, tmax] span.
+        let mut members: Vec<(usize, f64, f64)> = Vec::new();
+        for j in 0..items.len() {
             let lj = if let Geom::Line(l) = &items[j].1 { *l } else { continue };
             let dir_j = lj.b - lj.a;
             let len_j = dir_j.len();
@@ -3509,12 +3532,29 @@ fn find_collinear_line_group(items: &[(usize, Geom)]) -> Vec<usize> {
             // Same infinite line: parallel + lj.a lies on li's infinite line.
             let cross = u_i.x * dir_j.y - u_i.y * dir_j.x;
             if cross.abs() > JOIN_EPS * len_j { continue; }
-            // Perp distance from lj.a to li's infinite line.
-            let perp = u_i.perp();
             if (lj.a - li.a).dot(perp).abs() > JOIN_EPS { continue; }
-            group.push(j);
+            let (mut ta, mut tb) = (proj(lj.a), proj(lj.b));
+            if ta > tb { std::mem::swap(&mut ta, &mut tb); }
+            members.push((j, ta, tb));
         }
-        if group.len() >= 2 { return group; }
+        if members.len() < 2 { continue; }
+        // Sort along the line, then split into contiguous runs — a gap larger
+        // than CHAIN_EPS between consecutive spans starts a new run. Return the
+        // first gap-free run of >= 2 that contains the seed `i`.
+        members.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let mut run: Vec<usize> = Vec::new();
+        let mut run_max = f64::NEG_INFINITY;
+        for (idx, ta, tb) in members {
+            if run.is_empty() || ta <= run_max + CHAIN_EPS {
+                run.push(idx);
+                if tb > run_max { run_max = tb; }
+            } else {
+                if run.len() >= 2 && run.contains(&i) { return run; }
+                run = vec![idx];
+                run_max = tb;
+            }
+        }
+        if run.len() >= 2 && run.contains(&i) { return run; }
     }
     Vec::new()
 }
@@ -3623,8 +3663,8 @@ fn find_touching_chain(items: &[(usize, Geom)]) -> Vec<usize> {
             for j in 0..items.len() {
                 if seen[j] { continue; }
                 let Some((ja, jb)) = endpoints_of(&items[j].1) else { continue };
-                let touches = ca.dist(ja) < JOIN_EPS || ca.dist(jb) < JOIN_EPS
-                           || cb.dist(ja) < JOIN_EPS || cb.dist(jb) < JOIN_EPS;
+                let touches = ca.dist(ja) < CHAIN_EPS || ca.dist(jb) < CHAIN_EPS
+                           || cb.dist(ja) < CHAIN_EPS || cb.dist(jb) < CHAIN_EPS;
                 if touches {
                     seen[j] = true;
                     queue.push(j);
@@ -3650,7 +3690,7 @@ fn chain_to_polyline(geoms: &[Geom]) -> Option<Polyline> {
     let mut endpoint_count: Vec<(Vec2, usize)> = Vec::new();
     let bump = |list: &mut Vec<(Vec2, usize)>, p: Vec2| {
         for (q, c) in list.iter_mut() {
-            if q.dist(p) < JOIN_EPS { *c += 1; return; }
+            if q.dist(p) < CHAIN_EPS { *c += 1; return; }
         }
         list.push((p, 1));
     };
@@ -3674,22 +3714,26 @@ fn chain_to_polyline(geoms: &[Geom]) -> Option<Polyline> {
         let mut reverse = false;
         for (i, g) in remaining.iter().enumerate() {
             let Some((a, b)) = endpoints_of(g) else { continue };
-            if a.dist(current) < JOIN_EPS { found = Some(i); reverse = false; break; }
-            if b.dist(current) < JOIN_EPS { found = Some(i); reverse = true;  break; }
+            if a.dist(current) < CHAIN_EPS { found = Some(i); reverse = false; break; }
+            if b.dist(current) < CHAIN_EPS { found = Some(i); reverse = true;  break; }
         }
         let i = found?;
         let seg = remaining.remove(i);
-        let oriented = if reverse { seg.reversed() } else { seg };
-        let (_, next) = endpoints_of(&oriented)?;
-        // Compute bulge for the segment OUT of `current`. DXF bulge =
-        // tan(included_angle / 4) with sign by CCW (positive) / CW (negative).
-        let bulge_for_last = match &oriented {
-            Geom::Line(_) => 0.0,
-            Geom::Arc(a) => {
-                // included angle from start_angle to end of sweep is sweep_angle.
-                // CCW arcs in our struct → positive bulge.
-                (a.sweep_angle / 4.0).tan()
-            }
+        // Far endpoint relative to the entry point `current`. Compute it
+        // DIRECTLY from the segment's two endpoints and the side we entered on
+        // — do NOT route through `Geom::reversed()`. `Arc::reversed()` cannot
+        // encode a CW traversal under the positive-sweep invariant, so it
+        // returns the wrong far endpoint (P(start+2·sweep)) and stalls the
+        // walk. `endpoints_of` + the entry side is unambiguous for every type.
+        let (sa, sb) = endpoints_of(&seg)?;
+        let next = if reverse { sa } else { sb };
+        // Bulge for the segment OUT of `current` toward `next`. DXF bulge =
+        // tan(included_angle / 4), signed by which side of the chord
+        // (current→next) the centre lies. Because the chord direction follows
+        // the actual traversal, bulge_from_arc gets the sign right for EITHER
+        // direction — no reversal needed.
+        let bulge_for_last = match &seg {
+            Geom::Arc(a) => bulge_from_arc(current, next, a.center, a.sweep_angle),
             _ => 0.0,
         };
         if let Some(last) = verts.last_mut() { last.bulge = bulge_for_last; }
@@ -3873,6 +3917,86 @@ mod fillet_chamfer_join_tests {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 5.0));
         } else { panic!() }
+    }
+
+    #[test]
+    fn polyline_bbox_and_distance_account_for_bulge() {
+        // Two vertices with a semicircle bulge (bulge=1, CCW) from (0,0) to
+        // (2,0): the arc apex reaches (1,-1). bbox must include y≈-1, and a
+        // click on the apex must be near the polyline (not ~1 unit away at the
+        // chord).
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 1.0 },
+                PolyVertex { pos: Vec2::new(2.0, 0.0), bulge: 0.0 },
+            ],
+            closed: false,
+        };
+        let (min, max) = pl.bbox();
+        assert!(min.y <= -0.99, "bbox must include the arc apex, got min.y={}", min.y);
+        assert!(max.y >= -0.01);
+        // A point right on the arc apex (1,-1) should be ~0 from the polyline.
+        let d = pl.distance_to_point(Vec2::new(1.0, -1.0));
+        assert!(d < 1e-6, "apex should lie on the polyline, got dist={}", d);
+        // The chord midpoint (1,0) is ~1 unit from the arc (NOT on it).
+        let d_chord = pl.distance_to_point(Vec2::new(1.0, 0.0));
+        assert!(d_chord > 0.9, "chord midpoint should be off the arc, got {}", d_chord);
+    }
+
+    #[test]
+    fn join_does_not_bridge_collinear_gap() {
+        // Two collinear stubs with a GAP between them (like a line trimmed at a
+        // crossing). They must NOT merge into one line — that would redraw the
+        // removed middle piece. With no other geometry, nothing chains.
+        let items = vec![
+            (0usize, Geom::Line(ln(0.0, 0.0, 2.0, 0.0))),
+            (1usize, Geom::Line(ln(5.0, 0.0, 8.0, 0.0))),
+        ];
+        let out = join_geoms(&items);
+        assert!(out.merged.is_empty(), "gapped collinear lines must not merge");
+        assert!(out.consumed_indices.is_empty());
+    }
+
+    #[test]
+    fn join_line_arc_line_with_collinear_stubs_makes_one_polyline() {
+        // The trim-then-join case: two collinear line stubs that DON'T touch
+        // each other, but each touches an arc that bridges the gap. Must yield
+        // a single polyline (line→arc→line), NOT a straight line across.
+        let a = Vec2::new(0.0, 0.0);
+        let b = Vec2::new(2.0, 0.0);          // stub-left end / arc start
+        let c = Vec2::new(4.0, 0.0);          // arc end / stub-right start
+        let d = Vec2::new(6.0, 0.0);
+        // Semicircle bulging up from b to c (center (3,0), r=1).
+        let (center, r, start, sweep) = bulge_arc(b, c, 1.0).unwrap();
+        let items = vec![
+            (0usize, Geom::Line(Line { a, b })),
+            (1usize, Geom::Line(Line { a: c, b: d })),
+            (2usize, Geom::Arc(Arc { center, radius: r,
+                                     start_angle: start, sweep_angle: sweep })),
+        ];
+        let out = join_geoms(&items);
+        assert_eq!(out.consumed_indices.len(), 3, "all three pieces should chain");
+        assert_eq!(out.merged.len(), 1);
+        assert!(matches!(out.merged[0], Geom::Polyline(_)),
+                "result must be one polyline, not a bridged straight line");
+    }
+
+    #[test]
+    fn bulge_from_arc_sign_major_and_minor() {
+        let c = Vec2::ZERO;
+        let q = std::f64::consts::FRAC_PI_2;          // 90°
+        let three_q = 3.0 * q;                        // 270°
+        let s = Vec2::new(1.0, 0.0);
+        // Minor CCW: start (1,0) → end (0,1), 90° → positive bulge tan(22.5°).
+        let b_minor = bulge_from_arc(s, Vec2::new(0.0, 1.0), c, q);
+        assert!(b_minor > 0.0 && approx_eq(b_minor, (q * 0.25).tan()));
+        // Major CCW: start (1,0) → end (0,-1), 270° → STILL positive (CCW),
+        // magnitude tan(67.5°). The old chord-side rule got this NEGATIVE.
+        let b_major = bulge_from_arc(s, Vec2::new(0.0, -1.0), c, three_q);
+        assert!(b_major > 0.0 && approx_eq(b_major, (three_q * 0.25).tan()));
+        // Reverse traversal of the minor arc is CW → negative.
+        let b_rev = bulge_from_arc(Vec2::new(0.0, 1.0), s, c, q);
+        assert!(b_rev < 0.0);
     }
 
     // --- join: concentric arcs -------------------------------------------

@@ -147,3 +147,69 @@ when to break vs keep the associative link, migration of existing hatches).
 Requested: while moving, show a ghost preview of the selected dobjects following
 the cursor (base → destination). COPY and PASTE already have this ghost; MOVE
 does not yet. Straightforward; no design fork. Not yet built.
+
+---
+
+## PEDIT + JOIN — in progress (2026-06-22)
+
+`pedit`/`pe` (alias) polyline editor + JOIN. Subcommands: Close/Open, Join (J),
+Width (W), Undo (U). `pedit_start` converts a clicked Line/Arc into a polyline so
+it can be edited. JOIN (`j` or PEDIT→J) picks entities and chains touching
+Line/Arc/open-Polyline/Spline into one polyline.
+
+### Architecture
+- `pedit_join_selected` (app.rs): EXPLODES every picked entity into Line/Arc
+  primitives (`explode_polyline`, spline tessellate) BEFORE join, so the kernel
+  never mis-handles a whole polyline as one straight segment. Then calls
+  `cad_kernel::join_geoms`. Result = merged piece(s) + any unconsumed primitive
+  (geometry never lost).
+- `cad_kernel::join_geoms` 3 passes: (1) collinear-line merge, (2) concentric-arc
+  merge, (3) touching chain → polyline (`find_touching_chain` + `chain_to_polyline`).
+
+### Geometry bugs fixed THIS session (all in cad_kernel/src/geom.rs unless noted)
+1. **chain endpoint tolerance** — added `CHAIN_EPS = 1e-3` (vs precision
+   `JOIN_EPS = 1e-6`) for endpoint coincidence in find_touching_chain /
+   chain_to_polyline. Arc ends reconstructed via trig sit a few×1e-6 off.
+2. **`Arc::reversed()` was broken** — it set start=old_end but KEPT the positive
+   sweep, producing a DIFFERENT arc (far end at P(start+2·sweep)). It stalled the
+   join walk AND corrupted the standalone `reverse` command (teleported arcs).
+   Fix: an Arc can't encode CW under positive-sweep, so reversed() now returns the
+   SAME arc (identical geometry). EllipseArc::reversed() same fix. Test updated.
+   Also: chain_to_polyline no longer routes the far-endpoint through reversed() —
+   it reads it directly from endpoints + entry side.
+3. **collinear merge bridged trim gaps** — `find_collinear_line_group` merged any
+   two collinear lines regardless of distance, so joining the two stubs a trim
+   leaves (line cut at a circle crossing) REDREW the removed middle piece. Fix:
+   gap-aware — only a contiguous, touching run (gap ≤ CHAIN_EPS) collapses.
+4. **`bulge_from_arc` sign wrong for MAJOR arcs** — sign came from chord-side,
+   valid only for minor arcs (sweep < π). For a major arc the chord-side flips
+   while tan(sweep/4) already encodes the wide span → inverted curvature. Fix:
+   sign now from traversal direction (compare CCW angle start→end vs swept
+   magnitude). Renderer (`append_pline_segment_screen_pts`) and
+   `polyline_segments` were verified to compute the SAME center as the kernel.
+5. **polyline picking ignored bulges** — `Polyline::bbox()` and
+   `distance_to_point()` treated every segment as a straight chord. A major arc
+   bows outside its chord, so its bbox excluded the arc → spatial index culled the
+   click → only the line part was selectable. Fix: both now expand each bulged
+   segment into its true Arc via `polyline_segments` and union/min over those.
+
+Kernel tests: 170 pass (added regressions for #3, #4, #5).
+
+### OPEN BUG — arc curvature after `pe` + `j` (UNRESOLVED, next session)
+User reports: after merge the arc "curves the wrong way." Curvature was confirmed
+OK at the 18:04 build (fix #4); only the picking fix (#5, bbox/distance, read-only)
+landed after, which can't change curvature. My round-trip analysis says all four
+cases (minor/major × forward/reverse) preserve curvature. Likely a different arc
+orientation exposes a remaining case, OR something not visible from analysis.
+
+**Diagnostic added** (app.rs `pedit_join_selected`, build 18:21): before "merged
+into polyline" it prints each `src arc` (center/r/start°/sweep°/endpoints) and each
+resulting `pl v[i]` (pos + bulge). NEXT STEP: get a session dump with those lines,
+compare stored bulge vs source arc to determine if sign/magnitude/wrong-vertex.
+Remove the diagnostic once fixed.
+
+### Other deferred
+- Real Groups file persistence (in-session only now).
+- Move ghost preview.
+- Reconcile origin/main's +commits with this branch (overlapping file-dialog/zoom
+  work — do NOT blind-merge).
