@@ -9666,17 +9666,24 @@ impl CadApp {
             "  ⎘ copied {} dobject(s)", self.clipboard_dobjects.len()));
     }
 
-    /// Edit ▸ Paste — start the placement flow: pick a BASE point, then a
-    /// DESTINATION, with a live ghost preview (like COPY). Nothing is added
-    /// until the destination click commits.
+    /// Edit ▸ Paste (Ctrl+V) — start the placement flow. The base point is
+    /// assumed automatically (the clipboard's lower-left corner), so the user
+    /// only clicks a DESTINATION; a live ghost preview follows the cursor.
     fn start_paste(&mut self) {
         if self.clipboard_dobjects.is_empty() {
             self.history.push("  paste: clipboard is empty".into());
             return;
         }
-        self.paste_state = PasteState::WaitingForBase;
+        // Auto base = lower-left of the clipboard's bounding box.
+        let mut base = self.clipboard_dobjects[0].bbox().0;
+        for d in &self.clipboard_dobjects[1..] {
+            let a = d.bbox().0;
+            if a.x < base.x { base.x = a.x; }
+            if a.y < base.y { base.y = a.y; }
+        }
+        self.paste_state = PasteState::WaitingForDest(base);
         self.set_prompt(format!(
-            "paste: click BASE point for {} dobject(s)   [Esc=cancel]",
+            "paste: click DESTINATION for {} dobject(s)   [Esc=cancel]",
             self.clipboard_dobjects.len()));
         self.refocus_cmd = true;
     }
@@ -16953,7 +16960,42 @@ impl eframe::App for CadApp {
             self.run_command("erase");
         }
 
-        // (Copy/Paste are Edit-menu only — no keyboard shortcuts.)
+        // Ctrl+C / Ctrl+V — copy / paste selected dobjects. IMPORTANT: eframe
+        // turns Ctrl+C/X/V into `Event::Copy` / `Event::Cut` / `Event::Paste`
+        // (NOT Key presses), so we must match those events — `key_pressed(C)`
+        // is never true for Ctrl+C. We run BEFORE the command-line widget and
+        // CONSUME the events so the focused (empty) command line doesn't also
+        // do a text copy/paste. Skipped while editing text so fields keep
+        // normal clipboard behavior.
+        {
+            let editing_text = self.layer_rename.is_some()
+                || !self.cmd.trim().is_empty()
+                || self.text_draft != TextDraftState::Off
+                || self.text_waiting_height;
+            if !editing_text {
+                let (copy, paste) = ctx.input_mut(|i| {
+                    // Key fallback in case the platform delivers raw keys.
+                    let mut copy  = i.modifiers.command && i.key_pressed(egui::Key::C);
+                    let mut paste = i.modifiers.command && i.key_pressed(egui::Key::V);
+                    // Primary path: eframe's clipboard events (Ctrl+C/X/V).
+                    i.events.retain(|e| match e {
+                        egui::Event::Copy | egui::Event::Cut => { copy = true; false }
+                        egui::Event::Paste(_)                => { paste = true; false }
+                        _ => true,
+                    });
+                    (copy, paste)
+                });
+                if copy {
+                    self.copy_selection();
+                    // Mirror to the OS clipboard so a later Ctrl+V reliably
+                    // emits Event::Paste (eframe may skip it for an empty clip).
+                    ctx.copy_text(format!(
+                        "RUST-AutoRASM: {} object(s) on clipboard",
+                        self.clipboard_dobjects.len()));
+                }
+                if paste { self.start_paste(); }
+            }
+        }
 
         // Enter (when the command line is empty) finalises an in-progress
         // selection — this is the LibreCAD / AutoCAD convention. The cmd
@@ -17310,11 +17352,14 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Copy").clicked() {
+                    if ui.button("Copy    Ctrl+C").clicked() {
                         self.copy_selection();
+                        let n = self.clipboard_dobjects.len();
+                        ui.ctx().copy_text(format!(
+                            "RUST-AutoRASM: {} object(s) on clipboard", n));
                         ui.close_menu();
                     }
-                    if ui.button("Paste").clicked() {
+                    if ui.button("Paste   Ctrl+V").clicked() {
                         self.start_paste();
                         ui.close_menu();
                     }
@@ -22099,17 +22144,10 @@ impl eframe::App for CadApp {
                     let cur_world = self.cursor_world_constrained(
                         resp.hover_pos(), rect, snap_hit.map(|h| h.point));
                     if let Some(cw) = cur_world {
+                        // Base is auto (clipboard lower-left) → no base blip /
+                        // dashed line; just ghost the content under the cursor.
                         let v = cw - base;
-                        let base_s = self.w2s(base, rect);
-                        let dest_s = self.w2s(cw, rect);
-                        let accent = egui::Color32::from_rgb(150, 230, 170);
-                        draw_base_blip(&painter, base_s, accent);
-                        let time = ctx.input(|i| i.time) as f32;
-                        let phase = time * 60.0;
-                        draw_dashed_line(&painter, base_s, dest_s,
-                            6.0, 4.0, phase, egui::Stroke::new(1.2, accent));
                         let ghost_col = egui::Color32::from_rgba_unmultiplied(150, 230, 170, 180);
-                        // Ghost the CLIPBOARD content (not a doc selection).
                         for d in &self.clipboard_dobjects {
                             let g = d.geom.translated(v);
                             draw_dobject(&painter, rect, self, &g, ghost_col);
