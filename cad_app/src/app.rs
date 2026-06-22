@@ -890,6 +890,10 @@ pub struct CadApp {
     clipboard_dobjects: Vec<DObject>,
     /// Active PASTE placement flow (base → destination); `Off` when idle.
     paste_state: PasteState,
+    /// Object groups — each is a list of member dobject HANDLES (stable across
+    /// reindexing). Selecting any member selects the whole group; Ungroup
+    /// dissolves it. In-session only for now (not yet persisted to file).
+    groups: Vec<Vec<u64>>,
 
     // ---- Slice L: medium editing actions ----
     offset_state:   OffsetState,
@@ -2165,6 +2169,7 @@ impl Default for CadApp {
             current_file: None,
             clipboard_dobjects: Vec::new(),
             paste_state: PasteState::Off,
+            groups: Vec::new(),
             insert_state:    InsertState::Off,
             block_dialog:    None,
             offset_state:   OffsetState::Off,
@@ -2374,6 +2379,12 @@ impl CadApp {
                 self.zoom_start(rest.trim());
                 return;
             }
+        }
+        // `group` / `ungroup` — operate on the current selection.
+        match trimmed.to_ascii_lowercase().as_str() {
+            "group"   => { self.group_selection();   return; }
+            "ungroup" => { self.ungroup_selection(); return; }
+            _ => {}
         }
         // Selection sub-command shortcuts — only while the command line is
         // asking for a selection (a select session is active):
@@ -9651,6 +9662,103 @@ impl CadApp {
             }
             Err(e) => self.history.push(format!("  ! save '{}': {}", path, e)),
         }
+    }
+
+    // ---- Groups ---------------------------------------------------------
+
+    /// Handles of the currently selected dobjects.
+    fn selected_handles(&self) -> std::collections::HashSet<u64> {
+        self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
+            .collect()
+    }
+
+    /// Ctrl+G / `group` — make the current selection into one group.
+    fn group_selection(&mut self) {
+        let members: Vec<u64> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i).map(|d| d.handle))
+            .collect();
+        if members.len() < 2 {
+            self.history.push("  ! group: select 2+ objects first".into());
+            return;
+        }
+        // Re-grouping: drop any existing group that shares these members, so a
+        // member never lives in two groups.
+        let set: std::collections::HashSet<u64> = members.iter().copied().collect();
+        self.groups.retain(|g| !g.iter().any(|h| set.contains(h)));
+        let n = members.len();
+        self.groups.push(members);
+        self.history.push(format!("  ⊞ grouped {} objects", n));
+    }
+
+    /// Add to Group — when the selection includes an existing group plus other
+    /// entities, merge those entities (and any other touched groups) into one
+    /// group. Needs at least one already-grouped object in the selection.
+    fn add_to_group(&mut self) {
+        let sel = self.selected_handles();
+        if sel.is_empty() {
+            self.history.push("  ! add to group: nothing selected".into());
+            return;
+        }
+        let touched: Vec<usize> = self.groups.iter().enumerate()
+            .filter(|(_, g)| g.iter().any(|h| sel.contains(h)))
+            .map(|(i, _)| i)
+            .collect();
+        if touched.is_empty() {
+            self.history.push(
+                "  ! add to group: include an existing group in the selection".into());
+            return;
+        }
+        // Merge every touched group's members + all selected handles into one.
+        let mut set: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        let mut members: Vec<u64> = Vec::new();
+        for &gi in &touched {
+            for h in &self.groups[gi] { if set.insert(*h) { members.push(*h); } }
+        }
+        for h in &sel { if set.insert(*h) { members.push(*h); } }
+        // Drop the touched groups (descending), then push the merged group.
+        let mut t = touched.clone();
+        t.sort_unstable();
+        for &gi in t.iter().rev() { self.groups.remove(gi); }
+        let n = members.len();
+        self.groups.push(members);
+        self.history.push(format!("  ⊞ added to group ({} objects total)", n));
+    }
+
+    /// Edit ▸ Ungroup / `ungroup` — dissolve every group that any selected
+    /// object belongs to (objects themselves stay).
+    fn ungroup_selection(&mut self) {
+        let sel = self.selected_handles();
+        if sel.is_empty() {
+            self.history.push("  ! ungroup: nothing selected".into());
+            return;
+        }
+        let before = self.groups.len();
+        self.groups.retain(|g| !g.iter().any(|h| sel.contains(h)));
+        let removed = before - self.groups.len();
+        if removed == 0 {
+            self.history.push("  ungroup: selection isn't in a group".into());
+        } else {
+            self.history.push(format!("  ⊟ ungrouped {} group(s)", removed));
+        }
+    }
+
+    /// Grow the selection so that picking any group member selects the whole
+    /// group (groups select as a unit). Called after pointer-mode picks.
+    fn expand_selection_to_groups(&mut self) {
+        if self.groups.is_empty() || self.selection.is_empty() { return; }
+        let sel = self.selected_handles();
+        let mut want = sel.clone();
+        for g in &self.groups {
+            if g.iter().any(|h| sel.contains(h)) {
+                for h in g { want.insert(*h); }
+            }
+        }
+        if want.len() == sel.len() { return; }   // nothing new
+        self.selection = self.doc.dobjects.iter().enumerate()
+            .filter(|(_, d)| want.contains(&d.handle))
+            .map(|(i, _)| i)
+            .collect();
     }
 
     /// Ctrl+C — copy the current selection into the dobject clipboard.
@@ -16994,6 +17102,11 @@ impl eframe::App for CadApp {
                         self.clipboard_dobjects.len()));
                 }
                 if paste { self.start_paste(); }
+                // Ctrl+G — group the current selection (G is a normal key, not
+                // a clipboard event, so plain key detection works here).
+                if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
+                    self.group_selection();
+                }
             }
         }
 
@@ -17361,6 +17474,19 @@ impl eframe::App for CadApp {
                     }
                     if ui.button("Paste   Ctrl+V").clicked() {
                         self.start_paste();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    if ui.button("Group   Ctrl+G").clicked() {
+                        self.group_selection();
+                        ui.close_menu();
+                    }
+                    if ui.button("Add to Group").clicked() {
+                        self.add_to_group();
+                        ui.close_menu();
+                    }
+                    if ui.button("Ungroup").clicked() {
+                        self.ungroup_selection();
                         ui.close_menu();
                     }
                     ui.separator();
@@ -18886,6 +19012,50 @@ impl eframe::App for CadApp {
             // all block editing happens inside that window. Every interaction
             // gate below is AND-ed with `!canvas_locked`. See `BlockEditor`.
             let canvas_locked = self.block_editor.is_some();
+            // ---- right-click shortcut (context) menu --------------------
+            // Opens on a secondary CLICK (a right-DRAG still pans). Shown only
+            // when there's a selection or something on the clipboard.
+            if !canvas_locked
+                && (!self.selection.is_empty() || !self.clipboard_dobjects.is_empty())
+            {
+                resp.context_menu(|ui| {
+                    ui.set_min_width(150.0);
+                    // Group ▸ (flyout submenu)
+                    ui.menu_button("Group", |ui| {
+                        if ui.button("Group     Ctrl+G").clicked() {
+                            self.group_selection();
+                            ui.close_menu();
+                        }
+                        if ui.button("Add to Group").clicked() {
+                            self.add_to_group();
+                            ui.close_menu();
+                        }
+                        if ui.button("Ungroup").clicked() {
+                            self.ungroup_selection();
+                            ui.close_menu();
+                        }
+                    });
+                    // Clipboard ▸ (flyout submenu)
+                    ui.menu_button("Clipboard", |ui| {
+                        if ui.button("Copy      Ctrl+C").clicked() {
+                            self.copy_selection();
+                            let n = self.clipboard_dobjects.len();
+                            ui.ctx().copy_text(format!(
+                                "RUST-AutoRASM: {} object(s) on clipboard", n));
+                            ui.close_menu();
+                        }
+                        if ui.button("Paste     Ctrl+V").clicked() {
+                            self.start_paste();
+                            ui.close_menu();
+                        }
+                    });
+                    ui.separator();
+                    if ui.button("Properties").clicked() {
+                        self.info_window_open = true;
+                        ui.close_menu();
+                    }
+                });
+            }
             // ZOOM real-time mode: a primary drag zooms the view instead of
             // selecting / drawing. Gates the click/grip handlers below so the
             // drag is consumed only by the zoom logic. See the zoom_* methods.
@@ -19495,6 +19665,8 @@ impl eframe::App for CadApp {
                     // Shift adds, Alt removes; inside a session it accumulates.
                     self.add_window_selection(
                         press_world, release_world, shift, alt, was_off);
+                    // Window-selecting any group member selects the whole group.
+                    if was_off && !alt { self.expand_selection_to_groups(); }
                     // STRETCH: the crossing window is also the per-vertex
                     // test region — remember it (last window wins).
                     if self.queued_op == QueuedOp::Stretch {
@@ -20266,6 +20438,8 @@ impl eframe::App for CadApp {
                         if let Some(i) = self.nearest_entity_under(world, tol_world) {
                             // Pointer-mode pick: plain = fresh selection.
                             self.click_select(i, shift, alt, true);
+                            // Picking a group member selects the whole group.
+                            if !alt { self.expand_selection_to_groups(); }
                         } else if !shift && !alt {
                             self.selection.clear();
                             self.selected = None;
