@@ -2940,6 +2940,23 @@ impl CadApp {
                     self.update_pline_prompt();
                     return;
                 }
+                // Close — commit the run as a CLOSED polyline (AutoCAD's `C`:
+                // closes immediately and ends the run; the tool stays active
+                // for a fresh polyline). Was previously missing, so `c` leaked
+                // to the global Copy command.
+                "c" | "close" => {
+                    if self.pending.len() >= 2 {
+                        let verts = self.drain_pline_pending(true);
+                        self.add_dobject(Geom::Polyline(Polyline {
+                            vertices: verts, closed: true,
+                        }), "canvas");
+                        self.update_pline_prompt();
+                    } else {
+                        self.history.push(
+                            "  ! pline: need at least 2 vertices before Close".into());
+                    }
+                    return;
+                }
                 "l" | "line" if self.pline_mode == PlineMode::Arc => {
                     self.pline_mode = PlineMode::Line;
                     self.pline_arc_sub = PlineArcSub::Normal;
