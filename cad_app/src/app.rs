@@ -14467,7 +14467,8 @@ impl CadApp {
         self.pline_arc_sub = PlineArcSub::Normal;
         self.pline_dir_override = None;
         self.pline_width_cap = PlineWidthCap::None;
-        self.pline_next_width = (0.0, 0.0);
+        // pline_next_width PERSISTS as the sticky default width for the next
+        // polyline (AutoCAD PLINEWID) — only an explicit `w` changes it.
         (verts, widths)
     }
 
@@ -17125,7 +17126,7 @@ impl eframe::App for CadApp {
             self.pline_arc_sub = PlineArcSub::Normal;
             self.pline_dir_override = None;
             self.pline_width_cap = PlineWidthCap::None;
-            self.pline_next_width = (0.0, 0.0);
+            // pline_next_width persists (sticky default) across cancel too.
             self.wall_waiting_thickness = false;
             if self.block_def_state != BlockDefState::Off {
                 self.block_def_state = BlockDefState::Off;
@@ -17646,7 +17647,6 @@ impl eframe::App for CadApp {
                     self.pending_widths.clear();
                     self.pline_mode = PlineMode::Line;
                     self.pline_width_cap = PlineWidthCap::None;
-                    self.pline_next_width = (0.0, 0.0);
                 }
             }
         }
@@ -22231,6 +22231,51 @@ impl eframe::App for CadApp {
                         // the actual arc, not its chord. Each captured
                         // vertex gets a small filled dot.
                         (Tool::Polyline, verts) if !verts.is_empty() => {
+                            // LIVE WIDTH preview: if any width is set, fill the
+                            // committed segments + the rubber-band with their
+                            // widths so the user sees the wide shape WHILE
+                            // drawing (not only after the command finishes).
+                            let any_w = self.pline_next_width.0.abs() > 1e-9
+                                || self.pline_next_width.1.abs() > 1e-9
+                                || self.pending_widths.iter()
+                                    .any(|&(s, e)| s.abs() > 1e-9 || e.abs() > 1e-9);
+                            if any_w {
+                                let push_seg = |cl: &mut Vec<(Vec2, f64)>,
+                                                a: Vec2, b: Vec2, bulge: f64,
+                                                sw: f64, ew: f64, first: bool| {
+                                    let mut pts = vec![a];
+                                    append_arc_world_samples(a, b, bulge, &mut pts);
+                                    let mm = pts.len().max(1);
+                                    for (j, pt) in pts.iter().enumerate() {
+                                        if !first && j == 0 { continue; }
+                                        let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
+                                        cl.push((*pt, sw + (ew - sw) * t));
+                                    }
+                                };
+                                let mut cl: Vec<(Vec2, f64)> = Vec::new();
+                                for i in 0..verts.len().saturating_sub(1) {
+                                    let (sw, ew) = self.pending_widths
+                                        .get(i).copied().unwrap_or((0.0, 0.0));
+                                    let bulge = self.pending_bulges
+                                        .get(i).copied().unwrap_or(0.0);
+                                    push_seg(&mut cl, verts[i], verts[i + 1], bulge, sw, ew, i == 0);
+                                }
+                                // Rubber-band segment with the CURRENT width.
+                                if let Some(&last) = verts.last() {
+                                    let rb = matches!((self.pline_mode, self.pline_arc_sub),
+                                        (PlineMode::Line, _) | (PlineMode::Arc, PlineArcSub::Normal));
+                                    if rb {
+                                        let bulge = if self.pline_mode == PlineMode::Arc {
+                                            self.pline_arc_bulge_to(cw)
+                                        } else { 0.0 };
+                                        let (sw, ew) = self.pline_next_width;
+                                        let first = cl.is_empty();
+                                        push_seg(&mut cl, last, cw, bulge, sw, ew, first);
+                                    }
+                                }
+                                fill_width_strip(&painter, rect, self, &cl,
+                                    preview_col.gamma_multiply(0.40));
+                            }
                             let solid = egui::Stroke::new(
                                 1.0, preview_col.gamma_multiply(0.7));
                             for w in verts.iter() {
@@ -23342,12 +23387,71 @@ fn draw_dobject(
     draw_dobject_thick(painter, rect, app, g, color, 1.6);
 }
 
-/// Render a polyline with per-segment widths as FILLED tapered strips.
-/// Each segment's centerline is tessellated (arcs become real arcs via
-/// `append_arc_world_samples`); the width is linearly interpolated start→end
-/// and each sub-span is filled as a convex quad offset ±half-width along the
-/// local normal. Zero-width segments fall back to a thin stroke. Widths are in
-/// world units, so the fill scales with zoom (like real geometry).
+/// Build the centerline of a polyline as `(point, full_width)` samples in
+/// world space. Arc segments are tessellated (real arcs); width is linearly
+/// interpolated start→end within each segment. Shared vertices appear once, so
+/// the result is a single continuous path — the input the width-strip filler
+/// needs for gap-free mitred corners.
+fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
+    let n = p.vertices.len();
+    if n < 2 { return Vec::new(); }
+    let seg_count = if p.closed { n } else { n - 1 };
+    let mut cl: Vec<(Vec2, f64)> = Vec::new();
+    for i in 0..seg_count {
+        let a = p.vertices[i].pos;
+        let b = p.vertices[(i + 1) % n].pos;
+        let bulge = p.vertices[i].bulge;
+        let (sw, ew) = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
+        let mut pts = vec![a];
+        append_arc_world_samples(a, b, bulge, &mut pts);   // a + interior + b
+        let mm = pts.len().max(1);
+        for (j, pt) in pts.iter().enumerate() {
+            if i > 0 && j == 0 { continue; }               // dedup shared vertex
+            let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
+            cl.push((*pt, sw + (ew - sw) * t));
+        }
+    }
+    cl
+}
+
+/// Fill a width strip along a `(point, full_width)` centerline. Each point gets
+/// an AVERAGED-tangent normal so consecutive quads share their offset points —
+/// no gaps, mitred-ish corners. Widths are world units (scale with zoom).
+fn fill_width_strip(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    app: &CadApp,
+    cl: &[(Vec2, f64)],
+    color: egui::Color32,
+) {
+    let m = cl.len();
+    if m < 2 { return; }
+    let unit = |v: Vec2| { let l = v.len(); if l > EPS { v / l } else { Vec2::new(0.0, 0.0) } };
+    let mut left = Vec::with_capacity(m);
+    let mut right = Vec::with_capacity(m);
+    for k in 0..m {
+        let p = cl[k].0;
+        let tan = if k == 0 {
+            cl[1].0 - cl[0].0
+        } else if k == m - 1 {
+            cl[m - 1].0 - cl[m - 2].0
+        } else {
+            unit(cl[k].0 - cl[k - 1].0) + unit(cl[k + 1].0 - cl[k].0)
+        };
+        let n = unit(Vec2::new(-tan.y, tan.x));
+        let h = cl[k].1 * 0.5;
+        left.push(app.w2s(p + n * h, rect));
+        right.push(app.w2s(p - n * h, rect));
+    }
+    for k in 0..m - 1 {
+        painter.add(egui::Shape::convex_polygon(
+            vec![left[k], left[k + 1], right[k + 1], right[k]],
+            color, egui::Stroke::NONE));
+    }
+}
+
+/// Render a committed polyline with per-segment widths as one filled, mitred
+/// tapered strip.
 fn draw_polyline_widths(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -23355,44 +23459,8 @@ fn draw_polyline_widths(
     p: &Polyline,
     color: egui::Color32,
 ) {
-    let n = p.vertices.len();
-    if n < 2 { return; }
-    let seg_count = if p.closed { n } else { n - 1 };
-    for i in 0..seg_count {
-        let a = p.vertices[i].pos;
-        let b = p.vertices[(i + 1) % n].pos;
-        let bulge = p.vertices[i].bulge;
-        let (sw, ew) = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
-        // Centerline samples in world (a + intermediate arc points + b).
-        let mut cl = vec![a];
-        append_arc_world_samples(a, b, bulge, &mut cl);
-        let m = cl.len();
-        if m < 2 { continue; }
-        if sw.abs() < 1e-9 && ew.abs() < 1e-9 {
-            let pts: Vec<egui::Pos2> = cl.iter().map(|w| app.w2s(*w, rect)).collect();
-            painter.add(egui::Shape::line(pts, egui::Stroke::new(1.6, color)));
-            continue;
-        }
-        for k in 0..m - 1 {
-            let p0 = cl[k];
-            let p1 = cl[k + 1];
-            let dir = p1 - p0;
-            let dl = dir.len();
-            if dl < EPS { continue; }
-            let nrm = Vec2::new(-dir.y, dir.x) / dl;     // left normal (CCW)
-            let t0 = k as f64 / (m - 1) as f64;
-            let t1 = (k + 1) as f64 / (m - 1) as f64;
-            let h0 = (sw + (ew - sw) * t0) * 0.5;
-            let h1 = (sw + (ew - sw) * t1) * 0.5;
-            let quad = vec![
-                app.w2s(p0 + nrm * h0, rect),
-                app.w2s(p1 + nrm * h1, rect),
-                app.w2s(p1 - nrm * h1, rect),
-                app.w2s(p0 - nrm * h0, rect),
-            ];
-            painter.add(egui::Shape::convex_polygon(quad, color, egui::Stroke::NONE));
-        }
-    }
+    let cl = polyline_width_centerline(p);
+    fill_width_strip(painter, rect, app, &cl, color);
 }
 
 /// Render a DObject honouring its style.linetype (resolved through
