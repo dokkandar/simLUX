@@ -57,6 +57,7 @@ enum PlineArcSub {
     Normal,
     AwaitingSecondPt,            // user typed `s`; next click = on-arc midpoint
     AwaitingSecondPtEnd(Vec2),   // midpoint captured; next click = endpoint
+    AwaitingDirection,           // user typed `d`; next click/angle = start tangent
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -734,6 +735,11 @@ pub struct CadApp {
     /// `AwaitingSecondPtEnd(mid)` until the endpoint click commits a
     /// 3-point arc. Resets to `Normal` after each arc commits.
     pline_arc_sub: PlineArcSub,
+    /// PLINE Arc `d`/Direction override: when set, the NEXT arc segment uses
+    /// this unit vector as its START tangent (instead of the previous segment's
+    /// exit tangent). Captured by the click/angle after `d`, consumed (cleared)
+    /// once that arc segment commits.
+    pline_dir_override: Option<Vec2>,
 
     scale:        f32,
     world_offset: egui::Vec2,
@@ -2144,6 +2150,7 @@ impl Default for CadApp {
             pending_bulges: Vec::new(),
             pline_mode:    PlineMode::Line,
             pline_arc_sub: PlineArcSub::Normal,
+            pline_dir_override: None,
             scale:         6.0,
             world_offset:  egui::Vec2::ZERO,
             zoom_state:    ZoomState::Off,
@@ -2933,6 +2940,19 @@ impl CadApp {
         // queued. The prompt mentions all of them.
         if self.tool == Tool::Polyline {
             let lc = trimmed.to_ascii_lowercase();
+            // PLINE Arc Direction: a typed angle (degrees) while awaiting the
+            // start tangent sets it directly (alternative to clicking a point).
+            if self.pline_arc_sub == PlineArcSub::AwaitingDirection {
+                if let Ok(deg) = trimmed.parse::<f64>() {
+                    let r = deg.to_radians();
+                    self.pline_dir_override = Some(Vec2::new(r.cos(), r.sin()));
+                    self.pline_arc_sub = PlineArcSub::Normal;
+                    self.history.push(format!(
+                        "  pline·ARC direction set to {:.1}° — click ENDPOINT", deg));
+                    self.update_pline_prompt();
+                    return;
+                }
+            }
             match lc.as_str() {
                 "a" | "arc" => {
                     self.pline_mode = PlineMode::Arc;
@@ -2968,7 +2988,8 @@ impl CadApp {
                     // first instead of yanking a committed vertex.
                     if self.pline_arc_sub != PlineArcSub::Normal {
                         self.pline_arc_sub = PlineArcSub::Normal;
-                        self.history.push("  pline: cancelled Second-pt flow".into());
+                        self.pline_dir_override = None;
+                        self.history.push("  pline: cancelled arc sub-flow".into());
                         self.update_pline_prompt();
                         return;
                     }
@@ -2996,6 +3017,19 @@ impl CadApp {
                     self.update_pline_prompt();
                     return;
                 }
+                // Direction: set the START tangent of the NEXT arc segment.
+                // Then click a point (tangent = last-vertex → point) or type an
+                // angle in degrees. Arc mode only; needs a starting vertex.
+                "d" | "direction" if self.pline_mode == PlineMode::Arc => {
+                    if self.pending.is_empty() {
+                        self.history.push(
+                            "  ! pline: need a starting vertex before Direction".into());
+                        return;
+                    }
+                    self.pline_arc_sub = PlineArcSub::AwaitingDirection;
+                    self.update_pline_prompt();
+                    return;
+                }
                 // Recognised-but-not-wired sub-options: tell the user
                 // they're known so they don't keep retyping. Wire-up
                 // lands in the Phase 2 slice.
@@ -3003,7 +3037,6 @@ impl CadApp {
                 | "h" | "halfwidth"
                 | "len" | "length"
                 | "ce" | "center"
-                | "d" | "direction"
                 | "r" | "radius"
                 | "ang" | "angle" => {
                     self.history.push(format!(
@@ -14260,6 +14293,8 @@ impl CadApp {
                     "pline·ARC·SECOND: click a point ON the arc  [U=cancel sub-flow]".to_string(),
                 PlineArcSub::AwaitingSecondPtEnd(_) =>
                     "pline·ARC·SECOND: click ENDPOINT  [U=cancel sub-flow]".to_string(),
+                PlineArcSub::AwaitingDirection =>
+                    "pline·ARC·DIRECTION: click a point for the start tangent, or type an angle°  [U=cancel]".to_string(),
             },
         };
         self.set_prompt(prompt);
@@ -14335,6 +14370,7 @@ impl CadApp {
         self.pending_bulges.clear();
         self.pline_mode = PlineMode::Line;
         self.pline_arc_sub = PlineArcSub::Normal;
+        self.pline_dir_override = None;
         verts
     }
 
@@ -14408,9 +14444,11 @@ impl CadApp {
         let start = self.pending[n - 1];
         let chord = end - start;
         if chord.len() < EPS { return 0.0; }
-        // Default tangent: previous-segment exit; fall back to horizontal
-        // (X+) when there's only the start vertex.
-        let tangent = self.pline_previous_exit_tangent()
+        // Tangent priority: an explicit `d`/Direction override (this segment
+        // only) → the previous-segment exit tangent (G1-continuous) → X+ when
+        // there's only the start vertex.
+        let tangent = self.pline_dir_override
+            .or_else(|| self.pline_previous_exit_tangent())
             .unwrap_or(Vec2::new(1.0, 0.0));
         // Signed angle from chord to tangent, CCW positive.
         let cross = chord.x * tangent.y - chord.y * tangent.x;
@@ -20644,6 +20682,25 @@ impl eframe::App for CadApp {
                                     self.update_pline_prompt();
                                     true
                                 }
+                                // Direction: this click sets the arc's START
+                                // tangent (last vertex → click). No vertex is
+                                // committed; the NEXT click places the endpoint
+                                // and the arc bulge uses this override.
+                                PlineArcSub::AwaitingDirection => {
+                                    if let Some(&start) = self.pending.last() {
+                                        let dir = click_world - start;
+                                        if dir.len() > EPS {
+                                            let u = dir / dir.len();
+                                            self.pline_dir_override = Some(u);
+                                            self.history.push(format!(
+                                                "    pline·ARC direction ({:.3},{:.3}) — click ENDPOINT",
+                                                u.x, u.y));
+                                        }
+                                    }
+                                    self.pline_arc_sub = PlineArcSub::Normal;
+                                    self.update_pline_prompt();
+                                    true
+                                }
                                 PlineArcSub::Normal => false,
                             }
                         } else { false };
@@ -20677,6 +20734,9 @@ impl eframe::App for CadApp {
                                         0.0
                                     };
                                     self.pending_bulges.push(new_bulge);
+                                    // The Direction override applies to ONE arc
+                                    // segment only — consume it now.
+                                    self.pline_dir_override = None;
                                 }
                                 // Smart-dim flow: handle the click via
                                 // dim_draft instead of pending so the
@@ -22102,6 +22162,13 @@ impl eframe::App for CadApp {
                                         let bulge = self.pline_arc_bulge_to(cw);
                                         self.draw_pline_preview_segment(
                                             &painter, rect, *last, cw, bulge, dash);
+                                    }
+                                    (PlineMode::Arc, PlineArcSub::AwaitingDirection) => {
+                                        // Cursor defines the start tangent — show
+                                        // it as a reference line from the last
+                                        // vertex toward the cursor.
+                                        painter.line_segment(
+                                            [self.w2s(*last, rect), cursor], dash);
                                     }
                                     (PlineMode::Line, _) => {
                                         painter.line_segment(
