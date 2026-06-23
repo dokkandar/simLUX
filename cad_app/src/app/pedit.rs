@@ -60,8 +60,14 @@ impl CadApp {
                     closed: false,
                 }))
             }
+            // Elliptical arc / spline can't be a polyline exactly (bulges are
+            // circular). Tessellate to a faceted polyline so PEDIT can edit /
+            // join them — matches how pedit_join treats secondary picks.
+            g @ (Geom::EllipseArc(_) | Geom::Spline(_)) =>
+                tessellated_polyline(g).map(Geom::Polyline),
             _ => {
-                self.history.push("  ! pedit: that object isn't a polyline/line/arc".into());
+                self.history.push(
+                    "  ! pedit: that object isn't a polyline / line / arc / ellipse-arc / spline".into());
                 return;
             }
         };
@@ -136,30 +142,13 @@ impl CadApp {
             let Some(d) = self.doc.dobjects.get(i) else { continue; };
             match &d.geom {
                 Geom::Polyline(p) => prims.extend(explode_polyline(p)),
-                Geom::Spline(s) => {
-                    let pl = Polyline {
-                        vertices: s.tessellate(64).into_iter()
-                            .map(|p| PolyVertex { pos: p, bulge: 0.0 }).collect(),
-                        closed: false,
-                    };
-                    prims.extend(explode_polyline(&pl));
-                }
-                Geom::EllipseArc(ea) => {
-                    // An elliptical arc can't be a polyline bulge (bulges are
-                    // circular only). Tessellate it into short line segments so
-                    // it can chain — the merged polyline APPROXIMATES the
-                    // ellipse (faceted at very high zoom). Density scales with
-                    // the swept fraction (~96 segs for a full ellipse, min 12).
-                    let frac = (ea.sweep_param.abs()
-                        / std::f64::consts::TAU).clamp(0.0, 1.0);
-                    let n = (96.0 * frac).ceil().max(12.0) as usize;
-                    let pts: Vec<PolyVertex> = (0..=n).map(|i| {
-                        let t = ea.start_param
-                            + ea.sweep_param * (i as f64 / n as f64);
-                        PolyVertex { pos: ea.ellipse.point_at(t), bulge: 0.0 }
-                    }).collect();
-                    prims.extend(explode_polyline(
-                        &Polyline { vertices: pts, closed: false }));
+                // Ellipse arc / spline → tessellated to straight segments
+                // (they can't be circular-bulge segments). Same helper as
+                // pedit_start so a target and a pick tessellate identically.
+                g @ (Geom::EllipseArc(_) | Geom::Spline(_)) => {
+                    if let Some(pl) = tessellated_polyline(g) {
+                        prims.extend(explode_polyline(&pl));
+                    }
                 }
                 Geom::Line(_) | Geom::Arc(_) => prims.push(d.geom.clone()),
                 _ => {}   // non-chainable (full circle/ellipse, text, …) → skipped
@@ -325,5 +314,36 @@ impl CadApp {
         let p = self.pedit_menu_prompt(h);
         self.set_prompt(p);
         self.refocus_cmd = true;
+    }
+}
+
+/// Tessellate an elliptical arc or spline into a straight-segment (bulge-0)
+/// polyline so it can become — or join into — a PEDIT polyline. Circular arcs
+/// are NOT handled here (they keep their exact bulge). Returns `None` for any
+/// other geom. Used by both `pedit_start` (target) and `pedit_join_selected`
+/// (pick) so the same curve tessellates identically either way.
+///
+/// EllipseArc density scales with the swept fraction (~96 segments for a full
+/// ellipse, min 12); splines use the kernel's 64-sample tessellation. The
+/// result APPROXIMATES the curve (faceted at very high zoom) because a polyline
+/// can only encode straight + circular-arc spans.
+fn tessellated_polyline(g: &Geom) -> Option<Polyline> {
+    match g {
+        Geom::EllipseArc(ea) => {
+            let frac = (ea.sweep_param.abs()
+                / std::f64::consts::TAU).clamp(0.0, 1.0);
+            let n = (96.0 * frac).ceil().max(12.0) as usize;
+            let vertices = (0..=n).map(|i| {
+                let t = ea.start_param + ea.sweep_param * (i as f64 / n as f64);
+                PolyVertex { pos: ea.ellipse.point_at(t), bulge: 0.0 }
+            }).collect();
+            Some(Polyline { vertices, closed: false })
+        }
+        Geom::Spline(s) => Some(Polyline {
+            vertices: s.tessellate(64).into_iter()
+                .map(|p| PolyVertex { pos: p, bulge: 0.0 }).collect(),
+            closed: false,
+        }),
+        _ => None,
     }
 }
