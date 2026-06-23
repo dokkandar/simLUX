@@ -10,3 +10,5 @@ target-docker/
 
 # Local build / install logs captured during dev iteration (not source).
 *.log
+
+.git_commit_msg.txt
