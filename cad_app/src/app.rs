@@ -2425,6 +2425,10 @@ impl CadApp {
             return;
         }
         if matches!(trimmed.to_ascii_lowercase().as_str(), "pedit" | "pe") {
+            // Register as the repeatable command so empty-Enter re-runs PEDIT
+            // (this intercept returns early, bypassing the parse-ok path that
+            // normally sets last_command — same pattern as circle/zoom).
+            self.last_command = Some("pedit".into());
             self.pedit_start();
             return;
         }

@@ -144,8 +144,25 @@ impl CadApp {
                     };
                     prims.extend(explode_polyline(&pl));
                 }
+                Geom::EllipseArc(ea) => {
+                    // An elliptical arc can't be a polyline bulge (bulges are
+                    // circular only). Tessellate it into short line segments so
+                    // it can chain — the merged polyline APPROXIMATES the
+                    // ellipse (faceted at very high zoom). Density scales with
+                    // the swept fraction (~96 segs for a full ellipse, min 12).
+                    let frac = (ea.sweep_param.abs()
+                        / std::f64::consts::TAU).clamp(0.0, 1.0);
+                    let n = (96.0 * frac).ceil().max(12.0) as usize;
+                    let pts: Vec<PolyVertex> = (0..=n).map(|i| {
+                        let t = ea.start_param
+                            + ea.sweep_param * (i as f64 / n as f64);
+                        PolyVertex { pos: ea.ellipse.point_at(t), bulge: 0.0 }
+                    }).collect();
+                    prims.extend(explode_polyline(
+                        &Polyline { vertices: pts, closed: false }));
+                }
                 Geom::Line(_) | Geom::Arc(_) => prims.push(d.geom.clone()),
-                _ => {}   // non-chainable (circle, text, …) → skipped
+                _ => {}   // non-chainable (full circle/ellipse, text, …) → skipped
             }
         }
         if prims.len() < 2 {

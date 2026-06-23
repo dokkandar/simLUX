@@ -5,7 +5,7 @@
 //! the `polyline_segments` exploder, and the DXF bulge<->arc conversions.
 
 use crate::math::{Vec2, EPS};
-use crate::geom::{Arc, EllipseArc, Geom, Line, PolyVertex, Polyline};
+use crate::geom::{Arc, Geom, Line, PolyVertex, Polyline};
 
 /// Circular arc through `a`→`b` with DXF `bulge` (= tan(sweep/4)). Returns
 /// `(center, radius, start_angle, signed_sweep)`; signed sweep is

@@ -5,7 +5,7 @@
 //! operations.
 
 use crate::math::{Vec2, EPS};
-use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, PolyVertex, Polyline, Wall};
+use crate::geom::{Arc, Circle, Ellipse, Geom, Line, PolyVertex, Polyline, Wall};
 use crate::join::bulge_arc;
 
 impl Geom {
