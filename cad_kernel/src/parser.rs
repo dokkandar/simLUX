@@ -584,10 +584,14 @@ fn parse_point(args: &[&str]) -> Result<Command, String> {
 }
 
 fn parse_polyline(args: &[&str]) -> Result<Command, String> {
-    // `polyline x1,y1 x2,y2 …` — straight-segment polyline; closed if the
-    // last token is the literal "close" / "closed".
+    // Bare `polyline` / `pl` / `pline` → enter interactive draw-polyline mode.
+    // With args, add now: `polyline x1,y1 x2,y2 …` (closed if the last token is
+    // the literal "close" / "closed").
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Polyline));
+    }
     if args.len() < 2 {
-        return Err("usage: polyline x1,y1 x2,y2 [x3,y3 …] [close]".into());
+        return Err("usage: polyline  OR  polyline x1,y1 x2,y2 [x3,y3 …] [close]".into());
     }
     let (vert_args, closed) = match args.last().map(|s| s.to_ascii_lowercase()) {
         Some(ref s) if s == "close" || s == "closed" => (&args[..args.len()-1], true),
@@ -636,10 +640,14 @@ fn parse_ellipse(args: &[&str]) -> Result<Command, String> {
 
 // ---- Arc construction methods ----
 
-/// METHOD 1 — center + radius + start_deg + end_deg
+/// METHOD 1 — center + radius + start_deg + end_deg.
+/// Bare `arc` / `a` → enter interactive draw-arc mode.
 fn parse_arc(args: &[&str]) -> Result<Command, String> {
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Arc));
+    }
     if args.len() != 4 {
-        return Err("usage: arc cx,cy r start_deg end_deg".into());
+        return Err("usage: arc  OR  arc cx,cy r start_deg end_deg".into());
     }
     let r:   f64 = args[1].parse().map_err(|_| "bad radius".to_string())?;
     let sd:  f64 = args[2].parse().map_err(|_| "bad start angle".to_string())?;
