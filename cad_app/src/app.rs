@@ -23497,10 +23497,9 @@ fn fill_width_strip(
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let scr: Vec<egui::Pos2> = s.iter().map(|p| app.w2s(*p, rect)).collect();
-        for i in 1..scr.len() - 1 {
-            painter.add(egui::Shape::convex_polygon(
-                vec![scr[0], scr[i], scr[i + 1]], color, egui::Stroke::NONE));
-        }
+        // ONE convex polygon (not a triangle fan) so egui only anti-aliases the
+        // outer boundary — no internal hairline seams across the fill.
+        painter.add(egui::Shape::convex_polygon(scr, color, egui::Stroke::NONE));
     };
     const MITER_LIMIT: f64 = 8.0;
     // Per-segment unit direction.
