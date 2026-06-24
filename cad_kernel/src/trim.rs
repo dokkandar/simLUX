@@ -26,9 +26,12 @@ fn trim_polyline_connected(
     let a_pt = p.vertices[best_i].pos;        // start of clicked segment
     let b_pt = p.vertices[best_i + 1].pos;    // end of clicked segment
     let w_clicked = p.widths.get(best_i).copied().unwrap_or((0.0, 0.0));
+    // Intersects a cutter → trim normally. No intersection → REMOVE the whole
+    // clicked segment (empty pieces): the polyline splits into a "before" run
+    // ending at v[best_i] and an "after" run starting at v[best_i+1].
     let pieces = match segs[best_i].trim_at(cutters, pick, edge_mode) {
         Ok(ps) => ps,
-        Err(_) => vec![segs[best_i].clone()],
+        Err(_) => Vec::new(),
     };
     let near = |x: Vec2, y: Vec2| (x - y).len() < 1e-6;
     let ep = |g: &Geom| -> (Vec2, Vec2) {
@@ -381,12 +384,15 @@ impl Geom {
                     let w = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
                     if i == best_i {
                         match s.trim_at(cutters, pick, edge_mode) {
+                            // Intersects a cutter → normal trim (keep the pieces).
                             Ok(pieces) => {
                                 for piece in pieces {
                                     out.push(if has_w { wrap_with_width(piece, w) } else { piece });
                                 }
                             }
-                            Err(_) => out.push(if has_w { wrap_with_width(s, w) } else { s }),
+                            // No intersection with any boundary → REMOVE the
+                            // whole clicked segment (push nothing).
+                            Err(_) => {}
                         }
                     } else {
                         out.push(if has_w { wrap_with_width(s, w) } else { s });

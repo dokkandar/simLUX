@@ -22,6 +22,13 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-24) trim: click a polyline segment with no boundary → remove it ----
+When trimming a polyline, clicking a target segment that does NOT intersect any
+selected cutter now REMOVES that whole segment (was: kept). Connected-runs path
+splits the polyline at the removed segment (before-run + after-run); explode
+path drops the clicked segment, keeps the rest. Segment that crosses a cutter
+still trims normally. (cad_kernel/src/trim.rs)
+
 ---- ac62164 (2026-06-24) fillet: continuous by default ----
 FILLET now loops: pick pair after pair until Esc. `R` changes radius mid-command
 (persisted to env.FltRad as next default); `M` toggles single-shot; `T` toggles
