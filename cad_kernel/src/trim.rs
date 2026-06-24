@@ -9,6 +9,93 @@ use crate::math::{Vec2, EPS};
 use crate::geom::{Arc, Circle, Ellipse, EllipseArc, Geom, Line, PolyVertex, Polyline, Wall};
 use crate::join::{bulge_from_arc, polyline_segments, JOIN_EPS};
 
+/// Trim an OPEN, width-carrying polyline while keeping CONNECTED runs (so
+/// mitred corners and per-segment widths survive). The clicked segment is
+/// trimmed; the polyline splits into a "before" run (vertices up to the clicked
+/// segment + its surviving start piece) and an "after" run (its surviving end
+/// piece + the remaining vertices). Either run with ≥ 2 vertices is emitted.
+fn trim_polyline_connected(
+    p: &Polyline,
+    segs: &[Geom],
+    best_i: usize,
+    cutters: &[Geom],
+    pick: Vec2,
+    edge_mode: bool,
+) -> Vec<Geom> {
+    let n = p.vertices.len();
+    let a_pt = p.vertices[best_i].pos;        // start of clicked segment
+    let b_pt = p.vertices[best_i + 1].pos;    // end of clicked segment
+    let w_clicked = p.widths.get(best_i).copied().unwrap_or((0.0, 0.0));
+    let pieces = match segs[best_i].trim_at(cutters, pick, edge_mode) {
+        Ok(ps) => ps,
+        Err(_) => vec![segs[best_i].clone()],
+    };
+    let near = |x: Vec2, y: Vec2| (x - y).len() < 1e-6;
+    let ep = |g: &Geom| -> (Vec2, Vec2) {
+        match g {
+            Geom::Line(l) => (l.a, l.b),
+            Geom::Arc(ar) => ar.endpoints(),
+            _ => (Vec2::new(0.0, 0.0), Vec2::new(0.0, 0.0)),
+        }
+    };
+    let bulge_of = |g: &Geom, from: Vec2, to: Vec2| match g {
+        Geom::Arc(ar) => bulge_from_arc(from, to, ar.center, ar.sweep_angle),
+        _ => 0.0,
+    };
+    // Classify the surviving pieces of the clicked segment by which original
+    // endpoint they still touch.
+    let mut start_piece: Option<&Geom> = None;   // touches a_pt
+    let mut end_piece: Option<&Geom> = None;      // touches b_pt
+    for pc in &pieces {
+        let (pa, pb) = ep(pc);
+        if near(pa, a_pt) || near(pb, a_pt) { start_piece = Some(pc); }
+        else if near(pa, b_pt) || near(pb, b_pt) { end_piece = Some(pc); }
+    }
+    let mut out: Vec<Geom> = Vec::new();
+    // --- before run: v[0..=best_i] (+ start piece's far end) ---
+    {
+        let mut vb: Vec<PolyVertex> = (0..=best_i).map(|i| p.vertices[i]).collect();
+        let mut wb: Vec<(f64, f64)> =
+            (0..best_i).map(|i| p.widths.get(i).copied().unwrap_or((0.0, 0.0))).collect();
+        if let Some(pc) = start_piece {
+            let (pa, pb) = ep(pc);
+            let far = if near(pa, a_pt) { pb } else { pa };
+            let bl = bulge_of(pc, a_pt, far);
+            if let Some(last) = vb.last_mut() { last.bulge = bl; }
+            vb.push(PolyVertex { pos: far, bulge: 0.0 });
+            wb.push(w_clicked);
+        }
+        if vb.len() >= 2 {
+            out.push(Geom::Polyline(Polyline { vertices: vb, closed: false, widths: wb }));
+        }
+    }
+    // --- after run: (end piece's cut end +) v[best_i+1..] ---
+    {
+        let mut va: Vec<PolyVertex> = Vec::new();
+        let mut wa: Vec<(f64, f64)> = Vec::new();
+        if let Some(pc) = end_piece {
+            let (pa, pb) = ep(pc);
+            let cut = if near(pa, b_pt) { pb } else { pa };   // the new free start
+            let bl = bulge_of(pc, cut, b_pt);
+            va.push(PolyVertex { pos: cut, bulge: bl });
+            wa.push(w_clicked);
+        }
+        for i in (best_i + 1)..n {
+            va.push(p.vertices[i]);
+            if i < n - 1 { wa.push(p.widths.get(i).copied().unwrap_or((0.0, 0.0))); }
+        }
+        if va.len() >= 2 {
+            out.push(Geom::Polyline(Polyline { vertices: va, closed: false, widths: wa }));
+        }
+    }
+    // Fallback: nothing chained into a run (e.g. a 2-vertex polyline) — keep the
+    // surviving pieces individually so width isn't lost.
+    if out.is_empty() {
+        for pc in pieces { out.push(wrap_with_width(pc, w_clicked)); }
+    }
+    out
+}
+
 /// Wrap a single trimmed Line/Arc segment back into a 1-segment Polyline that
 /// carries the segment's `(start,end)` width — so trimming a WIDE polyline
 /// keeps its width (bare Line/Arc have no width field). Other geoms pass
@@ -281,10 +368,14 @@ impl Geom {
                     let d = s.distance_to_point(pick);
                     if d < best_d { best_d = d; best_i = i; }
                 }
-                // If the polyline carries WIDTHS, keep each surviving piece as a
-                // 1-segment polyline that retains its segment's width — bare
-                // Line/Arc can't store width, so exploding would drop it.
                 let has_w = !p.widths.is_empty();
+                // WIDTH + OPEN: keep CONNECTED runs so corners stay mitred and
+                // width is preserved. Trimming the clicked segment splits the
+                // polyline into a "before" run and an "after" run at the cut.
+                if has_w && !p.closed {
+                    return Ok(trim_polyline_connected(p, &segs, best_i, cutters, pick, edge_mode));
+                }
+                // Otherwise: EXPLODE into independent Line/Arc segments (v1).
                 let mut out = Vec::new();
                 for (i, s) in segs.into_iter().enumerate() {
                     let w = p.widths.get(i).copied().unwrap_or((0.0, 0.0));
@@ -343,6 +434,43 @@ impl Geom {
         edge_mode: bool,
     ) -> Result<Geom, &'static str> {
         use crate::intersect::intersect;
+        // Polyline: extend the END SEGMENT nearest the pick toward the boundary
+        // and move that free endpoint — handled here BEFORE the whole-target
+        // intersection test (a polyline doesn't itself reach the boundary).
+        if let Geom::Polyline(p) = self {
+            let n = p.vertices.len();
+            if n < 2 { return Err("extend: polyline has no segments"); }
+            let segs = polyline_segments(p);
+            if segs.is_empty() { return Err("extend: polyline has no segments"); }
+            let start_pt = p.vertices[0].pos;
+            let end_pt = p.vertices[n - 1].pos;
+            let at_end = pick.dist(end_pt) <= pick.dist(start_pt);
+            let seg_i = if at_end { segs.len() - 1 } else { 0 };
+            // The vertex that STAYS put (the inner end of the extended segment).
+            let fixed_pt = if at_end { p.vertices[n - 2].pos } else { p.vertices[1].pos };
+            let extended = segs[seg_i].extend_to(boundaries, pick, edge_mode)?;
+            let (ea, eb) = match &extended {
+                Geom::Line(l) => (l.a, l.b),
+                Geom::Arc(a)  => a.endpoints(),
+                _ => return Err("extend: unsupported polyline end segment"),
+            };
+            // The free end is whichever extended endpoint is farther from the
+            // fixed vertex.
+            let new_free = if ea.dist(fixed_pt) > eb.dist(fixed_pt) { ea } else { eb };
+            let mut verts = p.vertices.clone();
+            let free_idx  = if at_end { n - 1 } else { 0 };
+            let bulge_idx = if at_end { n - 2 } else { 0 };
+            verts[free_idx].pos = new_free;
+            // Recompute the affected segment's bulge if it's an arc.
+            verts[bulge_idx].bulge = match &extended {
+                Geom::Arc(a) => bulge_from_arc(
+                    verts[bulge_idx].pos, verts[bulge_idx + 1].pos, a.center, a.sweep_angle),
+                _ => 0.0,
+            };
+            return Ok(Geom::Polyline(Polyline {
+                vertices: verts, closed: p.closed, widths: p.widths.clone(),
+            }));
+        }
         // Build intersections of the target's INFINITE form with each
         // (possibly extended) boundary — extension is the whole point.
         let target_infinite = self.extended_for_edgemode();
