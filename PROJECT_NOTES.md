@@ -300,3 +300,31 @@ clamped corners) and filling as a single triangle strip.
   ";$env:USERPROFILE\.cargo\bin"`.
 - OPEN from earlier: circular-arc "curves wrong after pe+j" — diagnostic in
   pedit_join_selected prints `src arc:` / `pl v[i]`; still need a dump to close.
+
+---
+
+## 2026-06-24 session — trim/extend/fillet, width polish, last-point, cmt.txt
+
+Branch `windows-ui-session-2026-06-20` (pushed). See cmt.txt (repo root) for the
+full per-commit handoff log.
+
+- pline width render: final approach = mitered shared offset (within 8x limit)
+  else convex-hull bevel; ONE convex polygon per fill (no triangle-fan seams).
+  Clean solid edges, sharp corners, no spikes.
+- EXTEND now works on polylines (extends end segment nearest the pick).
+- TRIM: open polylines keep CONNECTED runs (rest stays one polyline, mitred,
+  widths preserved); clicking a segment that meets NO cutter REMOVES it (works
+  even when the polyline is the only selection — kernel + app guards bypassed
+  for polyline targets). Closed polylines still explode (v1).
+- FILLET: continuous by default (loop until Esc); `r` changes radius mid-command
+  (persists as env.FltRad default); `m` single-shot; `t` trim toggle.
+- DRAW last-point: Enter/Space at a draw tool's first-point prompt continues
+  from the last picked point (line/arc/circle/ellipse/polyline/rectangle/
+  spline/point). CadApp.last_point + feed_first_point_from_last.
+- Added cmt.txt — full change log + keys/feature reference + architecture notes
+  + open work, as a handoff for other coding agents.
+
+OPEN (next): DXF/RSM width persistence (Stage 4, still not done); width-change
+boundary taper quirk; chamfer continuous-by-default (optional); groups .rsm
+persistence; circular-arc "curves wrong after pe+j" (needs dump); reconcile
+origin/main (~14 overlapping commits) before merging to main.
