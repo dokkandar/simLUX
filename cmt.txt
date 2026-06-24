@@ -22,6 +22,17 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-24) draw: Enter/Space at first-point = continue from last point ----
+For draw tools that ask for a start point (line, arc, circle, ellipse, polyline,
+rectangle, spline, point), pressing Enter or Space INSTEAD of picking now uses
+the last point drawn in the previous command (AutoCAD "last point"). New field
+CadApp.last_point: Option<Vec2>, set on every draw-tool click (where click_world
+is computed), in flow_input_point (circle/arc + typed coords), and the Line DDE
+path. New helpers draw_tool_wants_first_point + feed_first_point_from_last;
+called in the empty-Enter cascade (only when nothing is pending yet, so it never
+steals Enter from finish/close). cmd_flow tools route via flow_input_point;
+pending tools via pending.push + try_finalise.
+
 ---- (2026-06-24) trim: click a polyline segment with no boundary → remove it ----
 When trimming a polyline, clicking a target segment that does NOT intersect any
 selected cutter now REMOVES that whole segment (was: kept). Connected-runs path
