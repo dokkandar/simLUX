@@ -28,6 +28,10 @@ selected cutter now REMOVES that whole segment (was: kept). Connected-runs path
 splits the polyline at the removed segment (before-run + after-run); explode
 path drops the clicked segment, keeps the rest. Segment that crosses a cutter
 still trims normally. (cad_kernel/src/trim.rs)
+App-side (cad_app apply_trim_pick): a POLYLINE target with NO other cutters
+(e.g. the polyline itself was the only thing selected) no longer errors "no
+other cutters available" — it proceeds with an empty cutter list so the clicked
+segment is removed. Non-polyline targets still require a real cutter.
 
 ---- ac62164 (2026-06-24) fillet: continuous by default ----
 FILLET now loops: pick pair after pair until Esc. `R` changes radius mid-command

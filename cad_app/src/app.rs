@@ -13506,7 +13506,14 @@ impl CadApp {
                 self.expand_cutter_geoms(&d.geom, &mut cutter_geoms, 0);
             }
         }
-        if cutter_geoms.is_empty() {
+        // A POLYLINE target with no other cutters is still valid: the clicked
+        // segment meets no boundary, so it should be REMOVED (the kernel splits
+        // the polyline at that segment). Only non-polyline targets need a real
+        // cutter — for a Line/Arc "no cutters" means nothing to do.
+        let target_is_polyline = matches!(
+            self.doc.dobjects.get(target_idx).map(|d| &d.geom),
+            Some(Geom::Polyline(_)));
+        if cutter_geoms.is_empty() && !target_is_polyline {
             // No OTHER dobjects to cut against → roll back, fail.
             if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
             self.history.push(format!(
