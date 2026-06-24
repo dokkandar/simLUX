@@ -32,6 +32,12 @@ App-side (cad_app apply_trim_pick): a POLYLINE target with NO other cutters
 (e.g. the polyline itself was the only thing selected) no longer errors "no
 other cutters available" — it proceeds with an empty cutter list so the clicked
 segment is removed. Non-polyline targets still require a real cutter.
+Kernel trim_at top guard ("target has no intersection with the cutting edges")
+is now SKIPPED for Polyline targets (the per-segment logic handles miss = remove).
+ALL OPEN polylines now go through the connected-runs path (was width-only), so
+trimming/removing a segment keeps the rest as a single polyline instead of
+exploding to bare Lines (non-width runs carry EMPTY widths). Updated the
+trim_polyline test to expect 2 polylines. Closed polylines still explode (v1).
 
 ---- ac62164 (2026-06-24) fillet: continuous by default ----
 FILLET now loops: pick pair after pair until Esc. `R` changes radius mid-command

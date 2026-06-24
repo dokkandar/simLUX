@@ -2787,9 +2787,22 @@ mod fillet_chamfer_join_tests {
             a: Vec2::new(2.0, -1.0), b: Vec2::new(2.0, 5.0),
         });
         let pieces = g.trim_at(&[cutter], Vec2::new(3.0, 0.0), false).unwrap();
-        // Expected: (0,0)→(2,0) plus the vertical (4,0)→(4,4). Two Lines.
+        // Open polylines now keep CONNECTED runs: the cut splits this into two
+        // polylines — (0,0)→(2,0) and (4,0)→(4,4) — instead of exploding to
+        // bare Lines, so the surviving structure stays a polyline.
         assert_eq!(pieces.len(), 2);
-        for p in &pieces { assert!(matches!(p, Geom::Line(_))); }
+        for p in &pieces { assert!(matches!(p, Geom::Polyline(_))); }
+        // First run starts at (0,0) and ends at the cut (2,0); second is the
+        // untouched vertical leg.
+        let ends: Vec<(Vec2, Vec2)> = pieces.iter().map(|g| {
+            if let Geom::Polyline(pl) = g {
+                (pl.vertices.first().unwrap().pos, pl.vertices.last().unwrap().pos)
+            } else { unreachable!() }
+        }).collect();
+        assert!(ends.iter().any(|&(a, b)|
+            approx_eq(a.x, 0.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 2.0) && approx_eq(b.y, 0.0)));
+        assert!(ends.iter().any(|&(a, b)|
+            approx_eq(a.x, 4.0) && approx_eq(a.y, 0.0) && approx_eq(b.x, 4.0) && approx_eq(b.y, 4.0)));
     }
 
     #[test]
