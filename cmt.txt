@@ -22,6 +22,18 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET / CHAMFER: no object-snap noise while picking objects ----
+Selecting an arc/curve during fillet showed the CEN osnap (aperture at the arc
+centre + the radius preview line to it) — pure noise, since fillet/chamfer pick
+ENTITIES, not points. Two causes / fixes:
+  * The draw tool was left ACTIVE when fillet started (sticky continuous tools),
+    so `self.tool != Tool::None` kept `snap_phase_active` true. Command::Fillet
+    and Command::Chamfer now clear `self.tool = Tool::None` + pending (like
+    STRETCH already does), so the leftover tool no longer drives snap.
+  * Defence-in-depth: the snap-candidate gate now also requires the entity-pick
+    phase be off (`fillet_state == Off && chamfer_state == Off`), so object snap
+    is suppressed during fillet/chamfer regardless of tool state.
+
 ---- (2026-06-25) FILLET P: re-apply with a new radius UPDATES the rounding ----
 Re-running `fillet P` on an already-filleted polyline used to round the already-
 rounded corners (stacking). Now polyline_all() first calls defillet_polyline()

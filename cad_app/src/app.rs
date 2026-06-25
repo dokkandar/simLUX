@@ -4259,6 +4259,10 @@ impl CadApp {
                     self.env.FltRad = r;
                     let _ = self.env.save();
                 }
+                // Drop any active (sticky) draw tool so its click semantics and
+                // object-snap markers don't bleed into the fillet pick phase.
+                self.tool = Tool::None;
+                self.pending.clear();
                 let r = self.env.FltRad;
                 self.fillet_state = FilletState::WaitingForFirst(r);
                 // Continuous by default: keep filleting pair after pair until
@@ -4276,6 +4280,8 @@ impl CadApp {
                     self.env.ChmDs2 = d2;
                     let _ = self.env.save();
                 }
+                self.tool = Tool::None;
+                self.pending.clear();
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
@@ -19864,7 +19870,15 @@ impl eframe::App for CadApp {
             // when the pline tool is mid-flow with at least 2 vertices.
             let pline_phantom: Option<DObject> = self.pline_phantom_dobject();
 
+            // Fillet/Chamfer pick ENTITIES, not points — object snap (the CEN
+            // aperture + radius-line to an arc's centre, END/MID markers, …) is
+            // pure visual noise there and must be suppressed even if a draw
+            // tool was left active when the command started (which otherwise
+            // keeps `snap_phase_active` true via `self.tool`).
+            let entity_pick_phase = self.fillet_state != FilletState::Off
+                || self.chamfer_state != ChamferState::Off;
             let snap_candidates: Vec<SnapHit> = if snap_phase_active
+                && !entity_pick_phase
                 && !self.picking_source && !self.intersect_pending_click
                 && (!self.doc.dobjects.is_empty() || pline_phantom.is_some())
             {
