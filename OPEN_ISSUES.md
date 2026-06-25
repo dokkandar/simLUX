@@ -6,6 +6,22 @@ work progresses. Ask any time and I'll give you the current list.
 Branch: `windows-ui-session-2026-06-20`
 Last updated: 2026-06-25
 
+## ▶ RESUME HERE (next session)
+UI redesign of the top bar is in progress and looking good. Done so far: two-line
+top bar (customizable Quick Access row + menu categories), tall logo column with
+the real PNG (Lanczos-downscaled), slim "Quick access" drop window under the
+chevron with painted checkmarks + auto-width. Latest commit: `63c8936`.
+**Next, pick up with:**
+  1. **Window buttons (min/max/close)** next to "AutoRASM 2026" — needs the user's
+     **A** (frameless custom title bar, modern look, needs Win resize handling) vs
+     **B** (keep OS title bar). Waiting on the user's choice. (issue U3)
+  2. Possibly enlarge the logo column if it still reads small/soft.
+  3. The command-icon (drafting tools) strip restyle — "later" per the user.
+  4. QAT persistence across restarts (issue U2).
+Also still open and parked: the **line↔polyline FILLET bug** (issue #1) — needs a
+session dump + the polyline's vertex data.
+NOT pushed yet — many local commits (UI + geometry fixes); push when the user OKs.
+
 Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up · 🔵 not started · ⚪ needs info from user
 
 ---
