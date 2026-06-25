@@ -22,6 +22,23 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET / CHAMFER: radius-too-big guard + re-prompt (don't exit) ----
+Two follow-ups from a session dump (P-fillet with a too-big radius drew a self-
+intersecting blob and silently exited):
+  * KERNEL: polyline_all now does an OVERLAP CHECK — two fillets on the SAME
+    segment (one at each end) must not eat past each other. After solving every
+    corner it verifies each segment's trimmed span keeps its direction (start
+    param ≤ end param via along_param()); if not → Err "radius too large —
+    rounded corners would overlap". count==0 message is now "radius too large
+    for any corner". 2 new tests (fillet_all_radius_too_large_overlaps_errs,
+    fillet_corner_radius_too_large_errs). cad_kernel: 177 tests pass.
+  * APP: on any "too large" fillet error the command STAYS active and re-prompts
+    for a smaller radius (fillet_radius_too_big() arms fillet_waiting_radius +
+    sets the prompt). Mirror for chamfer (chamfer_dist_too_big() on "too large"/
+    "exceeds" → re-arms the two-step distance entry). The canvas pick branches
+    skip their multiple/exit logic while a re-prompt is armed, so the prompt
+    isn't overwritten and the command never drops out. Esc still cancels.
+
 ---- (2026-06-25) FILLET / CHAMFER: polylines, arcs, and the P (whole-polyline) option ----
 FILLET and CHAMFER were LINE+LINE only (Walls rode on their centerline). Now they
 generalize to line/arc pieces and polylines:

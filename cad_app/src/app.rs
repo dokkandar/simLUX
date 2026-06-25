@@ -13732,6 +13732,29 @@ impl CadApp {
             r, tm, mm, pm, phase));
     }
 
+    /// A fillet failed because the radius was too large. Stay IN the fillet
+    /// command and ask for a smaller radius (arms `fillet_waiting_radius` so
+    /// the next typed number becomes the new radius). Returns true when it
+    /// armed the re-prompt, so the caller knows not to exit / overwrite it.
+    fn fillet_radius_too_big(&mut self, msg: &str) -> bool {
+        if !msg.contains("too large") { return false; }
+        self.fillet_waiting_radius = true;
+        self.set_prompt(format!(
+            "fillet: {} — type a SMALLER radius <{}> then re-pick  [Esc=cancel]",
+            msg, self.env.FltRad));
+        true
+    }
+
+    /// Mirror of `fillet_radius_too_big` for Chamfer — re-prompt for distances.
+    fn chamfer_dist_too_big(&mut self, msg: &str) -> bool {
+        if !(msg.contains("too large") || msg.contains("exceeds")) { return false; }
+        self.chamfer_dist_wait = ChamferDistWait::WaitingD1;
+        self.set_prompt(format!(
+            "chamfer: {} — type a SMALLER first distance <{}> then re-pick  [Esc=cancel]",
+            msg, self.env.ChmDs1));
+        true
+    }
+
     /// Re-issue the chamfer prompt — mirror of `refresh_fillet_prompt`.
     fn refresh_chamfer_prompt(&mut self) {
         let d1 = self.env.ChmDs1;
@@ -13807,6 +13830,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
             }
         }
     }
@@ -13842,6 +13866,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
             }
         }
     }
@@ -13866,6 +13891,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.fillet_radius_too_big(&msg);
             }
         }
     }
@@ -13958,6 +13984,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! fillet: {}", msg));
+                self.fillet_radius_too_big(msg);
             }
         }
     }
@@ -14012,6 +14039,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
             }
         }
     }
@@ -14049,6 +14077,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
             }
         }
     }
@@ -14074,6 +14103,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! {}", msg));
+                self.chamfer_dist_too_big(&msg);
             }
         }
     }
@@ -14121,6 +14151,7 @@ impl CadApp {
             Err(msg) => {
                 if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
                 self.history.push(format!("  ! chamfer: {}", msg));
+                self.chamfer_dist_too_big(msg);
             }
         }
     }
@@ -20975,7 +21006,10 @@ impl eframe::App for CadApp {
                             // polyline whose every corner gets rounded.
                             (FilletState::WaitingForFirst(r), Some(i)) if self.fillet_poly_all => {
                                 self.apply_fillet_poly_all(r, i);
-                                if self.fillet_multiple {
+                                if self.fillet_waiting_radius {
+                                    // Radius too large — stay put; the apply
+                                    // armed a "type a smaller radius" prompt.
+                                } else if self.fillet_multiple {
                                     self.fillet_state = FilletState::WaitingForFirst(r);
                                     self.refresh_fillet_prompt();
                                 } else {
@@ -20993,7 +21027,9 @@ impl eframe::App for CadApp {
                                 // first-pick state with the same radius
                                 // instead of returning to Off. Esc
                                 // exits. Single-mode (default) → Off.
-                                if self.fillet_multiple {
+                                if self.fillet_waiting_radius {
+                                    // Radius too large — stay; re-prompt armed.
+                                } else if self.fillet_multiple {
                                     self.fillet_state = FilletState::WaitingForFirst(r);
                                     self.refresh_fillet_prompt();
                                 } else {
@@ -21011,7 +21047,9 @@ impl eframe::App for CadApp {
                         match (self.chamfer_state, hit) {
                             (ChamferState::WaitingForFirst(d1, d2), Some(i)) if self.chamfer_poly_all => {
                                 self.apply_chamfer_poly_all(d1, d2, i);
-                                if self.chamfer_multiple {
+                                if self.chamfer_dist_wait != ChamferDistWait::Off {
+                                    // Distance too large — stay; re-prompt armed.
+                                } else if self.chamfer_multiple {
                                     self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
                                     self.refresh_chamfer_prompt();
                                 } else {
@@ -21026,7 +21064,9 @@ impl eframe::App for CadApp {
                             }
                             (ChamferState::WaitingForSecond(d1, d2, i1, p1), Some(i2)) => {
                                 self.apply_chamfer(d1, d2, i1, p1, i2, click_world);
-                                if self.chamfer_multiple {
+                                if self.chamfer_dist_wait != ChamferDistWait::Off {
+                                    // Distance too large — stay; re-prompt armed.
+                                } else if self.chamfer_multiple {
                                     self.chamfer_state =
                                         ChamferState::WaitingForFirst(d1, d2);
                                     self.refresh_chamfer_prompt();

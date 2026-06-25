@@ -633,6 +633,23 @@ fn apply_corner(pl: &Polyline, seg_in: usize, seg_out: usize, vtx: usize, cs: &C
 // Public: fillet/chamfer EVERY corner of one polyline (the `P` option).
 // ---------------------------------------------------------------------------
 
+/// Monotonic parameter of a point along a piece's host line/circle, measured
+/// from the piece's start: a fraction for a segment, the swept-angle delta for
+/// an arc. Used only to compare ordering of two points on the same segment.
+fn along_param(orig: &Piece, p: Vec2) -> f64 {
+    match *orig {
+        Piece::Seg { a, b } => {
+            let d = b - a;
+            let l2 = d.len_sq();
+            if l2 < EPS { 0.0 } else { (p - a).dot(d) / l2 }
+        }
+        Piece::Arc { c, a0, sweep, .. } => {
+            let s = if sweep >= 0.0 { 1.0 } else { -1.0 };
+            (((p - c).angle() - a0) * s).rem_euclid(TAU)
+        }
+    }
+}
+
 enum AllOp { Fillet(f64), Chamfer(f64, f64) }
 
 fn polyline_all(pl: &Polyline, op: AllOp) -> Result<(Polyline, usize), String> {
@@ -662,7 +679,7 @@ fn polyline_all(pl: &Polyline, op: AllOp) -> Result<(Polyline, usize), String> {
             count += 1;
         }
     }
-    if count == 0 { return Err("no corner could be filleted with that size".into()); }
+    if count == 0 { return Err("radius too large for any corner".into()); }
 
     // Assemble: for each segment, its start/end may be a tangent point.
     let start_of = |k: usize| corner_at[k].map(|c| c.1).unwrap_or(pl.vertices[k].pos);
@@ -670,6 +687,19 @@ fn polyline_all(pl: &Polyline, op: AllOp) -> Result<(Polyline, usize), String> {
         let ev = (k + 1) % n;
         corner_at[ev].map(|c| c.0).unwrap_or(pl.vertices[ev].pos)
     };
+
+    // OVERLAP CHECK: two fillets on the SAME segment (one at each end) must
+    // not eat past each other. Each individual corner only validated against
+    // its own full segment; here we require the trimmed span to keep its
+    // direction (start param ≤ end param along the original segment).
+    for i in 0..seg_count {
+        let Some(orig) = polyseg_piece(pl, i) else { continue };
+        let ts = along_param(&orig, start_of(i));
+        let te = along_param(&orig, end_of(i));
+        if ts > te + 1e-6 {
+            return Err("radius too large — rounded corners would overlap".into());
+        }
+    }
 
     let mut out: Vec<PolyVertex> = Vec::with_capacity(n * 2);
     for i in 0..seg_count {
@@ -809,6 +839,41 @@ mod tests {
         assert!(np.vertices[2].pos.dist(Vec2::new(4.0, 1.0)) < 1e-6,
             "v2 = {:?}", np.vertices[2].pos);
         assert!(np.vertices[1].bulge.abs() > 1e-6);
+    }
+
+    #[test]
+    fn fillet_all_radius_too_large_overlaps_errs() {
+        // 4×4 square; r=3 → each corner eats 3 of every 4-long side, so the
+        // two fillets on one side overlap. Must error (not silently produce a
+        // self-intersecting blob).
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 4.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        };
+        let err = fillet_polyline_all(&pl, 3.0).unwrap_err();
+        assert!(err.contains("too large"), "msg was: {err}");
+    }
+
+    #[test]
+    fn fillet_corner_radius_too_large_errs() {
+        let pl = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: Vec::new(),
+        };
+        // tangent distance = r = 10 ≫ 4-long segments.
+        let err = fillet_polyline_corner(&pl, 0, 1, 10.0).unwrap_err();
+        assert!(err.contains("too large"), "msg was: {err}");
     }
 
     #[test]
