@@ -22,6 +22,23 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) pline width: DXF/RSM persistence + chamfer continuous + taper fix ----
+1. PERSISTENCE (Stage 4): polyline tapered width now survives save/reload.
+   - RSM bumped to v4: after the polyline vertices, write u32 count + (start,end)
+     f64 per segment; read gated on ver>=4 (older files → empty widths).
+   - DXF LWPOLYLINE: write per-vertex 40/41 (start/end width of the segment at
+     that vertex) when non-zero; read parses 40/41 per vertex AND the constant-
+     width 43, maps to per-segment widths (n-1 open / n closed), empty when all
+     zero. Round-trip tests added (cad_io: 19 pass).
+2. CHAMFER continuous by default (mirror of fillet): loop until Esc; `D` changes
+   distances mid-command; `M` single-shot. (chamfer_multiple = true at start.)
+3. TAPER QUIRK fixed: polyline_width_centerline (and the live-preview push_seg)
+   emitted one width per vertex, so the first segment after a width change
+   tapered old->new. Now a COINCIDENT point carrying the new start width is
+   emitted only when the width STEPS at a shared vertex; fill_width_strip already
+   skips the zero-length span. Uniform segments after a width change stay uniform
+   (a clean step at the change).
+
 ---- (2026-06-24) draw: Enter/Space at first-point = continue from last point ----
 For draw tools that ask for a start point (line, arc, circle, ellipse, polyline,
 rectangle, spline, point), pressing Enter or Space INSTEAD of picking now uses

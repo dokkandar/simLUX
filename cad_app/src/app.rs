@@ -4251,7 +4251,10 @@ impl CadApp {
                 let d1 = self.env.ChmDs1;
                 let d2 = self.env.ChmDs2;
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
-                self.chamfer_multiple = false;
+                // Continuous by default (like fillet): chamfer pair after pair
+                // until Esc. `D` changes distances mid-command; `M` toggles
+                // back to single-shot.
+                self.chamfer_multiple = true;
                 self.refresh_chamfer_prompt();
             }
             Ok(Command::Join) => {
@@ -22353,9 +22356,16 @@ impl eframe::App for CadApp {
                                     append_arc_world_samples(a, b, bulge, &mut pts);
                                     let mm = pts.len().max(1);
                                     for (j, pt) in pts.iter().enumerate() {
-                                        if !first && j == 0 { continue; }
                                         let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
-                                        cl.push((*pt, sw + (ew - sw) * t));
+                                        let w = sw + (ew - sw) * t;
+                                        if !first && j == 0 {
+                                            // coincident re-emit only on a width step
+                                            if let Some(&(_, pw)) = cl.last() {
+                                                if (pw - w).abs() > 1e-9 { cl.push((*pt, w)); }
+                                            }
+                                            continue;
+                                        }
+                                        cl.push((*pt, w));
                                     }
                                 };
                                 let mut cl: Vec<(Vec2, f64)> = Vec::new();
@@ -23512,9 +23522,21 @@ fn polyline_width_centerline(p: &Polyline) -> Vec<(Vec2, f64)> {
         append_arc_world_samples(a, b, bulge, &mut pts);   // a + interior + b
         let mm = pts.len().max(1);
         for (j, pt) in pts.iter().enumerate() {
-            if i > 0 && j == 0 { continue; }               // dedup shared vertex
             let t = if mm > 1 { j as f64 / (mm - 1) as f64 } else { 0.0 };
-            cl.push((*pt, sw + (ew - sw) * t));
+            let w = sw + (ew - sw) * t;     // at j==0, w == sw (this seg's start)
+            if i > 0 && j == 0 {
+                // The shared start vertex is already in `cl` as segment i-1's
+                // end. Re-emit a COINCIDENT point only when the width STEPS
+                // here (sw_i != ew_{i-1}); otherwise dedup. This stops the first
+                // segment after a width change from falsely tapering.
+                if let Some(&(_, prev_w)) = cl.last() {
+                    if (prev_w - w).abs() > 1e-9 {
+                        cl.push((*pt, w));
+                    }
+                }
+                continue;
+            }
+            cl.push((*pt, w));
         }
     }
     cl

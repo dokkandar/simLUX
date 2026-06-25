@@ -309,14 +309,19 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
             // For LWPOLYLINE, vertex coords are interleaved 10/20 group codes
             // (and 42 for bulge per vertex). We walk fields in order and pair them.
             let mut vertices: Vec<PolyVertex> = Vec::with_capacity(count);
+            let mut vwidths: Vec<(f64, f64)> = Vec::with_capacity(count);
             let mut cur: Option<Vec2> = None;
             let mut cur_bulge = 0.0_f64;
+            let mut cur_sw = 0.0_f64;   // 40 = start width of segment at this vertex
+            let mut cur_ew = 0.0_f64;   // 41 = end width
+            let mut const_w = 0.0_f64;  // 43 = constant width for the whole pline
             for (c, v) in fields {
                 match *c {
                     10 => {
                         if let Some(p) = cur.take() {
                             vertices.push(PolyVertex { pos: p, bulge: cur_bulge });
-                            cur_bulge = 0.0;
+                            vwidths.push((cur_sw, cur_ew));
+                            cur_bulge = 0.0; cur_sw = 0.0; cur_ew = 0.0;
                         }
                         cur = Some(Vec2 { x: v.parse().unwrap_or(0.0), y: 0.0 });
                     }
@@ -325,15 +330,30 @@ fn build_entity(kind: &str, fields: &[(i32, String)], doc: &Document) -> Option<
                             p.y = v.parse().unwrap_or(0.0);
                         }
                     }
+                    40 => cur_sw = v.parse().unwrap_or(0.0),
+                    41 => cur_ew = v.parse().unwrap_or(0.0),
                     42 => cur_bulge = v.parse().unwrap_or(0.0),
+                    43 => const_w = v.parse().unwrap_or(0.0),
                     _ => {}
                 }
             }
             if let Some(p) = cur.take() {
                 vertices.push(PolyVertex { pos: p, bulge: cur_bulge });
+                vwidths.push((cur_sw, cur_ew));
             }
             if vertices.is_empty() { return None; }
-            Geom::Polyline(Polyline { vertices, closed, widths: Vec::new() })
+            // Map to per-SEGMENT widths (n-1 open, n closed). Prefer per-vertex
+            // 40/41; fall back to constant width 43; empty when all zero.
+            let seg_count = if closed { vertices.len() } else { vertices.len().saturating_sub(1) };
+            vwidths.truncate(seg_count);
+            let widths = if vwidths.iter().any(|&(a, b)| a.abs() > 1e-12 || b.abs() > 1e-12) {
+                vwidths
+            } else if const_w.abs() > 1e-12 {
+                vec![(const_w, const_w); seg_count]
+            } else {
+                Vec::new()
+            };
+            Geom::Polyline(Polyline { vertices, closed, widths })
         }
         _ => return None,   // unknown entity type — silently skip
     };
@@ -520,9 +540,17 @@ fn write_entity(s: &mut String, d: &DObject, doc: &Document) {
             common(s, "LWPOLYLINE");
             pair_i(s, 90, p.vertices.len() as i32);
             pair_i(s, 70, if p.closed { 1 } else { 0 });
-            for v in &p.vertices {
+            for (i, v) in p.vertices.iter().enumerate() {
                 pair_f(s, 10, v.pos.x);
                 pair_f(s, 20, v.pos.y);
+                // Per-vertex start/end width (DXF 40/41) = the width of the
+                // segment beginning at this vertex. Only emit when non-zero.
+                if let Some(&(sw, ew)) = p.widths.get(i) {
+                    if sw.abs() > 1e-12 || ew.abs() > 1e-12 {
+                        pair_f(s, 40, sw);
+                        pair_f(s, 41, ew);
+                    }
+                }
                 if v.bulge.abs() > 1e-12 {
                     pair_f(s, 42, v.bulge);
                 }
@@ -687,6 +715,27 @@ mod tests {
         let back = round_trip(&doc);
         if let Geom::Point(p) = &back.dobjects[0].geom {
             assert!((p.location.x - 1.0).abs() < 1e-9);
+        } else { panic!(); }
+    }
+
+    #[test]
+    fn polyline_widths_round_trip() {
+        let mut doc = Document::default();
+        doc.push(Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(4.0, 4.0), bulge: 0.0 },
+            ],
+            closed: false,
+            widths: vec![(2.0, 2.0), (1.0, 3.0)],
+        }.into());
+        let back = round_trip(&doc);
+        if let Geom::Polyline(p) = &back.dobjects[0].geom {
+            // 2 segments → 2 width pairs preserved via DXF 40/41.
+            assert_eq!(p.widths.len(), 2);
+            assert!((p.widths[0].0 - 2.0).abs() < 1e-9 && (p.widths[0].1 - 2.0).abs() < 1e-9);
+            assert!((p.widths[1].0 - 1.0).abs() < 1e-9 && (p.widths[1].1 - 3.0).abs() < 1e-9);
         } else { panic!(); }
     }
 
