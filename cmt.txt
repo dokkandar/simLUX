@@ -22,6 +22,12 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) keys: Ctrl+Z = Undo ----
+Ctrl+Z now undoes the drawing. Consumed via input_mut.consume_key so the
+command-line TextEdit doesn't also undo its own typed text — Ctrl+Z is always
+the drawing undo (AutoCAD-style). Calls run_command("undo"). Added after the
+F7/F8/F9 handlers in update().
+
 ---- (2026-06-25) pline width: DXF/RSM persistence + chamfer continuous + taper fix ----
 1. PERSISTENCE (Stage 4): polyline tapered width now survives save/reload.
    - RSM bumped to v4: after the polyline vertices, write u32 count + (start,end)
@@ -222,6 +228,7 @@ GLOBAL KEYBOARD KEYS
   Tab        Cycle snap candidates under the cursor
   Ctrl+C / Ctrl+V   Copy / Paste (clipboard events)
   Ctrl+G     Group the current selection
+  Ctrl+Z     Undo (drawing undo; consumed so it never undoes cmd-line text)
   F7         Toggle grid (env.GrdEnb)
   F8         Toggle CARD — cardinal/ortho drafting lock (cursor H or V only)
   F9         Toggle grid snap (env.GrdSnp)

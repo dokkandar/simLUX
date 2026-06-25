@@ -17193,6 +17193,12 @@ impl eframe::App for CadApp {
             self.history.push(format!("  SNAP {}", if self.env.GrdSnp { "on" } else { "off" }));
         }
 
+        // Ctrl+Z — Undo. Consumed so the command-line TextEdit doesn't also undo
+        // its own typed text; Ctrl+Z always undoes the DRAWING (AutoCAD-style).
+        if ctx.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::Z)) {
+            self.run_command("undo");
+        }
+
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
             self.pending.clear();
