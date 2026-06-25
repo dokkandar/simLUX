@@ -815,6 +815,11 @@ pub struct CadApp {
     qat_actions: Vec<QatAction>,
     /// Whether the QAT "customize" drop window is open.
     qat_customize_open: bool,
+    /// Brand logo texture (loaded once from assets/logo.png). None until
+    /// loaded; `logo_load_tried` prevents re-attempting every frame when the
+    /// file is absent (falls back to a painted placeholder).
+    logo_tex: Option<egui::TextureHandle>,
+    logo_load_tried: bool,
 
     // "Always-listen" command line: set when something else stole keyboard
     // focus (canvas click, window switch). The command-box renderer
@@ -2216,6 +2221,8 @@ impl Default for CadApp {
             settings_open:     false,
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
+            logo_tex:          None,
+            logo_load_tried:   false,
             refocus_cmd:       true,
             snap_cycle_index:  0,
             snap_cycle_anchor: None,
@@ -13736,6 +13743,36 @@ impl CadApp {
         }
     }
 
+    /// The tall logo column at the left of the top bar — spans the Quick
+    /// Access row + the menu-category row. Shows the brand PNG if present,
+    /// else a painted placeholder.
+    fn draw_logo_column(&mut self, ui: &mut egui::Ui) {
+        let size = egui::vec2(60.0, 56.0);
+        let (resp, painter) = ui.allocate_painter(size, egui::Sense::hover());
+        let rect = resp.rect;
+        // Subtle column background + a divider on its right edge.
+        painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(30, 37, 46));
+        painter.line_segment([rect.right_top(), rect.right_bottom()],
+            egui::Stroke::new(1.0, egui::Color32::from_rgb(55, 64, 78)));
+        // Lazy-load the logo texture once.
+        if self.logo_tex.is_none() && !self.logo_load_tried {
+            self.logo_tex = load_logo_texture(ui.ctx());
+            self.logo_load_tried = true;
+        }
+        if let Some(tex) = &self.logo_tex {
+            let avail = rect.shrink(5.0);
+            let img = tex.size_vec2();
+            let scale = (avail.width() / img.x).min(avail.height() / img.y);
+            let draw = img * scale;
+            let img_rect = egui::Rect::from_center_size(rect.center(), draw);
+            painter.image(tex.id(), img_rect,
+                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                egui::Color32::WHITE);
+        } else {
+            draw_logo_placeholder(&painter, rect);
+        }
+    }
+
     /// Run a Quick Access Toolbar shortcut.
     fn run_qat_action(&mut self, act: QatAction) {
         match act {
@@ -16671,45 +16708,57 @@ impl QatAction {
     }
 }
 
-/// AutoRASM logo placeholder at the far left of the top line. Paints a brand-
-/// teal gear-ring with a gold "R" until the real PNG is wired in (see
-/// OPEN_ISSUES — needs the logo asset on disk).
-fn draw_logo(ui: &mut egui::Ui) {
-    let sz = egui::vec2(34.0, 34.0);
-    let (resp, p) = ui.allocate_painter(sz, egui::Sense::hover());
-    let r = resp.rect;
-    let c = r.center();
+/// Try to load the brand logo PNG into a texture. Looks in a few likely spots
+/// so it works from the repo root, the crate dir, or next to the exe. Returns
+/// None if the file isn't there (caller draws a placeholder).
+fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let candidates = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.png"),
+        "cad_app/assets/logo.png",
+        "assets/logo.png",
+    ];
+    for path in candidates {
+        let Ok(bytes) = std::fs::read(path) else { continue };
+        let Ok(img) = image::load_from_memory(&bytes) else { continue };
+        let rgba = img.to_rgba8();
+        let (w, h) = rgba.dimensions();
+        let color = egui::ColorImage::from_rgba_unmultiplied(
+            [w as usize, h as usize], rgba.as_raw());
+        return Some(ctx.load_texture("autorasm_logo", color, egui::TextureOptions::LINEAR));
+    }
+    None
+}
+
+/// Painted placeholder logo (brand-teal gear ring + gold "R"), used until the
+/// real PNG is dropped at assets/logo.png.
+fn draw_logo_placeholder(p: &egui::Painter, rect: egui::Rect) {
+    let c = rect.center();
     let teal = egui::Color32::from_rgb(38, 78, 98);
     let gold = egui::Color32::from_rgb(214, 184, 122);
-    let radius = r.width() * 0.42;
-    // Gear teeth: short radial ticks around the ring.
+    let radius = rect.width().min(rect.height()) * 0.34;
     for k in 0..10 {
         let a = (k as f32) / 10.0 * std::f32::consts::TAU;
         let dir = egui::vec2(a.cos(), a.sin());
-        let p0 = c + dir * radius;
-        let p1 = c + dir * (radius + 4.0);
-        p.line_segment([p0, p1], egui::Stroke::new(3.0, teal));
+        p.line_segment([c + dir * radius, c + dir * (radius + 4.0)],
+            egui::Stroke::new(3.0, teal));
     }
-    // Ring (open on the right, like the brand mark's "C").
     p.circle_stroke(c, radius, egui::Stroke::new(3.0, teal));
-    // Gold "R".
     p.text(c, egui::Align2::CENTER_CENTER, "R",
-        egui::FontId::proportional(20.0), gold);
+        egui::FontId::proportional(radius * 1.1), gold);
 }
 
-/// One Quick Access shortcut button — a small flat icon tile.
+/// One Quick Access shortcut button — a small flat icon tile. Icon stroke
+/// uses the same colour as the menu-category text so the bar reads uniform.
 fn qat_button(ui: &mut egui::Ui, act: QatAction) -> bool {
-    let size = egui::vec2(30.0, 30.0);
+    let col = ui.visuals().widgets.inactive.fg_stroke.color;
+    let size = egui::vec2(28.0, 28.0);
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
     let rect = resp.rect;
-    let bg = if resp.hovered() {
-        egui::Color32::from_rgb(48, 58, 72)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
-    let col = egui::Color32::from_rgb(205, 216, 228);
-    paint_qat_icon(&painter, rect.shrink(7.0), act, col);
+    if resp.hovered() {
+        painter.rect(rect, 4.0, egui::Color32::from_rgb(48, 58, 72), egui::Stroke::NONE);
+    }
+    let icol = if resp.hovered() { egui::Color32::from_rgb(225, 235, 245) } else { col };
+    paint_qat_icon(&painter, rect.shrink(6.0), act, icol);
     resp.on_hover_text(act.label()).clicked()
 }
 
@@ -18364,42 +18413,38 @@ impl eframe::App for CadApp {
             if handled { self.cmd.clear(); }
         }
 
-        // ---- UI.2: MENUBAR (very top) -----------------------------------
-        // Declared BEFORE the toolbar so it sits at the absolute top.
-        // Every menu item dispatches via `run_command` so its behaviour
-        // matches typing the same cmd — keeps one source of truth.
-        // ---- Quick Access Toolbar (line 1) ------------------------------
-        // Logo · customizable file/common shortcuts · customize ▾ · title.
-        egui::TopBottomPanel::top("quick_access").show(ctx, |ui| {
-            ui.add_space(3.0);
-            ui.horizontal(|ui| {
-                draw_logo(ui);
-                ui.add_space(10.0);
-                let actions = self.qat_actions.clone();
-                for act in actions {
-                    if qat_button(ui, act) {
-                        self.run_qat_action(act);
-                    }
-                }
-                ui.add_space(2.0);
-                if qat_customize_button(ui, self.qat_customize_open) {
-                    self.qat_customize_open = !self.qat_customize_open;
-                }
-                // Product title, far right.
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_space(14.0);
-                    ui.label(egui::RichText::new("AutoRASM  2026")
-                        .size(16.0)
-                        .color(egui::Color32::from_rgb(176, 192, 208)));
-                });
-            });
-            ui.add_space(3.0);
-        });
-        // The customize drop window (anchored just under the QAT).
-        self.qat_customize_window(ctx);
-
-        egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
-            egui::menu::bar(ui, |ui| {
+        // ---- TOP BAR: logo (spanning) + Quick Access row + menu categories
+        // The AutoRASM logo sits in a tall left column that spans BOTH the
+        // Quick Access row and the menu-category row. Every menu item
+        // dispatches via `run_command` so its behaviour matches typing the
+        // same cmd — one source of truth.
+        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+            ui.horizontal_top(|ui| {
+                self.draw_logo_column(ui);
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.add_space(2.0);
+                    // --- line 1: customizable Quick Access shortcuts ---
+                    ui.horizontal(|ui| {
+                        let actions = self.qat_actions.clone();
+                        for act in actions {
+                            if qat_button(ui, act) { self.run_qat_action(act); }
+                        }
+                        ui.add_space(2.0);
+                        if qat_customize_button(ui, self.qat_customize_open) {
+                            self.qat_customize_open = !self.qat_customize_open;
+                        }
+                        // Product title, far right.
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.add_space(12.0);
+                            ui.label(egui::RichText::new("AutoRASM  2026")
+                                .size(15.0)
+                                .color(egui::Color32::from_rgb(176, 192, 208)));
+                        });
+                    });
+                    ui.add_space(1.0);
+                    // --- line 2: fixed menu categories ---
+                    egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
                         self.run_command("clear");
@@ -18874,7 +18919,11 @@ impl eframe::App for CadApp {
                     }
                 });
             });
+                    });
+                });
         });
+        // The customize drop window (anchored just under the QAT bar).
+        self.qat_customize_window(ctx);
 
         // ---- top toolbar ------------------------------------------------
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
