@@ -1091,9 +1091,15 @@ pub struct CadApp {
     /// non-empty cmd-line input is consumed as a number — NOT passed
     /// to the main parser. Cleared on success or Esc.
     fillet_waiting_radius: bool,
+    /// Polyline mode (the AutoCAD `P` option). When ON the next picked
+    /// object must be a polyline; the fillet is applied to EVERY corner.
+    /// Toggled with `p`; cleared when fillet exits.
+    fillet_poly_all: bool,
     chamfer_state:  ChamferState,
     /// Same as `fillet_multiple` for Chamfer.
     chamfer_multiple: bool,
+    /// Polyline mode for Chamfer (the `P` option). See `fillet_poly_all`.
+    chamfer_poly_all: bool,
     /// Chamfer's two-step distance entry after `d` alone (AutoCAD
     /// style): Off → WaitingD1 → WaitingD2(d1) → back to WaitingForFirst.
     /// At each step, empty input keeps the current value. Inline
@@ -2310,8 +2316,10 @@ impl Default for CadApp {
             fillet_state:   FilletState::Off,
             fillet_multiple: false,
             fillet_waiting_radius: false,
+            fillet_poly_all: false,
             chamfer_state:  ChamferState::Off,
             chamfer_multiple: false,
+            chamfer_poly_all: false,
             chamfer_dist_wait: ChamferDistWait::Off,
             trim_state:     TrimState::Off,
             extend_state:   ExtendState::Off,
@@ -3171,6 +3179,15 @@ impl CadApp {
                     self.refresh_fillet_prompt();
                     return;
                 }
+                Some("p") | Some("polyline") => {
+                    self.fillet_poly_all = !self.fillet_poly_all;
+                    self.history.push(format!(
+                        "  fillet: polyline mode → {}",
+                        if self.fillet_poly_all { "ON (pick ONE polyline → rounds ALL its corners)" }
+                        else { "OFF" }));
+                    self.refresh_fillet_prompt();
+                    return;
+                }
                 Some("r") | Some("radius") => {
                     // Inline form: `r 2`, `r 2.5`, `r r=3`, `r,2` all
                     // accepted via parse_dist_tokens leniency.
@@ -3225,6 +3242,15 @@ impl CadApp {
                     self.history.push(format!(
                         "  chamfer: multiple mode → {}",
                         if self.chamfer_multiple { "ON" } else { "OFF" }));
+                    self.refresh_chamfer_prompt();
+                    return;
+                }
+                Some("p") | Some("polyline") => {
+                    self.chamfer_poly_all = !self.chamfer_poly_all;
+                    self.history.push(format!(
+                        "  chamfer: polyline mode → {}",
+                        if self.chamfer_poly_all { "ON (pick ONE polyline → bevels ALL its corners)" }
+                        else { "OFF" }));
                     self.refresh_chamfer_prompt();
                     return;
                 }
@@ -4237,8 +4263,10 @@ impl CadApp {
                 self.fillet_state = FilletState::WaitingForFirst(r);
                 // Continuous by default: keep filleting pair after pair until
                 // Esc. `R` changes the radius mid-command (persists as the new
-                // default); `M` toggles back to single-shot.
+                // default); `M` toggles back to single-shot; `P` = polyline
+                // (round every corner of one picked polyline).
                 self.fillet_multiple = true;
+                self.fillet_poly_all = false;
                 self.refresh_fillet_prompt();
             }
             Ok(Command::Chamfer(opt)) => {
@@ -4253,8 +4281,9 @@ impl CadApp {
                 self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
                 // Continuous by default (like fillet): chamfer pair after pair
                 // until Esc. `D` changes distances mid-command; `M` toggles
-                // back to single-shot.
+                // back to single-shot; `P` = polyline (bevel every corner).
                 self.chamfer_multiple = true;
+                self.chamfer_poly_all = false;
                 self.refresh_chamfer_prompt();
             }
             Ok(Command::Join) => {
@@ -13688,14 +13717,19 @@ impl CadApp {
         let r = self.env.FltRad;
         let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
         let mm = if self.fillet_multiple { ", multi" } else { "" };
-        let phase = match self.fillet_state {
-            FilletState::WaitingForFirst(_)  => "click FIRST line on SIDE to KEEP",
-            FilletState::WaitingForSecond(..) => "click SECOND line",
-            FilletState::Off => return,
+        let pm = if self.fillet_poly_all { ", POLY" } else { "" };
+        let phase = if self.fillet_poly_all {
+            "pick a POLYLINE to round ALL corners"
+        } else {
+            match self.fillet_state {
+                FilletState::WaitingForFirst(_)  => "click FIRST object (or two segments of a polyline)",
+                FilletState::WaitingForSecond(..) => "click SECOND object",
+                FilletState::Off => return,
+            }
         };
         self.set_prompt(format!(
-            "fillet (r={}, {}{}): {}  [t=trim, m=multi, r=radius, Esc]",
-            r, tm, mm, phase));
+            "fillet (r={}, {}{}{}): {}  [t=trim, m=multi, p=poly, r=radius, Esc]",
+            r, tm, mm, pm, phase));
     }
 
     /// Re-issue the chamfer prompt — mirror of `refresh_fillet_prompt`.
@@ -13704,20 +13738,142 @@ impl CadApp {
         let d2 = self.env.ChmDs2;
         let tm = if self.env.TrmMd { "trim" } else { "no-trim" };
         let mm = if self.chamfer_multiple { ", multi" } else { "" };
-        let phase = match self.chamfer_state {
-            ChamferState::WaitingForFirst(..)  => "click FIRST line",
-            ChamferState::WaitingForSecond(..) => "click SECOND line",
-            ChamferState::Off => return,
+        let pm = if self.chamfer_poly_all { ", POLY" } else { "" };
+        let phase = if self.chamfer_poly_all {
+            "pick a POLYLINE to bevel ALL corners"
+        } else {
+            match self.chamfer_state {
+                ChamferState::WaitingForFirst(..)  => "click FIRST object (or two segments of a polyline)",
+                ChamferState::WaitingForSecond(..) => "click SECOND object",
+                ChamferState::Off => return,
+            }
         };
         self.set_prompt(format!(
-            "chamfer (d1={}, d2={}, {}{}): {}  [t=trim, m=multi, d=distance, Esc]",
-            d1, d2, tm, mm, phase));
+            "chamfer (d1={}, d2={}, {}{}{}): {}  [t=trim, m=multi, p=poly, d=distance, Esc]",
+            d1, d2, tm, mm, pm, phase));
     }
 
     // ---------------------------------------------------------------------
-    // Slice M.3 — Fillet (line-line). Two clicks; second click commits.
+    // Fillet dispatcher. Routes the two picks:
+    //   * same polyline, two different segments → corner fillet (insert arc)
+    //   * Line/Wall pair                        → centerline path (curved walls)
+    //   * anything with Arc / Polyline-end      → generalized kernel solver
     // ---------------------------------------------------------------------
     fn apply_fillet(&mut self, r: f64, idx1: usize, pick1: Vec2,
+                                  idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            // Two segments of the SAME polyline → round that corner in place.
+            self.apply_fillet_corner(r, idx1, pick1, pick2);
+            return;
+        }
+        let is_lw = |g: &Geom| matches!(g, Geom::Line(_) | Geom::Wall(_));
+        let lw = self.doc.dobjects.get(idx1).map(|d| is_lw(&d.geom)).unwrap_or(false)
+              && self.doc.dobjects.get(idx2).map(|d| is_lw(&d.geom)).unwrap_or(false);
+        if lw {
+            self.apply_fillet_lines(r, idx1, pick1, idx2, pick2);
+        } else {
+            self.apply_fillet_general(r, idx1, pick1, idx2, pick2);
+        }
+    }
+
+    /// Generalized fillet for any Line/Arc/Polyline-end pair (kernel solver).
+    fn apply_fillet_general(&mut self, r: f64, idx1: usize, pick1: Vec2,
+                                       idx2: usize, pick2: Vec2) {
+        let (Some(d1), Some(d2)) =
+            (self.doc.dobjects.get(idx1), self.doc.dobjects.get(idx2)) else { return; };
+        let g1 = d1.geom.clone();
+        let g2 = d2.geom.clone();
+        let style1 = d1.style;
+        self.snapshot_doc();
+        let trim = self.env.TrmMd;
+        match cad_kernel::fillet_geoms(&g1, pick1, &g2, pick2, r) {
+            Ok(out) => {
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
+                if let Some(arc_geom) = out.arc {
+                    let mut d = DObject::new(arc_geom);
+                    d.style = style1;
+                    self.doc.push(d);
+                }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} between #{} and #{} ({})",
+                    r, idx1, idx2, if trim { "trim" } else { "no-trim" }));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    /// Fillet the corner between two segments of one polyline (in place).
+    fn apply_fillet_corner(&mut self, r: f64, idx: usize, pick1: Vec2, pick2: Vec2) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! fillet: same object clicked twice".into());
+            return;
+        };
+        let (Some(sa), Some(sb)) = (
+            cad_kernel::nearest_polyline_segment(&pl, pick1),
+            cad_kernel::nearest_polyline_segment(&pl, pick2),
+        ) else {
+            self.history.push("  ! fillet: couldn't locate the polyline segments".into());
+            return;
+        };
+        if sa == sb {
+            self.history.push("  ! fillet: click two DIFFERENT segments of the polyline".into());
+            return;
+        }
+        self.snapshot_doc();
+        match cad_kernel::fillet_polyline_corner(&pl, sa, sb, r) {
+            Ok(np) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} corner of polyline #{} (segments {}+{})", r, idx, sa, sb));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    /// Fillet EVERY corner of one polyline (the `P` option).
+    fn apply_fillet_poly_all(&mut self, r: f64, idx: usize) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! fillet P: pick a POLYLINE".into());
+            return;
+        };
+        self.snapshot_doc();
+        match cad_kernel::fillet_polyline_all(&pl, r) {
+            Ok((np, count)) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ fillet ✓ r={} on polyline #{} — {} corner(s) rounded", r, idx, count));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Slice M.3 — Fillet (line-line / walls). Two clicks; second commits.
+    // ---------------------------------------------------------------------
+    fn apply_fillet_lines(&mut self, r: f64, idx1: usize, pick1: Vec2,
                                   idx2: usize, pick2: Vec2) {
         if idx1 == idx2 {
             self.history.push("  ! fillet: same dobject clicked twice".into());
@@ -13807,9 +13963,125 @@ impl CadApp {
     }
 
     // ---------------------------------------------------------------------
-    // Slice M.4 — Chamfer (line-line).
+    // Chamfer dispatcher — mirror of apply_fillet's routing.
     // ---------------------------------------------------------------------
     fn apply_chamfer(&mut self, d1_dist: f64, d2_dist: f64,
+                                idx1: usize, pick1: Vec2,
+                                idx2: usize, pick2: Vec2) {
+        if idx1 == idx2 {
+            self.apply_chamfer_corner(d1_dist, d2_dist, idx1, pick1, pick2);
+            return;
+        }
+        let is_l = |g: &Geom| matches!(g, Geom::Line(_));
+        let ll = self.doc.dobjects.get(idx1).map(|d| is_l(&d.geom)).unwrap_or(false)
+              && self.doc.dobjects.get(idx2).map(|d| is_l(&d.geom)).unwrap_or(false);
+        if ll {
+            self.apply_chamfer_lines(d1_dist, d2_dist, idx1, pick1, idx2, pick2);
+        } else {
+            self.apply_chamfer_general(d1_dist, d2_dist, idx1, pick1, idx2, pick2);
+        }
+    }
+
+    /// Generalized chamfer for any Line/Arc/Polyline-end pair.
+    fn apply_chamfer_general(&mut self, d1_dist: f64, d2_dist: f64,
+                                        idx1: usize, pick1: Vec2,
+                                        idx2: usize, pick2: Vec2) {
+        let (Some(da), Some(db)) =
+            (self.doc.dobjects.get(idx1), self.doc.dobjects.get(idx2)) else { return; };
+        let g1 = da.geom.clone();
+        let g2 = db.geom.clone();
+        let style1 = da.style;
+        self.snapshot_doc();
+        let trim = self.env.TrmMd;
+        match cad_kernel::chamfer_geoms(&g1, pick1, &g2, pick2, d1_dist, d2_dist) {
+            Ok(out) => {
+                if trim {
+                    if let Some(d) = self.doc.dobjects.get_mut(idx1) { d.geom = out.g1_new; }
+                    if let Some(d) = self.doc.dobjects.get_mut(idx2) { d.geom = out.g2_new; }
+                }
+                let mut bridge = DObject::new(out.bridge);
+                bridge.style = style1;
+                self.doc.push(bridge);
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) between #{} and #{} ({})",
+                    d1_dist, d2_dist, idx1, idx2, if trim { "trim" } else { "no-trim" }));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    /// Chamfer the corner between two segments of one polyline (in place).
+    fn apply_chamfer_corner(&mut self, d1_dist: f64, d2_dist: f64,
+                                       idx: usize, pick1: Vec2, pick2: Vec2) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! chamfer: same object clicked twice".into());
+            return;
+        };
+        let (Some(sa), Some(sb)) = (
+            cad_kernel::nearest_polyline_segment(&pl, pick1),
+            cad_kernel::nearest_polyline_segment(&pl, pick2),
+        ) else {
+            self.history.push("  ! chamfer: couldn't locate the polyline segments".into());
+            return;
+        };
+        if sa == sb {
+            self.history.push("  ! chamfer: click two DIFFERENT segments of the polyline".into());
+            return;
+        }
+        self.snapshot_doc();
+        match cad_kernel::chamfer_polyline_corner(&pl, sa, sb, d1_dist, d2_dist) {
+            Ok(np) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) corner of polyline #{} (segments {}+{})",
+                    d1_dist, d2_dist, idx, sa, sb));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    /// Chamfer EVERY corner of one polyline (the `P` option).
+    fn apply_chamfer_poly_all(&mut self, d1_dist: f64, d2_dist: f64, idx: usize) {
+        let Some(d) = self.doc.dobjects.get(idx) else { return; };
+        let Geom::Polyline(pl) = d.geom.clone() else {
+            self.history.push("  ! chamfer P: pick a POLYLINE".into());
+            return;
+        };
+        self.snapshot_doc();
+        match cad_kernel::chamfer_polyline_all(&pl, d1_dist, d2_dist) {
+            Ok((np, count)) => {
+                if let Some(d) = self.doc.dobjects.get_mut(idx) { d.geom = Geom::Polyline(np); }
+                self.history.push(format!(
+                    "  ⌐ chamfer ✓ d=({}, {}) on polyline #{} — {} corner(s) beveled",
+                    d1_dist, d2_dist, idx, count));
+                self.intersections.clear();
+                self.index_dirty = true;
+                self.gpu_dirty = true;
+            }
+            Err(msg) => {
+                if let Some(prev) = self.undo_stack.pop() { self.doc = prev; }
+                self.history.push(format!("  ! {}", msg));
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Slice M.4 — Chamfer (line-line).
+    // ---------------------------------------------------------------------
+    fn apply_chamfer_lines(&mut self, d1_dist: f64, d2_dist: f64,
                                 idx1: usize, pick1: Vec2,
                                 idx2: usize, pick2: Vec2) {
         if idx1 == idx2 {
@@ -17328,11 +17600,13 @@ impl eframe::App for CadApp {
                 self.fillet_state = FilletState::Off;
                 self.fillet_multiple = false;
                 self.fillet_waiting_radius = false;
+                self.fillet_poly_all = false;
                 self.history.push("  fillet cancelled".into());
             }
             if self.chamfer_state != ChamferState::Off {
                 self.chamfer_state = ChamferState::Off;
                 self.chamfer_multiple = false;
+                self.chamfer_poly_all = false;
                 self.chamfer_dist_wait = ChamferDistWait::Off;
                 self.history.push("  chamfer cancelled".into());
             }
@@ -20697,10 +20971,21 @@ impl eframe::App for CadApp {
                         let tol_world = 10.0 / self.scale as f64;
                         let hit = self.nearest_entity_under(world, tol_world);
                         match (self.fillet_state, hit) {
+                            // Polyline mode (P option): the first pick is a
+                            // polyline whose every corner gets rounded.
+                            (FilletState::WaitingForFirst(r), Some(i)) if self.fillet_poly_all => {
+                                self.apply_fillet_poly_all(r, i);
+                                if self.fillet_multiple {
+                                    self.fillet_state = FilletState::WaitingForFirst(r);
+                                    self.refresh_fillet_prompt();
+                                } else {
+                                    self.fillet_state = FilletState::Off;
+                                }
+                            }
                             (FilletState::WaitingForFirst(r), Some(i)) => {
                                 self.fillet_state = FilletState::WaitingForSecond(r, i, click_world);
                                 self.history.push(format!(
-                                    "  fillet — first = #{}. Click SECOND line on the side to KEEP.", i));
+                                    "  fillet — first = #{}. Click SECOND object (or another segment of the same polyline).", i));
                             }
                             (FilletState::WaitingForSecond(r, i1, p1), Some(i2)) => {
                                 self.apply_fillet(r, i1, p1, i2, click_world);
@@ -20724,11 +21009,20 @@ impl eframe::App for CadApp {
                         let tol_world = 10.0 / self.scale as f64;
                         let hit = self.nearest_entity_under(world, tol_world);
                         match (self.chamfer_state, hit) {
+                            (ChamferState::WaitingForFirst(d1, d2), Some(i)) if self.chamfer_poly_all => {
+                                self.apply_chamfer_poly_all(d1, d2, i);
+                                if self.chamfer_multiple {
+                                    self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                                    self.refresh_chamfer_prompt();
+                                } else {
+                                    self.chamfer_state = ChamferState::Off;
+                                }
+                            }
                             (ChamferState::WaitingForFirst(d1, d2), Some(i)) => {
                                 self.chamfer_state =
                                     ChamferState::WaitingForSecond(d1, d2, i, click_world);
                                 self.history.push(format!(
-                                    "  chamfer — first = #{}. Click SECOND line.", i));
+                                    "  chamfer — first = #{}. Click SECOND object (or another segment of the same polyline).", i));
                             }
                             (ChamferState::WaitingForSecond(d1, d2, i1, p1), Some(i2)) => {
                                 self.apply_chamfer(d1, d2, i1, p1, i2, click_world);

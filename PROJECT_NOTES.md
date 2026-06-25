@@ -303,6 +303,26 @@ clamped corners) and filling as a single triangle strip.
 
 ---
 
+## 2026-06-25 session — generalized FILLET/CHAMFER (polylines, arcs, P option)
+
+Branch `windows-ui-session-2026-06-20`. See cmt.txt for the per-commit handoff.
+
+- FILLET/CHAMFER were line+line only; now handle line/arc pieces and polylines:
+  two segments of one polyline (round/bevel that corner in place), a polyline
+  END segment vs a separate object, and the AutoCAD `P` option (pick one polyline
+  → all corners). Bare Line↔Arc and Arc↔Arc now work too.
+- New kernel module `cad_kernel/src/fillet.rs`: offset-locus tangent-circle solver
+  (line→parallel offset line, arc→concentric R±r circle; intersect loci, pick the
+  centre inside the corner nearest the vertex). Public: fillet_geoms/chamfer_geoms,
+  fillet_polyline_corner/chamfer_polyline_corner, fillet_polyline_all/
+  chamfer_polyline_all, nearest_polyline_segment. 5 tests; 175 kernel tests pass.
+- app.rs: apply_fillet/apply_chamfer are now dispatchers (corner / lines+walls /
+  general). `p` sub-command toggles poly-all mode; prompts show ", POLY" + p=poly.
+- OPEN: spline/ellipse-arc fillet (no offset locus — tessellate or numerical);
+  non-adjacent polyline-segment fillet (AutoCAD removes intervening segments).
+
+---
+
 ## 2026-06-24 session — trim/extend/fillet, width polish, last-point, cmt.txt
 
 Branch `windows-ui-session-2026-06-20` (pushed). See cmt.txt (repo root) for the

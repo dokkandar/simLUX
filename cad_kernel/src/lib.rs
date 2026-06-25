@@ -26,6 +26,7 @@ pub mod geom;
 pub mod join;
 pub mod trim;
 pub mod modify;
+pub mod fillet;
 pub mod color;
 pub mod lineweight;
 pub mod linetype;
@@ -59,6 +60,11 @@ pub use geom::GripRole;
 pub use join::{join_geoms, JoinOut};
 pub use trim::join_trim_survivors;
 pub use modify::{chamfer_lines, fillet_lines, ChamferOut, FilletOut};
+pub use fillet::{
+    chamfer_geoms, chamfer_polyline_all, chamfer_polyline_corner,
+    fillet_geoms, fillet_polyline_all, fillet_polyline_corner,
+    nearest_polyline_segment,
+};
 pub use color::{aci_palette, resolve_color, Color, TrueColorTable};
 pub use lineweight::{resolve_lineweight, Lineweight, DEFAULT_LINEWEIGHT_MM};
 pub use linetype::{Linetype, LinetypeTable};

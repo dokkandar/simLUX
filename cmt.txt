@@ -22,6 +22,39 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET / CHAMFER: polylines, arcs, and the P (whole-polyline) option ----
+FILLET and CHAMFER were LINE+LINE only (Walls rode on their centerline). Now they
+generalize to line/arc pieces and polylines:
+  * two segments of the SAME polyline  → round/bevel that corner IN PLACE (insert
+    a fillet-arc vertex via bulge; chamfer inserts a straight bevel vertex).
+  * a polyline's END segment ↔ a separate Line/Arc/Polyline-end → trims the end
+    segment (moves the free vertex to the tangent point) + adds the fillet arc.
+  * the AutoCAD `P` option → pick ONE polyline, round/bevel EVERY corner at once.
+  * bare Line ↔ Arc, Arc ↔ Arc now work too (was unsupported).
+
+KERNEL — new module cad_kernel/src/fillet.rs (re-exported from lib.rs). Unified
+"offset-locus" solver: the centre of a radius-r circle tangent to a line lies on
+a parallel offset line; tangent to a circle/arc, on a concentric circle R±r.
+Intersect the two pieces' loci → candidate centres; pick the one INSIDE the corner
+(on the keep-side bisector) nearest the corner; tangent points are the feet/radial
+projections. Public fns:
+  fillet_geoms / chamfer_geoms (g1,p1,g2,p2,...) -> FilletOut/ChamferOut  [separate objs]
+  fillet_polyline_corner / chamfer_polyline_corner (pl, seg_a, seg_b, ...) -> Polyline
+  fillet_polyline_all / chamfer_polyline_all (pl, ...) -> (Polyline, count)  [P option]
+  nearest_polyline_segment(pl, p) -> Option<usize>   [which segment was clicked]
+Polyline arc (bulge) segments are handled; bulges recomputed when endpoints move.
+Splines / ellipse-arcs NOT yet (no simple offset locus — tessellate first, or add
+a numerical solver). 5 unit tests (perp lines, square all-corners, open-L corner,
+chamfer square). cad_kernel: 175 tests pass.
+
+APP — apply_fillet/apply_chamfer became DISPATCHERS:
+  same polyline (2 segments) → apply_*_corner;  Line/Wall pair → apply_*_lines
+  (old centerline/curved-wall path, unchanged);  else → apply_*_general (kernel).
+P option: `p` sub-command toggles fillet_poly_all/chamfer_poly_all; the next pick
+is a polyline → apply_*_poly_all. Prompts show ", POLY" + a `p=poly` hint; flag
+resets at command start and on Esc. New per-corner apply_*_corner / apply_*_general
+/ apply_*_poly_all methods (snapshot_doc + undo-pop on Err, like the originals).
+
 ---- (2026-06-25) keys: Ctrl+Z = Undo ----
 Ctrl+Z now undoes the drawing. Consumed via input_mut.consume_key so the
 command-line TextEdit doesn't also undo its own typed text — Ctrl+Z is always
@@ -252,6 +285,9 @@ SUB-COMMAND KEYS (typed while a command is active)
     (+ real-time drag)
   FILLET / CHAMFER (while picking):
     R radius (fillet) / D distances (chamfer) · T trim toggle · M multiple toggle
+    P polyline mode (pick ONE polyline → round/bevel ALL its corners)
+    Works on: Line, Arc, Wall, and Polylines (two segments of one polyline =
+    round that corner; an end segment vs a separate object; or P for all corners).
   Selection session (while a command asks you to select):
     p previous selection · l last created object · d remove from selection
 
@@ -278,19 +314,21 @@ PART 3 — KEY ARCHITECTURE NOTES (for re-implementers)
 ================================================================================
 PART 4 — OPEN / PENDING WORK
 ================================================================================
-1. DXF/RSM PERSISTENCE OF PLINE WIDTH (Stage 4) — NOT done. Save/reload drops
-   width (cad_io read paths default widths to empty). Need DXF LWPOLYLINE group
-   codes 40/41 (start/end width) + 43 (const width) read/write, and RSM
-   serialization of Polyline.widths.
-2. Width-change-boundary taper quirk: polyline_width_centerline assigns ONE
-   width per vertex (incoming segment's end), so the first segment after a width
-   change tapers old→new instead of being uniform. Fix: carry per-segment
-   start/end widths into the centerline.
-3. Possibly apply continuous-by-default to CHAMFER (same m/d/t structure).
-4. Groups: in-session only — not persisted to .rsm yet.
-5. Old open bug: circular-arc "curves wrong after pe+j" — diagnostic in
+1. FILLET/CHAMFER on SPLINE and ELLIPSE-ARC — NOT done (no simple offset locus).
+   Plan: either tessellate to a dense polyline first (result becomes a polyline)
+   or add a numerical tangent-circle root-finder in fillet.rs alongside the
+   offset-locus solver.
+2. FILLET/CHAMFER of two NON-ADJACENT segments of one polyline — currently errs
+   ("segments must be adjacent"). AutoCAD removes the intervening segments; not
+   implemented.
+3. Groups: in-session only — not persisted to .rsm yet.
+4. Old open bug: circular-arc "curves wrong after pe+j" — diagnostic in
    pedit_join_selected prints `src arc:` / `pl v[i]`; needs a session dump.
-6. RECONCILE: origin/main is ~14 commits ahead (other machine) with OVERLAPPING
+5. RECONCILE: origin/main is ~14 commits ahead (other machine) with OVERLAPPING
    file-dialog/zoom/block work. Do NOT blind-merge this branch into main —
    review upstream vs this branch first.
+
+DONE since last edit: pline width DXF/RSM persistence (Stage 4); width-change
+taper quirk; chamfer continuous-by-default; generalized fillet/chamfer (polylines
++ arcs + P option).
 ================================================================================
