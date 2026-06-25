@@ -70,6 +70,12 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🔧 HOUSEKEEPING
 
+### UI baseline snapshot (2026-06-25)
+- Before the UI redesign, the current UI state was saved as branch + tag
+  **`ui-baseline-2026-06-25`** (at commit `5e27101`). To revert the whole UI:
+  `git checkout ui-baseline-2026-06-25`. To revert just one file:
+  `git checkout ui-baseline-2026-06-25 -- cad_app/src/app.rs`.
+
 ### 8. Unpushed commits
 - The branch has local commits not yet pushed to GitHub
   (`b0a2291` → `c78af96`, plus the Ctrl+Z work `a5a6327`). Push when ready.
