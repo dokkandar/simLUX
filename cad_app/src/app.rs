@@ -809,6 +809,13 @@ pub struct CadApp {
     /// Settings window visibility.
     settings_open: bool,
 
+    // ---- Quick Access Toolbar (top line) -----------------------------
+    /// Ordered list of file/common actions shown as icon shortcuts on the
+    /// top Quick Access row. Customizable via the `▾` dropdown.
+    qat_actions: Vec<QatAction>,
+    /// Whether the QAT "customize" drop window is open.
+    qat_customize_open: bool,
+
     // "Always-listen" command line: set when something else stole keyboard
     // focus (canvas click, window switch). The command-box renderer
     // reclaims focus on the next frame.
@@ -2207,6 +2214,8 @@ impl Default for CadApp {
             snap_window_open:  false,
             env:               UserEnv::load(),
             settings_open:     false,
+            qat_actions:       QatAction::default_set(),
+            qat_customize_open: false,
             refocus_cmd:       true,
             snap_cycle_index:  0,
             snap_cycle_anchor: None,
@@ -13727,6 +13736,56 @@ impl CadApp {
         }
     }
 
+    /// Run a Quick Access Toolbar shortcut.
+    fn run_qat_action(&mut self, act: QatAction) {
+        match act {
+            QatAction::New       => self.run_command("clear"),
+            QatAction::Open      => self.open_file_dialog(FileDialogMode::Open, ".rsm"),
+            QatAction::Save      => self.do_save_current(),
+            QatAction::SaveAsDxf => self.open_file_dialog(FileDialogMode::Save, ".dxf"),
+            QatAction::SaveAsRsm => self.open_file_dialog(FileDialogMode::Save, ".rsm"),
+            QatAction::Undo      => self.run_command("undo"),
+            QatAction::Redo      => self.run_command("redo"),
+        }
+    }
+
+    /// The "customize Quick Access Toolbar" drop window — one panel listing
+    /// every action with a checkbox; ticking adds it to the top strip,
+    /// unticking removes it. Order follows `QatAction::all()`.
+    fn qat_customize_window(&mut self, ctx: &egui::Context) {
+        if !self.qat_customize_open { return; }
+        let mut open = self.qat_customize_open;
+        egui::Window::new("Customize Quick Access")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(60.0, 44.0))
+            .show(ctx, |ui| {
+                ui.label(egui::RichText::new("Show as shortcut on the top toolbar:")
+                    .size(12.0).color(egui::Color32::from_rgb(170, 185, 200)));
+                ui.add_space(4.0);
+                for act in QatAction::all() {
+                    let mut on = self.qat_actions.contains(&act);
+                    if ui.checkbox(&mut on, act.label()).changed() {
+                        if on {
+                            // Re-insert in canonical order.
+                            self.qat_actions = QatAction::all().into_iter()
+                                .filter(|a| *a == act || self.qat_actions.contains(a))
+                                .collect();
+                        } else {
+                            self.qat_actions.retain(|a| *a != act);
+                        }
+                    }
+                }
+                ui.add_space(6.0);
+                ui.separator();
+                if ui.button("Reset to default").clicked() {
+                    self.qat_actions = QatAction::default_set();
+                }
+            });
+        self.qat_customize_open = open;
+    }
+
     /// Re-issue the fillet prompt with the current radius, trim mode,
     /// and multiple-mode badges. Called after any sub-option toggle.
     fn refresh_fillet_prompt(&mut self) {
@@ -16570,6 +16629,199 @@ fn aci_color_picker(
 ///
 /// `active` highlights the button in the same blue as a selected drafting
 /// tool — visual cue that the corresponding panel is open / feature is on.
+// ---------------------------------------------------------------------------
+// Quick Access Toolbar — top line. A customizable strip of file/common-action
+// icon shortcuts, plus the AutoRASM logo on the left and the product title on
+// the right. The set of shortcuts is edited through the `▾` customize drop
+// window. Command (drafting) icons are a separate strip, handled elsewhere.
+// ---------------------------------------------------------------------------
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum QatAction {
+    New,
+    Open,
+    Save,
+    SaveAsDxf,
+    SaveAsRsm,
+    Undo,
+    Redo,
+}
+
+impl QatAction {
+    /// Every action offered in the customize drop window, in display order.
+    fn all() -> [QatAction; 7] {
+        [QatAction::New, QatAction::Open, QatAction::Save, QatAction::SaveAsDxf,
+         QatAction::SaveAsRsm, QatAction::Undo, QatAction::Redo]
+    }
+    /// The shortcuts shown by default (first run / before customization).
+    fn default_set() -> Vec<QatAction> {
+        vec![QatAction::New, QatAction::Open, QatAction::Save,
+             QatAction::SaveAsDxf, QatAction::Undo, QatAction::Redo]
+    }
+    /// Human label for the customize list + tooltips.
+    fn label(self) -> &'static str {
+        match self {
+            QatAction::New       => "New",
+            QatAction::Open      => "Open…",
+            QatAction::Save      => "Save",
+            QatAction::SaveAsDxf => "Save As .dxf…",
+            QatAction::SaveAsRsm => "Save As .rsm…",
+            QatAction::Undo      => "Undo",
+            QatAction::Redo      => "Redo",
+        }
+    }
+}
+
+/// AutoRASM logo placeholder at the far left of the top line. Paints a brand-
+/// teal gear-ring with a gold "R" until the real PNG is wired in (see
+/// OPEN_ISSUES — needs the logo asset on disk).
+fn draw_logo(ui: &mut egui::Ui) {
+    let sz = egui::vec2(34.0, 34.0);
+    let (resp, p) = ui.allocate_painter(sz, egui::Sense::hover());
+    let r = resp.rect;
+    let c = r.center();
+    let teal = egui::Color32::from_rgb(38, 78, 98);
+    let gold = egui::Color32::from_rgb(214, 184, 122);
+    let radius = r.width() * 0.42;
+    // Gear teeth: short radial ticks around the ring.
+    for k in 0..10 {
+        let a = (k as f32) / 10.0 * std::f32::consts::TAU;
+        let dir = egui::vec2(a.cos(), a.sin());
+        let p0 = c + dir * radius;
+        let p1 = c + dir * (radius + 4.0);
+        p.line_segment([p0, p1], egui::Stroke::new(3.0, teal));
+    }
+    // Ring (open on the right, like the brand mark's "C").
+    p.circle_stroke(c, radius, egui::Stroke::new(3.0, teal));
+    // Gold "R".
+    p.text(c, egui::Align2::CENTER_CENTER, "R",
+        egui::FontId::proportional(20.0), gold);
+}
+
+/// One Quick Access shortcut button — a small flat icon tile.
+fn qat_button(ui: &mut egui::Ui, act: QatAction) -> bool {
+    let size = egui::vec2(30.0, 30.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
+    let col = egui::Color32::from_rgb(205, 216, 228);
+    paint_qat_icon(&painter, rect.shrink(7.0), act, col);
+    resp.on_hover_text(act.label()).clicked()
+}
+
+/// Simple geometric glyphs for the QAT actions (placeholder art — clean and
+/// recognizable without needing image assets).
+fn paint_qat_icon(painter: &egui::Painter, r: egui::Rect, act: QatAction, col: egui::Color32) {
+    let st = egui::Stroke::new(1.6, col);
+    match act {
+        QatAction::New => {
+            // A page with a folded top-right corner.
+            let fold = r.width() * 0.32;
+            let tl = r.left_top();
+            let tr = egui::pos2(r.right() - fold, r.top());
+            let pts = vec![
+                tl, tr,
+                egui::pos2(r.right(), r.top() + fold),
+                r.right_bottom(), r.left_bottom(), tl,
+            ];
+            painter.add(egui::Shape::closed_line(pts, st));
+            painter.line_segment([tr, egui::pos2(r.right(), r.top() + fold)], st);
+            painter.line_segment([tr, egui::pos2(r.right() - fold, r.top() + fold)], st);
+            painter.line_segment([egui::pos2(r.right() - fold, r.top() + fold),
+                                  egui::pos2(r.right(), r.top() + fold)], st);
+        }
+        QatAction::Open => {
+            // An open folder (trapezoid lid).
+            let y0 = r.top() + r.height() * 0.30;
+            painter.add(egui::Shape::closed_line(vec![
+                egui::pos2(r.left(), y0),
+                egui::pos2(r.left() + r.width() * 0.45, y0),
+                egui::pos2(r.left() + r.width() * 0.55, r.top() + r.height() * 0.12),
+                egui::pos2(r.right(), r.top() + r.height() * 0.12),
+                egui::pos2(r.right(), r.bottom()),
+                egui::pos2(r.left(), r.bottom()),
+            ], st));
+        }
+        QatAction::Save | QatAction::SaveAsDxf | QatAction::SaveAsRsm => {
+            // A floppy disk: outer square + label notch + shutter.
+            painter.rect_stroke(r, 2.0, st);
+            let top = egui::Rect::from_min_max(
+                egui::pos2(r.left() + r.width() * 0.22, r.top()),
+                egui::pos2(r.right() - r.width() * 0.18, r.top() + r.height() * 0.34));
+            painter.rect_stroke(top, 0.0, st);
+            let body = egui::Rect::from_min_max(
+                egui::pos2(r.left() + r.width() * 0.18, r.top() + r.height() * 0.52),
+                egui::pos2(r.right() - r.width() * 0.18, r.bottom() - r.height() * 0.10));
+            painter.rect_stroke(body, 0.0, st);
+            // Tiny format tag for the Save-As variants.
+            let tag = match act {
+                QatAction::SaveAsDxf => Some("DXF"),
+                QatAction::SaveAsRsm => Some("RSM"),
+                _ => None,
+            };
+            if let Some(t) = tag {
+                painter.text(egui::pos2(body.center().x, body.center().y),
+                    egui::Align2::CENTER_CENTER, t,
+                    egui::FontId::proportional(5.5), col);
+            }
+        }
+        QatAction::Undo | QatAction::Redo => {
+            // A curved arrow. Redo is the mirror of Undo.
+            let mirror = matches!(act, QatAction::Redo);
+            let cy = r.center().y;
+            let mut pts = Vec::new();
+            for k in 0..=16 {
+                let t = k as f32 / 16.0;
+                let a = std::f32::consts::PI * (0.15 + t * 0.85);
+                let x = r.center().x + a.cos() * r.width() * 0.40;
+                let y = cy + a.sin() * r.height() * 0.34;
+                pts.push(egui::pos2(if mirror { 2.0 * r.center().x - x } else { x }, y));
+            }
+            painter.add(egui::Shape::line(pts.clone(), st));
+            // Arrowhead at the start of the arc.
+            if let Some(&head) = pts.first() {
+                let dx = if mirror { -1.0 } else { 1.0 };
+                painter.line_segment([head, head + egui::vec2(4.0 * dx, -4.0)], st);
+                painter.line_segment([head, head + egui::vec2(4.0 * dx, 4.0)], st);
+            }
+        }
+    }
+}
+
+/// The "customize" affordance — a short bar with a down-chevron beneath it
+/// (the Office/AutoCAD Quick-Access drop button the user described as "arrow
+/// with a small line on top").
+fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> bool {
+    let size = egui::vec2(22.0, 30.0);
+    let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
+    let rect = resp.rect;
+    let bg = if open {
+        egui::Color32::from_rgb(60, 110, 175)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(48, 58, 72)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
+    let col = egui::Color32::from_rgb(205, 216, 228);
+    let cx = rect.center().x;
+    let top = rect.top() + 10.0;
+    // Short horizontal bar.
+    painter.line_segment([egui::pos2(cx - 5.0, top), egui::pos2(cx + 5.0, top)],
+        egui::Stroke::new(1.6, col));
+    // Down chevron beneath.
+    painter.add(egui::Shape::line(vec![
+        egui::pos2(cx - 5.0, top + 4.0),
+        egui::pos2(cx, top + 9.0),
+        egui::pos2(cx + 5.0, top + 4.0),
+    ], egui::Stroke::new(1.6, col)));
+    resp.on_hover_text("Customize Quick Access Toolbar").clicked()
+}
+
 fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
     // Allocate space matching tool_button height (52 px) but text-width
     // sized so the label decides the width.
@@ -18116,6 +18368,36 @@ impl eframe::App for CadApp {
         // Declared BEFORE the toolbar so it sits at the absolute top.
         // Every menu item dispatches via `run_command` so its behaviour
         // matches typing the same cmd — keeps one source of truth.
+        // ---- Quick Access Toolbar (line 1) ------------------------------
+        // Logo · customizable file/common shortcuts · customize ▾ · title.
+        egui::TopBottomPanel::top("quick_access").show(ctx, |ui| {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                draw_logo(ui);
+                ui.add_space(10.0);
+                let actions = self.qat_actions.clone();
+                for act in actions {
+                    if qat_button(ui, act) {
+                        self.run_qat_action(act);
+                    }
+                }
+                ui.add_space(2.0);
+                if qat_customize_button(ui, self.qat_customize_open) {
+                    self.qat_customize_open = !self.qat_customize_open;
+                }
+                // Product title, far right.
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_space(14.0);
+                    ui.label(egui::RichText::new("AutoRASM  2026")
+                        .size(16.0)
+                        .color(egui::Color32::from_rgb(176, 192, 208)));
+                });
+            });
+            ui.add_space(3.0);
+        });
+        // The customize drop window (anchored just under the QAT).
+        self.qat_customize_window(ctx);
+
         egui::TopBottomPanel::top("menubar").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
                 ui.menu_button("File", |ui| {
