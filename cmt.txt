@@ -22,6 +22,18 @@ as a red "NativeCommandError" even on success — check the final ref-update lin
 PART 1 — COMMITS (newest first), each with what changed & why
 ================================================================================
 
+---- (2026-06-25) FILLET P: re-apply with a new radius UPDATES the rounding ----
+Re-running `fillet P` on an already-filleted polyline used to round the already-
+rounded corners (stacking). Now polyline_all() first calls defillet_polyline()
+which collapses existing fillet arcs back to sharp corners, then fillets the
+sharpened outline — so changing the radius mid-command and re-picking the same
+polyline UPDATES every corner to the new radius. A fillet arc is detected by its
+signature: a line→arc→line run where the arc is TANGENT to both straight
+neighbours; the recovered corner is the intersection of the two straight sides.
+Genuine (non-tangent) arcs and arc-neighboured arcs are left untouched. Only the
+Fillet op de-fillets (chamfer P does not). 2 tests (refillet_updates_radius_
+does_not_stack, defillet_recovers_original_square_corners). cad_kernel: 179 pass.
+
 ---- (2026-06-25) FILLET / CHAMFER: radius-too-big guard + re-prompt (don't exit) ----
 Two follow-ups from a session dump (P-fillet with a too-big radius drew a self-
 intersecting blob and silently exited):

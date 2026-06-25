@@ -633,6 +633,65 @@ fn apply_corner(pl: &Polyline, seg_in: usize, seg_out: usize, vtx: usize, cs: &C
 // Public: fillet/chamfer EVERY corner of one polyline (the `P` option).
 // ---------------------------------------------------------------------------
 
+/// Collapse existing fillet arcs back to their sharp corners. A fillet is a
+/// line → arc → line run where the arc is TANGENT to both straight neighbours
+/// (its defining property). Each such arc + its two tangent vertices is
+/// replaced by the single recovered corner (the intersection of the two
+/// straight sides). This lets `fillet P` be re-run with a new radius to UPDATE
+/// the rounding instead of filleting the already-rounded corners. Genuine
+/// (non-tangent) arc segments, and arcs whose neighbours aren't straight, are
+/// left untouched.
+fn defillet_polyline(pl: &Polyline) -> Polyline {
+    let n = pl.vertices.len();
+    if n < 4 { return pl.clone(); }
+    let seg_count = if pl.closed { n } else { n - 1 };
+    let seg_straight = |i: usize| pl.vertices[i].bulge.abs() < 1e-9;
+    let seg_dir = |i: usize| -> Vec2 {
+        (pl.vertices[(i + 1) % n].pos - pl.vertices[i].pos).normalized()
+    };
+
+    let mut fillet = vec![false; n];
+    let mut corner = vec![Vec2::ZERO; n];
+    for a in 0..seg_count {
+        if seg_straight(a) { continue; }              // need an arc segment
+        if !pl.closed && (a == 0 || a >= seg_count - 1) { continue; } // needs both sides
+        let prev = (a + n - 1) % n;
+        let next = (a + 1) % n;
+        if prev >= seg_count || next >= seg_count { continue; }
+        if !seg_straight(prev) || !seg_straight(next) { continue; }
+        let va = pl.vertices[a].pos;
+        let vb = pl.vertices[next].pos;
+        let Some((center, _r, _sa, _sw)) = bulge_arc(va, vb, pl.vertices[a].bulge) else { continue };
+        // Tangency: arc tangent (⊥ radius) ∥ the straight neighbour at each end.
+        let ta = (va - center).perp().normalized();
+        let tb = (vb - center).perp().normalized();
+        if ta.cross(seg_dir(prev)).abs() > 1e-3 { continue; }
+        if tb.cross(seg_dir(next)).abs() > 1e-3 { continue; }
+        // Recover the corner = intersection of the two straight sides.
+        let Some(c) = line_line(pl.vertices[prev].pos, seg_dir(prev),
+                                pl.vertices[next].pos, seg_dir(next)) else { continue };
+        fillet[a] = true;
+        corner[a] = c;
+    }
+    if !fillet.iter().any(|&f| f) { return pl.clone(); }
+
+    // Rebuild: an arc's start vertex (tp_in) → the corner; its end vertex
+    // (tp_out) is dropped (merged into that corner). Wrap-safe for closed.
+    let mut out: Vec<PolyVertex> = Vec::with_capacity(n);
+    for v in 0..n {
+        let starts = fillet[v];                    // seg v is a fillet arc → v = tp_in
+        let ends = fillet[(v + n - 1) % n];        // seg v-1 is a fillet arc → v = tp_out
+        if starts {
+            out.push(PolyVertex { pos: corner[v], bulge: 0.0 });
+        } else if ends {
+            // tp_out — merged into the corner already emitted at tp_in.
+        } else {
+            out.push(pl.vertices[v]);
+        }
+    }
+    Polyline { vertices: out, closed: pl.closed, widths: Vec::new() }
+}
+
 /// Monotonic parameter of a point along a piece's host line/circle, measured
 /// from the piece's start: a fraction for a segment, the swept-angle delta for
 /// an arc. Used only to compare ordering of two points on the same segment.
@@ -653,6 +712,16 @@ fn along_param(orig: &Piece, p: Vec2) -> f64 {
 enum AllOp { Fillet(f64), Chamfer(f64, f64) }
 
 fn polyline_all(pl: &Polyline, op: AllOp) -> Result<(Polyline, usize), String> {
+    // Re-running fillet P should UPDATE existing fillets to the new radius, not
+    // round the already-rounded corners. Collapse tangent fillet arcs back to
+    // sharp corners first, then fillet the sharpened outline.
+    let sharpened = if matches!(op, AllOp::Fillet(_)) {
+        Some(defillet_polyline(pl))
+    } else {
+        None
+    };
+    let pl = sharpened.as_ref().unwrap_or(pl);
+
     let n = pl.vertices.len();
     if n < 3 { return Err("need at least 3 vertices".into()); }
     let seg_count = if pl.closed { n } else { n - 1 };
@@ -839,6 +908,57 @@ mod tests {
         assert!(np.vertices[2].pos.dist(Vec2::new(4.0, 1.0)) < 1e-6,
             "v2 = {:?}", np.vertices[2].pos);
         assert!(np.vertices[1].bulge.abs() > 1e-6);
+    }
+
+    #[test]
+    fn refillet_updates_radius_does_not_stack() {
+        // Square → fillet r=1 → re-fillet r=0.5. Must still be 8 vertices
+        // (4 rounded corners), NOT 16, and the new fillet radius must be ~0.5.
+        let sq = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        };
+        let (round1, _) = fillet_polyline_all(&sq, 1.0).unwrap();
+        assert_eq!(round1.vertices.len(), 8);
+        let (round2, count) = fillet_polyline_all(&round1, 0.5).unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(round2.vertices.len(), 8, "re-fillet stacked: {:?}", round2.vertices);
+        // Reconstruct an arc radius from one fillet vertex.
+        let arc_v = round2.vertices.iter().enumerate()
+            .find(|(_, v)| v.bulge.abs() > 1e-6).unwrap();
+        let i = arc_v.0;
+        let a = round2.vertices[i].pos;
+        let b = round2.vertices[(i + 1) % round2.vertices.len()].pos;
+        let (_, r, _, _) = bulge_arc(a, b, round2.vertices[i].bulge).unwrap();
+        assert!((r - 0.5).abs() < 1e-6, "radius after re-fillet was {r}, want 0.5");
+    }
+
+    #[test]
+    fn defillet_recovers_original_square_corners() {
+        let sq = Polyline {
+            vertices: vec![
+                PolyVertex { pos: Vec2::new(0.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 0.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(10.0, 10.0), bulge: 0.0 },
+                PolyVertex { pos: Vec2::new(0.0, 10.0), bulge: 0.0 },
+            ],
+            closed: true,
+            widths: Vec::new(),
+        };
+        let (rounded, _) = fillet_polyline_all(&sq, 2.0).unwrap();
+        let back = defillet_polyline(&rounded);
+        assert_eq!(back.vertices.len(), 4);
+        // Each recovered corner should coincide with an original corner.
+        for orig in &sq.vertices {
+            assert!(back.vertices.iter().any(|v| v.pos.dist(orig.pos) < 1e-6),
+                "missing corner {:?} in {:?}", orig.pos, back.vertices);
+        }
     }
 
     #[test]
