@@ -811,6 +811,10 @@ pub struct CadApp {
     /// Which section (left sidebar) is selected in the settings window.
     /// Empty → default to the first section on first render.
     settings_section: String,
+    /// When `Some(name)`, the command line is waiting for the NEW VALUE of a
+    /// SYSVAR (after `setvar NAME` or a bare variable name). The next input is
+    /// consumed as that value (validated via varreg::env_set). Esc cancels.
+    var_set_pending: Option<String>,
 
     // ---- Quick Access Toolbar (top line) -----------------------------
     /// Ordered list of file/common actions shown as icon shortcuts on the
@@ -2230,6 +2234,7 @@ impl Default for CadApp {
             env:               UserEnv::load(),
             settings_open:     false,
             settings_section:  String::new(),
+            var_set_pending:   None,
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
             qat_just_opened:   false,
@@ -2475,6 +2480,35 @@ impl CadApp {
             source:        crate::dbg_recorder::CmdSource::Typed,
         });
 
+        // ---- SYSVAR value entry (after `setvar NAME` or a bare var name) ----
+        // The next input is the new value; empty keeps current; bad input
+        // re-prompts (Esc cancels via the Esc handler).
+        if let Some(name) = self.var_set_pending.clone() {
+            if trimmed.is_empty() {
+                let cur = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                self.history.push(format!("  {} kept at {}", name, cur));
+                self.var_set_pending = None;
+                self.clear_prompt();
+            } else {
+                match crate::varreg::env_set(&mut self.env, &name, trimmed) {
+                    Ok(_) => {
+                        let _ = self.env.save();
+                        let nv = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                        self.history.push(format!("  {} = {}", name, nv));
+                        self.var_set_pending = None;
+                        self.clear_prompt();
+                    }
+                    Err(e) => {
+                        self.history.push(format!("  ! {}", e));
+                        let cur = crate::varreg::env_get(&self.env, &name).unwrap_or_default();
+                        self.set_prompt(format!(
+                            "Enter new value for {} <{}>:  [Esc=cancel]", name, cur));
+                    }
+                }
+            }
+            return;
+        }
+
         // ---- Prompt-driven command flow (Slice 1: CIRCLE) ----------------
         // When a flow is live the command line IS its prompt — route typed
         // input there. Otherwise `circle`/`ci` STARTS the flow. Each prompt +
@@ -2521,6 +2555,25 @@ impl CadApp {
             if let Some(rest) = lc.strip_prefix("zoom ").or_else(|| lc.strip_prefix("z ")) {
                 self.zoom_start(rest.trim());
                 return;
+            }
+        }
+        // ---- SYSVAR access: `setvar [NAME [VALUE]]` / `setvar ?`, or a bare
+        // variable name typed as a command (AutoCAD-style). ------------------
+        {
+            let parts: Vec<&str> = trimmed.split_whitespace().collect();
+            if let Some(&first) = parts.first() {
+                if first.eq_ignore_ascii_case("setvar") {
+                    let name = parts.get(1).copied();
+                    let value = if parts.len() > 2 { parts[2..].join(" ") } else { String::new() };
+                    self.handle_setvar(name, &value);
+                    return;
+                }
+                // A bare variable name (optionally with an inline value).
+                if crate::varreg::find(first).is_some() {
+                    let value = if parts.len() > 1 { parts[1..].join(" ") } else { String::new() };
+                    self.handle_setvar(Some(first), &value);
+                    return;
+                }
             }
         }
         // `group` / `ungroup` — operate on the current selection.
@@ -14081,6 +14134,49 @@ impl CadApp {
         }
     }
 
+    /// `setvar` / bare-variable-name handler. `name=None` (or "?") lists the
+    /// editable variables; `name` + non-empty `value` sets it inline; `name`
+    /// alone queries + arms the value prompt (for wired vars) or reports the
+    /// read-only status (for unwired ones).
+    fn handle_setvar(&mut self, name: Option<&str>, value: &str) {
+        let Some(name) = name else { self.list_setvars(); return; };
+        if name == "?" { self.list_setvars(); return; }
+        let Some(var) = crate::varreg::find(name) else {
+            self.history.push(format!("  ! unknown variable '{}'", name));
+            return;
+        };
+        let canon = var.name;
+        if !value.trim().is_empty() {
+            match crate::varreg::env_set(&mut self.env, canon, value.trim()) {
+                Ok(_) => {
+                    let _ = self.env.save();
+                    let nv = crate::varreg::env_get(&self.env, canon).unwrap_or_default();
+                    self.history.push(format!("  {} = {}", canon, nv));
+                }
+                Err(e) => self.history.push(format!("  ! {}", e)),
+            }
+            return;
+        }
+        if var.wired {
+            let cur = crate::varreg::env_get(&self.env, canon).unwrap_or_default();
+            self.var_set_pending = Some(canon.to_string());
+            self.set_prompt(format!(
+                "Enter new value for {} <{}>:  [Esc=cancel]", canon, cur));
+        } else {
+            self.history.push(format!(
+                "  {} = {} ({:?} — not editable yet)", canon, var.default, var.status));
+        }
+    }
+
+    /// List the editable (wired) variables with their current values.
+    fn list_setvars(&mut self) {
+        self.history.push("  Editable variables — `setvar NAME VALUE` or type the name:".into());
+        for v in crate::varreg::VARS.iter().filter(|v| v.wired) {
+            let cur = crate::varreg::env_get(&self.env, v.name).unwrap_or_default();
+            self.history.push(format!("    {:<8} = {:<14} {}", v.name, cur, v.desc));
+        }
+    }
+
     /// Re-issue the fillet prompt with the current radius, trim mode,
     /// and multiple-mode badges. Called after any sub-option toggle.
     fn refresh_fillet_prompt(&mut self) {
@@ -18285,6 +18381,11 @@ impl eframe::App for CadApp {
             if self.align_state != AlignState::Off {
                 self.align_state = AlignState::Off;
                 self.history.push("  align cancelled".into());
+            }
+            if self.var_set_pending.is_some() {
+                self.var_set_pending = None;
+                self.clear_prompt();
+                self.history.push("  setvar cancelled".into());
             }
             if self.fillet_state != FilletState::Off {
                 self.fillet_state = FilletState::Off;
