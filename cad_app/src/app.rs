@@ -808,6 +808,9 @@ pub struct CadApp {
     env: UserEnv,
     /// Settings window visibility.
     settings_open: bool,
+    /// Which section (left sidebar) is selected in the settings window.
+    /// Empty → default to the first section on first render.
+    settings_section: String,
 
     // ---- Quick Access Toolbar (top line) -----------------------------
     /// Ordered list of file/common actions shown as icon shortcuts on the
@@ -2226,6 +2229,7 @@ impl Default for CadApp {
             snap_window_open:  false,
             env:               UserEnv::load(),
             settings_open:     false,
+            settings_section:  String::new(),
             qat_actions:       QatAction::default_set(),
             qat_customize_open: false,
             qat_just_opened:   false,
@@ -13891,6 +13895,192 @@ impl CadApp {
         }
     }
 
+    // ---------------------------------------------------------------------
+    // USER-ENVIRONMENT SETTINGS window — registry-driven (varreg::VARS).
+    // Left sidebar = sections; right panel = typed rows with status badges.
+    // Every variable is shown; WIRED ones are editable (through the shared
+    // validated varreg::env_set), the rest are disabled (Option A).
+    // ---------------------------------------------------------------------
+    fn settings_window(&mut self, ctx: &egui::Context) {
+        if !self.settings_open { return; }
+        let sections = crate::varreg::sections();
+        if self.settings_section.is_empty() {
+            if let Some(first) = sections.first() {
+                self.settings_section = first.to_string();
+            }
+        }
+        let mut keep = true;
+        egui::Window::new("USER-ENVIRONMENT SETTINGS")
+            .open(&mut keep)
+            .resizable(true)
+            .default_width(820.0)
+            .default_height(580.0)
+            .default_pos(egui::pos2(40.0, 70.0))
+            .show(ctx, |ui| {
+                ui.horizontal_top(|ui| {
+                    // ---- left sidebar: section list -------------------------
+                    ui.vertical(|ui| {
+                        ui.set_width(210.0);
+                        egui::ScrollArea::vertical().id_salt("set_sections")
+                            .max_height(500.0)
+                            .show(ui, |ui| {
+                                for sec in &sections {
+                                    let count = crate::varreg::VARS.iter()
+                                        .filter(|v| v.section == *sec).count();
+                                    let selected = self.settings_section == *sec;
+                                    if settings_section_item(ui, sec, count, selected) {
+                                        self.settings_section = sec.to_string();
+                                    }
+                                }
+                            });
+                    });
+                    ui.separator();
+                    // ---- right panel: rows for the selected section ---------
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.heading(egui::RichText::new(&self.settings_section).size(15.0));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                settings_legend(ui);
+                            });
+                        });
+                        ui.label(egui::RichText::new(
+                            "AutoCAD-style SYSVARS. Edits to Active/Planned vars persist to ~/.config/rust_cad/user_env.txt")
+                            .size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
+                        ui.separator();
+                        let sec = self.settings_section.clone();
+                        egui::ScrollArea::vertical().id_salt("set_rows")
+                            .max_height(470.0)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for v in crate::varreg::VARS.iter().filter(|v| v.section == sec) {
+                                    self.settings_row(ui, v);
+                                }
+                            });
+                    });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Save now").clicked() {
+                        match self.env.save() {
+                            Ok(_)  => self.history.push("  settings saved".into()),
+                            Err(e) => self.history.push(format!("  ! settings save failed: {}", e)),
+                        }
+                    }
+                    if ui.button("Reload from disk").clicked() { self.env = UserEnv::load(); }
+                    if ui.button("Reset to defaults").clicked() {
+                        self.env = UserEnv::default();
+                        let _ = self.env.save();
+                    }
+                });
+            });
+        if !keep { self.settings_open = false; }
+    }
+
+    /// One settings row: name · description · status badge · typed input.
+    fn settings_row(&mut self, ui: &mut egui::Ui, v: &crate::varreg::Var) {
+        let frame = egui::Frame::none()
+            .fill(egui::Color32::from_rgb(28, 31, 40))
+            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(38, 42, 51)))
+            .rounding(4.0)
+            .inner_margin(egui::Margin::symmetric(8.0, 5.0));
+        frame.show(ui, |ui| {
+            ui.horizontal(|ui| {
+                // name (mono, fixed width)
+                ui.add_sized([86.0, 18.0], egui::Label::new(
+                    egui::RichText::new(v.name).monospace().strong()
+                        .color(egui::Color32::from_rgb(220, 226, 234))).truncate());
+                // description (flex)
+                ui.add_sized([300.0, 18.0], egui::Label::new(
+                    egui::RichText::new(v.desc).size(11.5)
+                        .color(egui::Color32::from_rgb(155, 162, 174))).truncate());
+                settings_status_badge(ui, v.status);
+                // input — right aligned
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(v.wired, |ui| {
+                        self.settings_input(ui, v);
+                    });
+                });
+            });
+        });
+        ui.add_space(3.0);
+    }
+
+    /// The typed control for one variable. WIRED → reads/writes the live value
+    /// through varreg::env_get / env_set (validated). UNWIRED → shows the
+    /// default (the enclosing add_enabled_ui(false) greys it out).
+    fn settings_input(&mut self, ui: &mut egui::Ui, v: &crate::varreg::Var) {
+        use crate::varreg::Kind;
+        let cur = if v.wired {
+            crate::varreg::env_get(&self.env, v.name).unwrap_or_default()
+        } else {
+            v.default.to_string()
+        };
+        let mut changed: Option<String> = None;
+        match v.kind {
+            Kind::Bool => {
+                let mut b = matches!(cur.as_str(), "on" | "true" | "1");
+                let label = if b { "On" } else { "Off" };
+                if ui.checkbox(&mut b, label).changed() {
+                    changed = Some(if b { "true" } else { "false" }.into());
+                }
+            }
+            Kind::U8 { min, max } => {
+                let mut n: u8 = cur.parse().unwrap_or(min);
+                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                    changed = Some(n.to_string());
+                }
+            }
+            Kind::Int { min, max } => {
+                let mut n: i64 = cur.parse().unwrap_or(min);
+                if ui.add(egui::DragValue::new(&mut n).range(min..=max)).changed() {
+                    changed = Some(n.to_string());
+                }
+            }
+            Kind::Float { min, max } => {
+                let mut f: f64 = cur.parse().unwrap_or(0.0);
+                let speed = ((max - min) / 500.0).clamp(0.001, 1.0);
+                if ui.add(egui::DragValue::new(&mut f).range(min..=max).speed(speed)).changed() {
+                    changed = Some(format!("{}", f));
+                }
+            }
+            Kind::Choice(names) => {
+                let cur_idx = names.iter().position(|n| *n == cur)
+                    .unwrap_or_else(|| cur.parse().unwrap_or(0));
+                let mut sel = cur_idx;
+                egui::ComboBox::from_id_salt(v.name)
+                    .selected_text(names.get(sel).copied().unwrap_or(""))
+                    .width(140.0)
+                    .show_ui(ui, |ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            ui.selectable_value(&mut sel, i, *name);
+                        }
+                    });
+                if sel != cur_idx { changed = Some(sel.to_string()); }
+            }
+            Kind::Color => {
+                let rgb = u32::from_str_radix(cur.trim_start_matches("0x")
+                    .trim_start_matches("0X"), 16).unwrap_or(0);
+                let mut c = egui::Color32::from_rgb(
+                    (rgb >> 16) as u8, (rgb >> 8) as u8, rgb as u8);
+                if ui.color_edit_button_srgba(&mut c).changed() {
+                    changed = Some(format!("0x{:02X}{:02X}{:02X}", c.r(), c.g(), c.b()));
+                }
+            }
+            Kind::Text => {
+                let mut s = cur.clone();
+                if ui.add(egui::TextEdit::singleline(&mut s).desired_width(150.0)).changed() {
+                    changed = Some(s);
+                }
+            }
+        }
+        if let (Some(nv), true) = (changed, v.wired) {
+            match crate::varreg::env_set(&mut self.env, v.name, &nv) {
+                Ok(_)  => { let _ = self.env.save(); }
+                Err(e) => self.history.push(format!("  ! {}: {}", v.name, e)),
+            }
+        }
+    }
+
     /// Re-issue the fillet prompt with the current radius, trim mode,
     /// and multiple-mode badges. Called after any sub-option toggle.
     fn refresh_fillet_prompt(&mut self) {
@@ -15550,12 +15740,76 @@ fn active_snap_letters(s: SnapSet) -> String {
     buf
 }
 
-// ---- Settings-window widgets ----------------------------------------------
+// ---- Registry-driven settings page widgets --------------------------------
+
+/// A left-sidebar section entry: name + variable count, selectable.
+fn settings_section_item(ui: &mut egui::Ui, name: &str, count: usize, selected: bool) -> bool {
+    let h = 26.0;
+    let (rect, resp) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), h), egui::Sense::click());
+    let bg = if selected {
+        egui::Color32::from_rgb(38, 54, 72)
+    } else if resp.hovered() {
+        egui::Color32::from_rgb(32, 37, 46)
+    } else {
+        egui::Color32::TRANSPARENT
+    };
+    ui.painter().rect_filled(rect, 3.0, bg);
+    if selected {
+        ui.painter().rect_filled(
+            egui::Rect::from_min_size(rect.left_top(), egui::vec2(3.0, h)),
+            0.0, egui::Color32::from_rgb(91, 155, 213));
+    }
+    let txt_c = if selected { egui::Color32::from_rgb(225, 232, 240) }
+               else { egui::Color32::from_rgb(170, 178, 190) };
+    ui.painter().text(egui::pos2(rect.left() + 10.0, rect.center().y),
+        egui::Align2::LEFT_CENTER, name, egui::FontId::proportional(12.5), txt_c);
+    ui.painter().text(egui::pos2(rect.right() - 8.0, rect.center().y),
+        egui::Align2::RIGHT_CENTER, count.to_string(),
+        egui::FontId::monospace(10.0), egui::Color32::from_rgb(110, 118, 130));
+    resp.clicked()
+}
+
+/// (colour, label) for a variable status.
+fn settings_status_meta(s: crate::varreg::Status) -> (egui::Color32, &'static str) {
+    use crate::varreg::Status;
+    match s {
+        Status::Active    => (egui::Color32::from_rgb(67, 181, 129), "ACTIVE"),
+        Status::Planned   => (egui::Color32::from_rgb(91, 155, 213), "PLANNED"),
+        Status::Stub      => (egui::Color32::from_rgb(120, 128, 140), "STUB"),
+        Status::Tentative => (egui::Color32::from_rgb(212, 168, 83), "TENTAT."),
+    }
+}
+
+/// A small pill badge for a variable's status.
+fn settings_status_badge(ui: &mut egui::Ui, s: crate::varreg::Status) {
+    let (col, label) = settings_status_meta(s);
+    let galley = ui.painter().layout_no_wrap(
+        label.to_string(), egui::FontId::proportional(9.0), col);
+    let pad = egui::vec2(6.0, 3.0);
+    let (rect, _resp) = ui.allocate_exact_size(
+        galley.size() + pad * 2.0, egui::Sense::hover());
+    ui.painter().rect(rect, 3.0, col.linear_multiply(0.12),
+        egui::Stroke::new(1.0, col.linear_multiply(0.5)));
+    ui.painter().galley(rect.center() - galley.size() * 0.5, galley, col);
+}
+
+/// The status legend shown in the panel header.
+fn settings_legend(ui: &mut egui::Ui) {
+    use crate::varreg::Status;
+    for s in [Status::Tentative, Status::Stub, Status::Planned, Status::Active] {
+        let (col, label) = settings_status_meta(s);
+        ui.label(egui::RichText::new(label).size(9.0).color(col));
+    }
+}
+
+// ---- Legacy settings-window widgets (kept for env preview helpers) ---------
 //
 // Each row pairs the cryptic field name (bold, monospace) with a plain-
 // English description and a type-appropriate input. The cryptic name is
 // what gets persisted; the description is just for humans.
 
+#[allow(dead_code)]
 fn env_row(ui: &mut egui::Ui, key: &str, desc: &str, body: impl FnOnce(&mut egui::Ui)) {
     ui.horizontal(|ui| {
         ui.add_sized([70.0, 18.0],
@@ -19413,117 +19667,8 @@ impl eframe::App for CadApp {
             if !keep { self.snap_window_open = false; }
         }
 
-        // ---- User-Environment Settings window ------------------------------
-        if self.settings_open {
-            let mut keep = true;
-            let mut save_now = false;
-            egui::Window::new("USER-ENVIRONMENT SETTINGS")
-                .open(&mut keep)
-                .resizable(true)
-                .default_width(760.0)
-                .default_height(560.0)
-                .default_pos(egui::pos2(40.0, 80.0))
-                .show(ctx, |ui| {
-                    ui.label("AutoCAD-style SYSVARS for RUST_CAD. Persists to ~/.config/rust_cad/user_env.txt");
-                    ui.separator();
-                    // Horizontal split: settings list on the left, live
-                    // preview on the right. Preview reflects current values
-                    // in real time as the user drags sliders / toggles boxes.
-                    ui.horizontal(|ui| {
-                        ui.vertical(|ui| {
-                            ui.set_min_width(450.0);
-                            ui.set_max_width(520.0);
-                            egui::ScrollArea::vertical()
-                                .id_salt("env_scroll")
-                                .max_height(440.0)
-                                .show(ui, |ui| {
-                        ui.heading("Snap & picking");
-                        env_u8(ui, "SpTGSZ", "Object-snap target height (px)",
-                            &mut self.env.SpTGSZ, 4, 80);
-                        env_u8(ui, "PkBxSz", "Pickbox height (px)",
-                            &mut self.env.PkBxSz, 1, 40);
-                        env_u8(ui, "CrsHrS", "Crosshair size (% of viewport)",
-                            &mut self.env.CrsHrS, 1, 100);
-
-                        ui.separator();
-                        ui.heading("Dialogs");
-                        env_bool(ui, "AtDlgM", "Attribute entry dialog on INSERT",
-                            &mut self.env.AtDlgM);
-                        env_bool(ui, "AtPrmM", "Attribute prompting during INSERT",
-                            &mut self.env.AtPrmM);
-                        env_bool(ui, "CmDlgM", "Dialog boxes for PLOT, etc.",
-                            &mut self.env.CmDlgM);
-                        env_bool(ui, "FlDlgM", "Use OS file-navigation dialogs",
-                            &mut self.env.FlDlgM);
-
-                        ui.separator();
-                        ui.heading("Display");
-                        env_u8_choice(ui, "DrDspM", "Dragging display during MOVE/COPY",
-                            &mut self.env.DrDspM, &["off", "on", "auto"]);
-                        env_bool(ui, "MnuBar", "Classic menu bar",
-                            &mut self.env.MnuBar);
-                        env_bool(ui, "TltEnb", "Toolbar/ribbon tooltips",
-                            &mut self.env.TltEnb);
-                        env_bool(ui, "RllTp",  "Tooltips on dobject rollover",
-                            &mut self.env.RllTp);
-                        env_bool(ui, "SelPrv", "Preview-highlight on hover",
-                            &mut self.env.SelPrv);
-                        env_bool(ui, "HltSel", "Highlight selected dobjects",
-                            &mut self.env.HltSel);
-                        env_u8_choice(ui, "WpFrmM", "Wipeout frame display",
-                            &mut self.env.WpFrmM, &["off", "on", "on for selection only"]);
-
-                        ui.separator();
-                        ui.heading("Grips");
-                        env_bool(ui, "GrpEnb", "Enable grips",
-                            &mut self.env.GrpEnb);
-                        env_bool(ui, "GrpBlk", "Grips inside blocks",
-                            &mut self.env.GrpBlk);
-                        env_color(ui, "GrClrU", "Unselected grip colour",
-                            &mut self.env.GrClrU);
-                        env_color(ui, "GrClrS", "Selected (hot) grip colour",
-                            &mut self.env.GrClrS);
-                        env_u8(ui, "GrpSz",  "Grip size (px)",
-                            &mut self.env.GrpSz, 1, 20);
-                        env_u8(ui, "GrpHvR", "Grip hover + grab radius (px)",
-                            &mut self.env.GrpHvR, 4, 80);
-
-                        ui.separator();
-                        ui.heading("External references");
-                        env_u8_choice(ui, "XrLdMd", "Xref demand-loading mode",
-                            &mut self.env.XrLdMd, &["off", "on", "on with copy"]);
-                        env_text(ui, "XrTmpP", "Temp path for xref copies",
-                            &mut self.env.XrTmpP);
-                            });   // ← close inner ScrollArea
-                        });       // ← close left vertical
-                        ui.separator();
-                        // Right column: live preview
-                        ui.vertical(|ui| {
-                            ui.heading("Live preview");
-                            ui.small("Reflects current values in real time.");
-                            ui.add_space(4.0);
-                            draw_settings_preview(ui, &self.env);
-                        });
-                    });
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        if ui.button("Save now").clicked() { save_now = true; }
-                        if ui.button("Reload from disk").clicked() {
-                            self.env = UserEnv::load();
-                        }
-                        if ui.button("Reset to defaults").clicked() {
-                            self.env = UserEnv::default();
-                        }
-                    });
-                });
-            if !keep { self.settings_open = false; }
-            if save_now {
-                match self.env.save() {
-                    Ok(_)  => self.history.push("  settings saved".into()),
-                    Err(e) => self.history.push(format!("  ! settings save failed: {}", e)),
-                }
-            }
-        }
+        // ---- User-Environment Settings window (registry-driven) ------------
+        self.settings_window(ctx);
 
         // ---- arc method picker ----------------------------------------------
         if self.arc_picker_open {
