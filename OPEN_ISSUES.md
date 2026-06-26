@@ -64,6 +64,20 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ---
 
+## 🟡 SETTINGS / VARIABLES — registry-driven (mostly done)
+- **Single source of truth is now `cad_app/src/varreg.rs`** (240 vars, 40 wired
+  = the real UserEnv fields). `Variables.md` + the HTML mockup are superseded by
+  it — keep `varreg.rs` updated; reconcile `Variables.md` to match when time
+  permits. Decisions locked: show ALL vars, code defaults win, Option A (unwired
+  disabled), all three CLI styles.
+- DONE: registry `c4998fb`; settings page (sidebar + typed rows + status badges)
+  `0199360`; CLI `setvar`/bare-name `b9b53c3`.
+- OPEN follow-ups: (1) wire the ~6 overlap vars to LIVE state (OsnOpt↔snap_enabled,
+  PkAdd↔select_remove_mode, SnpPri, audit colours) instead of independent fields;
+  (2) flip Planned→Active + wire read-sites as features land; (3) old env_bool/
+  env_u8/draw_settings_preview helpers now dead (remove or repurpose);
+  (4) section icons in the sidebar (mockup has emoji per section).
+
 ## 🟡 UI REDESIGN — in progress
 
 ### U2. Quick Access Toolbar — persistence + real icons
