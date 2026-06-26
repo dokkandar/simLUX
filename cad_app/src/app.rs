@@ -13815,6 +13815,13 @@ impl CadApp {
         let frame = egui::Frame::popup(&ctx.style())
             .fill(bg)
             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)))
+            .rounding(0.0)                              // right-angle corners
+            .shadow(egui::epaint::Shadow {              // drop shadow to bottom-right
+                offset: egui::vec2(4.0, 4.0),
+                blur: 10.0,
+                spread: 0.0,
+                color: egui::Color32::from_black_alpha(120),
+            })
             .inner_margin(egui::Margin::symmetric(8.0, 6.0));
         // Open directly beneath the chevron.
         let pos = self.qat_chevron_rect
@@ -16770,17 +16777,26 @@ impl QatAction {
 /// so it works from the repo root, the crate dir, or next to the exe. Returns
 /// None if the file isn't there (caller draws a placeholder).
 fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let candidates = [
+    // Prefer the vector SVG (crisp at any size); fall back to a PNG.
+    let svg = [
+        concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.svg"),
+        "cad_app/assets/logo.svg",
+        "assets/logo.svg",
+    ];
+    for path in svg {
+        if let Ok(bytes) = std::fs::read(path) {
+            if let Some(tex) = rasterize_svg_logo(ctx, &bytes) { return Some(tex); }
+        }
+    }
+    let png = [
         concat!(env!("CARGO_MANIFEST_DIR"), "/assets/logo.png"),
         "cad_app/assets/logo.png",
         "assets/logo.png",
     ];
-    for path in candidates {
+    for path in png {
         let Ok(bytes) = std::fs::read(path) else { continue };
         let Ok(img) = image::load_from_memory(&bytes) else { continue };
-        // Pre-downscale with a high-quality filter so the small on-screen logo
-        // stays crisp (raw 626px → ~50px bilinear in egui looks rough/aliased).
-        let img = img.resize(128, 128, image::imageops::FilterType::Lanczos3);
+        let img = img.resize(256, 256, image::imageops::FilterType::Lanczos3);
         let rgba = img.to_rgba8();
         let (w, h) = rgba.dimensions();
         let color = egui::ColorImage::from_rgba_unmultiplied(
@@ -16788,6 +16804,24 @@ fn load_logo_texture(ctx: &egui::Context) -> Option<egui::TextureHandle> {
         return Some(ctx.load_texture("autorasm_logo", color, egui::TextureOptions::LINEAR));
     }
     None
+}
+
+/// Rasterize an SVG to a texture at a generous resolution so it stays sharp.
+fn rasterize_svg_logo(ctx: &egui::Context, data: &[u8]) -> Option<egui::TextureHandle> {
+    use resvg::{tiny_skia, usvg};
+    let opt = usvg::Options::default();
+    let tree = usvg::Tree::from_data(data, &opt).ok()?;
+    let size = tree.size();
+    // Render so the longest side is ~256 px (≥ any sensible on-screen size).
+    let target = 256.0;
+    let scale = target / size.width().max(size.height());
+    let pw = (size.width() * scale).ceil().max(1.0) as u32;
+    let ph = (size.height() * scale).ceil().max(1.0) as u32;
+    let mut pixmap = tiny_skia::Pixmap::new(pw, ph)?;
+    resvg::render(&tree, tiny_skia::Transform::from_scale(scale, scale), &mut pixmap.as_mut());
+    let color = egui::ColorImage::from_rgba_premultiplied(
+        [pw as usize, ph as usize], pixmap.data());
+    Some(ctx.load_texture("autorasm_logo", color, egui::TextureOptions::LINEAR))
 }
 
 /// Painted placeholder logo (brand-teal gear ring + gold "R"), used until the
@@ -16905,16 +16939,12 @@ fn qat_customize_button(ui: &mut egui::Ui, open: bool) -> egui::Response {
     // Chevron uses the same colour as the menu/category text.
     let col = ui.visuals().widgets.inactive.fg_stroke.color;
     let size = egui::vec2(20.0, 28.0);
+    let _ = open;   // no special background when the drop window is open
     let (resp, painter) = ui.allocate_painter(size, egui::Sense::click());
     let rect = resp.rect;
-    let bg = if open {
-        egui::Color32::from_rgb(60, 110, 175)
-    } else if resp.hovered() {
-        egui::Color32::from_rgb(48, 58, 72)
-    } else {
-        egui::Color32::TRANSPARENT
-    };
-    painter.rect(rect, 4.0, bg, egui::Stroke::NONE);
+    if resp.hovered() {
+        painter.rect(rect, 4.0, egui::Color32::from_rgb(48, 58, 72), egui::Stroke::NONE);
+    }
     let cx = rect.center().x;
     let top = rect.top() + 10.0;
     // Short horizontal bar.

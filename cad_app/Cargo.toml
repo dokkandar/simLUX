@@ -18,8 +18,9 @@ eframe     = { version = "0.30", default-features = false, features = ["default_
 egui       = "0.30"
 egui_glow  = "0.30"
 glow       = "0.14"
-# PNG decoding for the brand logo (assets/logo.png). PNG-only to stay light.
+# Logo: SVG (vector → crisp at any size) via resvg, with PNG as a fallback.
 image      = { version = "0.25", default-features = false, features = ["png"] }
+resvg      = { version = "0.44", default-features = false }
 
 # Linux-only windowing backends (the original Arch Linux build used these).
 [target.'cfg(target_os = "linux")'.dependencies]
