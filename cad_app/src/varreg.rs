@@ -1,6 +1,10 @@
 //! varreg.rs — the canonical variable registry. Single source of truth for
 //! the settings page and the command line. Each row is presentation +
 //! metadata; the WIRED ones map to real UserEnv fields via env_get/env_set.
+//!
+//! After editing this file, SETTINGS.md's tables are regenerated automatically
+//! by the pre-commit hook (.githooks/pre-commit → tools/gen-settings.ps1).
+//! To regenerate by hand: powershell -ExecutionPolicy Bypass -File tools/gen-settings.ps1
 #![allow(non_snake_case)]
 use crate::settings::UserEnv;
 

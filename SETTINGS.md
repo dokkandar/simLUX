@@ -9,7 +9,7 @@ the variable catalog. **Keep this updated whenever the variable system changes**
 > bottom of this file are GENERATED from it — regenerate after editing the
 > registry (see "Regenerating the tables").
 
-Last updated: 2026-06-26 · Branch `windows-ui-session-2026-06-20`
+Last updated: 2026-06-26 (branch windows-ui-session-2026-06-20)
 
 ---
 
@@ -468,7 +468,7 @@ tables"). Everything above this line is hand-maintained prose.
 | `SelPlsMax` | Float | `0.85` | Planned |  | Selection-basket pulse alpha max |
 | `SelPlsHz` | Float | `1.4` | Planned |  | Selection-basket pulse frequency |
 | `HitTolPx` | Float | `10` | Planned |  | Hit-test tolerance (pixels) (overlaps PkBxSz) |
-| `IntRad` | Float | `50` | Planned |  | âˆ© click search radius |
+| `IntRad` | Float | `50` | Planned |  | ∩ click search radius |
 | `PairLim` | Int 0-1_000_000_000 | `5000000` | Planned |  | Max candidate pair count |
 | `TabCycR` | Float | `4` | Planned |  | Cursor-move px before Tab cycle resets |
 | `ArrCol` | Int 0-1_000_000 | `10` | Planned |  | Array default columns |
@@ -512,4 +512,3 @@ tables"). Everything above this line is hand-maintained prose.
 | `TxHt` | Float | `0.25` | Active | yes | Default text height (world units) |
 | `WlCnL` | Bool | `true` | Active | yes | Wall centerline visible |
 | `TrmMd` | Bool | `true` | Active | yes | Trim mode shared by Fillet and Chamfer (TRIMMODE) |
-

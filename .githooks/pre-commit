@@ -1,0 +1,19 @@
+#!/bin/sh
+# Auto-regenerate SETTINGS.md tables when the variable registry changes.
+# Fail-safe: never blocks a commit — if regen can't run, it just warns.
+#
+# Activate once per clone:  git config core.hooksPath .githooks
+
+if git diff --cached --name-only | grep -q 'cad_app/src/varreg.rs'; then
+  if command -v powershell.exe >/dev/null 2>&1; then
+    echo "[pre-commit] varreg.rs changed -> regenerating SETTINGS.md tables"
+    if powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/gen-settings.ps1; then
+      git add SETTINGS.md
+    else
+      echo "[pre-commit] gen-settings.ps1 failed; committing without regen"
+    fi
+  else
+    echo "[pre-commit] powershell.exe not found; skipping SETTINGS.md regen"
+  fi
+fi
+exit 0
