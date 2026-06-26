@@ -130,9 +130,12 @@ Open via the **settings…** toolbar button.
 ## 10. Regenerating the tables
 
 The "Editable variables" and "Full catalog" tables below are generated from
-`varreg.rs`. After editing the registry, re-run the generator (a PowerShell
-snippet kept with this doc / ask the assistant to "regenerate SETTINGS.md
-tables"). Everything above this line is hand-maintained prose.
+`varreg.rs` by **`tools/gen-settings.ps1`**, which runs **automatically** via the
+**`.githooks/pre-commit`** hook whenever `cad_app/src/varreg.rs` is part of a
+commit (regenerates the tables + re-stages this file). Regenerate by hand:
+`powershell -ExecutionPolicy Bypass -File tools/gen-settings.ps1`. Activate the
+hook once per clone: `git config core.hooksPath .githooks`. Only the section
+below the marker is rewritten; the prose above it is hand-maintained.
 
 ## 11. Changelog
 
@@ -141,7 +144,8 @@ tables"). Everything above this line is hand-maintained prose.
 | 2026-06-25 | `c4998fb` | Added reconciled variable registry `varreg.rs` (240 vars, 40 wired) |
 | 2026-06-25 | `0199360` | Registry-driven settings page (sidebar + typed rows + status badges, Option A) |
 | 2026-06-25 | `b9b53c3` | Command-line variable access (`setvar` + bare name) via the shared validated setter |
-| 2026-06-26 | (this file) | Created SETTINGS.md living reference |
+| 2026-06-26 | `2885905` | Created SETTINGS.md living reference |
+| 2026-06-26 | `e6060b2` | Auto-regenerate tables via tools/gen-settings.ps1 + pre-commit hook |
 
 ---
 <!-- ===== GENERATED TABLES BELOW (from varreg.rs) — do not hand-edit ===== -->
