@@ -4,6 +4,7 @@ mod dbg_recorder;
 mod gpu;
 mod hatch_trace;
 mod settings;
+mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
 
 fn main() -> Result<(), eframe::Error> {
