@@ -13966,49 +13966,57 @@ impl CadApp {
         egui::Window::new("USER-ENVIRONMENT SETTINGS")
             .open(&mut keep)
             .resizable(true)
-            .default_width(820.0)
-            .default_height(580.0)
+            .default_size([840.0, 600.0])
             .default_pos(egui::pos2(40.0, 70.0))
             .show(ctx, |ui| {
-                ui.horizontal_top(|ui| {
-                    // ---- left sidebar: section list -------------------------
-                    ui.vertical(|ui| {
-                        ui.set_width(210.0);
-                        egui::ScrollArea::vertical().id_salt("set_sections")
-                            .max_height(500.0)
-                            .show(ui, |ui| {
-                                for sec in &sections {
-                                    let count = crate::varreg::VARS.iter()
-                                        .filter(|v| v.section == *sec).count();
-                                    let selected = self.settings_section == *sec;
-                                    if settings_section_item(ui, sec, count, selected) {
-                                        self.settings_section = sec.to_string();
+                // Reserve the footer row at the BOTTOM, then let the body
+                // (sidebar + rows) fill ALL the remaining height — so the
+                // lists grow/shrink with the window, there's no blank gap, and
+                // the window resizes freely (no fixed inner heights forcing a
+                // minimum). Clamp guards against egui's first-frame huge value.
+                let footer_h = 34.0;
+                let body_h = (ui.available_height() - footer_h).clamp(140.0, 4000.0);
+                ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
+                    ui.horizontal_top(|ui| {
+                        // ---- left sidebar: section list ---------------------
+                        ui.vertical(|ui| {
+                            ui.set_width(210.0);
+                            egui::ScrollArea::vertical().id_salt("set_sections")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for sec in &sections {
+                                        let count = crate::varreg::VARS.iter()
+                                            .filter(|v| v.section == *sec).count();
+                                        let selected = self.settings_section == *sec;
+                                        if settings_section_item(ui, sec, count, selected) {
+                                            self.settings_section = sec.to_string();
+                                        }
                                     }
-                                }
-                            });
-                    });
-                    ui.separator();
-                    // ---- right panel: rows for the selected section ---------
-                    ui.vertical(|ui| {
-                        ui.horizontal(|ui| {
-                            ui.heading(egui::RichText::new(&self.settings_section).size(15.0));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                settings_legend(ui);
-                            });
+                                });
                         });
-                        ui.label(egui::RichText::new(
-                            "AutoCAD-style SYSVARS. Edits to Active/Planned vars persist to ~/.config/rust_cad/user_env.txt")
-                            .size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
                         ui.separator();
-                        let sec = self.settings_section.clone();
-                        egui::ScrollArea::vertical().id_salt("set_rows")
-                            .max_height(470.0)
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                for v in crate::varreg::VARS.iter().filter(|v| v.section == sec) {
-                                    self.settings_row(ui, v);
-                                }
+                        // ---- right panel: rows for the selected section -----
+                        ui.vertical(|ui| {
+                            ui.horizontal(|ui| {
+                                ui.heading(egui::RichText::new(&self.settings_section).size(15.0));
+                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                    settings_legend(ui);
+                                });
                             });
+                            ui.label(egui::RichText::new(format!(
+                                "{} variables  ·  edits to Active/Planned vars persist to ~/.config/rust_cad/user_env.txt",
+                                crate::varreg::VARS.iter().filter(|v| v.section == self.settings_section).count()))
+                                .size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
+                            ui.separator();
+                            let sec = self.settings_section.clone();
+                            egui::ScrollArea::vertical().id_salt("set_rows")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    for v in crate::varreg::VARS.iter().filter(|v| v.section == sec) {
+                                        self.settings_row(ui, v);
+                                    }
+                                });
+                        });
                     });
                 });
                 ui.separator();
