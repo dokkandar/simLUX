@@ -25,6 +25,130 @@ mod pedit;
 // 5 million pairs is roughly half a second on this CPU.
 const PAIR_LIMIT: usize = 5_000_000;
 
+// ── Properties-panel chrome (app-layer only — no kernel involvement) ──────
+const PP_BG_LO:  egui::Color32 = egui::Color32::from_rgb(0x14, 0x1c, 0x25);
+const PP_BG_HI:  egui::Color32 = egui::Color32::from_rgb(0x22, 0x2b, 0x34);
+const PP_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x49, 0x4c);
+const PP_TEXT:   egui::Color32 = egui::Color32::from_rgb(0xda, 0xe3, 0xef);
+const PP_LABEL:  egui::Color32 = egui::Color32::from_rgb(0xba, 0xc9, 0xcc);
+const PP_MUTED:  egui::Color32 = egui::Color32::from_rgb(0xb4, 0xb5, 0xb7);
+const PP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x00, 0xda, 0xf3);
+const PP_LABEL_W: f32 = 84.0;   // fixed left-label column width
+const PP_ROW_H:   f32 = 24.0;   // uniform field height
+const PP_ROW_GAP: f32 = 7.0;    // vertical gap between rows
+
+/// A labelled property row: muted fixed-width label on the left, a value
+/// area that fills the rest. `add` receives the value-cell width so every
+/// field lines up at the same left edge and width.
+fn pp_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) {
+    ui.horizontal(|ui| {
+        let (lr, _) = ui.allocate_exact_size(
+            egui::vec2(PP_LABEL_W, PP_ROW_H), egui::Sense::hover());
+        ui.painter().text(egui::pos2(lr.left(), lr.center().y),
+            egui::Align2::LEFT_CENTER, label,
+            egui::FontId::proportional(13.0), PP_LABEL);
+        pp_capture(ui, &format!("{} · label", label), lr);
+        let w = (ui.available_width() - 2.0).max(40.0);
+        let vx = lr.right() + ui.spacing().item_spacing.x;
+        pp_capture(ui, &format!("{} · value", label),
+            egui::Rect::from_min_size(egui::pos2(vx, lr.top()), egui::vec2(w, PP_ROW_H)));
+        add(ui, w);
+    });
+    ui.add_space(PP_ROW_GAP);
+}
+
+/// Draw a flat bordered field box of `w × PP_ROW_H`. Returns its rect +
+/// response (click sense when `clickable`); caller paints the contents.
+fn pp_box(ui: &mut egui::Ui, w: f32, clickable: bool) -> (egui::Rect, egui::Response) {
+    let sense = if clickable { egui::Sense::click() } else { egui::Sense::hover() };
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), sense);
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, egui::Rounding::ZERO, PP_BG_LO);
+    let edge = if clickable && resp.hovered() { PP_ACCENT } else { PP_BORDER };
+    let s = egui::Stroke::new(1.0, edge);
+    p.line_segment([rect.left_top(),    rect.right_top()],    s);
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], s);
+    p.line_segment([rect.left_top(),    rect.left_bottom()],  s);
+    p.line_segment([rect.right_top(),   rect.right_bottom()], s);
+    (rect, resp)
+}
+
+/// Record one element's rect into the layout-capture buffer (egui temp
+/// data), but only while capture is armed. Free helpers and call sites
+/// sprinkle this so the recorder can dump the whole menu's geometry.
+fn pp_capture(ui: &egui::Ui, name: &str, rect: egui::Rect) {
+    let on = ui.data(|d| d.get_temp::<bool>(egui::Id::new("pp_cap_on")).unwrap_or(false));
+    if !on { return; }
+    ui.data_mut(|d| {
+        let id = egui::Id::new("pp_cap_buf");
+        let mut v: Vec<(String, egui::Rect)> = d.get_temp(id).unwrap_or_default();
+        v.push((name.to_string(), rect));
+        d.insert_temp(id, v);
+    });
+}
+
+/// Auto-close a top category menu once the pointer has left BOTH the menu bar
+/// (`bar_rect`) and this menu's popup. Call at the END of a top-level menu
+/// closure. NOTE: only safe for menus WITHOUT submenus — a side-opening submenu
+/// flyout sits outside `ui.min_rect()`, so this would wrongly close the parent
+/// while the user is in the child. Submenu-bearing menus keep click-to-close.
+fn menu_autoclose(ui: &mut egui::Ui, bar_rect: egui::Rect) {
+    let pop = ui.min_rect().expand(6.0);
+    match ui.input(|i| i.pointer.hover_pos()) {
+        Some(p) if pop.contains(p) || bar_rect.contains(p) => {}
+        _ => ui.close_menu(),
+    }
+}
+
+/// Record the CONTAINER rect of a menu/popup body. Call ONCE at the end of
+/// any menu closure (`ui.menu_button` body, `context_menu`, popup) — by then
+/// `ui.min_rect()` bounds everything the body added, so this captures the
+/// whole dropdown/popup box. One line makes any menu show up in the recorder.
+/// Captured widgets inside (rail icons, etc.) record themselves via `pp_capture`.
+fn pp_cap_ui(ui: &egui::Ui, name: &str) {
+    pp_capture(ui, name, ui.min_rect());
+}
+
+/// A 1px full-width divider line in the panel border colour.
+fn pp_divider(ui: &mut egui::Ui) {
+    let w = ui.available_width();
+    let (r, _) = ui.allocate_exact_size(egui::vec2(w, 1.0), egui::Sense::hover());
+    ui.painter().line_segment([r.left_center(), r.right_center()],
+        egui::Stroke::new(1.0, PP_BORDER));
+    pp_capture(ui, "divider", r);
+}
+
+/// A collapsible section: full-width clickable header with a painted triangle
+/// (label colour, 30% larger than the title) + caps title. No body indent /
+/// left vline. Open state persists per `id_src`.
+fn pp_section(ui: &mut egui::Ui, id_src: &str, title: &str,
+              default_open: bool, body: impl FnOnce(&mut egui::Ui)) {
+    let id = ui.make_persistent_id(id_src);
+    let mut open = ui.data_mut(|d| d.get_temp::<bool>(id)).unwrap_or(default_open);
+    let w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, 18.0), egui::Sense::click());
+    let p = ui.painter_at(rect);
+    let c = egui::pos2(rect.left() + 7.0, rect.center().y);
+    let sz = 4.5;  // ~30% larger than egui's default header triangle
+    let tri = if open {
+        vec![egui::pos2(c.x - sz, c.y - sz * 0.55),
+             egui::pos2(c.x + sz, c.y - sz * 0.55),
+             egui::pos2(c.x, c.y + sz * 0.7)]
+    } else {
+        vec![egui::pos2(c.x - sz * 0.55, c.y - sz),
+             egui::pos2(c.x - sz * 0.55, c.y + sz),
+             egui::pos2(c.x + sz * 0.7, c.y)]
+    };
+    p.add(egui::Shape::convex_polygon(tri, PP_LABEL, egui::Stroke::NONE));
+    p.text(egui::pos2(rect.left() + 20.0, rect.center().y),
+        egui::Align2::LEFT_CENTER, title, egui::FontId::monospace(10.0), PP_LABEL);
+    pp_capture(ui, &format!("SECTION: {}", title), rect);
+    if resp.clicked() { open = !open; }
+    ui.data_mut(|d| d.insert_temp(id, open));
+    if open { ui.add_space(3.0); body(ui); }
+    ui.add_space(5.0);
+}
+
 /// Where the user's customised ACI-wheel permutation lives. Sits next to
 /// the other project-root files (Audit.html, Variables.md, etc.) so the
 /// arrangement travels with the codebase, not a per-user config dir.
@@ -87,6 +211,22 @@ enum ArcMethod {
 }
 
 impl ArcMethod {
+    /// Compact code shown on the rail flyout + icon (e.g. "SCE").
+    fn short(&self) -> &'static str {
+        match self {
+            ArcMethod::ThreePoints       => "3P",
+            ArcMethod::StartCenterEnd    => "SCE",
+            ArcMethod::StartCenterAngle  => "SCA",
+            ArcMethod::StartCenterLength => "SCL",
+            ArcMethod::StartEndAngle     => "SEA",
+            ArcMethod::StartEndDirection => "SED",
+            ArcMethod::StartEndRadius    => "SER",
+            ArcMethod::CenterStartEnd    => "CSE",
+            ArcMethod::CenterStartAngle  => "CSA",
+            ArcMethod::CenterStartLength => "CSL",
+            ArcMethod::Continue          => "CON",
+        }
+    }
     fn name(&self) -> &'static str {
         match self {
             ArcMethod::ThreePoints       => "3-Point",
@@ -645,9 +785,41 @@ pub struct CadApp {
     /// Open/closed state for each dockable Window panel. Default true
     /// for the most-used panels. Toggled from the Tools menu.
     cmd_window_open:     bool,
+    /// Screen rect of the top menu-bar panel (updated each frame). Used to
+    /// keep a hover-opened category menu open while the pointer is still over
+    /// its button, and close it once the pointer leaves both bar and popup.
+    menubar_rect:        egui::Rect,
+    /// When true the command bar is docked as a bottom strip (above the status
+    /// bar, under the canvas) instead of floating. Drag the floating window to
+    /// the bottom edge to dock; the ⏏ button in the docked strip undocks.
+    cmd_docked:          bool,
     layers_window_open:  bool,
     pens_window_open:    bool,
     info_window_open:    bool,
+    /// One-shot: when true, the next Properties-panel render records the
+    /// pixel geometry of every element into the session recorder, then
+    /// clears the flag. Activated from the recorder window.
+    props_layout_capture: bool,
+    /// Left command rails (Phase 1): which are shown + the last-invoked
+    /// command name for the active-icon highlight.
+    draw_rail_open:      bool,
+    modify_rail_open:    bool,
+    /// A rail is either docked (SidePanel, canvas reflows after it) or
+    /// floating (draggable Area over the canvas). Drag the strip to undock;
+    /// drag back to the left edge to re-dock.
+    draw_rail_floating:  bool,
+    modify_rail_floating: bool,
+    draw_rail_pos:       egui::Pos2,
+    modify_rail_pos:     egui::Pos2,
+    rail_active:         String,
+    /// Per-rail visible command lists (indices into DRAW_CMDS / MODIFY_CMDS)
+    /// so the user can delete (right-click) and re-add (+) commands.
+    draw_items:          Vec<usize>,
+    modify_items:        Vec<usize>,
+    /// Last method picked from a command's ▼ flyout (cmd → method key). The
+    /// rail icon renders THAT method's glyph so the button reflects the last
+    /// variant used (e.g. circle shows the 3-Point glyph after picking 3P).
+    rail_last_method:    std::collections::HashMap<String, String>,
     dobjects_window_open: bool,
     /// Pattern args for the in-progress hatch op — set when the user
     /// runs `hatch [NAME] [scale] [angle]`, consumed by `apply_hatch`
@@ -1003,6 +1175,14 @@ pub struct CadApp {
     /// `Some` while a command like CIRCLE is collecting its inputs. See
     /// `CmdFlow` + COMMAND_LINE.md.
     cmd_flow:       Option<CmdFlow>,
+    /// Command-internal UNDO ("U" keyword) baselines, captured when a fresh
+    /// top-level command begins. `cmd_undo_base` = undo-stack depth (so a
+    /// command that snapshots each result — offset/trim/extend — can pop its
+    /// own results without crossing into the prior command). `cmd_base_objs` =
+    /// dobject count (so chained draws like LINE know which segments they
+    /// added). See `command_internal_undo`.
+    cmd_undo_base:  Option<usize>,
+    cmd_base_objs:  Option<usize>,
     /// Command-line TRANSCRIPT — every (prompt, reply) the flow exchanges with
     /// the user. Kept on the command structure for review / replay / future AI.
     transcript:     Vec<PromptReply>,
@@ -2173,8 +2353,8 @@ impl Default for CadApp {
             grip_drag: None,
             last_render_stats:   RenderStats::default(),
             lod_active:          false,
-            screen_stats_open:   true,
-            screen_stats_was_open: true,
+            screen_stats_open:   false,
+            screen_stats_was_open: false,
             hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
@@ -2184,9 +2364,22 @@ impl Default for CadApp {
             press_time:          None,
             press_pos:           None,
             cmd_window_open:     true,
-            layers_window_open:  true,
+            menubar_rect:        egui::Rect::NOTHING,
+            cmd_docked:          false,
+            layers_window_open:  false,
             pens_window_open:    false,
             info_window_open:    false,
+            props_layout_capture: false,
+            draw_rail_open:      true,
+            modify_rail_open:    true,
+            draw_rail_floating:  false,
+            modify_rail_floating: false,
+            draw_rail_pos:       egui::pos2(120.0, 90.0),
+            modify_rail_pos:     egui::pos2(190.0, 90.0),
+            rail_active:         "line".to_string(),
+            draw_items:          (0..DRAW_CMDS.len()).collect(),
+            modify_items:        (0..MODIFY_CMDS.len()).collect(),
+            rail_last_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
                 let mut p = crate::aci_picker::AciPickerState::default();
@@ -2269,7 +2462,7 @@ impl Default for CadApp {
             index_dirty: true,
             index_label: String::new(),
             render_mode:  RenderMode::Cpu,
-            debug_open:   true,
+            debug_open:   false,
             gpu_renderer: StdArc::new(Mutex::new(GpuCircleRenderer::default())),
             gpu_dirty:    true,
             layer_panel_open:   true,
@@ -2309,6 +2502,8 @@ impl Default for CadApp {
             props_edit_gesture: false,
             block_editor:   None,
             cmd_flow:       None,
+            cmd_undo_base:  None,
+            cmd_base_objs:  None,
             transcript:     Vec::new(),
             draft_preview:  true,
             text_draft:     TextDraftState::Off,
@@ -2439,8 +2634,192 @@ toolbar:
   arc      - click center, start point, end point (CCW)
   Esc cancels an in-progress draw";
 
+/// Outcome of a command-internal "U" press. Drives whether `run_command`
+/// returns (handled), reports "nothing left", or falls back to global undo.
+enum CmdUndo { Handled, NothingLeft, NoCommand }
+
 impl CadApp {
     // ---- commands & math -----------------------------------------------
+
+    /// True when ANY command / draw tool / modify flow is mid-operation. Used
+    /// by command-internal undo to decide whether a bare "U" is an in-command
+    /// step-back (something active) or a global undo (nothing active).
+    fn any_command_active(&self) -> bool {
+        self.tool != Tool::None
+            || self.cmd_flow.is_some()
+            || self.select_mode != SelectMode::Off
+            || !matches!(self.trim_state, TrimState::Off)
+            || !matches!(self.extend_state, ExtendState::Off)
+            || self.move_state       != MoveState::Off
+            || self.copy_state       != CopyState::Off
+            || self.paste_state      != PasteState::Off
+            || self.pedit_state      != PeditState::Off
+            || self.rotate_state     != RotateState::Off
+            || self.scale_state      != ScaleState::Off
+            || self.mirror_state     != MirrorState::Off
+            || self.align_state      != AlignState::Off
+            || self.break_state      != BreakState::Off
+            || self.lengthen_state   != LengthenState::Off
+            || self.offset_state     != OffsetState::Off
+            || self.stretch_state    != StretchState::Off
+            || self.matchprops_state != MatchPropsState::Off
+            || self.fillet_state     != FilletState::Off
+            || self.chamfer_state    != ChamferState::Off
+            || self.picking_source
+            || self.intersect_pending_click
+    }
+
+    /// Reverse the LAST step of the currently-active command only (AutoCAD "U"
+    /// keyword). PLINE is NOT handled here — it has its own richer U handler in
+    /// the `Tool::Polyline` block (arc sub-flows, bulges, widths). Returns
+    /// whether it reversed a step, found nothing to reverse, or found no active
+    /// command (so the caller does a global undo). NEVER undoes command
+    /// initiation itself — that's what Esc is for.
+    fn command_internal_undo(&mut self) -> CmdUndo {
+        // 1) CIRCLE prompt-flow — walk the state machine back one captured point.
+        let flow = self.cmd_flow.as_ref().map(|f| (f.name, f.circle));
+        if let Some((name, step)) = flow {
+            if name == "circle" {
+                let back = match step {
+                    CircleStep::P3c(p1, _)              => Some(CircleStep::P3b(p1)),
+                    CircleStep::P3b(_)                  => Some(CircleStep::P3a),
+                    CircleStep::P3a                     => Some(CircleStep::Center),
+                    CircleStep::P2b(_)                  => Some(CircleStep::P2a),
+                    CircleStep::P2a                     => Some(CircleStep::Center),
+                    CircleStep::TtrRadius(o1, p1, _, _) => Some(CircleStep::TtrObj2(o1, p1)),
+                    CircleStep::TtrObj2(_, _)           => Some(CircleStep::TtrObj1),
+                    CircleStep::TtrObj1                 => Some(CircleStep::Center),
+                    CircleStep::Radius(_)
+                    | CircleStep::Diameter(_)           => Some(CircleStep::Center),
+                    CircleStep::Center                  => None, // at start — can't
+                };
+                return match back {
+                    Some(s) => {
+                        self.cmd_flow = Some(CmdFlow { name: "circle", circle: s });
+                        self.flow_show_prompt();
+                        self.history.push("  circle: stepped back one point".into());
+                        CmdUndo::Handled
+                    }
+                    None => CmdUndo::NothingLeft,
+                };
+            }
+            return CmdUndo::NothingLeft; // some other flow active — leave it be
+        }
+
+        // 2) Selection in progress — drop the most-recently picked dobject.
+        if self.select_mode != SelectMode::Off {
+            return match self.selection.pop() {
+                Some(i) => {
+                    self.history.push(format!(
+                        "  selection: removed #{} ({} left)", i, self.selection.len()));
+                    self.gpu_dirty = true;
+                    CmdUndo::Handled
+                }
+                None => CmdUndo::NothingLeft,
+            };
+        }
+
+        // 3) Committed-result modify commands (offset / trim / extend / fillet
+        //    / chamfer). Each result snapshotted the doc, so pop back to — but
+        //    never past — the depth captured when the command began. Fillet and
+        //    chamfer also step back an in-progress FIRST pick when no committed
+        //    result remains (so U "un-picks" before it "un-does").
+        let committed_active = self.offset_state != OffsetState::Off
+            || !matches!(self.trim_state, TrimState::Off)
+            || !matches!(self.extend_state, ExtendState::Off)
+            || self.fillet_state != FilletState::Off
+            || self.chamfer_state != ChamferState::Off;
+        if committed_active {
+            if let Some(base) = self.cmd_undo_base {
+                if self.undo_stack.len() > base {
+                    self.do_undo();
+                    self.history.push(
+                        "  ↶ reversed last result (still in command)".into());
+                    return CmdUndo::Handled;
+                }
+            }
+            // No committed result left — for fillet/chamfer, clear a pending
+            // first-object pick instead (back to "select first object").
+            if let FilletState::WaitingForSecond(r, _, _) = self.fillet_state {
+                self.fillet_state = FilletState::WaitingForFirst(r);
+                self.refresh_fillet_prompt();
+                self.history.push("  fillet: cleared first pick".into());
+                return CmdUndo::Handled;
+            }
+            if let ChamferState::WaitingForSecond(d1, d2, _, _) = self.chamfer_state {
+                self.chamfer_state = ChamferState::WaitingForFirst(d1, d2);
+                self.history.push("  chamfer: cleared first pick".into());
+                return CmdUndo::Handled;
+            }
+            return CmdUndo::NothingLeft;
+        }
+
+        // 4) In-memory draw flows (uncommitted pending points).
+        match self.tool {
+            Tool::Line => {
+                // Chained: the last committed segment is the last dobject; its
+                // start point `a` is where the rubber-band returns to.
+                let base = self.cmd_base_objs.unwrap_or(0);
+                if self.doc.dobjects.len() > base {
+                    if let Some(d) = self.doc.dobjects.pop() {
+                        if let Geom::Line(l) = d.geom {
+                            self.pending = vec![l.a];
+                            self.last_point = Some(l.a);
+                        }
+                        self.intersections.clear();
+                        self.index_dirty = true;
+                        self.gpu_dirty = true;
+                        self.history.push("  line: removed last segment".into());
+                    }
+                    CmdUndo::Handled
+                } else if self.pending.pop().is_some() {
+                    self.last_point = None;
+                    self.set_prompt(current_hint(Tool::Line, self.arc_method, 0));
+                    self.history.push("  line: removed first point".into());
+                    CmdUndo::Handled
+                } else {
+                    CmdUndo::NothingLeft
+                }
+            }
+            Tool::Arc => {
+                if self.pending.pop().is_some() {
+                    let n = self.pending.len();
+                    self.set_prompt(current_hint(Tool::Arc, self.arc_method, n));
+                    self.history.push("  arc: removed last point".into());
+                    CmdUndo::Handled
+                } else { CmdUndo::NothingLeft }
+            }
+            Tool::Rectangle => {
+                if self.pending.pop().is_some() {
+                    self.set_prompt(current_hint(Tool::Rectangle, self.arc_method, 0));
+                    self.history.push("  rectangle: removed last corner".into());
+                    CmdUndo::Handled
+                } else { CmdUndo::NothingLeft }
+            }
+            Tool::Spline => {
+                if self.pending.pop().is_some() {
+                    self.pending_bulges.pop();
+                    self.pending_widths.pop();
+                    self.history.push("  spline: removed last point".into());
+                    CmdUndo::Handled
+                } else { CmdUndo::NothingLeft }
+            }
+            // Any other active draw tool: pop a pending point if present.
+            t if t != Tool::None => {
+                if self.pending.pop().is_some() {
+                    self.history.push("  removed last point".into());
+                    CmdUndo::Handled
+                } else { CmdUndo::NothingLeft }
+            }
+            // No draw tool: either another modify state is mid-flight (nothing
+            // to step back) or truly idle (caller does a global undo).
+            _ => if self.any_command_active() {
+                CmdUndo::NothingLeft
+            } else {
+                CmdUndo::NoCommand
+            },
+        }
+    }
 
     /// Update the live status line shown above the cmd input. Empty
     /// string clears it. Replaces history-pushed prompts so the user sees
@@ -2507,6 +2886,35 @@ impl CadApp {
                 }
             }
             return;
+        }
+
+        // ---- Command-internal UNDO ("U" keyword) -------------------------
+        // "u"/"undo" while a command is ACTIVE reverses only the last step of
+        // THAT command (segment / vertex / pick / result). With nothing active
+        // it falls back to the global undo. Must run BEFORE the cmd_flow and
+        // parser intercepts so "u" is caught mid-circle/arc/etc. PLINE keeps
+        // its own richer U handler (arc sub-flows / bulges / widths), so we
+        // let "u" fall through to the Tool::Polyline block for that tool.
+        if matches!(trimmed.to_ascii_lowercase().as_str(), "u" | "undo")
+            && self.tool != Tool::Polyline
+        {
+            match self.command_internal_undo() {
+                CmdUndo::Handled => return,
+                CmdUndo::NothingLeft => {
+                    self.history.push(
+                        "  ! nothing left to undo in this command — Esc cancels it".into());
+                    return;
+                }
+                CmdUndo::NoCommand => { self.do_undo(); return; }
+            }
+        }
+        // ---- Capture command-internal-undo baselines at command start ----
+        // A fresh top-level command (typed at the idle prompt) records the
+        // undo-stack depth + dobject count so its own "U" can reverse only its
+        // own results. Skipped for replies to an active prompt (prompt set).
+        if self.current_prompt.is_empty() && !trimmed.is_empty() {
+            self.cmd_undo_base = Some(self.undo_stack.len());
+            self.cmd_base_objs = Some(self.doc.dobjects.len());
         }
 
         // ---- Prompt-driven command flow (Slice 1: CIRCLE) ----------------
@@ -3426,6 +3834,30 @@ impl CadApp {
                     } else {
                         self.history.push("  ! offset: undo stack empty".into());
                     }
+                    return;
+                }
+                Some("d") | Some("distance") => {
+                    // AutoCAD "D" = Distance option. Accept an inline value
+                    // ("d 5") or, with none, switch to Distance mode and ask
+                    // for the number (the Some(num) arm below consumes it).
+                    if let Some(v) = toks.next().and_then(|s| s.parse::<f64>().ok()) {
+                        if v.abs() < 1e-12 {
+                            self.history.push(
+                                "  ! offset: distance must be non-zero".into());
+                        } else {
+                            self.env.OfsDis = v;
+                            let _ = self.env.save();
+                            self.offset_state =
+                                OffsetState::WaitingForObject(OffsetMode::Distance(v));
+                            self.history.push(format!("  offset: distance → {}", v));
+                        }
+                    } else {
+                        self.offset_state = OffsetState::WaitingForObject(
+                            OffsetMode::Distance(self.env.OfsDis));
+                        self.history.push(format!(
+                            "  offset: type the offset distance  <{}>", self.env.OfsDis));
+                    }
+                    self.refresh_offset_prompt();
                     return;
                 }
                 Some(num) if num.parse::<f64>().is_ok() => {
@@ -8286,6 +8718,29 @@ impl CadApp {
                       stretches (each logs ✂REC) · Stop ■ · 📋 Copy.");
             ui.add_space(6.0);
             ui.separator();
+            // ---- Menu layout capture (ANY open menu's geometry) -----------
+            ui.label("Menu layout (compare rendered vs design):");
+            ui.horizontal(|ui| {
+                let lay = egui::Button::new(
+                    egui::RichText::new("📐 Capture menu layout")
+                        .strong().color(egui::Color32::WHITE))
+                    .fill(egui::Color32::from_rgb(90, 70, 140));
+                if ui.add(lay).on_hover_text(
+                    "Records the pixel geometry (x y w h) of every element in WHATEVER \
+                     menus are open this frame — the Draw/Modify rails and their \
+                     flyout / add / remove popups, the menu-bar dropdowns, the canvas \
+                     right-click menu, the object-snap popup, and the Properties panel — \
+                     into the timeline. Open the menu(s) you want measured FIRST, keep \
+                     them on screen, then click this.")
+                    .clicked()
+                {
+                    self.props_layout_capture = true;
+                    if !self.dbg.recording { self.dbg_start(); }
+                }
+                if self.props_layout_capture { ui.label("⏳ capturing next frame…"); }
+            });
+            ui.add_space(6.0);
+            ui.separator();
             ui.label("Annotate (📝 added with current ms):");
             ui.horizontal(|ui| {
                 let resp = ui.add(
@@ -9308,16 +9763,70 @@ impl CadApp {
     //      bulk-edit layer / visibility / color.
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
+        // Scoped "Properties" palette (dark teal-grey, cyan accent) — applied
+        // only to this window's ui so the rest of the app is untouched.
+        let bg     = egui::Color32::from_rgb(0x18, 0x20, 0x29);
+        let bg_lo  = egui::Color32::from_rgb(0x14, 0x1c, 0x25);
+        let bg_hi  = egui::Color32::from_rgb(0x22, 0x2b, 0x34);
+        let border = egui::Color32::from_rgb(0x3b, 0x49, 0x4c);
+        let text   = egui::Color32::from_rgb(0xda, 0xe3, 0xef);
+        let muted  = egui::Color32::from_rgb(0xb4, 0xb5, 0xb7);
+        let accent = egui::Color32::from_rgb(0x00, 0xda, 0xf3);
+
+        if !self.info_window_open { return; }
+
+        // A right-docked, width-stable panel (egui SidePanel). Its width is
+        // driven by the resize handle / default_width — content NEVER auto-
+        // grows the panel (the bug we had with a resizable Window + fill-width
+        // ScrollArea). The CentralPanel canvas reflows to the left of it.
+        let frame = egui::Frame::none()
+            .fill(bg)
+            .stroke(egui::Stroke::new(1.0, border))
+            .inner_margin(egui::Margin::symmetric(10.0, 8.0));
+
+        // Capture is armed once per frame at the TOP of update() (so it works
+        // for EVERY open menu, not just this panel). Here we only note whether
+        // it's active so we can add the panel-frame rect below.
+        let capturing = self.props_layout_capture;
+
+        // Floating, DRAGGABLE window (drag its title bar). Width is FIXED —
+        // resizable(false) + an explicit content width below — so it can't
+        // auto-stretch (the bug we hit with a resizable fill-width window).
         let mut open = self.info_window_open;
-        let win = egui::Window::new("DObject Properties")
+        let resp = egui::Window::new("Properties")
             .open(&mut open)
-            .default_pos(egui::pos2(640.0, 70.0))
-            .default_size(egui::vec2(320.0, 560.0))
-            .min_width(260.0)
-            .resizable(true)
-            .collapsible(true);
-        let win = self.apply_dock_pos("DObject Properties", ctx, win);
-        let resp = win.show(ctx, |ui| {
+            .resizable(false)
+            .collapsible(false)
+            .frame(frame)
+            .default_pos(egui::pos2(900.0, 70.0))
+            .show(ctx, |ui| {
+                ui.set_width(300.0);   // lock content width → no stretch
+                {
+                    let v = ui.visuals_mut();
+                    v.override_text_color = Some(text);
+                    v.widgets.inactive.weak_bg_fill = bg_lo;
+                    v.widgets.inactive.bg_fill = bg_lo;
+                    v.widgets.hovered.weak_bg_fill = bg_hi;
+                    v.widgets.hovered.bg_fill = bg_hi;
+                    v.widgets.active.weak_bg_fill = bg_hi;
+                    v.widgets.active.bg_fill = bg_hi;
+                    v.widgets.open.weak_bg_fill = bg_lo;
+                    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+                    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+                    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0, 218, 243, 60);
+                    v.selection.stroke = egui::Stroke::new(1.0, accent);
+                    v.hyperlink_color = accent;
+                    v.indent_has_left_vline = false;
+                    // TextEdit / DragValue backgrounds use extreme_bg_color, not
+                    // widgets.*.bg_fill — match it to the painted boxes. Square
+                    // the widget corners too so all fields look identical.
+                    v.extreme_bg_color = bg_lo;
+                    v.widgets.inactive.rounding = egui::Rounding::ZERO;
+                    v.widgets.hovered.rounding  = egui::Rounding::ZERO;
+                    v.widgets.active.rounding   = egui::Rounding::ZERO;
+                }
+                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+
                 // Target set: the basket (group) takes priority; otherwise
                 // the single click-selected dobject. Deduped + sorted so the
                 // "shared value / *VARIES*" scan and the apply loop agree.
@@ -9332,20 +9841,578 @@ impl CadApp {
                 targets.sort_unstable();
                 targets.dedup();
 
-                ui.separator();
+                // ---- Header: selection-count badge (title + close are on
+                // the draggable window title bar) ----
+                ui.add_space(2.0);
+                if !targets.is_empty() {
+                    ui.horizontal(|ui| {
+                        let label = if targets.len() == 1 {
+                            self.doc.dobjects.get(targets[0])
+                                .map(|d| dobject_kind_name(&d.geom).to_uppercase())
+                                .unwrap_or_else(|| "DOBJECT".into())
+                        } else if self.targets_uniform_tag(&targets).is_some() {
+                            let k = self.doc.dobjects.get(targets[0])
+                                .map(|d| dobject_kind_name(&d.geom).to_uppercase())
+                                .unwrap_or_else(|| "DOBJECT".into());
+                            format!("{} ({})", k, targets.len())
+                        } else {
+                            format!("MIXED ({})", targets.len())
+                        };
+                        let br = egui::Frame::none()
+                            .fill(egui::Color32::from_rgb(0x2d, 0x36, 0x3f))
+                            .rounding(8.0)
+                            .inner_margin(egui::Margin::symmetric(7.0, 1.0))
+                            .show(ui, |ui| {
+                                ui.label(egui::RichText::new(label).monospace().size(10.0).color(accent));
+                            });
+                        pp_capture(ui, "selection badge", br.response.rect);
+                    });
+                    ui.add_space(2.0);
+                }
+                pp_divider(ui);
+                ui.add_space(8.0);
+
                 if targets.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(180, 180, 200),
-                        "(no selection — click a dobject, or use `select` / `props`)",
-                    );
-                } else {
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        self.render_props_body(ui, &targets);
+                    ui.colored_label(muted,
+                        "No selection — click a dobject, or use select / props.");
+                    return;
+                }
+
+                // ---- Search ----
+                let search_id = egui::Id::new("props_search_box");
+                let mut q: String = ui.data_mut(|d| d.get_temp::<String>(search_id).unwrap_or_default());
+                let avail = ui.available_width();
+                let sr = egui::Frame::none().fill(bg_lo).stroke(egui::Stroke::new(1.0, border))
+                    .rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 3.0))
+                    .show(ui, |ui| {
+                        ui.add_sized([avail - 16.0, 16.0], egui::TextEdit::singleline(&mut q)
+                            .hint_text("Search parameters…")
+                            .frame(false));
+                    });
+                pp_capture(ui, "search box", sr.response.rect);
+                ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
+                ui.add_space(6.0);
+
+                // Body fills remaining height; the panel width is stable, so
+                // the fill-width ScrollArea can't grow it. Changes auto-apply;
+                // Ctrl+Z undoes.
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.render_props_body(ui, &targets, &q);
+                });
+            });
+        self.info_window_open = open;
+
+        // Add this panel's outer frame rect into the shared capture buffer.
+        // The actual dump (all menus together) happens at frame-end in update().
+        if capturing {
+            let frame_rect = resp.as_ref().map(|r| r.response.rect)
+                .unwrap_or(egui::Rect::NOTHING);
+            ctx.data_mut(|d| {
+                let id = egui::Id::new("pp_cap_buf");
+                let mut v: Vec<(String, egui::Rect)> = d.get_temp(id).unwrap_or_default();
+                v.push(("Properties · PANEL FRAME".to_string(), frame_rect));
+                d.insert_temp(id, v);
+            });
+        }
+    }
+
+    /// Dispatch a rail command. Most go through `run_command`; `array` opens
+    /// its own dialog instead of a command flow.
+    fn rail_dispatch(&mut self, cmd: &str) {
+        // A command with a remembered method (chosen via the ▼ flyout or a
+        // shortkey) RUNS in that method by default — the last-used method is
+        // the default until another is picked. Keeps the rail icon's glyph and
+        // the actual running method in sync.
+        if matches!(cmd, "arc" | "circle" | "fillet") {
+            if let Some(key) = self.rail_last_method.get(cmd).cloned() {
+                self.rail_flyout_dispatch(cmd, &key);
+                return;
+            }
+        }
+        match cmd {
+            "pointer" => { self.tool = Tool::None; }   // selection mode
+            "array"   => self.array_open = true,
+            other     => self.run_command(other),
+        }
+    }
+
+    /// Start a rail command in a SPECIFIC creation method, chosen from the ▼
+    /// flyout. Reuses each command's normal start (via `run_command`) and then
+    /// nudges it into the requested method/option so all the usual setup runs.
+    fn rail_flyout_dispatch(&mut self, cmd: &str, key: &str) {
+        // Remember the chosen method so the rail icon shows its glyph.
+        if matches!(cmd, "arc" | "circle" | "fillet") {
+            self.rail_last_method.insert(cmd.to_string(), key.to_string());
+        }
+        match cmd {
+            "arc" => {
+                self.run_command("arc");
+                if let Ok(i) = key.parse::<usize>() {
+                    if let Some(&m) = ALL_ARC_METHODS.get(i) { self.arc_method = m; }
+                }
+                self.rail_active = "arc".into();
+            }
+            "circle" => {
+                self.run_command("circle");           // starts at CircleStep::Center
+                let step = match key {
+                    "3p"  => Some(CircleStep::P3a),
+                    "2p"  => Some(CircleStep::P2a),
+                    "ttr" => Some(CircleStep::TtrObj1),
+                    _      => None,                    // "center" = default start
+                };
+                if let (Some(s), Some(f)) = (step, self.cmd_flow.as_mut()) {
+                    f.circle = s;
+                }
+                self.flow_show_prompt();
+                self.rail_active = "circle".into();
+            }
+            "fillet" => {
+                self.run_command("fillet");
+                match key {
+                    "poly"  => self.run_command("p"),
+                    "multi" => self.run_command("m"),
+                    _        => {}
+                }
+                self.rail_active = "fillet".into();
+            }
+            _ => self.rail_dispatch(cmd),
+        }
+    }
+
+    /// The scrolling icon list + pinned footer (+ / reset) for one rail.
+    /// Right-click an icon to remove it. `ui.available_height()` must be
+    /// bounded (docked panel height, or the floating rail's set_height).
+    fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool) {
+        let muted = egui::Color32::from_rgb(0x88, 0x93, 0xab);
+        let footer_h = 48.0;
+        let body_h = (ui.available_height() - footer_h).max(48.0);
+        let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
+        let mut del: Option<usize> = None;
+        // (from_slot, to_slot) when an icon is dropped onto another to reorder.
+        let mut reorder: Option<(usize, usize)> = None;
+        ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
+            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                ui.add_space(3.0);
+                for (pos, &idx) in items.iter().enumerate() {
+                    let (cmd, nm) = if is_draw { (DRAW_CMDS[idx].1, DRAW_CMDS[idx].2) }
+                                    else { (MODIFY_CMDS[idx].1, MODIFY_CMDS[idx].2) };
+                    let active = self.rail_active == cmd;
+                    // If a method was last picked from this command's flyout,
+                    // the icon renders THAT method's glyph; otherwise the base
+                    // command glyph.
+                    let last_m = self.rail_last_method.get(cmd).cloned();
+                    let methods = rail_flyout_items(cmd);
+                    // Tooltip: "Circle (3P)" when a method is active, else the
+                    // plain command label.
+                    let base_name = nm.split("  (").next().unwrap_or(nm);
+                    let active_short = last_m.as_ref().and_then(|k| methods.iter()
+                        .find(|(_, _, key)| key == k).map(|(s, _, _)| s.clone()));
+                    let tip_owned = match &active_short {
+                        Some(s) => format!("{} ({})", base_name, s),
+                        None    => nm.to_string(),
+                    };
+                    // ONE response drives everything: click = run command,
+                    // right-click = remove menu, drag = reorder. The payload
+                    // tags the rail so a Draw icon can't drop onto Modify.
+                    let resp = ui.vertical_centered(|ui| {
+                        rail_icon_btn(ui, active, &tip_owned, |p, c, pen, ink| {
+                            if let Some(k) = &last_m {
+                                draw_method_glyph(p, c, cmd, k, pen, ink);
+                            } else {
+                                let dot = |q| { p.circle_filled(q, 1.6, ink); };
+                                if is_draw { draw_draw_glyph(p, c, DRAW_CMDS[idx].0, pen, dot, ink); }
+                                else { draw_cmd_glyph(p, c, MODIFY_CMDS[idx].0, pen, dot, ink); }
+                            }
+                        })
+                    }).inner;
+                    // Arm the drag payload only while THIS icon is being dragged.
+                    resp.dnd_set_drag_payload(RailDnd { is_draw, pos });
+                    // ▼ method flyout: commands with multiple creation methods
+                    // (arc, circle, fillet) get a small triangle in the
+                    // bottom-right corner. A click there opens the method list;
+                    // a click anywhere else on the icon runs the default command.
+                    let fly_id = ui.make_persistent_id(("rail_fly", is_draw, idx));
+                    let corner = egui::Rect::from_min_max(
+                        egui::pos2(resp.rect.right() - 12.0, resp.rect.bottom() - 12.0),
+                        resp.rect.right_bottom());
+                    if !methods.is_empty() {
+                        let p = ui.painter_at(resp.rect);
+                        let a = corner.right_bottom() - egui::vec2(2.0, 2.0);
+                        p.add(egui::Shape::convex_polygon(
+                            vec![a, a - egui::vec2(6.0, 0.0), a - egui::vec2(0.0, 6.0)],
+                            PP_ACCENT, egui::Stroke::NONE));
+                    }
+                    // A bare click (not a drag) runs the command — UNLESS it
+                    // landed on the ▼ corner, which opens the flyout instead.
+                    if resp.clicked() {
+                        let on_corner = !methods.is_empty()
+                            && resp.interact_pointer_pos().is_some_and(|p| corner.contains(p));
+                        if on_corner {
+                            ui.memory_mut(|m| m.toggle_popup(fly_id));
+                        } else {
+                            self.rail_active = cmd.to_string();
+                            self.rail_dispatch(cmd);
+                        }
+                    }
+                    // Method flyout — a SQUARE popup to the RIGHT of the icon,
+                    // using the DEFAULT menu colours (no imposed tint). The
+                    // current/default method is marked with a small solid square
+                    // on the left; each row shows the full name + short code,
+                    // e.g. "3-Point (3P)".
+                    if !methods.is_empty() && ui.memory(|m| m.is_popup_open(fly_id)) {
+                        let active_key = last_m.clone();
+                        let pos = egui::pos2(resp.rect.right() + 3.0, resp.rect.top());
+                        let mut pick: Option<String> = None;
+                        let area = egui::Area::new(fly_id.with("area"))
+                            .order(egui::Order::Foreground)
+                            .fixed_pos(pos)
+                            .constrain(true)
+                            .show(ui.ctx(), |ui| {
+                                egui::Frame::popup(ui.style())
+                                    .rounding(egui::Rounding::ZERO)
+                                    .show(ui, |ui| {
+                                        let txt = ui.visuals().text_color();
+                                        for (short, full, key) in &methods {
+                                            let is_active =
+                                                active_key.as_deref() == Some(key.as_str());
+                                            let (rr, rp) = ui.allocate_painter(
+                                                egui::vec2(176.0, 22.0), egui::Sense::click());
+                                            let rect = rr.rect;
+                                            if rr.hovered() {
+                                                rp.rect_filled(rect, 0.0,
+                                                    ui.visuals().widgets.hovered.weak_bg_fill);
+                                            }
+                                            // current-method marker
+                                            if is_active {
+                                                let sq = egui::Rect::from_center_size(
+                                                    egui::pos2(rect.left() + 7.0, rect.center().y),
+                                                    egui::vec2(6.0, 6.0));
+                                                rp.rect_filled(sq, 0.0, txt);
+                                            }
+                                            let gc = egui::pos2(rect.left() + 24.0, rect.center().y);
+                                            let pen = egui::Stroke::new(1.4, txt);
+                                            draw_method_glyph(&rp, gc, cmd, key, pen, txt);
+                                            rp.text(egui::pos2(rect.left() + 40.0, rect.center().y),
+                                                egui::Align2::LEFT_CENTER,
+                                                format!("{} ({})", full, short),
+                                                egui::FontId::proportional(12.0), txt);
+                                            if rr.clicked() { pick = Some(key.clone()); }
+                                        }
+                                        pp_cap_ui(ui, &format!("rail flyout · {}", cmd));
+                                    });
+                            });
+                        if let Some(key) = pick {
+                            self.rail_flyout_dispatch(cmd, &key);
+                            ui.memory_mut(|m| m.close_popup());
+                        } else if ui.ctx().input(|i| i.pointer.any_click()) {
+                            // Click outside the popup AND the ▼ corner closes it.
+                            let p = ui.ctx().input(|i| i.pointer.interact_pos());
+                            let inside = p.is_some_and(|p|
+                                area.response.rect.contains(p) || corner.contains(p));
+                            if !inside { ui.memory_mut(|m| m.close_popup()); }
+                        }
+                    }
+                    // Insertion hint: a teal bar on the edge we'd drop next to.
+                    if let Some(src) = resp.dnd_hover_payload::<RailDnd>() {
+                        if src.is_draw == is_draw && src.pos != pos {
+                            let r = resp.rect;
+                            let y = if src.pos < pos { r.bottom() } else { r.top() };
+                            ui.painter().hline(r.x_range(), y, egui::Stroke::new(2.0, PP_ACCENT));
+                        }
+                    }
+                    // Drop: move the dragged slot to land at this slot.
+                    if let Some(src) = resp.dnd_release_payload::<RailDnd>() {
+                        if src.is_draw == is_draw && src.pos != pos {
+                            reorder = Some((src.pos, pos));
+                        }
+                    }
+                    let short = nm.split("  ").next().unwrap_or(nm).to_string();
+                    resp.context_menu(|ui| {
+                        // Two-step, both next to the icon: "Remove <command>"
+                        // opens a "Confirm" submenu. Both items name the actual
+                        // command (not "the icon"). Click-outside cancels at
+                        // either level without removing.
+                        ui.menu_button(format!("Remove  {}", short), |ui| {
+                            if ui.button(format!("Confirm — remove  {}", short)).clicked() {
+                                del = Some(idx); ui.close_menu();
+                            }
+                            pp_cap_ui(ui, &format!("rail remove confirm · {}", short));
+                        });
+                        pp_cap_ui(ui, &format!("rail remove menu · {}", short));
                     });
                 }
+                ui.add_space(4.0);
             });
-        self.process_dock_after_show("DObject Properties", ctx, resp);
-        self.info_window_open = open;
+        });
+        if let Some((from, to)) = reorder {
+            let v = if is_draw { &mut self.draw_items } else { &mut self.modify_items };
+            if from < v.len() && to < v.len() {
+                let x = v.remove(from);
+                v.insert(to, x);
+            }
+        }
+        if let Some(idx) = del {
+            if is_draw { self.draw_items.retain(|&x| x != idx); }
+            else { self.modify_items.retain(|&x| x != idx); }
+        }
+        // ---- footer: + opens an anchored add-popup; reset below ----
+        ui.add_space(3.0);
+        let mut add: Option<usize> = None;
+        ui.vertical_centered(|ui| {
+            let plus = ui.add(egui::Label::new(
+                egui::RichText::new("+").size(20.0).color(muted))
+                .sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text("Add commands");
+            let popup_id = ui.make_persistent_id(
+                if is_draw { "rail_add_draw" } else { "rail_add_modify" });
+            if plus.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
+            pp_capture(ui, "rail footer · + (add)", plus.rect);
+            // Theme the popup frame to the Properties palette (the popup snapshots
+            // these window visuals when it builds its frame).
+            {
+                let v = ui.visuals_mut();
+                v.window_fill = PP_BG_LO;
+                v.window_stroke = egui::Stroke::new(1.0, PP_BORDER);
+            }
+            let present: std::collections::HashSet<usize> = items.iter().copied().collect();
+            let n = if is_draw { DRAW_CMDS.len() } else { MODIFY_CMDS.len() };
+            egui::popup_above_or_below_widget(ui, popup_id, &plus,
+                egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                    ui.set_min_width(252.0);
+                    ui.label(egui::RichText::new("Highlighted = add · dimmed = already on rail")
+                        .small().color(PP_LABEL));
+                    ui.add_space(3.0);
+                    egui::Grid::new("rail_add_grid").spacing([5.0, 5.0]).show(ui, |ui| {
+                        for j in 0..n {
+                            let on_rail = present.contains(&j);
+                            let nm = if is_draw { DRAW_CMDS[j].2 } else { MODIFY_CMDS[j].2 };
+                            let short = nm.split("  ").next().unwrap_or(nm);
+                            let sense = if on_rail { egui::Sense::hover() } else { egui::Sense::click() };
+                            let (r, painter) = ui.allocate_painter(egui::vec2(46.0, 42.0), sense);
+                            let rect = r.rect;
+                            let hov = r.hovered() && !on_rail;
+                            // Hovered tile = teal-tinted raised surface; idle = panel raised bg.
+                            painter.rect(rect, 5.0,
+                                if hov { egui::Color32::from_rgb(0x1c, 0x3a, 0x40) }
+                                else { PP_BG_HI },
+                                egui::Stroke::new(1.0, PP_BORDER));
+                            let ink = if on_rail { PP_MUTED }
+                                      else { PP_TEXT };
+                            let pen = egui::Stroke::new(1.6, ink);
+                            let c = rect.center() - egui::vec2(0.0, 5.0);
+                            let dot = |q| { painter.circle_filled(q, 1.5, ink); };
+                            if is_draw { draw_draw_glyph(&painter, c, DRAW_CMDS[j].0, pen, dot, ink); }
+                            else { draw_cmd_glyph(&painter, c, MODIFY_CMDS[j].0, pen, dot, ink); }
+                            painter.text(egui::pos2(rect.center().x, rect.bottom() - 6.0),
+                                egui::Align2::CENTER_CENTER, short, egui::FontId::proportional(7.5), ink);
+                            if !on_rail && r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
+                                add = Some(j);
+                            }
+                            pp_capture(ui, &format!("rail add tile · {}", short), rect);
+                            if (j + 1) % 5 == 0 { ui.end_row(); }
+                        }
+                    });
+                    pp_cap_ui(ui, "rail add popup");
+                });
+            let reset = ui.add(egui::Label::new(
+                egui::RichText::new("reset").size(10.0).underline().color(muted))
+                .sense(egui::Sense::click()))
+                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            pp_capture(ui, "rail footer · reset", reset.rect);
+            if reset.clicked() {
+                if is_draw { self.draw_items = (0..DRAW_CMDS.len()).collect(); }
+                else { self.modify_items = (0..MODIFY_CMDS.len()).collect(); }
+            }
+        });
+        if let Some(j) = add {
+            if is_draw { if !self.draw_items.contains(&j) { self.draw_items.push(j); } }
+            else if !self.modify_items.contains(&j) { self.modify_items.push(j); }
+        }
+    }
+
+    /// A floating (undocked) rail — a draggable Area over the canvas. Fixed
+    /// height (so its footer pins + scroll behaves). Drop near the left edge
+    /// to re-dock.
+    fn rail_floating(&mut self, ctx: &egui::Context, name: &str, is_draw: bool,
+                     side: egui::Color32, strip: egui::Color32,
+                     line: egui::Color32, muted: egui::Color32) {
+        let id = if is_draw { "cmd_rail_draw_float" } else { "cmd_rail_modify_float" };
+        let pos = if is_draw { self.draw_rail_pos } else { self.modify_rail_pos };
+        let h = (ctx.screen_rect().height() - pos.y - 30.0).clamp(220.0, 560.0);
+        let mut collapse = false;
+        let mut delta = egui::Vec2::ZERO;
+        egui::Area::new(egui::Id::new(id)).order(egui::Order::Middle).fixed_pos(pos)
+            .show(ctx, |ui| {
+                egui::Frame::none().fill(side).stroke(egui::Stroke::new(1.0, line))
+                    .shadow(egui::epaint::Shadow {
+                        offset: egui::vec2(0.0, 4.0), blur: 16.0, spread: 0.0,
+                        color: egui::Color32::from_black_alpha(110) })
+                    .show(ui, |ui| {
+                        ui.set_width(46.0);
+                        ui.set_height(h);
+                        let (c, dr) = rail_strip(ui, name, strip, line, muted);
+                        collapse = c;
+                        if dr.dragged() { delta = dr.drag_delta(); }
+                        self.rail_inner(ui, is_draw);
+                        pp_cap_ui(ui, &format!("{} rail (floating)", name));
+                    });
+            });
+        let np = pos + delta;
+        let np = egui::pos2(np.x.max(0.0), np.y.max(44.0));
+        let dock = np.x < 28.0;
+        if is_draw {
+            self.draw_rail_pos = np;
+            if collapse { self.draw_rail_open = false; self.draw_rail_floating = false; }
+            else if dock { self.draw_rail_floating = false; }
+        } else {
+            self.modify_rail_pos = np;
+            if collapse { self.modify_rail_open = false; self.modify_rail_floating = false; }
+            else if dock { self.modify_rail_floating = false; }
+        }
+    }
+
+    /// Shared body of the command bar — the history scroll, the current-prompt
+    /// line, and the input row. Used by BOTH the floating Command window and the
+    /// docked-at-bottom panel so the two can't drift.
+    fn command_bar_body(&mut self, ui: &mut egui::Ui) {
+        // Reserve space at the bottom for: prompt line (always shown) +
+        // the input row.
+        let bottom_reserve = 32.0 + 18.0;
+        egui::ScrollArea::vertical()
+            .id_salt("hist_scroll")
+            .stick_to_bottom(true)
+            .max_height((ui.available_height() - bottom_reserve).max(24.0))
+            .show(ui, |ui| {
+                for h in &self.history {
+                    ui.monospace(h);
+                }
+            });
+        // The line directly above the input is the CURRENT prompt for the
+        // active command — or the idle "command:" ready prompt when nothing
+        // is active. It always shows, so the user always knows what's expected.
+        if self.current_prompt.is_empty() {
+            ui.colored_label(egui::Color32::from_rgb(150, 200, 235), "command:");
+        } else {
+            ui.colored_label(
+                egui::Color32::from_rgb(0x18, 0x4c, 0x04), &self.current_prompt);
+        }
+        ui.horizontal(|ui| {
+            ui.label(">");
+            let btn_w = 56.0_f32;
+            let row_h = ui.spacing().interact_size.y;
+            let text_resp = ui.add_sized(
+                [(ui.available_width() - btn_w - 8.0).max(40.0), row_h],
+                egui::TextEdit::singleline(&mut self.cmd),
+            );
+            let run_clicked = ui.button("run").clicked();
+            let enter_pressed = (text_resp.lost_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Enter)))
+                || (text_resp.has_focus()
+                    && ui.input(|i| i.key_pressed(egui::Key::Enter)));
+            let space_pressed = text_resp.has_focus()
+                && ui.input(|i| i.key_pressed(egui::Key::Space));
+            let in_text_body = matches!(self.text_draft,
+                TextDraftState::WaitingForString(_))
+                || self.text_waiting_height;
+            let submit_via_space = space_pressed
+                && !self.cmd.trim_end_matches(' ').is_empty()
+                && !in_text_body;
+            if submit_via_space {
+                self.cmd = self.cmd.trim_end_matches(' ').to_string();
+            }
+            if enter_pressed || run_clicked || submit_via_space {
+                if !self.cmd.trim().is_empty() {
+                    let c = std::mem::take(&mut self.cmd);
+                    self.run_command(&c);
+                }
+                self.refocus_cmd = true;
+            }
+            let other_focused = ui.ctx().memory(|m| {
+                m.focused().is_some_and(|id| id != text_resp.id)
+            });
+            let modal_textedit_active = self.layer_rename.is_some();
+            if modal_textedit_active {
+                self.refocus_cmd = false;
+            } else if self.refocus_cmd && !other_focused {
+                text_resp.request_focus();
+                self.refocus_cmd = false;
+                ui.ctx().request_repaint();
+            } else if !other_focused && !text_resp.has_focus() {
+                text_resp.request_focus();
+                ui.ctx().request_repaint();
+            }
+        });
+    }
+
+    /// Left command rails (Draw + Modify). Docked (SidePanel) by default;
+    /// dragging the strip undocks to a floating Area.
+    fn render_command_rails(&mut self, ctx: &egui::Context) {
+        // Palette matches the Properties panel (PP_*) so every surface reads as
+        // one theme. side = panel bg, strip = a slightly darker header band,
+        // line = panel border, muted = label text.
+        let side  = PP_BG_LO;                                     // #141c25 panel bg
+        let strip = egui::Color32::from_rgb(0x0d, 0x14, 0x1b);    // darker header band
+        let line  = PP_BORDER;                                    // #3b494c panel border
+        let muted = PP_LABEL;                                     // #bac9cc label text
+        let frame = egui::Frame::none().fill(side).stroke(egui::Stroke::new(1.0, line));
+
+        // DRAW
+        if self.draw_rail_open {
+            if self.draw_rail_floating {
+                self.rail_floating(ctx, "DRAW", true, side, strip, line, muted);
+            } else {
+                egui::SidePanel::left("cmd_rail_draw").exact_width(46.0)
+                    .frame(frame).show(ctx, |ui| {
+                        let (collapse, dr) = rail_strip(ui, "DRAW", strip, line, muted);
+                        if collapse { self.draw_rail_open = false; }
+                        if dr.drag_started() {
+                            let pp = dr.interact_pointer_pos().unwrap_or(dr.rect.center());
+                            self.draw_rail_pos = pp - egui::vec2(23.0, 12.0);
+                            self.draw_rail_floating = true;
+                        }
+                        self.rail_inner(ui, true);
+                        pp_cap_ui(ui, "DRAW rail (docked)");
+                    });
+            }
+        }
+        // MODIFY
+        if self.modify_rail_open {
+            if self.modify_rail_floating {
+                self.rail_floating(ctx, "MODIFY", false, side, strip, line, muted);
+            } else {
+                egui::SidePanel::left("cmd_rail_modify").exact_width(46.0)
+                    .frame(frame).show(ctx, |ui| {
+                        let (collapse, dr) = rail_strip(ui, "MODIFY", strip, line, muted);
+                        if collapse { self.modify_rail_open = false; }
+                        if dr.drag_started() {
+                            let pp = dr.interact_pointer_pos().unwrap_or(dr.rect.center());
+                            self.modify_rail_pos = pp - egui::vec2(23.0, 12.0);
+                            self.modify_rail_floating = true;
+                        }
+                        self.rail_inner(ui, false);
+                        pp_cap_ui(ui, "MODIFY rail (docked)");
+                    });
+            }
+        }
+        // Reopen handles for collapsed rails.
+        if !self.draw_rail_open || !self.modify_rail_open {
+            egui::SidePanel::left("cmd_rail_reopen").exact_width(18.0)
+                .frame(egui::Frame::none().fill(strip).stroke(egui::Stroke::new(1.0, line)))
+                .show(ctx, |ui| {
+                    ui.add_space(8.0);
+                    if !self.draw_rail_open
+                        && ui.small_button("D").on_hover_text("Show Draw rail").clicked() {
+                        self.draw_rail_open = true;
+                        self.draw_rail_floating = false;
+                    }
+                    if !self.modify_rail_open
+                        && ui.small_button("M").on_hover_text("Show Modify rail").clicked() {
+                        self.modify_rail_open = true;
+                        self.modify_rail_floating = false;
+                    }
+                });
+        }
     }
 
     // ---- helpers shared by the Properties dialog ----------------------
@@ -9422,51 +10489,46 @@ impl CadApp {
     /// target (all non-coordinate props + respected style + read-only
     /// geometry); group = N targets (common General props with `*VARIES*`,
     /// plus respected style when the selection is homogeneous).
-    fn render_props_body(&mut self, ui: &mut egui::Ui, targets: &[usize]) {
+    fn render_props_body(&mut self, ui: &mut egui::Ui, targets: &[usize], query: &str) {
         let n = targets.len();
         let uniform = self.targets_uniform_tag(targets);
 
-        // ---- Header --------------------------------------------------
+        // ---- Identity line -------------------------------------------
         if n == 1 {
             let idx = targets[0];
-            let kind = self.doc.dobjects.get(idx)
-                .map(|d| dobject_kind_name(&d.geom)).unwrap_or("dobject");
-            ui.label(egui::RichText::new(format!("{} · #{}", kind, idx)).strong());
             let handle = self.doc.dobjects.get(idx).map(|d| d.handle).unwrap_or(0);
-            ui.monospace(format!("handle 0x{:X}", handle));
+            ui.monospace(format!("#{}   handle 0x{:X}", idx, handle));
         } else {
-            ui.label(egui::RichText::new(format!("{} dobjects selected", n)).strong());
             ui.monospace(self.props_kind_breakdown(targets));
         }
-        ui.separator();
+        ui.add_space(4.0);
 
         // ---- General (common Style) ----------------------------------
-        ui.label(egui::RichText::new("General").strong());
-        ui.add_space(2.0);
-        self.render_props_general(ui, targets);
+        pp_section(ui, "pp_sec_general", "GENERAL", true, |ui| {
+            self.render_props_general(ui, targets, query);
+        });
 
-        // ---- Respected style + type-specific (homogeneous only) ------
+        // ---- Type-specific (homogeneous only) ------------------------
         if let Some(tag) = uniform {
-            if matches!(tag, 5 | 6 | 7 | 9 | 10 | 11 | 12) {
-                ui.add_space(6.0);
-                ui.label(egui::RichText::new("Type properties").strong());
-                ui.add_space(2.0);
-                self.render_props_type_specific(ui, targets, tag);
+            if matches!(tag, 0 | 5 | 6 | 7 | 9 | 10 | 11 | 12) {
+                let title = if tag == 7 { "FILL / HATCH" } else { "TYPE PROPERTIES" };
+                pp_section(ui, "pp_sec_type", title, true, |ui| {
+                    self.render_props_type_specific(ui, targets, tag);
+                });
             }
         } else {
-            ui.add_space(6.0);
+            ui.add_space(4.0);
             ui.colored_label(egui::Color32::from_rgb(150, 165, 185),
-                "(mixed types — only general properties apply)");
+                "Mixed types — only general properties apply.");
         }
 
         // ---- Geometry (read-only; coordinates edited via grips) ------
         if n == 1 {
-            ui.add_space(6.0);
-            ui.label(egui::RichText::new("Geometry (read-only)").strong());
-            ui.add_space(2.0);
-            let desc = describe(&self.doc.dobjects[targets[0]].geom);
-            ui.monospace(desc);
-            ui.small("Coordinates are edited on-canvas with grips, not here.");
+            pp_section(ui, "pp_sec_geometry", "GEOMETRY", false, |ui| {
+                let desc = describe(&self.doc.dobjects[targets[0]].geom);
+                ui.monospace(desc);
+                ui.small("Coordinates are edited on-canvas with grips, not here.");
+            });
         }
     }
 
@@ -9487,100 +10549,184 @@ impl CadApp {
     /// The common-Style editor (layer / color / linetype / lt-scale /
     /// lineweight / visible). Each control shows the shared value or
     /// `*VARIES*`; editing writes to EVERY target with one undo step.
-    fn render_props_general(&mut self, ui: &mut egui::Ui, targets: &[usize]) {
-        egui::Grid::new("props_general")
-            .num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
-            // Layer
-            ui.label("Layer");
+    /// Resolve a `Color` to an on-screen swatch colour (ByLayer follows the
+    /// given layer's colour). App-layer only — for the Properties swatches.
+    fn resolve_color32(&self, c: Color, layer: LayerId) -> egui::Color32 {
+        let tc = |idx: u16| -> (u8, u8, u8) {
+            let v = self.doc.truecolors.get(idx).unwrap_or(0xFFFFFF);
+            (((v >> 16) & 0xFF) as u8, ((v >> 8) & 0xFF) as u8, (v & 0xFF) as u8)
+        };
+        let (r, g, b) = match c {
+            Color::Aci(i) => aci_palette(i),
+            Color::TrueColorRef(idx) => tc(idx),
+            Color::ByBlock => (140, 140, 160),
+            Color::ByLayer => match self.doc.layers.get(layer).map(|l| l.color) {
+                Some(Color::Aci(i)) => aci_palette(i),
+                Some(Color::TrueColorRef(idx)) => tc(idx),
+                _ => (180, 180, 200),
+            },
+        };
+        egui::Color32::from_rgb(r, g, b)
+    }
+
+    fn render_props_general(&mut self, ui: &mut egui::Ui, targets: &[usize], query: &str) {
+        let q = query.trim().to_lowercase();
+        let show = |label: &str| q.is_empty() || label.to_lowercase().contains(&q);
+
+        let layer0 = self.shared_style(targets, |s| s.layer).unwrap_or(0);
+
+        // ---- Layer (swatch = actual layer colour, click → layer list) ----
+        if show("Layer") {
             let shared_layer = self.shared_style(targets, |s| s.layer);
-            let cur = match shared_layer {
-                Some(lid) => self.doc.layers.get(lid)
-                    .map(|l| l.name.clone()).unwrap_or_else(|| "?".into()),
-                None => "*VARIES*".into(),
+            let (name, lcol) = match shared_layer {
+                Some(lid) => (
+                    self.doc.layers.get(lid).map(|l| l.name.clone()).unwrap_or_else(|| "?".into()),
+                    self.resolve_color32(Color::ByLayer, lid)),
+                None => ("*VARIES*".into(), PP_MUTED),
             };
-            let mut new_layer: Option<LayerId> = None;
-            egui::ComboBox::from_id_salt("props_layer").selected_text(cur)
-                .show_ui(ui, |ui| {
-                    for lid in 0..(self.doc.layers.len() as LayerId) {
-                        let name = match self.doc.layers.get(lid) {
-                            Some(l) => l.name.clone(), None => continue,
-                        };
-                        if ui.selectable_label(shared_layer == Some(lid), name).clicked() {
-                            new_layer = Some(lid);
+            let layers: Vec<(LayerId, String)> = (0..self.doc.layers.len() as LayerId)
+                .filter_map(|lid| self.doc.layers.get(lid).map(|l| (lid, l.name.clone())))
+                .collect();
+            let mut pick: Option<LayerId> = None;
+            pp_row(ui, "Layer", |ui, w| {
+                let (rect, resp) = pp_box(ui, w, true);
+                let p = ui.painter_at(rect);
+                let sw = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 13.0, rect.center().y), egui::vec2(13.0, 13.0));
+                p.rect_filled(sw, egui::Rounding::ZERO, lcol);
+                p.text(egui::pos2(sw.right() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
+                p.text(egui::pos2(rect.right() - 11.0, rect.center().y),
+                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                let pid = ui.make_persistent_id("pp_layer_popup");
+                if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                egui::popup_below_widget(ui, pid, &resp,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(w);
+                        for (lid, nm) in &layers {
+                            if ui.selectable_label(shared_layer == Some(*lid), nm).clicked() {
+                                pick = Some(*lid);
+                            }
                         }
-                    }
-                });
-            if let Some(lid) = new_layer {
-                self.props_apply(targets, true, |d| d.style.layer = lid);
-            }
-            ui.end_row();
-
-            // Color (ACI primary; ByLayer/ByBlock/TrueColor secondary)
-            ui.label("Color");
-            let shared_color = self.shared_style(targets, |s| s.color);
-            ui.vertical(|ui| {
-                if shared_color.is_none() {
-                    ui.colored_label(egui::Color32::from_rgb(210, 180, 120), "*VARIES*");
-                }
-                let mut col = shared_color.unwrap_or(Color::ByLayer);
-                let mut wants_pick = false;
-                let before = col;
-                if aci_color_picker(ui, "props_color", &mut col,
-                                    &mut self.doc.truecolors, &mut wants_pick)
-                    && col != before
-                {
-                    self.props_apply(targets, true, |d| d.style.color = col);
-                }
-                if wants_pick {
-                    // Defer to the polar ACI wheel; commit applies to all.
-                    self.aci_pick_many = targets.to_vec();
-                    self.aci_pick_request = Some(AciPickRequest::DobjectMany);
-                }
+                    });
             });
-            ui.end_row();
+            if let Some(lid) = pick { self.props_apply(targets, true, |d| d.style.layer = lid); }
+        }
 
-            // Linetype
-            ui.label("Linetype");
+        // ---- Color (swatch + label box, click → ACI wheel) ----
+        if show("Color") {
+            let shared_color = self.shared_style(targets, |s| s.color);
+            let (label, c32, italic) = match shared_color {
+                Some(Color::ByLayer) => ("By Layer".to_string(),
+                    self.resolve_color32(Color::ByLayer, layer0), true),
+                Some(Color::ByBlock) => ("By Block".to_string(),
+                    egui::Color32::from_rgb(140, 140, 160), true),
+                Some(Color::Aci(i)) => (format!("ACI {}", i),
+                    self.resolve_color32(Color::Aci(i), layer0), false),
+                Some(c @ Color::TrueColorRef(_)) => {
+                    let cc = self.resolve_color32(c, layer0);
+                    (format!("RGB #{:02X}{:02X}{:02X}", cc.r(), cc.g(), cc.b()), cc, false)
+                }
+                None => ("*VARIES*".to_string(), PP_MUTED, true),
+            };
+            let mut open_wheel = false;
+            pp_row(ui, "Color", |ui, w| {
+                let (rect, resp) = pp_box(ui, w, true);
+                let p = ui.painter_at(rect);
+                let sw = egui::Rect::from_center_size(
+                    egui::pos2(rect.left() + 13.0, rect.center().y), egui::vec2(13.0, 13.0));
+                p.rect_filled(sw, egui::Rounding::ZERO, c32);
+                let s = egui::Stroke::new(1.0, PP_BORDER);
+                p.line_segment([sw.left_top(), sw.right_top()], s);
+                p.line_segment([sw.left_bottom(), sw.right_bottom()], s);
+                p.line_segment([sw.left_top(), sw.left_bottom()], s);
+                p.line_segment([sw.right_top(), sw.right_bottom()], s);
+                let col = if italic { PP_MUTED } else { PP_TEXT };
+                p.text(egui::pos2(sw.right() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, &label, egui::FontId::proportional(13.0), col);
+                let resp = resp.on_hover_text("Click to choose a colour (ACI / TrueColor)");
+                if resp.clicked() { open_wheel = true; }
+            });
+            if open_wheel {
+                self.aci_pick_many = targets.to_vec();
+                self.aci_pick_request = Some(AciPickRequest::DobjectMany);
+            }
+        }
+
+        // ---- Linetype (name + dash preview, click → list) ----
+        if show("Linetype") || show("Line Type") {
             let shared_lt = self.shared_style(targets, |s| s.linetype);
-            let cur = match shared_lt {
+            let name = match shared_lt {
                 Some(id) => self.doc.linetypes.get(id)
                     .map(|l| l.name.clone()).unwrap_or_else(|| "?".into()),
                 None => "*VARIES*".into(),
             };
-            let mut new_lt: Option<u32> = None;
-            egui::ComboBox::from_id_salt("props_lt").selected_text(cur)
-                .show_ui(ui, |ui| {
-                    for id in 0..(self.doc.linetypes.len() as u32) {
-                        let name = match self.doc.linetypes.get(id) {
-                            Some(l) => l.name.clone(), None => continue,
-                        };
-                        if ui.selectable_label(shared_lt == Some(id), name).clicked() {
-                            new_lt = Some(id);
-                        }
+            let solid = matches!(shared_lt, Some(id)
+                if self.doc.linetypes.get(id).map(|l| l.pattern.is_empty()).unwrap_or(true));
+            let lts: Vec<(u32, String)> = (0..self.doc.linetypes.len() as u32)
+                .filter_map(|id| self.doc.linetypes.get(id).map(|l| (id, l.name.clone())))
+                .collect();
+            let mut pick: Option<u32> = None;
+            pp_row(ui, "Line Type", |ui, w| {
+                let (rect, resp) = pp_box(ui, w, true);
+                let p = ui.painter_at(rect);
+                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
+                let y = rect.center().y;
+                let (x0, x1) = (rect.center().x + 6.0, rect.right() - 20.0);
+                let s = egui::Stroke::new(1.4, PP_LABEL);
+                if solid {
+                    p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], s);
+                } else {
+                    let mut x = x0;
+                    while x < x1 {
+                        let e = (x + 7.0).min(x1);
+                        p.line_segment([egui::pos2(x, y), egui::pos2(e, y)], s);
+                        x += 11.0;
                     }
-                });
-            if let Some(id) = new_lt {
-                self.props_apply(targets, true, |d| d.style.linetype = id);
-            }
-            ui.end_row();
+                }
+                p.text(egui::pos2(rect.right() - 11.0, y),
+                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                let pid = ui.make_persistent_id("pp_lt_popup");
+                if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                egui::popup_below_widget(ui, pid, &resp,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(w);
+                        for (id, nm) in &lts {
+                            if ui.selectable_label(shared_lt == Some(*id), nm).clicked() {
+                                pick = Some(*id);
+                            }
+                        }
+                    });
+            });
+            if let Some(id) = pick { self.props_apply(targets, true, |d| d.style.linetype = id); }
+        }
 
-            // Linetype scale
-            ui.label("Lt Scale");
+        // ---- Lt Scale (numeric, value left-aligned in the box) ----
+        if show("Lt Scale") || show("Linetype scale") {
             let shared_sc = self.shared_style(targets, |s| s.linetype_scale);
-            let mut sc = shared_sc.unwrap_or(1.0);
-            let resp = ui.add(egui::DragValue::new(&mut sc)
-                .speed(0.05).range(0.01..=1000.0)
-                .prefix(if shared_sc.is_none() { "≠ " } else { "" }));
-            if resp.changed() {
-                self.props_gesture_snapshot(&resp);
-                self.props_apply(targets, false, |d| d.style.linetype_scale = sc);
-            } else {
-                self.props_gesture_snapshot(&resp);
-            }
-            ui.end_row();
+            let buf_id = egui::Id::new("pp_ltscale_buf");
+            pp_row(ui, "Lt Scale", |ui, w| {
+                let mut buf = ui.data_mut(|d| d.get_temp::<String>(buf_id))
+                    .unwrap_or_else(|| shared_sc.map(|v| format!("{:.3}", v)).unwrap_or_default());
+                let r = ui.add_sized([w, PP_ROW_H],
+                    egui::TextEdit::singleline(&mut buf).hint_text("≠"));
+                self.props_gesture_snapshot(&r);
+                if r.changed() {
+                    if let Ok(v) = buf.trim().parse::<f32>() {
+                        self.props_apply(targets, false, |d|
+                            d.style.linetype_scale = v.clamp(0.01, 1000.0));
+                    }
+                }
+                if !r.has_focus() {
+                    buf = shared_sc.map(|v| format!("{:.3}", v)).unwrap_or_default();
+                }
+                ui.data_mut(|d| d.insert_temp(buf_id, buf));
+            });
+        }
 
-            // Lineweight
-            ui.label("Lineweight");
+        // ---- Lineweight (click → list) ----
+        if show("Lineweight") || show("Line Weight") {
             let shared_lw = self.shared_style(targets, |s| s.lineweight);
             let lw_text = match shared_lw {
                 None => "*VARIES*".to_string(),
@@ -9589,50 +10735,129 @@ impl CadApp {
                 Some(Lineweight::Default) => "Default".to_string(),
                 Some(Lineweight::Custom(mm)) => format!("{:.2} mm", mm),
             };
-            let mut new_lw: Option<Lineweight> = None;
-            egui::ComboBox::from_id_salt("props_lw").selected_text(lw_text)
-                .show_ui(ui, |ui| {
-                    if ui.selectable_label(shared_lw == Some(Lineweight::ByLayer), "ByLayer").clicked() {
-                        new_lw = Some(Lineweight::ByLayer);
-                    }
-                    if ui.selectable_label(shared_lw == Some(Lineweight::ByBlock), "ByBlock").clicked() {
-                        new_lw = Some(Lineweight::ByBlock);
-                    }
-                    if ui.selectable_label(shared_lw == Some(Lineweight::Default), "Default").clicked() {
-                        new_lw = Some(Lineweight::Default);
-                    }
-                    for mm in [0.05_f32, 0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0] {
-                        let is_this = matches!(shared_lw, Some(Lineweight::Custom(x)) if (x - mm).abs() < 1e-3);
-                        if ui.selectable_label(is_this, format!("{:.2} mm", mm)).clicked() {
-                            new_lw = Some(Lineweight::Custom(mm));
+            let mut pick: Option<Lineweight> = None;
+            pp_row(ui, "Line Weight", |ui, w| {
+                let (rect, resp) = pp_box(ui, w, true);
+                let p = ui.painter_at(rect);
+                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, &lw_text, egui::FontId::proportional(13.0), PP_TEXT);
+                p.text(egui::pos2(rect.right() - 11.0, rect.center().y),
+                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                let pid = ui.make_persistent_id("pp_lw_popup");
+                if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
+                egui::popup_below_widget(ui, pid, &resp,
+                    egui::PopupCloseBehavior::CloseOnClick, |ui| {
+                        ui.set_min_width(w);
+                        if ui.selectable_label(shared_lw == Some(Lineweight::ByLayer), "ByLayer").clicked() { pick = Some(Lineweight::ByLayer); }
+                        if ui.selectable_label(shared_lw == Some(Lineweight::ByBlock), "ByBlock").clicked() { pick = Some(Lineweight::ByBlock); }
+                        if ui.selectable_label(shared_lw == Some(Lineweight::Default), "Default").clicked() { pick = Some(Lineweight::Default); }
+                        for mm in [0.05_f32, 0.13, 0.18, 0.25, 0.35, 0.5, 0.7, 1.0, 1.4, 2.0] {
+                            let is_this = matches!(shared_lw, Some(Lineweight::Custom(x)) if (x - mm).abs() < 1e-3);
+                            if ui.selectable_label(is_this, format!("{:.2} mm", mm)).clicked() { pick = Some(Lineweight::Custom(mm)); }
                         }
-                    }
-                });
-            if let Some(v) = new_lw {
-                self.props_apply(targets, true, |d| d.style.lineweight = v);
-            }
-            ui.end_row();
-
-            // Visible
-            ui.label("Visible");
-            let shared_vis = self.shared_style(targets, |s| s.visible);
-            ui.horizontal(|ui| {
-                let mut v = shared_vis.unwrap_or(true);
-                let label = if shared_vis.is_none() { "(varies)" }
-                    else if v { "shown" } else { "hidden" };
-                let resp = ui.checkbox(&mut v, label);
-                if resp.changed() {
-                    self.props_apply(targets, true, |d| d.style.visible = v);
-                }
+                    });
             });
-            ui.end_row();
-        });
+            if let Some(v) = pick { self.props_apply(targets, true, |d| d.style.lineweight = v); }
+        }
+
+        // ---- Visible (click toggles) ----
+        if show("Visible") {
+            let shared_vis = self.shared_style(targets, |s| s.visible);
+            let on = matches!(shared_vis, Some(true) | None);
+            let txt = match shared_vis { Some(true) => "shown", Some(false) => "hidden", None => "(varies)" };
+            let mut toggle = false;
+            pp_row(ui, "Visible", |ui, w| {
+                let (rect, resp) = pp_box(ui, w, true);
+                let p = ui.painter_at(rect);
+                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, txt, egui::FontId::proportional(13.0),
+                    if on { PP_TEXT } else { PP_MUTED });
+                if resp.clicked() { toggle = true; }
+            });
+            if toggle {
+                let nv = !matches!(shared_vis, Some(true));
+                self.props_apply(targets, true, |d| d.style.visible = nv);
+            }
+        }
     }
 
     /// Type-specific "respected style" + non-coordinate properties for a
     /// homogeneous selection (`tag` from `geom_tag`). Coordinates are
     /// excluded — only the editable non-geometry fields per variant.
     fn render_props_type_specific(&mut self, ui: &mut egui::Ui, targets: &[usize], tag: u8) {
+        // Line: Length + Angle laid out in two columns (small caps label over
+        // a numeric field), like the mockup's paired fields.
+        if tag == 0 {
+            let shared_len = self.props_shared_geom(targets, |g| {
+                if let Geom::Line(l) = g { Some(((l.b - l.a).len() * 1e6).round() as i64) } else { None } });
+            let shared_ang = self.props_shared_geom(targets, |g| {
+                if let Geom::Line(l) = g {
+                    Some(((l.b - l.a).angle().to_degrees() * 1e4).round() as i64)
+                } else { None } });
+            let mut len = shared_len.map(|x| x as f64 / 1e6).unwrap_or(0.0);
+            let mut ang = shared_ang.map(|x| x as f64 / 1e4).unwrap_or(0.0);
+            let mut len_set: Option<f64> = None;
+            let mut ang_set: Option<f64> = None;
+            let cap = |t: &str| egui::RichText::new(t).monospace().size(9.0).color(PP_MUTED);
+            let varies = |ui: &mut egui::Ui, half: f32, name: &str| {
+                let (rect, _) = pp_box(ui, half, false);
+                ui.painter_at(rect).text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, "various",
+                    egui::FontId::proportional(13.0), PP_MUTED);
+                pp_capture(ui, name, rect);
+            };
+            ui.horizontal(|ui| {
+                let half = ((ui.available_width() - 8.0) / 2.0).max(50.0);
+                ui.vertical(|ui| {
+                    ui.set_width(half);
+                    ui.label(cap("LENGTH"));
+                    ui.add_space(2.0);
+                    if shared_len.is_none() {
+                        varies(ui, half, "LENGTH · value");
+                    } else {
+                        let r = ui.add_sized([half, PP_ROW_H],
+                            egui::DragValue::new(&mut len).speed(0.1).range(0.0..=1e12));
+                        pp_capture(ui, "LENGTH · value", r.rect);
+                        self.props_gesture_snapshot(&r);
+                        if r.changed() { len_set = Some(len); }
+                    }
+                });
+                ui.add_space(8.0);
+                ui.vertical(|ui| {
+                    ui.set_width(half);
+                    ui.label(cap("ANGLE"));
+                    ui.add_space(2.0);
+                    if shared_ang.is_none() {
+                        varies(ui, half, "ANGLE · value");
+                    } else {
+                        let r = ui.add_sized([half, PP_ROW_H],
+                            egui::DragValue::new(&mut ang).speed(0.5).range(-360.0..=360.0).suffix("°"));
+                        pp_capture(ui, "ANGLE · value", r.rect);
+                        self.props_gesture_snapshot(&r);
+                        if r.changed() { ang_set = Some(ang); }
+                    }
+                });
+            });
+            if let Some(v) = len_set {
+                self.props_apply(targets, false, |d| {
+                    if let Geom::Line(l) = &mut d.geom {
+                        let dir = l.b - l.a; let cur = dir.len();
+                        l.b = if cur > 1e-12 { l.a + dir * (v / cur) }
+                              else { l.a + Vec2::new(v, 0.0) };
+                    }
+                });
+            }
+            if let Some(v) = ang_set {
+                self.props_apply(targets, false, |d| {
+                    if let Geom::Line(l) = &mut d.geom {
+                        let ln = (l.b - l.a).len(); let r = v.to_radians();
+                        l.b = l.a + Vec2::new(r.cos() * ln, r.sin() * ln);
+                    }
+                });
+            }
+            return;
+        }
+
         egui::Grid::new("props_type")
             .num_columns(2).spacing([12.0, 5.0]).show(ui, |ui| {
             match tag {
@@ -9679,21 +10904,100 @@ impl CadApp {
                     }
                     ui.end_row();
                 }
-                // ---- Hatch: pattern name + scale + angle ----
+                // ---- Hatch: name + swatch + scale + angle (colour = General) ----
                 7 => {
-                    ui.label("Pattern");
-                    let cur = self.props_first_geom_string(targets, |g| {
+                    let name = self.props_first_geom_string(targets, |g| {
                         if let Geom::Hatch(h) = g {
                             Some(match &h.pattern {
                                 cad_kernel::HatchPattern::Solid => "Solid".to_string(),
                                 cad_kernel::HatchPattern::Pattern { name, .. } => name.clone(),
                             })
                         } else { None }
+                    }).unwrap_or_else(|| "—".into());
+
+                    // Name + small pattern preview swatch.
+                    ui.label("Pattern");
+                    ui.horizontal(|ui| {
+                        let (rect, _) = ui.allocate_exact_size(
+                            egui::vec2(36.0, 16.0), egui::Sense::hover());
+                        let p = ui.painter_at(rect);
+                        p.rect_filled(rect, egui::Rounding::ZERO,
+                            egui::Color32::from_rgb(0x14, 0x1c, 0x25));
+                        let edge = egui::Stroke::new(1.0, egui::Color32::from_rgb(0x3b, 0x49, 0x4c));
+                        p.line_segment([rect.left_top(), rect.right_top()], edge);
+                        p.line_segment([rect.left_bottom(), rect.right_bottom()], edge);
+                        p.line_segment([rect.left_top(), rect.left_bottom()], edge);
+                        p.line_segment([rect.right_top(), rect.right_bottom()], edge);
+                        let ink = egui::Color32::from_rgb(0xba, 0xc9, 0xcc);
+                        if name == "Solid" {
+                            p.rect_filled(rect.shrink(3.0), egui::Rounding::ZERO, ink);
+                        } else {
+                            let s = egui::Stroke::new(1.0, ink);
+                            let mut x = rect.left() - rect.height();
+                            while x < rect.right() {
+                                p.line_segment([egui::pos2(x, rect.bottom()),
+                                    egui::pos2(x + rect.height(), rect.top())], s);
+                                x += 6.0;
+                            }
+                        }
+                        ui.monospace(&name);
                     });
-                    ui.monospace(cur.unwrap_or_else(|| "—".into()));
                     ui.end_row();
+
+                    // Scale + Angle apply only to a real Pattern (not Solid).
+                    let is_pattern = self.props_first_geom_string(targets, |g| {
+                        if let Geom::Hatch(h) = g {
+                            if let cad_kernel::HatchPattern::Pattern { .. } = &h.pattern {
+                                Some("y".to_string())
+                            } else { None }
+                        } else { None }
+                    }).is_some();
+                    if is_pattern {
+                        ui.label("Scale");
+                        let shared = self.props_shared_geom(targets, |g| {
+                            if let Geom::Hatch(h) = g {
+                                if let cad_kernel::HatchPattern::Pattern { scale, .. } = &h.pattern {
+                                    Some((*scale * 1e6).round() as i64)
+                                } else { None }
+                            } else { None } });
+                        let mut sc = shared.map(|x| x as f64 / 1e6).unwrap_or(1.0);
+                        let resp = ui.add(egui::DragValue::new(&mut sc).speed(0.05).range(0.001..=1e6)
+                            .prefix(if shared.is_none() { "≠ " } else { "" }));
+                        if resp.changed() {
+                            self.props_gesture_snapshot(&resp);
+                            self.props_apply(targets, false, |d| {
+                                if let Geom::Hatch(h) = &mut d.geom {
+                                    if let cad_kernel::HatchPattern::Pattern { scale, .. } = &mut h.pattern {
+                                        *scale = sc;
+                                    }
+                                } });
+                        } else { self.props_gesture_snapshot(&resp); }
+                        ui.end_row();
+
+                        ui.label("Angle");
+                        let shared = self.props_shared_geom(targets, |g| {
+                            if let Geom::Hatch(h) = g {
+                                if let cad_kernel::HatchPattern::Pattern { angle_deg, .. } = &h.pattern {
+                                    Some((*angle_deg * 1e4).round() as i64)
+                                } else { None }
+                            } else { None } });
+                        let mut ang = shared.map(|x| x as f64 / 1e4).unwrap_or(0.0);
+                        let resp = ui.add(egui::DragValue::new(&mut ang).speed(0.5).range(-360.0..=360.0)
+                            .suffix("°").prefix(if shared.is_none() { "≠ " } else { "" }));
+                        if resp.changed() {
+                            self.props_gesture_snapshot(&resp);
+                            self.props_apply(targets, false, |d| {
+                                if let Geom::Hatch(h) = &mut d.geom {
+                                    if let cad_kernel::HatchPattern::Pattern { angle_deg, .. } = &mut h.pattern {
+                                        *angle_deg = ang;
+                                    }
+                                } });
+                        } else { self.props_gesture_snapshot(&resp); }
+                        ui.end_row();
+                    }
+
                     ui.label("");
-                    ui.small("Pattern/scale/angle: use the `hatch` dialog.");
+                    ui.small("Colour: General ▸ Color.  Background / origin / type: planned.");
                     ui.end_row();
                 }
                 // ---- Wall: wall style + thickness ----
@@ -17350,6 +18654,256 @@ fn panel_button(ui: &mut egui::Ui, label: &str, active: bool) -> bool {
 /// drafting `tool_button` height + color so the toolbar reads as one
 /// strip. `glyph_kind` picks a hand-drawn placeholder icon; replace
 /// with proper graphics later.
+// ── Left command rails (Draw / Modify) ──────────────────────────────────
+// (icon-id, command-string, tooltip). Draw icons are painted by
+// `draw_draw_glyph`; Modify icons reuse `draw_cmd_glyph` via GlyphKind.
+const DRAW_CMDS: &[(&str, &str, &'static str)] = &[
+    ("pointer", "pointer",    "Selection pointer  (Esc)"),
+    ("line",    "line",       "Line  (L)"),
+    ("pline",   "pline",      "Polyline  (PL)"),
+    ("circle",  "circle",     "Circle  (C)"),
+    ("arc",     "arc",        "Arc  (A)"),
+    ("rect",    "rectangle",  "Rectangle  (REC)"),
+    ("ellipse", "ellipse",    "Ellipse  (EL)"),
+    ("ellarc",  "ellipsearc", "Elliptical arc"),
+    ("point",   "point",      "Point  (PO)"),
+    ("spline",  "spline",     "Spline  (SPL)"),
+    ("wall",    "wall",       "Wall"),
+    ("text",    "text",       "Text  (T)"),
+    ("dim",     "dim",        "Dimension  (DIM)"),
+    ("hatch",   "hatch",      "Hatch  (H)"),
+];
+const MODIFY_CMDS: &[(GlyphKind, &str, &'static str)] = &[
+    (GlyphKind::Move,        "move",       "Move  (M)"),
+    (GlyphKind::Copy,        "copy",       "Copy  (CO)"),
+    (GlyphKind::Rotate,      "rotate",     "Rotate  (RO)"),
+    (GlyphKind::Scale,       "scale",      "Scale  (SC)"),
+    (GlyphKind::Mirror,      "mirror",     "Mirror  (MI)"),
+    (GlyphKind::Stretch,     "stretch",    "Stretch  (S)"),
+    (GlyphKind::Align,       "align",      "Align"),
+    (GlyphKind::Trim,        "trim",       "Trim  (TR)"),
+    (GlyphKind::Extend,      "extend",     "Extend  (EX)"),
+    (GlyphKind::Fillet,      "fillet",     "Fillet  (F)"),
+    (GlyphKind::Chamfer,     "chamfer",    "Chamfer  (CHA)"),
+    (GlyphKind::Offset,      "offset",     "Offset  (O)"),
+    (GlyphKind::Join,        "join",       "Join"),
+    (GlyphKind::Break,       "break",      "Break"),
+    (GlyphKind::Lengthen,    "lengthen 1", "Lengthen"),
+    (GlyphKind::Reverse,     "reverse",    "Reverse"),
+    (GlyphKind::ArrayGrid,   "array",      "Array  (AR)"),
+    (GlyphKind::MatchProps,  "matchprop",  "Match properties"),
+    (GlyphKind::ChangeLayer, "chlayer",    "Change layer"),
+    (GlyphKind::Erase,       "erase",      "Erase  (E)"),
+    (GlyphKind::Block,       "block",      "Make block"),
+    (GlyphKind::Insert,      "insert",     "Insert block"),
+    (GlyphKind::Explode,     "explode",    "Explode  (X)"),
+];
+
+/// Line-art glyphs for the Draw rail — parallels `draw_cmd_glyph`, same
+/// stroke style, centered at `c` (~±10px).
+fn draw_draw_glyph(
+    p: &egui::Painter, c: egui::Pos2, id: &str,
+    pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32,
+) {
+    use egui::vec2;
+    let v = |x: f32, y: f32| c + vec2(x, y);
+    let poly = |pts: Vec<egui::Pos2>| { p.add(egui::Shape::line(pts, pen)); };
+    let ring = |cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32| {
+        let n = 22; let mut pts = Vec::with_capacity(n + 1);
+        for i in 0..=n {
+            let t = a0 + (a1 - a0) * (i as f32 / n as f32);
+            pts.push(c + vec2(cx + rx * t.cos(), cy - ry * t.sin()));
+        }
+        p.add(egui::Shape::line(pts, pen));
+    };
+    let tau = std::f32::consts::TAU;
+    let rstroke = |a: egui::Pos2, b: egui::Pos2|
+        p.rect(egui::Rect::from_two_pos(a, b), 0.0, egui::Color32::TRANSPARENT, pen);
+    match id {
+        "pointer" => { poly(vec![v(-5.0, -8.0), v(-5.0, 6.0), v(-1.0, 2.0), v(2.0, 8.0),
+                                 v(4.0, 7.0), v(1.0, 1.0), v(6.0, 1.0), v(-5.0, -8.0)]); }
+        "line"    => { p.line_segment([v(-7.0, 7.0), v(7.0, -7.0)], pen); dot(v(-7.0, 7.0)); dot(v(7.0, -7.0)); }
+        "pline"   => { poly(vec![v(-8.0, 5.0), v(-3.0, -3.0), v(2.0, 3.0), v(8.0, -5.0)]); }
+        "circle"  => { p.circle_stroke(c, 8.0, pen); dot(c); }
+        "arc"     => { ring(0.0, 4.0, 9.0, 9.0, 0.06 * tau, 0.44 * tau); }
+        "rect"    => { rstroke(v(-8.0, -5.0), v(8.0, 5.0)); }
+        "ellipse" => { ring(0.0, 0.0, 9.0, 5.5, 0.0, tau); }
+        "point"   => { p.line_segment([v(-6.0, 0.0), v(6.0, 0.0)], pen); p.line_segment([v(0.0, -6.0), v(0.0, 6.0)], pen); dot(c); }
+        "spline"  => { let n = 20; let mut pts = Vec::with_capacity(n + 1);
+                       for i in 0..=n { let x = -9.0 + 18.0 * (i as f32 / n as f32); let y = 4.5 * (x * 0.55).sin(); pts.push(v(x, -y)); }
+                       poly(pts); }
+        "hatch"   => { rstroke(v(-8.0, -6.0), v(8.0, 6.0));
+                       for k in -1..=1 { let o = k as f32 * 5.0; p.line_segment([v(o - 1.0, 6.0), v(o + 5.0, -6.0)], pen); } }
+        "text"    => { poly(vec![v(-6.0, 8.0), v(0.0, -8.0), v(6.0, 8.0)]); p.line_segment([v(-3.5, 2.0), v(3.5, 2.0)], pen); }
+        "ellarc"  => { ring(0.0, 0.0, 9.0, 5.5, 0.12 * tau, 0.66 * tau); }
+        "wall"    => { rstroke(v(-9.0, -3.5), v(9.0, 3.5)); p.line_segment([v(-9.0, 0.0), v(9.0, 0.0)], pen); }
+        "dim"     => {
+            p.line_segment([v(-8.0, 3.0), v(-8.0, -5.0)], pen);
+            p.line_segment([v(8.0, 3.0), v(8.0, -5.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(8.0, 0.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(-5.0, -2.0)], pen);
+            p.line_segment([v(-8.0, 0.0), v(-5.0, 2.0)], pen);
+            p.line_segment([v(8.0, 0.0), v(5.0, -2.0)], pen);
+            p.line_segment([v(8.0, 0.0), v(5.0, 2.0)], pen);
+        }
+        _ => {}
+    }
+}
+
+/// Drag-and-drop payload for reordering rail icons. Carries which rail
+/// (`is_draw`) and the SLOT position being dragged so a drop on another slot
+/// can move it. The rail tag stops a Draw icon from dropping onto Modify.
+#[derive(Clone, Copy)]
+struct RailDnd { is_draw: bool, pos: usize }
+
+/// Method list for a rail command's ▼ flyout, as `(short, full, key)` triples.
+/// `short` is the compact code shown next to the glyph (e.g. "3P", "TTR"),
+/// `full` is the hover tooltip, `key` is interpreted by `rail_flyout_dispatch`.
+/// Empty = the command has no methods (no ▼ shown).
+fn rail_flyout_items(cmd: &str) -> Vec<(String, String, String)> {
+    match cmd {
+        "arc" => ALL_ARC_METHODS.iter().enumerate()
+            .map(|(i, m)| (m.short().to_string(), m.name().to_string(), i.to_string()))
+            .collect(),
+        "circle" => vec![
+            ("CR".into(),  "Center, Radius".into(),   "center".into()),
+            ("3P".into(),  "3-Point".into(),          "3p".into()),
+            ("2P".into(),  "2-Point".into(),          "2p".into()),
+            ("TTR".into(), "Tan, Tan, Radius".into(), "ttr".into()),
+        ],
+        "fillet" => vec![
+            ("F".into(),   "Fillet (pick two)".into(), "run".into()),
+            ("PL".into(),  "Polyline (whole)".into(),  "poly".into()),
+            ("×N".into(),  "Multiple".into(),          "multi".into()),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Draw a SMALL method-specific glyph (for the ▼ flyout rows and for the rail
+/// icon once a method has been used). Compact (~7px) primitives so it reads at
+/// flyout size. `cmd`+`key` select the variant; falls back to nothing if
+/// unknown (caller then draws the base command glyph).
+fn draw_method_glyph(p: &egui::Painter, c: egui::Pos2, cmd: &str, key: &str,
+                     pen: egui::Stroke, ink: egui::Color32) {
+    use std::f32::consts::{PI, TAU};
+    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
+    let d = |q: egui::Pos2| p.circle_filled(q, 1.5, ink);
+    match cmd {
+        "circle" => {
+            let r = 7.0;
+            p.circle_stroke(c, r, pen);
+            match key {
+                "3p" => for k in 0..3 {
+                    let a = TAU * (k as f32 / 3.0) - PI / 2.0;
+                    d(v(r * a.cos(), r * a.sin()));
+                },
+                "2p" => { p.line_segment([v(-r, 0.0), v(r, 0.0)], pen);
+                          d(v(-r, 0.0)); d(v(r, 0.0)); }
+                "ttr" => { // circle nestled in a right-angle pair of tangents
+                    p.line_segment([v(-9.0, 8.0), v(9.0, 8.0)], pen);
+                    p.line_segment([v(-9.0, 8.0), v(-9.0, -8.0)], pen); }
+                _ => { d(c); p.line_segment([c, v(r, 0.0)], pen); } // center+radius
+            }
+        }
+        "arc" => {
+            let n = 18;
+            let pts: Vec<egui::Pos2> = (0..=n).map(|i| {
+                let t = PI * (i as f32 / n as f32);
+                v(-8.0 * t.cos(), -8.0 * t.sin())
+            }).collect();
+            p.add(egui::Shape::line(pts.clone(), pen));
+            match ALL_ARC_METHODS.get(key.parse::<usize>().unwrap_or(0)) {
+                Some(ArcMethod::ThreePoints) => { d(pts[0]); d(pts[n / 2]); d(pts[n]); }
+                Some(ArcMethod::StartCenterEnd) | Some(ArcMethod::CenterStartEnd) => {
+                    d(pts[0]); d(c); d(pts[n]); }
+                _ => { d(pts[0]); d(pts[n]); }
+            }
+        }
+        "fillet" => {
+            // An L of two segments joined by a quarter-round corner.
+            p.line_segment([v(-8.0, 7.0), v(-1.0, 7.0)], pen);
+            p.line_segment([v(7.0, -8.0), v(7.0, -1.0)], pen);
+            let q: Vec<egui::Pos2> = (0..=6).map(|i| {
+                let t = (PI / 2.0) * (i as f32 / 6.0);
+                v(7.0 - 8.0 * t.cos(), 7.0 - 8.0 * t.sin())
+            }).collect();
+            p.add(egui::Shape::line(q, pen));
+            match key {
+                "poly"  => { d(v(-1.0, 7.0)); d(v(7.0, -1.0)); }  // emphasise both ends
+                "multi" => { p.line_segment([v(2.0, -6.0), v(6.0, -2.0)], pen);
+                             p.line_segment([v(6.0, -6.0), v(2.0, -2.0)], pen); } // ×
+                _ => {}
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A single icon-only rail button (38×32). Highlights when `active`.
+/// `paint(painter, center, pen, ink)` draws the glyph.
+fn rail_icon_btn(
+    ui: &mut egui::Ui, active: bool, tip: &str,
+    paint: impl FnOnce(&egui::Painter, egui::Pos2, egui::Stroke, egui::Color32),
+) -> egui::Response {
+    // click_and_drag so the SAME response drives command-dispatch (click),
+    // the remove menu (right-click), AND reorder (drag) — no overlapping
+    // second interactor stealing the pointer.
+    let (resp, painter) = ui.allocate_painter(egui::vec2(38.0, 32.0), egui::Sense::click_and_drag());
+    let rect = resp.rect;
+    if active {
+        // Teal accent (PP_ACCENT #00daf3) translucent fill + solid edge.
+        painter.rect(rect, 4.0,
+            egui::Color32::from_rgba_unmultiplied(0x00, 0xda, 0xf3, 38),
+            egui::Stroke::new(1.0, PP_ACCENT));
+    } else if resp.dragged() {
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(0x00, 0xda, 0xf3, 28));
+    } else if resp.hovered() {
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16));
+    }
+    let ink = PP_TEXT;
+    let pen = egui::Stroke::new(1.6, ink);
+    paint(&painter, rect.center(), pen, ink);
+    pp_capture(ui, &format!("rail icon · {}", tip.split("  ").next().unwrap_or(tip)), rect);
+    resp.on_hover_text(tip)
+}
+
+/// Small painted ✕ (collapse) button — never depends on a font glyph.
+fn rail_xbtn(ui: &mut egui::Ui, col: egui::Color32) -> bool {
+    let (resp, p) = ui.allocate_painter(egui::vec2(14.0, 14.0), egui::Sense::click());
+    let r = resp.rect; let c = r.center(); let s = 3.5;
+    let st = egui::Stroke::new(1.4,
+        if resp.hovered() { egui::Color32::from_rgb(231, 236, 246) } else { col });
+    p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
+    p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
+    resp.clicked()
+}
+
+/// Two-row rail strip (✕ collapse top-right, category name below) that ALSO
+/// acts as a drag handle. Returns (collapse_clicked, strip_drag_response).
+fn rail_strip(ui: &mut egui::Ui, name: &str, strip: egui::Color32,
+              line: egui::Color32, muted: egui::Color32) -> (bool, egui::Response) {
+    let w = ui.available_width();
+    let (rect, dragr) = ui.allocate_exact_size(
+        egui::vec2(w, 30.0), egui::Sense::click_and_drag());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, strip);
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, line));
+    p.text(egui::pos2(rect.center().x, rect.bottom() - 8.0),
+        egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(8.0), muted);
+    // Collapse ✕ (top-right), interacted on top of the drag area.
+    let xr = egui::Rect::from_min_size(
+        egui::pos2(rect.right() - 16.0, rect.top() + 3.0), egui::vec2(13.0, 13.0));
+    let xresp = ui.interact(xr.expand(1.0), ui.id().with((name, "railx")), egui::Sense::click());
+    let xc = xr.center(); let s = 3.3;
+    let xcol = if xresp.hovered() { egui::Color32::from_rgb(231, 236, 246) } else { muted };
+    let xs = egui::Stroke::new(1.4, xcol);
+    p.line_segment([egui::pos2(xc.x - s, xc.y - s), egui::pos2(xc.x + s, xc.y + s)], xs);
+    p.line_segment([egui::pos2(xc.x - s, xc.y + s), egui::pos2(xc.x + s, xc.y - s)], xs);
+    let dragr = dragr.on_hover_cursor(egui::CursorIcon::Grab);
+    (xresp.clicked(), dragr)
+}
+
 fn cmd_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -18216,6 +19770,25 @@ impl eframe::App for CadApp {
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
+        // Square corners on ALL menus, popups, and tooltips (menu_rounding
+        // drives Frame::menu + Frame::popup; windows keep their own rounding).
+        if ctx.style().visuals.menu_rounding != egui::Rounding::ZERO {
+            ctx.style_mut(|s| s.visuals.menu_rounding = egui::Rounding::ZERO);
+        }
+
+        // Menu-layout recorder: arm geometry capture for THIS whole frame and
+        // reset the shared buffer BEFORE any panel/menu renders. Every menu that
+        // calls pp_capture / pp_cap_ui records into it; the dump runs at the very
+        // end of update() so it captures ANY open menu (rails, dropdowns, popups,
+        // Properties) — not just the Properties panel.
+        ctx.data_mut(|d| {
+            d.insert_temp(egui::Id::new("pp_cap_on"), self.props_layout_capture);
+            if self.props_layout_capture {
+                d.insert_temp(egui::Id::new("pp_cap_buf"),
+                    Vec::<(String, egui::Rect)>::new());
+            }
+        });
+
         // Drain any in-flight hatch trace worker. If the worker
         // finished this frame, this materialises the result (Success
         // → push polylines + hatch dobject; Failure → fall back to
@@ -18869,7 +20442,10 @@ impl eframe::App for CadApp {
         // Quick Access row and the menu-category row. Every menu item
         // dispatches via `run_command` so its behaviour matches typing the
         // same cmd — one source of truth.
-        egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
+        // Last frame's menu-bar rect — keeps a hover-opened category menu open
+        // while the pointer is over its button (see `menu_autoclose`).
+        let bar_rect = self.menubar_rect;
+        let topbar_ir = egui::TopBottomPanel::top("topbar").show(ctx, |ui| {
             ui.horizontal_top(|ui| {
                 self.draw_logo_column(ui);
                 ui.add_space(8.0);
@@ -18937,6 +20513,8 @@ impl eframe::App for CadApp {
                     if ui.button("Exit").clicked() {
                         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
                     }
+                    pp_cap_ui(ui, "menu: File");
+                    menu_autoclose(ui, bar_rect);
                 });
                 ui.menu_button("Edit", |ui| {
                     if ui.button("Undo").clicked() {
@@ -18992,26 +20570,13 @@ impl eframe::App for CadApp {
                         self.run_command("matchprop");
                         ui.close_menu();
                     }
-                });
-                ui.menu_button("View", |ui| {
-                    if ui.button("Zoom Extents (fit all)").clicked() {
-                        self.zoom_extents();
+                    ui.separator();
+                    if ui.button("Settings…").clicked() {
+                        self.settings_open = true;
                         ui.close_menu();
                     }
-                    if ui.button("Zoom Window").clicked() {
-                        self.zoom_start("w");
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Previous").clicked() {
-                        self.zoom_previous();
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset View").clicked() {
-                        self.view_push_history();
-                        self.scale = 20.0;
-                        self.world_offset = egui::vec2(0.0, 0.0);
-                        ui.close_menu();
-                    }
+                    pp_cap_ui(ui, "menu: Edit");
+                    menu_autoclose(ui, bar_rect);
                 });
                 ui.menu_button("Draw", |ui| {
                     for (label, cmd) in [
@@ -19030,6 +20595,13 @@ impl eframe::App for CadApp {
                             self.run_command(cmd);
                             ui.close_menu();
                         }
+                    }
+                    if ui.button("Wall  (chained run — t = thickness)")
+                        .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
+                        .clicked()
+                    {
+                        self.run_command("wall");
+                        ui.close_menu();
                     }
                     ui.separator();
                     // Blocks — the dialog collects the name; insert lists
@@ -19055,11 +20627,13 @@ impl eframe::App for CadApp {
                                 ui.close_menu();
                             }
                         }
+                        pp_cap_ui(ui, "menu: Draw ▸ Insert Block");
                     });
                     if let Some(n) = insert_pick {
                         self.run_command(&format!("insert {}", n));
                         ui.close_menu();
                     }
+                    pp_cap_ui(ui, "menu: Draw");
                 });
                 ui.menu_button("Modify", |ui| {
                     // Transform group
@@ -19132,131 +20706,164 @@ impl eframe::App for CadApp {
                         self.run_command("erase");
                         ui.close_menu();
                     }
+                    pp_cap_ui(ui, "menu: Modify");
+                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Dimension", |ui| {
-                    // Smart dim auto-decides Linear / Radius / Diameter
-                    // from what the first click hits (single `dim`
-                    // command — no separate dimlinear/dimradius words).
-                    if ui.button("Dimension  (smart: linear · radius · diameter)")
-                        .on_hover_text(
-                            "Click a defining point for a linear dim, or a \
-                             circle/arc for radius (press D for diameter)")
-                        .clicked()
-                    {
-                        self.run_command("dim");
+                ui.menu_button("View", |ui| {
+                    if ui.button("Zoom Extents (fit all)").clicked() {
+                        self.zoom_extents();
+                        ui.close_menu();
+                    }
+                    if ui.button("Zoom Window").clicked() {
+                        self.zoom_start("w");
+                        ui.close_menu();
+                    }
+                    if ui.button("Zoom Previous").clicked() {
+                        self.zoom_previous();
+                        ui.close_menu();
+                    }
+                    if ui.button("Reset View").clicked() {
+                        self.view_push_history();
+                        self.scale = 20.0;
+                        self.world_offset = egui::vec2(0.0, 0.0);
+                        ui.close_menu();
+                    }
+                    pp_cap_ui(ui, "menu: View");
+                    menu_autoclose(ui, bar_rect);
+                });
+                ui.menu_button("Formative", |ui| {
+                    if ui.button("Layers…").clicked() {
+                        self.layer_panel_open = !self.layer_panel_open;
+                        ui.close_menu();
+                    }
+                    if ui.button("Pens…").clicked() {
+                        self.pen_panel_open = !self.pen_panel_open;
                         ui.close_menu();
                     }
                     ui.separator();
-                    if ui.button("Dimension Style…")
-                        .on_hover_text("Add or edit a dimension style \
-                                        (arrow size, text height, decimals, color)")
-                        .clicked()
-                    {
-                        self.run_command("dimstyle");
-                        ui.close_menu();
-                    }
-                });
-                ui.menu_button("Wall", |ui| {
-                    if ui.button("Wall  (chained run — t = thickness)")
-                        .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
-                        .clicked()
-                    {
-                        self.run_command("wall");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Wall Style…")
-                        .on_hover_text("Wall types (Dry Wall / Structural / …): thickness, poché fill, face color")
-                        .clicked()
-                    {
-                        self.run_command("wallstyle");
-                        ui.close_menu();
-                    }
-                });
-                // ---- Styles menu — ONE home for every style table. Maps
-                // 1:1 onto a future ribbon "Styles" tab. Managers first,
-                // then current-style quick switchers (✔ = current).
-                ui.menu_button("Styles", |ui| {
-                    ui.label(egui::RichText::new("Managers").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
-                    for (label, cmd, tip) in [
-                        ("Text Style…", "style",
-                         "Named text styles (font, default height)"),
-                        ("Dimension Style…", "dimstyle",
-                         "Arrow size, text height/placement, decimals, colors"),
-                        ("Wall Style…", "wallstyle",
-                         "Wall types (Dry Wall / Structural / …): thickness, poché fill, face color"),
-                    ] {
-                        if ui.button(label).on_hover_text(tip).clicked() {
-                            self.run_command(cmd);
+                    // Dimension — a formative sub-category (not a top-level menu).
+                    ui.menu_button("Dimension", |ui| {
+                        // Smart dim auto-decides Linear / Radius / Diameter
+                        // from what the first click hits (single `dim`
+                        // command — no separate dimlinear/dimradius words).
+                        if ui.button("Dimension  (smart: linear · radius · diameter)")
+                            .on_hover_text(
+                                "Click a defining point for a linear dim, or a \
+                                 circle/arc for radius (press D for diameter)")
+                            .clicked()
+                        {
+                            self.run_command("dim");
                             ui.close_menu();
                         }
-                    }
-                    ui.separator();
-                    ui.label(egui::RichText::new("Current").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
-                    // Snapshot names so the submenu closures don't borrow doc.
-                    let dim_names: Vec<(u32, String)> = self.doc.dim_styles.styles
-                        .iter().enumerate()
-                        .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                    let wall_names: Vec<(u32, String)> = self.doc.wall_styles.styles
-                        .iter().enumerate()
-                        .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                    let mut set_dim:  Option<u32> = None;
-                    let mut set_wall: Option<u32> = None;
-                    ui.menu_button(
-                        format!("Dim style:  {}", dim_names
-                            .get(self.current_dim_style as usize)
-                            .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                        |ui| {
-                            for (id, name) in &dim_names {
-                                if ui.selectable_label(
-                                    *id == self.current_dim_style, name).clicked()
-                                {
-                                    set_dim = Some(*id);
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    ui.menu_button(
-                        format!("Wall style:  {}", wall_names
-                            .get(self.current_wall_style as usize)
-                            .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                        |ui| {
-                            for (id, name) in &wall_names {
-                                if ui.selectable_label(
-                                    *id == self.current_wall_style, name).clicked()
-                                {
-                                    set_wall = Some(*id);
-                                    ui.close_menu();
-                                }
-                            }
-                        });
-                    if let Some(id) = set_dim {
-                        self.current_dim_style = id;
-                        self.history.push(format!(
-                            "  dim style: '{}' set current",
-                            dim_names[id as usize].1));
-                    }
-                    if let Some(id) = set_wall {
-                        self.current_wall_style = id;
-                        // Same WlThk sync the Wall Style Manager's Set
-                        // Current does, so the next wall draws at the
-                        // style's thickness.
-                        if let Some(s) = self.doc.wall_styles.get(id) {
-                            self.env.WlThk = s.thickness;
-                            let _ = self.env.save();
+                        ui.separator();
+                        if ui.button("Dimension Style…")
+                            .on_hover_text("Add or edit a dimension style \
+                                            (arrow size, text height, decimals, color)")
+                            .clicked()
+                        {
+                            self.run_command("dimstyle");
+                            ui.close_menu();
                         }
-                        self.history.push(format!(
-                            "  wall style: '{}' set current",
-                            wall_names[id as usize].1));
+                        pp_cap_ui(ui, "menu: Formative ▸ Dimension");
+                    });
+                    // Styles — a formative sub-category. ONE home for every
+                    // style table. Managers first, then current-style switchers.
+                    ui.menu_button("Styles", |ui| {
+                        ui.label(egui::RichText::new("Managers").small().color(
+                            egui::Color32::from_rgb(150, 165, 185)));
+                        for (label, cmd, tip) in [
+                            ("Text Style…", "style",
+                             "Named text styles (font, default height)"),
+                            ("Dimension Style…", "dimstyle",
+                             "Arrow size, text height/placement, decimals, colors"),
+                            ("Wall Style…", "wallstyle",
+                             "Wall types (Dry Wall / Structural / …): thickness, poché fill, face color"),
+                        ] {
+                            if ui.button(label).on_hover_text(tip).clicked() {
+                                self.run_command(cmd);
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        ui.label(egui::RichText::new("Current").small().color(
+                            egui::Color32::from_rgb(150, 165, 185)));
+                        // Snapshot names so the submenu closures don't borrow doc.
+                        let dim_names: Vec<(u32, String)> = self.doc.dim_styles.styles
+                            .iter().enumerate()
+                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
+                        let wall_names: Vec<(u32, String)> = self.doc.wall_styles.styles
+                            .iter().enumerate()
+                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
+                        let mut set_dim:  Option<u32> = None;
+                        let mut set_wall: Option<u32> = None;
+                        ui.menu_button(
+                            format!("Dim style:  {}", dim_names
+                                .get(self.current_dim_style as usize)
+                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
+                            |ui| {
+                                for (id, name) in &dim_names {
+                                    if ui.selectable_label(
+                                        *id == self.current_dim_style, name).clicked()
+                                    {
+                                        set_dim = Some(*id);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        ui.menu_button(
+                            format!("Wall style:  {}", wall_names
+                                .get(self.current_wall_style as usize)
+                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
+                            |ui| {
+                                for (id, name) in &wall_names {
+                                    if ui.selectable_label(
+                                        *id == self.current_wall_style, name).clicked()
+                                    {
+                                        set_wall = Some(*id);
+                                        ui.close_menu();
+                                    }
+                                }
+                            });
+                        if let Some(id) = set_dim {
+                            self.current_dim_style = id;
+                            self.history.push(format!(
+                                "  dim style: '{}' set current",
+                                dim_names[id as usize].1));
+                        }
+                        if let Some(id) = set_wall {
+                            self.current_wall_style = id;
+                            // Same WlThk sync the Wall Style Manager's Set
+                            // Current does, so the next wall draws at the
+                            // style's thickness.
+                            if let Some(s) = self.doc.wall_styles.get(id) {
+                                self.env.WlThk = s.thickness;
+                                let _ = self.env.save();
+                            }
+                            self.history.push(format!(
+                                "  wall style: '{}' set current",
+                                wall_names[id as usize].1));
+                        }
+                        ui.separator();
+                        // Future style tables — visible intent, honestly disabled.
+                        ui.add_enabled(false, egui::Button::new("Opening Style…  (planned)"))
+                            .on_disabled_hover_text(
+                                "Door / window / niche styles riding on walls — \
+                                 see Smart_Dobjects.md §2.6");
+                        pp_cap_ui(ui, "menu: Formative ▸ Styles");
+                    });
+                    pp_cap_ui(ui, "menu: Formative");
+                });
+                ui.menu_button("Utilities", |ui| {
+                    if ui.button("Distance (2 clicks)").clicked() {
+                        self.run_command("dist");
+                        ui.close_menu();
                     }
-                    ui.separator();
-                    // Future style tables — visible intent, honestly disabled.
-                    ui.add_enabled(false, egui::Button::new("Opening Style…  (planned)"))
-                        .on_disabled_hover_text(
-                            "Door / window / niche styles riding on walls — \
-                             see Smart_Dobjects.md §2.6");
+                    if ui.button("List selected dobjects").clicked() {
+                        self.run_command("list");
+                        ui.close_menu();
+                    }
+                    pp_cap_ui(ui, "menu: Utilities");
+                    menu_autoclose(ui, bar_rect);
                 });
                 ui.menu_button("Tools", |ui| {
                     ui.label(egui::RichText::new("Palettes").small().color(
@@ -19266,6 +20873,11 @@ impl eframe::App for CadApp {
                     ui.checkbox(&mut self.pens_window_open,     "Pens");
                     ui.checkbox(&mut self.info_window_open,     "Info / Properties");
                     ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
+                    ui.separator();
+                    ui.label(egui::RichText::new("Command rails").small().color(
+                        egui::Color32::from_rgb(150, 165, 185)));
+                    ui.checkbox(&mut self.draw_rail_open,   "Draw rail (left)");
+                    ui.checkbox(&mut self.modify_rail_open, "Modify rail (left)");
                     ui.separator();
                     if ui.button("Snap window").clicked() {
                         self.snap_window_open = !self.snap_window_open;
@@ -19361,7 +20973,9 @@ impl eframe::App for CadApp {
                             self.history.push("  cleared".into());
                             ui.close_menu();
                         }
+                        pp_cap_ui(ui, "menu: Tools ▸ Debug tools");
                     });
+                    pp_cap_ui(ui, "menu: Tools");
                 });
                 ui.menu_button("Help", |ui| {
                     if ui.button("Command help").clicked() {
@@ -19375,280 +20989,34 @@ impl eframe::App for CadApp {
                             "  github.com/HSI-Lighting/RUST-AutoRASM".into());
                         ui.close_menu();
                     }
+                    pp_cap_ui(ui, "menu: Help");
+                    menu_autoclose(ui, bar_rect);
                 });
             });
                     });
                 });
         });
+        self.menubar_rect = topbar_ir.response.rect;
         // The customize drop window (anchored just under the QAT bar).
         self.qat_customize_window(ctx);
 
         // ---- top toolbar ------------------------------------------------
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
-            ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let prev = self.tool;
-                tool_button(ui, &mut self.tool, Tool::None,   "pointer");
+        // Top toolbar — all draw/modify icons moved to the left rails, so this
+        // panel only exists to surface an intersection-result label. Render it
+        // ONLY when there's a label, otherwise it's a blank gap above the canvas.
+        if !self.last_intersect_label.is_empty() {
+            egui::TopBottomPanel::top("toolbar").show(ctx, |ui| {
                 ui.add_space(4.0);
-                tool_button(ui, &mut self.tool, Tool::Line,     "line");
-                tool_button(ui, &mut self.tool, Tool::Rectangle, "rect");
-                // Circle ribbon button → the prompt-driven flow (same as
-                // typing `circle`), NOT the old click-click tool. tool_button
-                // toggles self.tool first; we reset it and start the flow.
-                if tool_button(ui, &mut self.tool, Tool::Circle, "circle") {
-                    self.tool = Tool::None;
-                    self.circle_flow_start();
-                }
-                // Hatch is a one-shot command (not a persistent draw
-                // tool); custom-painted icon — clicking opens the
-                // Choose Hatch Attributes dialog same as the `hatch`
-                // cmd-line word. Placed next to circle per user req.
-                if hatch_command_button(ui) {
-                    self.run_command("hatch");
-                }
-                tool_button(ui, &mut self.tool, Tool::Ellipse,    "ellipse");
-                tool_button(ui, &mut self.tool, Tool::EllipseArc, "ell.arc");
-                tool_button(ui, &mut self.tool, Tool::Point,    "point");
-                tool_button(ui, &mut self.tool, Tool::Polyline, "pline");
-                tool_button(ui, &mut self.tool, Tool::Spline,   "spline");
-                tool_button(ui, &mut self.tool, Tool::Wall,     "wall");
-                tool_button(ui, &mut self.tool, Tool::Text,     "text");
-                tool_button(ui, &mut self.tool, Tool::Dim,      "dim");
-                // Three quick-access buttons for the functional arc methods.
-                let prev_method = self.arc_method;
-                arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
-                                ArcMethod::ThreePoints,    "3p");
-                arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
-                                ArcMethod::StartCenterEnd, "SCE");
-                arc_tool_button(ui, &mut self.tool, &mut self.arc_method,
-                                ArcMethod::CenterStartEnd, "CSE");
-                if ui.button("▾ more arcs")
-                    .on_hover_text("all 11 arc construction methods incl. frozen")
-                    .clicked()
-                {
-                    self.arc_picker_open = !self.arc_picker_open;
-                }
-                if self.tool != prev || self.arc_method != prev_method {
-                    self.pending.clear();
-                }
-                // The Dim toolbar button only flips `self.tool`; route
-                // entry through the `dim` command so the draft state +
-                // prompt get set up exactly as if it were typed. Leaving
-                // Dim for another tool clears the lingering draft.
-                if self.tool != prev {
-                    if self.tool == Tool::Dim {
-                        self.run_command("dim");
-                    } else if prev == Tool::Dim {
-                        self.dim_draft = DimDraftState::Off;
-                    }
-                    // Ribbon/icon command → record it as the last command so an
-                    // empty Enter repeats it (icon commands ARE app commands).
-                    if let Some(word) = tool_command_word(self.tool) {
-                        self.last_command = Some(word.to_string());
-                    }
-                }
-                ui.add_space(20.0);
-                // ---- User-facing panel toggles ---------------------------
-                // Styled to match the drafting tool buttons (same height,
-                // same color scheme) so the toolbar reads as one strip.
-                // Debug-only buttons moved to Tools → Debug tools menu.
-                if panel_button(ui, "array…", self.array_open) {
-                    self.array_open = !self.array_open;
-                }
-                // OSNAP settings (floating window) + active-snaps badge.
-                let snap_btn = format!("snap…\n{}", active_snap_letters(self.snap_enabled));
-                if panel_button(ui, &snap_btn, self.snap_window_open) {
-                    self.snap_window_open = !self.snap_window_open;
-                }
-                // GRIPS toggle (also: cmd `grips`, or GrpEnb in settings).
-                let grips_btn = if self.env.GrpEnb { "grips\nON" } else { "grips\noff" };
-                if panel_button(ui, grips_btn, self.env.GrpEnb) {
-                    self.env.GrpEnb = !self.env.GrpEnb;
-                }
-                if panel_button(ui, "settings…", self.settings_open) {
-                    self.settings_open = !self.settings_open;
-                }
-                if panel_button(ui, "layers", self.layer_panel_open) {
-                    self.layer_panel_open = !self.layer_panel_open;
-                }
-                if panel_button(ui, "pens", self.pen_panel_open) {
-                    self.pen_panel_open = !self.pen_panel_open;
-                }
-                if panel_button(ui, "info", self.info_panel_open) {
-                    self.info_panel_open = !self.info_panel_open;
-                }
-                ui.add_space(20.0);
-                if !self.last_intersect_label.is_empty() {
+                ui.horizontal(|ui| {
+                    ui.add_space(2.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(180, 200, 220),
                         &self.last_intersect_label,
                     );
-                }
-                ui.add_space(20.0);
-                // Active-tool indicator
-                let green = egui::Color32::from_rgb(120, 220, 160);
-                let grey  = egui::Color32::from_rgb(140, 150, 165);
-                let (label_s, color) = match self.tool {
-                    Tool::None   => (String::from("idle — no tool active"), grey),
-                    Tool::Line    => (String::from("DRAWING LINE"), green),
-                    Tool::Circle  => (String::from("DRAWING CIRCLE"), green),
-                    Tool::Ellipse    => (String::from("DRAWING ELLIPSE"), green),
-                    Tool::EllipseArc => (String::from("DRAWING ELLIPTICAL ARC"), green),
-                    Tool::Point     => (String::from("PLACING POINT"), green),
-                    Tool::Rectangle => (
-                        if self.pending.is_empty() {
-                            String::from("DRAWING RECTANGLE — click first corner")
-                        } else {
-                            String::from("DRAWING RECTANGLE — click opposite corner, or type  width height")
-                        }, green),
-                    Tool::Polyline  => (format!("DRAWING POLYLINE ({} verts; Enter to finish, 'c' Enter to close)",
-                        self.pending.len()), green),
-                    Tool::Spline    => (format!("DRAWING SPLINE ({} ctrl pts; Enter finishes after \u{2265}3)",
-                        self.pending.len()), green),
-                    Tool::Arc     => (format!("DRAWING ARC ({})",
-                        self.arc_method.name()), green),
-                    Tool::Wall    => (
-                        if self.pending.is_empty() {
-                            format!("DRAWING WALL run (thickness={}) — click start", self.env.WlThk)
-                        } else {
-                            format!("DRAWING WALL run (thickness={}) — click next; Enter ends", self.env.WlThk)
-                        }, green),
-                    Tool::Text    => (format!("PLACING TEXT (height={})", self.env.TxHt), green),
-                    Tool::Dim     => {
-                        let phase = match &self.dim_draft {
-                            DimDraftState::Off => "idle",
-                            DimDraftState::WaitingForP1 => "click first point",
-                            DimDraftState::WaitingForP2 { .. } => "click second point",
-                            DimDraftState::WaitingForDimLinePos { .. } => "click dim line / leader position",
-                        };
-                        (format!("DRAWING DIMENSION — {}", phase), green)
-                    }
-                };
-                ui.colored_label(color, egui::RichText::new(label_s)
-                    .monospace().size(14.0).strong());
+                });
+                ui.add_space(4.0);
             });
-            // -------- SECOND TOOLBAR ROW: modify ops + inquiry -------
-            // Placeholder hand-drawn glyphs — swap to real icons later.
-            // Every modify command + inquiry tool surfaced here so the
-            // user doesn't have to dig through menus or type aliases.
-            ui.add_space(2.0);
-            ui.horizontal(|ui| {
-                // History
-                if cmd_button(ui, "undo", GlyphKind::Undo, "Undo last edit") {
-                    self.run_command("undo");
-                }
-                if cmd_button(ui, "redo", GlyphKind::Redo, "Redo") {
-                    self.run_command("redo");
-                }
-                ui.add_space(8.0);
-                // Transform group
-                for (lbl, kind, cmd, tip) in [
-                    ("move",    GlyphKind::Move,    "move",    "Translate selection by 2 picks"),
-                    ("copy",    GlyphKind::Copy,    "copy",    "Copy selection by 2 picks"),
-                    ("rotate",  GlyphKind::Rotate,  "rotate",  "Rotate selection around a pivot"),
-                    ("scale",   GlyphKind::Scale,   "scale",   "Scale selection from a pivot"),
-                    ("mirror",  GlyphKind::Mirror,  "mirror",  "Mirror selection across a line"),
-                    ("stretch", GlyphKind::Stretch, "stretch", "Stretch by crossing window"),
-                    ("align",   GlyphKind::Align,   "align",   "Translate + rotate to align 2 pts"),
-                ] {
-                    if cmd_button(ui, lbl, kind, tip) { self.run_command(cmd); }
-                }
-                ui.add_space(8.0);
-                // Edit-geometry group
-                for (lbl, kind, cmd, tip) in [
-                    ("trim",     GlyphKind::Trim,     "trim",     "Trim to cutting edges"),
-                    ("extend",   GlyphKind::Extend,   "extend",   "Extend to boundary"),
-                    ("fillet",   GlyphKind::Fillet,   "fillet",   "Round a corner (r/t/m sub-options)"),
-                    ("chamfer",  GlyphKind::Chamfer,  "chamfer",  "Bevel a corner (d/t/m sub-options)"),
-                    ("offset",   GlyphKind::Offset,   "offset",   "Parallel copy (t/e/l/u sub-options)"),
-                    ("join",     GlyphKind::Join,     "join",     "Merge collinear / chain-able dobjects"),
-                    ("break",    GlyphKind::Break,    "break",    "Split a dobject at a clicked point"),
-                    ("lengthen", GlyphKind::Lengthen, "lengthen 1", "Lengthen a line/arc end"),
-                    ("reverse",  GlyphKind::Reverse,  "reverse",  "Flip direction of selected dobjects"),
-                ] {
-                    if cmd_button(ui, lbl, kind, tip) { self.run_command(cmd); }
-                }
-                ui.add_space(8.0);
-                // Properties + multi-instance
-                if cmd_button(ui, "array", GlyphKind::ArrayGrid,
-                    "Rectangular array (rows × cols × dx, dy)")
-                {
-                    self.array_open = true;
-                }
-                if cmd_button(ui, "match", GlyphKind::MatchProps,
-                    "Match Properties — paint a source dobject's style onto selection")
-                {
-                    self.run_command("matchprop");
-                }
-                if cmd_button(ui, "→ layer", GlyphKind::ChangeLayer,
-                    "Change selection's layer to the active layer")
-                {
-                    self.run_command("chlayer");
-                }
-                ui.add_space(8.0);
-                // Destructive
-                if cmd_button(ui, "erase", GlyphKind::Erase,
-                    "Erase selection (or pick then Enter)")
-                {
-                    self.run_command("erase");
-                }
-                ui.add_space(20.0);
-                // Inquiry
-                if cmd_button(ui, "dist", GlyphKind::Dist,
-                    "Distance between two clicked points") {
-                    self.run_command("dist");
-                }
-                if cmd_button(ui, "list", GlyphKind::List,
-                    "List full properties of the selected dobjects") {
-                    self.run_command("list");
-                }
-                ui.add_space(20.0);
-                // ---- Blocks group: define / insert / explode -------------
-                if cmd_button(ui, "block", GlyphKind::Block,
-                    "Create a block from the selection (opens the Block dialog)")
-                {
-                    self.run_command("block");
-                }
-                // Insert: dropdown of defined blocks. No blocks → the bare
-                // `insert` command prints a helpful hint instead.
-                let block_names: Vec<String> = self.doc.blocks.blocks.iter()
-                    .map(|b| b.name.clone()).collect();
-                let insert_resp = cmd_button_resp(ui, "insert", GlyphKind::Insert,
-                    "Place an instance of a defined block (pick from the list)");
-                let insert_popup = ui.make_persistent_id("toolbar_insert_popup");
-                if insert_resp.clicked() {
-                    if block_names.is_empty() {
-                        self.run_command("insert");   // prints "no blocks defined"
-                    } else {
-                        ui.memory_mut(|m| m.toggle_popup(insert_popup));
-                    }
-                }
-                let mut insert_pick: Option<String> = None;
-                egui::popup_below_widget(
-                    ui, insert_popup, &insert_resp,
-                    egui::PopupCloseBehavior::CloseOnClick,
-                    |ui| {
-                        ui.set_min_width(120.0);
-                        ui.label(egui::RichText::new("Insert block").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
-                        for n in &block_names {
-                            if ui.button(n).clicked() {
-                                insert_pick = Some(n.clone());
-                            }
-                        }
-                    },
-                );
-                if let Some(n) = insert_pick {
-                    self.run_command(&format!("insert {}", n));
-                }
-                if cmd_button(ui, "explode", GlyphKind::Explode,
-                    "Explode selected block instances into their dobjects")
-                {
-                    self.run_command("explode");
-                }
-            });
-            ui.add_space(4.0);
-        });
+        }
 
         // ---- debug window (CPU/GPU render toggle + stats) -------------------
         if self.debug_open {
@@ -19736,45 +21104,8 @@ impl eframe::App for CadApp {
         }
 
         // ---- snap settings window -----------------------------------------
-        if self.snap_window_open {
-            let mut keep = true;
-            egui::Window::new("OBJECT SNAP — running osnaps")
-                .open(&mut keep)
-                .resizable(false)
-                .collapsible(false)
-                .default_width(280.0)
-                .default_pos(egui::pos2(20.0, 360.0))
-                .show(ctx, |ui| {
-                    ui.label("Snaps to find automatically while you hover.");
-                    ui.label("Type the same name in the command line to use it once.");
-                    ui.separator();
-                    for k in SnapKind::ALL {
-                        let mut on = self.snap_enabled.is_enabled(k);
-                        let label = format!("{:<5}  {}", k.name(), snap_blurb(k));
-                        if ui.checkbox(&mut on, label).changed() {
-                            self.snap_enabled.set(k, on);
-                        }
-                    }
-                    ui.separator();
-                    ui.horizontal(|ui| {
-                        ui.label("search radius (SpTGSZ)");
-                        ui.add(egui::Slider::new(&mut self.env.SpTGSZ, 4..=80)
-                            .suffix(" px"));
-                    });
-                    ui.horizontal(|ui| {
-                        if ui.button("All on").clicked() {
-                            for k in SnapKind::ALL { self.snap_enabled.set(k, true); }
-                        }
-                        if ui.button("All off").clicked() {
-                            self.snap_enabled = SnapSet::default();
-                        }
-                        if ui.button("Defaults").clicked() {
-                            self.snap_enabled = SnapSet::defaults();
-                        }
-                    });
-                });
-            if !keep { self.snap_window_open = false; }
-        }
+        // (Object-snap settings are now a popup anchored to the status-bar
+        // "dsnap" button — see render of the bottom status bar.)
 
         // ---- User-Environment Settings window (registry-driven) ------------
         self.settings_window(ctx);
@@ -20177,6 +21508,45 @@ impl eframe::App for CadApp {
                             let _ = self.env.save();
                         }
                         ui.separator();
+                        // DSNAP — opens the object-snap menu as a popup right
+                        // above the button; click-outside closes it.
+                        let dsnap = ui.button("dsnap")
+                            .on_hover_text("DObject-snap (DSNAP) settings");
+                        let snap_popup = ui.make_persistent_id("dsnap_popup");
+                        if dsnap.clicked() { ui.memory_mut(|m| m.toggle_popup(snap_popup)); }
+                        egui::popup_above_or_below_widget(ui, snap_popup, &dsnap,
+                            egui::AboveOrBelow::Above,
+                            egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
+                                ui.set_min_width(258.0);
+                                ui.label("Snaps found automatically while you hover:");
+                                ui.separator();
+                                for k in SnapKind::ALL {
+                                    let mut on = self.snap_enabled.is_enabled(k);
+                                    let label = format!("{:<5}  {}", k.name(), snap_blurb(k));
+                                    if ui.checkbox(&mut on, label).changed() {
+                                        self.snap_enabled.set(k, on);
+                                    }
+                                }
+                                ui.separator();
+                                ui.horizontal(|ui| {
+                                    ui.label("search radius");
+                                    ui.add(egui::Slider::new(&mut self.env.SpTGSZ, 4..=80)
+                                        .suffix(" px"));
+                                });
+                                ui.horizontal(|ui| {
+                                    if ui.button("All on").clicked() {
+                                        for k in SnapKind::ALL { self.snap_enabled.set(k, true); }
+                                    }
+                                    if ui.button("All off").clicked() {
+                                        self.snap_enabled = SnapSet::default();
+                                    }
+                                    if ui.button("Defaults").clicked() {
+                                        self.snap_enabled = SnapSet::defaults();
+                                    }
+                                });
+                                pp_cap_ui(ui, "object-snap (dsnap) popup");
+                            });
+                        ui.separator();
                         // Drafting-mode toggles: GRID (F7), SNAP (F9), ORTHO (F8).
                         // Clickable badges (same affordance as the osnap row).
                         let drafting_badge = |ui: &mut egui::Ui, label: &str, on: bool, tip: &str| {
@@ -20248,16 +21618,41 @@ impl eframe::App for CadApp {
             egui::pos2(r.left() + 360.0, r.bottom() - 220.0)
         };
         let mut cmd_open = self.cmd_window_open;
-        let win = egui::Window::new("Command")
-            .open(&mut cmd_open)
-            .default_pos(cmd_default_pos)
-            .default_size(egui::vec2(720.0, 180.0))
-            .min_width(360.0)
-            .min_height(120.0)
-            .resizable(true)
-            .collapsible(true);
-        let win = self.apply_dock_pos("Command", ctx, win);
-        let resp = win.show(ctx, |ui| {
+        // ---- Docked variant: a bottom strip ABOVE the status bar, under the
+        // canvas (status_bar is added first, so this bottom panel stacks above
+        // it). Full width — the AutoCAD-style command line position. ----
+        if self.cmd_docked {
+            egui::TopBottomPanel::bottom("cmd_dock")
+                .resizable(true)
+                .default_height(150.0)
+                .min_height(96.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Command").strong().color(PP_LABEL));
+                        ui.with_layout(
+                            egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.small_button("⏏ undock")
+                                    .on_hover_text("Float the command bar again")
+                                    .clicked()
+                                {
+                                    self.cmd_docked = false;
+                                }
+                            });
+                    });
+                    self.command_bar_body(ui);
+                });
+        }
+        // ---- Floating variant: the draggable Command window ----
+        let resp = if self.cmd_docked { None } else {
+            let win = egui::Window::new("Command")
+                .open(&mut cmd_open)
+                .default_pos(cmd_default_pos)
+                .default_size(egui::vec2(720.0, 180.0))
+                .min_width(360.0)
+                .min_height(120.0)
+                .resizable(true)
+                .collapsible(true);
+            win.show(ctx, |ui| {
                 // Reserve space at the bottom for: prompt line (always shown) +
                 // the input row.
                 let bottom_reserve = 32.0 + 18.0;
@@ -20371,9 +21766,23 @@ impl eframe::App for CadApp {
                         ui.ctx().request_repaint();
                     }
                 });
-            });
-        self.process_dock_after_show("Command", ctx, resp);
+            })
+        };
         self.cmd_window_open = cmd_open;
+        // Drag-to-dock: when the floating window's bottom edge is dragged down
+        // near the canvas bottom (just above the status bar), dock it as a strip.
+        if let Some(r) = &resp {
+            if let Some(canvas) = self.canvas_screen_rect {
+                let wr = r.response.rect;
+                if r.response.dragged() && wr.bottom() >= canvas.bottom() - 26.0 {
+                    self.cmd_docked = true;
+                }
+            }
+        }
+
+        // ---- left command rails (Draw / Modify) — before the CentralPanel
+        // so the canvas reflows to their right.
+        self.render_command_rails(ctx);
 
         // ---- central panel: canvas --------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -20427,11 +21836,34 @@ impl eframe::App for CadApp {
                             ui.close_menu();
                         }
                     });
+                    // DObject Snap ▸ (running-osnap toggles, same set as DSNAP)
+                    ui.menu_button("DObject Snap", |ui| {
+                        for k in SnapKind::ALL {
+                            let mut on = self.snap_enabled.is_enabled(k);
+                            let label = format!("{:<5}  {}", k.name(), snap_blurb(k));
+                            if ui.checkbox(&mut on, label).changed() {
+                                self.snap_enabled.set(k, on);
+                            }
+                        }
+                        ui.separator();
+                        ui.horizontal(|ui| {
+                            if ui.button("All on").clicked() {
+                                for k in SnapKind::ALL { self.snap_enabled.set(k, true); }
+                            }
+                            if ui.button("All off").clicked() {
+                                self.snap_enabled = SnapSet::default();
+                            }
+                            if ui.button("Defaults").clicked() {
+                                self.snap_enabled = SnapSet::defaults();
+                            }
+                        });
+                    });
                     ui.separator();
                     if ui.button("Properties").clicked() {
                         self.info_window_open = true;
                         ui.close_menu();
                     }
+                    pp_cap_ui(ui, "canvas right-click menu");
                 });
             }
             // ZOOM real-time mode: a primary drag zooms the view instead of
@@ -24023,6 +25455,33 @@ impl eframe::App for CadApp {
 
             ctx.request_repaint();
         });
+
+        // Menu-layout recorder DUMP — runs after the WHOLE frame's UI, so it
+        // captures every menu that was open this frame (rails + their flyouts /
+        // add / remove popups, menu-bar dropdowns, the canvas right-click menu,
+        // the object-snap popup, and the Properties panel). One-shot: disarms
+        // itself. Open the menu(s) you want measured, THEN click "Capture menu
+        // layout" so they're on-screen during the captured frame.
+        if self.props_layout_capture {
+            let buf: Vec<(String, egui::Rect)> = ctx.data(|d|
+                d.get_temp(egui::Id::new("pp_cap_buf")).unwrap_or_default());
+            let fmt = |name: &str, r: egui::Rect| format!(
+                "{:<32} x={:7.1} y={:7.1}  w={:7.1} h={:6.1}",
+                name, r.left(), r.top(), r.width(), r.height());
+            let mut elements: Vec<String> =
+                buf.iter().map(|(n, r)| fmt(n, *r)).collect();
+            let n = elements.len();
+            if n == 0 {
+                elements.push(
+                    "(no instrumented menu was open — open a menu first, then capture)".into());
+            }
+            crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuLayout {
+                label: "menus".into(), elements });
+            self.props_layout_capture = false;
+            ctx.data_mut(|d| d.insert_temp(egui::Id::new("pp_cap_on"), false));
+            self.history.push(format!(
+                "  📐 menu layout captured ({} elements) — see recorder timeline", n));
+        }
 
         // Item 1 — clear the live status line when no edit phase remains
         // active (e.g. apply_fillet ended its state). Keeps the cmd area

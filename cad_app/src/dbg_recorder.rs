@@ -198,6 +198,11 @@ pub enum DbgEvent {
 
     /// Dialog or palette state changed.
     WindowToggle { name: String, opened: bool },
+    /// Captured pixel geometry of a UI menu — the whole frame plus every
+    /// element (label, value box, swatch, button…) as `name: x y w h` in
+    /// screen points. Lets the reader compare the RENDERED layout against
+    /// the intended design.
+    MenuLayout   { label: String, elements: Vec<String> },
     /// Menu button clicked from the menu bar.
     MenuClick    { path: String },
     /// Keyboard event handled outside the cmd-line text edit (Esc, F-keys).
@@ -495,6 +500,15 @@ fn format_event_oneline(e: &DbgEvent) -> String {
         }
         DbgEvent::WindowToggle { name, opened } =>
             format!("🪟 {} {}", name, if *opened {"OPENED"} else {"CLOSED"}),
+        DbgEvent::MenuLayout { label, elements } => {
+            let mut s = format!("📐 MENU LAYOUT — {} ({} elements)  [x y w h, screen pts]",
+                label, elements.len());
+            for e in elements {
+                s.push_str("\n         ");
+                s.push_str(e);
+            }
+            s
+        }
         DbgEvent::MenuClick { path } =>
             format!("☰ MENU {}", path),
         DbgEvent::KeyEvent { key, modifiers } =>
