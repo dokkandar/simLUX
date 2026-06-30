@@ -156,8 +156,32 @@ Header on `surface-chrome`, muted-mono labels; names left (Geist) / numbers righ
 tint + 2px left bar**; sortable headers; frozen = `text-disabled`; no zebra;
 multi-select (Ctrl toggle / Shift range).
 
-*(Remaining design-system points — Icons, Charts, Forms detail, Global states —
-are pending and will be added here as locked.)*
+### 5.12 Icons
+**Lucide** line set, outline-only, **1px** stroke (Lucide generated at
+stroke-width 1; CAD command glyphs hand-drawn at the matching ~1px weight),
+rounded caps/joins, monochrome (inherits colour). Sizes **16** (inline/menu) ·
+**18** (rail/toolbar) · **24** box. idle = muted · active = accent · disabled =
+text-disabled · destructive = danger. Two families read as one: hand-drawn CAD
+glyphs (need true geometry) + Lucide UI icons. Replace all legacy emoji glyphs.
+
+### 5.13 Global states
+- **Loading — non-blocking.** Indeterminate spinner or determinate progress bar
+  in the status bar / panel header; the canvas never blocks. See
+  [Background_Ops_Pattern.md](Background_Ops_Pattern.md).
+- **Empty — invitation, not apology.** Centered muted icon + headline naming the
+  space + one-line hint + optional CTA (Inspector no-selection, empty Block
+  library, history greeting).
+- **Error — inline, non-modal, actionable, semantic danger, never raw
+  exceptions** (AGENTS.md rule 10): field validation = red border + ring +
+  message under the field; op failure = danger status chip ("Fillet needs
+  exactly 2 lines"); recoverable = re-prompt in the command flow; file/IO =
+  danger banner. Toasts/notifications deferred to the reserved Bottom Dock.
+
+> The 16-point design-system review is **complete** (spacing, radius, elevation,
+> colour, text, states, type, accessibility, navigation, tables, menus, motion,
+> dark-only, layout/architecture, icons, global states). Still undefined and
+> owed before the Theme Editor's matching sub-sections ship: **Charts** (no
+> spec yet) and the deeper **Forms** patterns beyond inputs/states.
 
 ---
 
