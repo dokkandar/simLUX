@@ -58,10 +58,25 @@ pub mod space {
 
     /// Uniform control / field / row height.
     pub const CONTROL_H: f32 = 24.0;
-    /// Vertical gap between property rows.
+    /// Vertical gap between property rows (pitch = CONTROL_H + ROW_GAP = 32).
     pub const ROW_GAP: f32 = 8.0;
     /// Icon hit-box.
     pub const ICON_BOX: f32 = 24.0;
+
+    // ── Relationship spacings (THEME_SYSTEM §5.1, finalized compact scale) ──
+    /// Horizontal label → input gap, and the inside-field edge → text padding.
+    pub const LABEL_INPUT: f32 = 8.0;
+    pub const INPUT_PAD:   f32 = 8.0;
+    /// Section header → its first content row.
+    pub const SECTION_GAP: f32 = 12.0;
+    /// Gap between property groups / sections.
+    pub const GROUP_GAP:   f32 = 12.0;
+    /// Start ↔ End (coordinate) column gap.
+    pub const COLUMN_GAP:  f32 = 12.0;
+    /// Panel inner edge padding.
+    pub const PANEL_EDGE:  f32 = 16.0;
+    /// Panel header band → first content.
+    pub const PANEL_HEADER: f32 = 24.0;
 }
 
 /// Corner-radius scale. See THEME_SYSTEM §5.2.

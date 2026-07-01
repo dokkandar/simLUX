@@ -26,6 +26,10 @@ pub enum DockState { Docked(DockRegion), Floating(Pos2) }
 pub struct DockConfig<'a> {
     pub id: &'a str,
     pub title: &'a str,
+    /// Optional accent chip shown at the right of the header (before the ×) —
+    /// the Inspector uses it for the selected dobject's type ("Line"), per the
+    /// design (type shows in the header, not as a field).
+    pub badge: Option<&'a str>,
     /// The ONE edge this panel may dock to. A panel never docks anywhere else,
     /// so dragging it toward any other edge just leaves it floating (the command
     /// bar docks only Bottom, the rails only Left, the Inspector only Right).
@@ -71,22 +75,39 @@ const MUTED: Color32 = crate::theme::color::TEXT_MUTED;
 /// no name) — then only the × and the drag band show. Returns
 /// `(close_clicked, band_response)`; callers derive undock/drag from the band.
 fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
+    // INSPECTOR_DESIGN §2: header band height 40, chrome fill, bottom hairline,
+    // title at panel-edge (16), type pill (full radius, accent @10%) at the right.
+    let edge = crate::theme::space::PANEL_EDGE;
     let w = ui.available_width();
-    // ONE widget senses the whole band (click + drag) — allocating a separate
-    // hover widget over the same rect made the two fight for the pointer and
-    // swallowed the drag in docked panels (close worked, undock didn't).
-    let (rect, band) = ui.allocate_exact_size(egui::vec2(w, 32.0), Sense::click_and_drag());
+    // ONE widget senses the whole band (click + drag) — a separate hover widget
+    // over the same rect made the two fight for the pointer and swallowed the
+    // docked undock drag (close worked, undock didn't).
+    let (rect, band) = ui.allocate_exact_size(egui::vec2(w, 40.0), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, chrome());
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
     if !cfg.title.is_empty() {
-        p.text(egui::pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER,
+        p.text(egui::pos2(rect.left() + edge, rect.center().y), Align2::LEFT_CENTER,
             cfg.title, FontId::proportional(16.0), TEXT);
     }
-    // × close hit-box (right). A click landing on the × closes; everything else
-    // drags.
+    // Place from the right: type pill (12px from the edge), then × to its left.
+    let mut right_x = rect.right() - 12.0;
+    if let Some(b) = cfg.badge {
+        let accent = crate::theme::color::ACCENT;
+        let font = FontId::proportional(11.0);
+        let tw = ui.fonts(|f| f.layout_no_wrap(b.to_owned(), font.clone(), accent)).size().x;
+        let pw = tw + 16.0;
+        let pill = Rect::from_min_size(
+            egui::pos2(right_x - pw, rect.center().y - 9.0), egui::vec2(pw, 18.0));
+        p.rect(pill, egui::Rounding::same(9.0),
+            Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 26), Stroke::NONE);
+        p.text(pill.center(), Align2::CENTER_CENTER, b, font, accent);
+        right_x = pill.left() - 8.0;
+    }
+    // × close hit-box: at the right (or left of the pill). A click on it closes;
+    // everything else on the band drags.
     let xr = Rect::from_center_size(
-        egui::pos2(rect.right() - 15.0, rect.center().y), egui::vec2(20.0, 20.0));
+        egui::pos2(right_x - 10.0, rect.center().y), egui::vec2(20.0, 20.0));
     let over_x = ui.rect_contains_pointer(xr);
     if band.hovered() {
         ui.ctx().set_cursor_icon(

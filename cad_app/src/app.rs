@@ -49,17 +49,125 @@ fn pp_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) 
     ui.horizontal(|ui| {
         let (lr, _) = ui.allocate_exact_size(
             egui::vec2(PP_LABEL_W, PP_ROW_H), egui::Sense::hover());
-        ui.painter().text(egui::pos2(lr.left(), lr.center().y),
+        let ltr = ui.painter().text(egui::pos2(lr.left(), lr.center().y),
             egui::Align2::LEFT_CENTER, label,
             egui::FontId::proportional(13.0), PP_LABEL);
-        pp_capture(ui, &format!("{} · label", label), lr);
+        pp_capture(ui, &format!(
+            "{lbl} · LABEL  text='{lbl}' color={} font=13px  col-width={:.0}  pad-top={:.1}",
+            pp_hex(PP_LABEL), PP_LABEL_W, ltr.top() - lr.top(), lbl = label), lr);
         let w = (ui.available_width() - 2.0).max(40.0);
-        let vx = lr.right() + ui.spacing().item_spacing.x;
-        pp_capture(ui, &format!("{} · value", label),
-            egui::Rect::from_min_size(egui::pos2(vx, lr.top()), egui::vec2(w, PP_ROW_H)));
         add(ui, w);
     });
     ui.add_space(PP_ROW_GAP);
+}
+
+/// Color32 → `#RRGGBB` for the UI-inspect dump.
+fn pp_hex(c: egui::Color32) -> String { format!("#{:02X}{:02X}{:02X}", c.r(), c.g(), c.b()) }
+
+/// Painted downward dropdown triangle (▼) — a real shape, since the `▾` char
+/// renders as a tofu box in the default font. Sits `input-pad`(8)+ from the
+/// field's right edge, vertically centered. Returns its rect (for capture).
+fn pp_arrow(p: &egui::Painter, box_rect: egui::Rect) -> egui::Rect {
+    let cx = box_rect.right() - 12.0;
+    let cy = box_rect.center().y;
+    let s = 3.5;
+    p.add(egui::Shape::convex_polygon(
+        vec![egui::pos2(cx - s, cy - s * 0.5), egui::pos2(cx + s, cy - s * 0.5),
+             egui::pos2(cx, cy + s * 0.75)],
+        PP_LABEL, egui::Stroke::NONE));
+    egui::Rect::from_center_size(egui::pos2(cx, cy), egui::vec2(2.0 * s, 2.0 * s))
+}
+
+/// Rich capture for a field, so the UI-inspect dump can be rebuilt as HTML:
+/// records the box (fill / border / radius) + the value text (content, color,
+/// font, and REAL measured top/bottom/left padding from the drawn text rect) +
+/// whether it carries a dropdown arrow.
+fn pp_cap_field(ui: &egui::Ui, label: &str, box_rect: egui::Rect,
+                text_rect: egui::Rect, text: &str, text_col: egui::Color32,
+                font: f32, arrow: bool) {
+    let pl = text_rect.left() - box_rect.left();
+    let pt = text_rect.top() - box_rect.top();
+    let pb = box_rect.bottom() - text_rect.bottom();
+    let detail = format!(
+        "{lbl} · FIELD  w={:.0} h={:.0} @({:.0},{:.0})  |  box fill={} border={} radius={}  |  \
+text='{txt}' color={tc} font={ft:.0}px  pad-left={:.1} pad-top={:.1} pad-bottom={:.1}  |  arrow={arw}",
+        box_rect.width(), box_rect.height(), box_rect.left(), box_rect.top(),
+        pp_hex(PP_BG_LO), pp_hex(PP_BORDER), crate::theme::radius::SM,
+        pl, pt, pb,
+        lbl = label, txt = text, tc = pp_hex(text_col), ft = font,
+        arw = if arrow { "down-triangle ▼" } else { "none" });
+    pp_capture(ui, &detail, box_rect);
+}
+
+/// Read-only key/value row — muted label + a muted mono value at the unified
+/// value start, with NO field box (design: derived/computed values like Length,
+/// Angle, Area render borderless and muted).
+fn pp_kv(ui: &mut egui::Ui, label: &str, value: &str) {
+    pp_row(ui, label, |ui, _w| {
+        let r = ui.add(egui::Label::new(
+            egui::RichText::new(value).monospace().size(12.0).color(PP_MUTED)));
+        pp_capture(ui, &format!(
+            "{lbl} · READ-ONLY  value='{val}' color={} font=12px-mono  NO box/border",
+            pp_hex(PP_MUTED), lbl = label, val = value), r.rect);
+    });
+}
+
+/// Two column headers ("Start" / "End", or "X" / "Y") above a coordinate-pair
+/// row — aligned over the two value boxes.
+fn pp_pair_headers(ui: &mut egui::Ui, a: &str, b: &str) {
+    ui.horizontal(|ui| {
+        let (lr, _) = ui.allocate_exact_size(
+            egui::vec2(PP_LABEL_W, 13.0), egui::Sense::hover());
+        let vx = lr.right() + ui.spacing().item_spacing.x;
+        let gap = crate::theme::space::COLUMN_GAP;
+        let half = (ui.available_width() - gap) / 2.0;
+        let y = lr.center().y;
+        let p = ui.painter();
+        p.text(egui::pos2(vx, y), egui::Align2::LEFT_CENTER, a,
+            egui::FontId::proportional(11.0), PP_LABEL);
+        p.text(egui::pos2(vx + half + gap, y), egui::Align2::LEFT_CENTER, b,
+            egui::FontId::proportional(11.0), PP_LABEL);
+    });
+    ui.add_space(2.0);
+}
+
+/// A label + two side-by-side numeric fields (Start/End or X/Y). Returns
+/// (changed, [both responses]) so the caller can snapshot + write back.
+fn pp_pair_row(ui: &mut egui::Ui, label: &str, a: &mut f64, b: &mut f64)
+    -> (bool, Vec<egui::Response>) {
+    let mut changed = false;
+    let mut resps = Vec::new();
+    pp_row(ui, label, |ui, w| {
+        let gap = crate::theme::space::COLUMN_GAP;
+        let half = ((w - gap) / 2.0).max(40.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let ra = ui.add_sized([half, PP_ROW_H],
+                egui::DragValue::new(a).speed(0.5).max_decimals(2));
+            let rb = ui.add_sized([half, PP_ROW_H],
+                egui::DragValue::new(b).speed(0.5).max_decimals(2));
+            changed = ra.changed() || rb.changed();
+            let cap = |ui: &egui::Ui, tag: &str, r: &egui::Rect, v: f64| pp_capture(ui,
+                &format!("{lbl} {tag} · FIELD  w={:.0} h={:.0} @({:.0},{:.0})  |  box \
+egui-DragValue radius=4 fill=#141C25 border=#34414B  |  value='{:.2}' color={} font=12px-mono  |  arrow=none",
+                    r.width(), r.height(), r.left(), r.top(), v, pp_hex(PP_TEXT), lbl=label, tag=tag), *r);
+            cap(ui, "start", &ra.rect, *a);
+            cap(ui, "end", &rb.rect, *b);
+            resps.push(ra); resps.push(rb);
+        });
+    });
+    (changed, resps)
+}
+
+/// A label + one numeric field (Radius, Lt scale). Returns (changed, response).
+fn pp_num_row(ui: &mut egui::Ui, label: &str, v: &mut f64) -> (bool, egui::Response) {
+    let mut out = None;
+    pp_row(ui, label, |ui, w| {
+        out = Some(ui.add_sized([w, PP_ROW_H],
+            egui::DragValue::new(v).speed(0.5).max_decimals(2)));
+    });
+    let r = out.expect("pp_row always invokes the body");
+    (r.changed(), r)
 }
 
 /// Draw a flat bordered field box of `w × PP_ROW_H`. Returns its rect +
@@ -68,13 +176,10 @@ fn pp_box(ui: &mut egui::Ui, w: f32, clickable: bool) -> (egui::Rect, egui::Resp
     let sense = if clickable { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), sense);
     let p = ui.painter_at(rect);
-    p.rect_filled(rect, egui::Rounding::ZERO, PP_BG_LO);
+    // surface-0 fill, 1px border, radius sm(4) — INSPECTOR_DESIGN §4.
     let edge = if clickable && resp.hovered() { PP_ACCENT } else { PP_BORDER };
-    let s = egui::Stroke::new(1.0, edge);
-    p.line_segment([rect.left_top(),    rect.right_top()],    s);
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], s);
-    p.line_segment([rect.left_top(),    rect.left_bottom()],  s);
-    p.line_segment([rect.right_top(),   rect.right_bottom()], s);
+    p.rect(rect, egui::Rounding::same(crate::theme::radius::SM), PP_BG_LO,
+        egui::Stroke::new(1.0, edge));
     (rect, resp)
 }
 
@@ -172,13 +277,17 @@ fn pp_section(ui: &mut egui::Ui, id_src: &str, title: &str,
              egui::pos2(c.x + sz * 0.7, c.y)]
     };
     p.add(egui::Shape::convex_polygon(tri, PP_LABEL, egui::Stroke::NONE));
+    // Caption 11/500 (THEME_SYSTEM §5.7), not the old monospace 10.
     p.text(egui::pos2(rect.left() + 20.0, rect.center().y),
-        egui::Align2::LEFT_CENTER, title, egui::FontId::monospace(10.0), PP_LABEL);
-    pp_capture(ui, &format!("SECTION: {}", title), rect);
+        egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(11.0), PP_LABEL);
+    pp_capture(ui, &format!(
+        "SECTION '{title}' · HEADER  h=18  caption color={} font=11px  chevron={}",
+        pp_hex(PP_LABEL), if open { "▼ open" } else { "▸ collapsed" }, title = title), rect);
     if resp.clicked() { open = !open; }
     ui.data_mut(|d| d.insert_temp(id, open));
-    if open { ui.add_space(3.0); body(ui); }
-    ui.add_space(5.0);
+    // Section header → content = 12 (SECTION_GAP); between sections = 12 (GROUP_GAP).
+    if open { ui.add_space(crate::theme::space::SECTION_GAP); body(ui); }
+    ui.add_space(crate::theme::space::GROUP_GAP);
 }
 
 /// Where the user's customised ACI-wheel permutation lives. Sits next to
@@ -837,6 +946,14 @@ pub struct CadApp {
     /// pixel geometry of every element into the session recorder, then
     /// clears the flag. Activated from the recorder window.
     props_layout_capture: bool,
+    /// Live UI inspector: when on, every `pp_capture`'d element is measured each
+    /// frame and hovering one shows its name + exact w×h + position — a
+    /// devtools-style ruler for comparing the build against the design spec.
+    ui_inspect: bool,
+    /// Click-to-log buffer for the UI inspector: each click records the clicked
+    /// element + its full box hierarchy (name, w, h, x, y). Shown in a copyable
+    /// "UI Inspect Log" window so the user can dump a precise report.
+    ui_inspect_log: Vec<String>,
     /// Left command rails (Phase 1): which are shown + the last-invoked
     /// command name for the active-icon highlight.
     draw_rail_open:      bool,
@@ -2415,6 +2532,8 @@ impl Default for CadApp {
             info_window_open:    false,
             inspector_dock_state: crate::dock::DockState::Docked(crate::dock::DockRegion::Right),
             props_layout_capture: false,
+            ui_inspect:          false,
+            ui_inspect_log:      Vec::new(),
             draw_rail_open:      true,
             modify_rail_open:    true,
             draw_rail_dock_state:   crate::dock::DockState::Docked(crate::dock::DockRegion::Left),
@@ -9811,11 +9930,31 @@ impl CadApp {
         if !self.info_window_open { return; }
         // Rendered through the UNIFIED dock host (dock.rs) — same docking
         // behaviour as every other dockable panel, and the engine is swappable.
+        // Type chip for the header (per the design: the dobject type shows in the
+        // header, not as a field). Single = "Line"; uniform many = "Line (3)";
+        // mixed = "Mixed (n)"; empty = none.
+        let badge_txt: Option<String> = {
+            let mut t: Vec<usize> = if !self.selection.is_empty() { self.selection.clone() }
+                else if let Some(i) = self.selected { vec![i] } else { Vec::new() };
+            t.retain(|&i| i < self.doc.dobjects.len());
+            let cap1 = |s: &str| { let mut c = s.chars();
+                c.next().map(|f| f.to_uppercase().collect::<String>() + c.as_str())
+                    .unwrap_or_default() };
+            if t.is_empty() { None }
+            else if t.len() == 1 {
+                self.doc.dobjects.get(t[0]).map(|d| cap1(dobject_kind_name(&d.geom)))
+            } else if self.targets_uniform_tag(&t).is_some() {
+                self.doc.dobjects.get(t[0])
+                    .map(|d| format!("{} ({})", cap1(dobject_kind_name(&d.geom)), t.len()))
+            } else { Some(format!("Mixed ({})", t.len())) }
+        };
         let cfg = crate::dock::DockConfig {
-            id: "inspector", title: "Inspector",
+            id: "inspector", title: "Inspector", badge: badge_txt.as_deref(),
             dock_region: crate::dock::DockRegion::Right,
             size: 264.0, min: 220.0, max: 520.0,
-            resizable: true, flush_body: false, float_w: 264.0, float_max_h_frac: 0.5,
+            // flush_body: the Inspector paints its own padding (panel-edge 16,
+            // panel-header→content 24) per INSPECTOR_DESIGN §2.
+            resizable: true, flush_body: true, float_w: 264.0, float_max_h_frac: 0.5,
         };
         let mut state = self.inspector_dock_state;
         let mut open = self.info_window_open;
@@ -9865,11 +10004,17 @@ impl CadApp {
             v.hyperlink_color = accent;
             v.indent_has_left_vline = false;
             v.extreme_bg_color = bg_lo;
-            v.widgets.inactive.rounding = egui::Rounding::ZERO;
-            v.widgets.hovered.rounding  = egui::Rounding::ZERO;
-            v.widgets.active.rounding   = egui::Rounding::ZERO;
+            // Inputs / value boxes = 4px radius (sm), per THEME_SYSTEM §5.2.
+            let fld = egui::Rounding::same(crate::theme::radius::SM);
+            v.widgets.inactive.rounding = fld;
+            v.widgets.hovered.rounding  = fld;
+            v.widgets.active.rounding   = fld;
         }
-        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+        // Horizontal item gap = label→input (8); vertical = 0 so EVERY vertical
+        // gap is an explicit token (row gap 8, section gap 12, group gap 12) and
+        // the measured layout matches the spec exactly.
+        ui.spacing_mut().item_spacing =
+            egui::vec2(crate::theme::space::LABEL_INPUT, 0.0);
 
         // Target set: the basket (group) takes priority; otherwise the single
         // click-selected dobject. Deduped + sorted so the shared-value scan and
@@ -9885,66 +10030,29 @@ impl CadApp {
         targets.sort_unstable();
         targets.dedup();
 
-        // ---- selection-count badge ----
-        ui.add_space(2.0);
-        if !targets.is_empty() {
-            ui.horizontal(|ui| {
-                let label = if targets.len() == 1 {
-                    self.doc.dobjects.get(targets[0])
-                        .map(|d| dobject_kind_name(&d.geom).to_uppercase())
-                        .unwrap_or_else(|| "DOBJECT".into())
-                } else if self.targets_uniform_tag(&targets).is_some() {
-                    let k = self.doc.dobjects.get(targets[0])
-                        .map(|d| dobject_kind_name(&d.geom).to_uppercase())
-                        .unwrap_or_else(|| "DOBJECT".into());
-                    format!("{} ({})", k, targets.len())
-                } else {
-                    format!("MIXED ({})", targets.len())
-                };
-                let br = egui::Frame::none()
-                    .fill(egui::Color32::from_rgb(0x2d, 0x36, 0x3f))
-                    .rounding(8.0)
-                    .inner_margin(egui::Margin::symmetric(7.0, 1.0))
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new(label).monospace().size(10.0).color(accent));
-                    });
-                pp_capture(ui, "selection badge", br.response.rect);
-            });
-            ui.add_space(2.0);
-        }
-        pp_divider(ui);
-        ui.add_space(8.0);
-
-        if targets.is_empty() {
-            ui.colored_label(muted,
-                "No selection — click a dobject to edit its properties.");
-            return;
-        }
-
-        // ---- Search ----
-        let search_id = egui::Id::new("props_search_box");
-        let mut q: String = ui.data_mut(|d| d.get_temp::<String>(search_id).unwrap_or_default());
-        let avail = ui.available_width();
-        let sr = egui::Frame::none().fill(bg_lo).stroke(egui::Stroke::new(1.0, border))
-            .rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 3.0))
+        // Content padded per INSPECTOR_DESIGN §2 (type is in the header chip):
+        // sides = panel-edge (16), top = panel-header→content (24), bottom = 16.
+        egui::Frame::none()
+            .inner_margin(egui::Margin {
+                left:   crate::theme::space::PANEL_EDGE,
+                right:  crate::theme::space::PANEL_EDGE,
+                top:    crate::theme::space::PANEL_HEADER,
+                bottom: crate::theme::space::PANEL_EDGE,
+            })
             .show(ui, |ui| {
-                ui.add_sized([avail - 16.0, 16.0], egui::TextEdit::singleline(&mut q)
-                    .hint_text("Search parameters…")
-                    .frame(false));
+                if targets.is_empty() {
+                    ui.colored_label(muted,
+                        "No selection — click a dobject to edit its properties.");
+                    return;
+                }
+                // Docked: fill height. Floating: grow to content, cap ~50% screen.
+                let shrink_v = scroll_max_h.is_some();
+                let mut sa = egui::ScrollArea::vertical().auto_shrink([false, shrink_v]);
+                if let Some(h) = scroll_max_h { sa = sa.max_height(h); }
+                sa.show(ui, |ui| {
+                    self.render_props_body(ui, &targets, "");
+                });
             });
-        pp_capture(ui, "search box", sr.response.rect);
-        ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
-        ui.add_space(6.0);
-
-        // Docked: fill the panel's full height (no vertical shrink). Floating:
-        // grow to content height but cap at ~50% of the screen (float_max_h_frac)
-        // — a long property list then scrolls instead of pushing past the cap.
-        let shrink_v = scroll_max_h.is_some();
-        let mut sa = egui::ScrollArea::vertical().auto_shrink([false, shrink_v]);
-        if let Some(h) = scroll_max_h { sa = sa.max_height(h); }
-        sa.show(ui, |ui| {
-            self.render_props_body(ui, &targets, &q);
-        });
     }
 
     /// Dispatch a rail command. Most go through `run_command`; `array` opens
@@ -10382,7 +10490,7 @@ impl CadApp {
             let cols = cols_for(self.draw_items.len());
             let w = width_for(cols);
             let cfg = crate::dock::DockConfig {
-                id: "rail_draw", title: "",
+                id: "rail_draw", title: "", badge: None,
                 dock_region: crate::dock::DockRegion::Left,
                 size: w, min: w, max: w, resizable: false,
                 flush_body: true, float_w: w, float_max_h_frac: 0.92,
@@ -10406,7 +10514,7 @@ impl CadApp {
             let cols = cols_for(self.modify_items.len());
             let w = width_for(cols);
             let cfg = crate::dock::DockConfig {
-                id: "rail_modify", title: "",
+                id: "rail_modify", title: "", badge: None,
                 dock_region: crate::dock::DockRegion::Left,
                 size: w, min: w, max: w, resizable: false,
                 flush_body: true, float_w: w, float_max_h_frac: 0.92,
@@ -10522,42 +10630,82 @@ impl CadApp {
         let n = targets.len();
         let uniform = self.targets_uniform_tag(targets);
 
-        // ---- Identity line -------------------------------------------
-        if n == 1 {
-            let idx = targets[0];
-            let handle = self.doc.dobjects.get(idx).map(|d| d.handle).unwrap_or(0);
-            ui.monospace(format!("#{}   handle 0x{:X}", idx, handle));
-        } else {
-            ui.monospace(self.props_kind_breakdown(targets));
-        }
-        ui.add_space(4.0);
-
-        // ---- General (common Style) ----------------------------------
+        // ---- GENERAL (common Style) ----------------------------------
         pp_section(ui, "pp_sec_general", "GENERAL", true, |ui| {
             self.render_props_general(ui, targets, query);
         });
 
-        // ---- Type-specific (homogeneous only) ------------------------
+        // ---- GEOMETRY (per-type coordinate pairs + read-only derived) -
+        if n == 1 {
+            pp_section(ui, "pp_sec_geometry", "GEOMETRY", true, |ui| {
+                self.render_props_geometry(ui, targets[0]);
+            });
+        } else if uniform.is_none() {
+            ui.add_space(2.0);
+            ui.colored_label(crate::theme::color::TEXT_MUTED,
+                "Mixed types — only general properties apply.");
+            ui.add_space(4.0);
+        }
+
+        // ---- Type-specific extras (hatch fill, etc.) -----------------
         if let Some(tag) = uniform {
-            if matches!(tag, 0 | 5 | 6 | 7 | 9 | 10 | 11 | 12) {
-                let title = if tag == 7 { "FILL / HATCH" } else { "TYPE PROPERTIES" };
-                pp_section(ui, "pp_sec_type", title, true, |ui| {
+            if matches!(tag, 7) {
+                pp_section(ui, "pp_sec_hatch", "HATCH", false, |ui| {
                     self.render_props_type_specific(ui, targets, tag);
                 });
             }
-        } else {
-            ui.add_space(4.0);
-            ui.colored_label(egui::Color32::from_rgb(150, 165, 185),
-                "Mixed types — only general properties apply.");
         }
 
-        // ---- Geometry (read-only; coordinates edited via grips) ------
+        // ---- MISC (handle / index) -----------------------------------
         if n == 1 {
-            pp_section(ui, "pp_sec_geometry", "GEOMETRY", false, |ui| {
-                let desc = describe(&self.doc.dobjects[targets[0]].geom);
-                ui.monospace(desc);
-                ui.small("Coordinates are edited on-canvas with grips, not here.");
+            pp_section(ui, "pp_sec_misc", "MISC", false, |ui| {
+                let idx = targets[0];
+                let handle = self.doc.dobjects.get(idx).map(|d| d.handle).unwrap_or(0);
+                pp_kv(ui, "Handle", &format!("0x{:X}", handle));
+                pp_kv(ui, "Index", &format!("#{}", idx));
             });
+        }
+    }
+
+    /// GEOMETRY section — per-type coordinate pairs (editable) + read-only
+    /// derived values (Length/Angle/Area), laid out per the finalized design.
+    fn render_props_geometry(&mut self, ui: &mut egui::Ui, idx: usize) {
+        let geom = match self.doc.dobjects.get(idx) { Some(d) => d.geom.clone(), None => return };
+        let targets = [idx];
+        match geom {
+            Geom::Line(l) => {
+                pp_pair_headers(ui, "Start", "End");
+                let (mut ax, mut bx) = (l.a.x, l.b.x);
+                let (cx, rx) = pp_pair_row(ui, "X", &mut ax, &mut bx);
+                for r in &rx { self.props_gesture_snapshot(r); }
+                if cx { self.props_apply(&targets, false, |d| {
+                    if let Geom::Line(l) = &mut d.geom { l.a.x = ax; l.b.x = bx; } }); }
+                let (mut ay, mut by) = (l.a.y, l.b.y);
+                let (cy, ry) = pp_pair_row(ui, "Y", &mut ay, &mut by);
+                for r in &ry { self.props_gesture_snapshot(r); }
+                if cy { self.props_apply(&targets, false, |d| {
+                    if let Geom::Line(l) = &mut d.geom { l.a.y = ay; l.b.y = by; } }); }
+                pp_kv(ui, "Length", &format!("{:.2}", (l.b - l.a).len()));
+                pp_kv(ui, "Angle", &format!("{:.2}°", (l.b - l.a).angle().to_degrees()));
+            }
+            Geom::Circle(c) => {
+                pp_pair_headers(ui, "X", "Y");
+                let (mut cx, mut cy) = (c.center.x, c.center.y);
+                let (cc, rr) = pp_pair_row(ui, "Center", &mut cx, &mut cy);
+                for r in &rr { self.props_gesture_snapshot(r); }
+                if cc { self.props_apply(&targets, false, |d| {
+                    if let Geom::Circle(c) = &mut d.geom { c.center.x = cx; c.center.y = cy; } }); }
+                let mut r = c.radius;
+                let (cr, rp) = pp_num_row(ui, "Radius", &mut r);
+                self.props_gesture_snapshot(&rp);
+                if cr { self.props_apply(&targets, false, |d| {
+                    if let Geom::Circle(c) = &mut d.geom { c.radius = r.max(0.0); } }); }
+                pp_kv(ui, "Area", &format!("{:.2}", std::f64::consts::PI * c.radius * c.radius));
+            }
+            other => {
+                ui.add_space(2.0);
+                ui.monospace(describe(&other));
+            }
         }
     }
 
@@ -10620,13 +10768,14 @@ impl CadApp {
             pp_row(ui, "Layer", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                let sw = egui::Rect::from_center_size(
-                    egui::pos2(rect.left() + 13.0, rect.center().y), egui::vec2(13.0, 13.0));
-                p.rect_filled(sw, egui::Rounding::ZERO, lcol);
-                p.text(egui::pos2(sw.right() + 8.0, rect.center().y),
+                let sw = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.center().y - 6.5), egui::vec2(13.0, 13.0));
+                p.rect_filled(sw, egui::Rounding::same(crate::theme::radius::XS), lcol);
+                pp_capture(ui, &format!("Layer · swatch  size=13 radius=2 color={}", pp_hex(lcol)), sw);
+                let tr = p.text(egui::pos2(sw.right() + 9.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
-                p.text(egui::pos2(rect.right() - 11.0, rect.center().y),
-                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                pp_arrow(&p, rect);
+                pp_cap_field(ui, "Layer", rect, tr, &name, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_layer_popup");
                 if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
                 egui::popup_below_widget(ui, pid, &resp,
@@ -10662,17 +10811,16 @@ impl CadApp {
             pp_row(ui, "Color", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                let sw = egui::Rect::from_center_size(
-                    egui::pos2(rect.left() + 13.0, rect.center().y), egui::vec2(13.0, 13.0));
-                p.rect_filled(sw, egui::Rounding::ZERO, c32);
-                let s = egui::Stroke::new(1.0, PP_BORDER);
-                p.line_segment([sw.left_top(), sw.right_top()], s);
-                p.line_segment([sw.left_bottom(), sw.right_bottom()], s);
-                p.line_segment([sw.left_top(), sw.left_bottom()], s);
-                p.line_segment([sw.right_top(), sw.right_bottom()], s);
+                let sw = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.center().y - 6.5), egui::vec2(13.0, 13.0));
+                p.rect(sw, egui::Rounding::same(crate::theme::radius::XS), c32,
+                    egui::Stroke::new(1.0, PP_BORDER));
+                pp_capture(ui, &format!("Color · swatch  size=13 radius=2 color={}", pp_hex(c32)), sw);
                 let col = if italic { PP_MUTED } else { PP_TEXT };
-                p.text(egui::pos2(sw.right() + 8.0, rect.center().y),
+                let tr = p.text(egui::pos2(sw.right() + 9.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, &label, egui::FontId::proportional(13.0), col);
+                pp_arrow(&p, rect);
+                pp_cap_field(ui, "Color", rect, tr, &label, col, 13.0, true);
                 let resp = resp.on_hover_text("Click to choose a colour (ACI / TrueColor)");
                 if resp.clicked() { open_wheel = true; }
             });
@@ -10699,7 +10847,7 @@ impl CadApp {
             pp_row(ui, "Line Type", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
                 let y = rect.center().y;
                 let (x0, x1) = (rect.center().x + 6.0, rect.right() - 20.0);
@@ -10714,8 +10862,8 @@ impl CadApp {
                         x += 11.0;
                     }
                 }
-                p.text(egui::pos2(rect.right() - 11.0, y),
-                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                pp_arrow(&p, rect);
+                pp_cap_field(ui, "Line Type", rect, tr, &name, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_lt_popup");
                 if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
                 egui::popup_below_widget(ui, pid, &resp,
@@ -10736,10 +10884,18 @@ impl CadApp {
             let shared_sc = self.shared_style(targets, |s| s.linetype_scale);
             let buf_id = egui::Id::new("pp_ltscale_buf");
             pp_row(ui, "Lt Scale", |ui, w| {
+                // Painted box + a FRAMELESS editor placed centered inside it, so
+                // the number is vertically centered (a plain add_sized TextEdit
+                // top-aligns its text in the 24px box — the "1.000 too high" bug).
+                let (rect, _) = pp_box(ui, w, false);
+                let disp = shared_sc.map(|v| format!("{:.3}", v)).unwrap_or_default();
                 let mut buf = ui.data_mut(|d| d.get_temp::<String>(buf_id))
-                    .unwrap_or_else(|| shared_sc.map(|v| format!("{:.3}", v)).unwrap_or_default());
-                let r = ui.add_sized([w, PP_ROW_H],
-                    egui::TextEdit::singleline(&mut buf).hint_text("≠"));
+                    .unwrap_or_else(|| disp.clone());
+                let inner = egui::Rect::from_min_size(
+                    egui::pos2(rect.left() + 8.0, rect.center().y - 8.0),
+                    egui::vec2((w - 16.0).max(10.0), 16.0));
+                let r = ui.put(inner, egui::TextEdit::singleline(&mut buf)
+                    .frame(false).hint_text("≠"));
                 self.props_gesture_snapshot(&r);
                 if r.changed() {
                     if let Ok(v) = buf.trim().parse::<f32>() {
@@ -10747,10 +10903,9 @@ impl CadApp {
                             d.style.linetype_scale = v.clamp(0.01, 1000.0));
                     }
                 }
-                if !r.has_focus() {
-                    buf = shared_sc.map(|v| format!("{:.3}", v)).unwrap_or_default();
-                }
+                if !r.has_focus() { buf = disp.clone(); }
                 ui.data_mut(|d| d.insert_temp(buf_id, buf));
+                pp_cap_field(ui, "Lt Scale", rect, inner, &disp, PP_TEXT, 13.0, false);
             });
         }
 
@@ -10768,10 +10923,10 @@ impl CadApp {
             pp_row(ui, "Line Weight", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, &lw_text, egui::FontId::proportional(13.0), PP_TEXT);
-                p.text(egui::pos2(rect.right() - 11.0, rect.center().y),
-                    egui::Align2::CENTER_CENTER, "▾", egui::FontId::proportional(12.0), PP_LABEL);
+                pp_arrow(&p, rect);
+                pp_cap_field(ui, "Line Weight", rect, tr, &lw_text, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_lw_popup");
                 if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
                 egui::popup_below_widget(ui, pid, &resp,
@@ -10798,9 +10953,10 @@ impl CadApp {
             pp_row(ui, "Visible", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, txt, egui::FontId::proportional(13.0),
-                    if on { PP_TEXT } else { PP_MUTED });
+                let vcol = if on { PP_TEXT } else { PP_MUTED };
+                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER, txt, egui::FontId::proportional(13.0), vcol);
+                pp_cap_field(ui, "Visible", rect, tr, txt, vcol, 13.0, false);
                 if resp.clicked() { toggle = true; }
             });
             if toggle {
@@ -19773,9 +19929,10 @@ impl eframe::App for CadApp {
         // calls pp_capture / pp_cap_ui records into it; the dump runs at the very
         // end of update() so it captures ANY open menu (rails, dropdowns, popups,
         // Properties) — not just the Properties panel.
+        let cap_on = self.props_layout_capture || self.ui_inspect;
         ctx.data_mut(|d| {
-            d.insert_temp(egui::Id::new("pp_cap_on"), self.props_layout_capture);
-            if self.props_layout_capture {
+            d.insert_temp(egui::Id::new("pp_cap_on"), cap_on);
+            if cap_on {
                 d.insert_temp(egui::Id::new("pp_cap_buf"),
                     Vec::<(String, egui::Rect)>::new());
             }
@@ -20921,6 +21078,9 @@ impl eframe::App for CadApp {
                             .on_hover_text("Log every click + state transition during trim/extend");
                         ui.checkbox(&mut self.hatch_debug_open, "Hatch Debug Log")
                             .on_hover_text("Log dialog + pick-point + apply + render for hatch");
+                        ui.checkbox(&mut self.ui_inspect, "UI inspect (element sizes)")
+                            .on_hover_text("Devtools ruler: hover any panel element to read its \
+                                exact w×h + position, to compare the build against the design spec");
                         ui.separator();
                         // Spatial index — rebuild + status
                         let idx_label = if self.index_dirty || self.index.is_none() {
@@ -21611,7 +21771,7 @@ impl eframe::App for CadApp {
         // is `command_bar_body` — one implementation for both docking modes.
         {
             let cfg = crate::dock::DockConfig {
-                id: "command", title: "Command",
+                id: "command", title: "Command", badge: None,
                 dock_region: crate::dock::DockRegion::Bottom,
                 size: 150.0, min: 96.0, max: 320.0,
                 resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
@@ -25303,6 +25463,101 @@ impl eframe::App for CadApp {
         // the object-snap popup, and the Properties panel). One-shot: disarms
         // itself. Open the menu(s) you want measured, THEN click "Capture menu
         // layout" so they're on-screen during the captured frame.
+        // ---- Live UI inspector overlay (devtools-style ruler) -------------
+        // All captured elements get a faint outline; the smallest one under the
+        // pointer is highlighted with its name + exact w×h + position.
+        if self.ui_inspect {
+            let buf: Vec<(String, egui::Rect)> = ctx.data(|d|
+                d.get_temp(egui::Id::new("pp_cap_buf")).unwrap_or_default());
+            let painter = ctx.layer_painter(egui::LayerId::new(
+                egui::Order::Foreground, egui::Id::new("ui_inspect_overlay")));
+            for (_, r) in &buf {
+                painter.rect_stroke(*r, 0.0, egui::Stroke::new(1.0,
+                    egui::Color32::from_rgba_unmultiplied(0, 0xe5, 0xff, 40)));
+            }
+            if let Some(p) = ctx.pointer_hover_pos() {
+                if let Some((name, r)) = buf.iter()
+                    .filter(|(_, r)| r.contains(p))
+                    .min_by(|a, b| (a.1.width() * a.1.height())
+                        .partial_cmp(&(b.1.width() * b.1.height()))
+                        .unwrap_or(std::cmp::Ordering::Equal))
+                {
+                    painter.rect_stroke(*r, 0.0,
+                        egui::Stroke::new(1.5, egui::Color32::from_rgb(0, 0xe5, 0xff)));
+                    // Multi-line tooltip: geometry first, then each " | " segment
+                    // of the rich capture on its own (wrapped) line.
+                    let mut lines = vec![format!("▸ {:.0}×{:.0}   @({:.0}, {:.0})",
+                        r.width(), r.height(), r.left(), r.top())];
+                    for part in name.split(" | ") { lines.push(part.trim().to_string()); }
+                    let font = egui::FontId::monospace(11.0);
+                    let galley = painter.layout(lines.join("\n"), font,
+                        egui::Color32::from_rgb(0xda, 0xe3, 0xef), 360.0);
+                    let sz = galley.size();
+                    let sr = ctx.screen_rect();
+                    let mut lp = egui::pos2(p.x + 14.0, p.y + 16.0);
+                    if lp.x + sz.x + 10.0 > sr.right() { lp.x = (sr.right() - sz.x - 10.0).max(4.0); }
+                    if lp.y + sz.y + 10.0 > sr.bottom() { lp.y = (p.y - sz.y - 16.0).max(4.0); }
+                    let bg = egui::Rect::from_min_size(lp - egui::vec2(7.0, 6.0),
+                        sz + egui::vec2(14.0, 12.0));
+                    painter.rect(bg, 4.0, egui::Color32::from_black_alpha(238),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0xe5, 0xff)));
+                    painter.galley(lp, galley, egui::Color32::WHITE);
+                }
+            }
+            // ---- Click-to-log: record the clicked element + its box hierarchy.
+            if ctx.input(|i| i.pointer.primary_clicked()) {
+                if let Some(p) = ctx.input(|i| i.pointer.interact_pos()) {
+                    let mut under: Vec<&(String, egui::Rect)> =
+                        buf.iter().filter(|(_, r)| r.contains(p)).collect();
+                    if !under.is_empty() {
+                        // outer → inner (largest area first); last = the smallest,
+                        // i.e. the element actually clicked.
+                        under.sort_by(|a, b| (b.1.width() * b.1.height())
+                            .partial_cmp(&(a.1.width() * a.1.height()))
+                            .unwrap_or(std::cmp::Ordering::Equal));
+                        let (tn, tr) = under.last().unwrap();
+                        self.ui_inspect_log.push(format!(
+                            "═══ CLICK: {}   →   {:.0}×{:.0}  @({:.0}, {:.0})",
+                            tn, tr.width(), tr.height(), tr.left(), tr.top()));
+                        self.ui_inspect_log.push(
+                            "    box hierarchy (outer → inner):".to_string());
+                        for (n, r) in &under {
+                            self.ui_inspect_log.push(format!(
+                                "      {:<30} w={:6.1} h={:5.1}   x={:7.1} y={:7.1}",
+                                n, r.width(), r.height(), r.left(), r.top()));
+                        }
+                        self.ui_inspect_log.push(String::new());
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+
+        // ---- UI Inspect Log window (copyable report) ----------------------
+        if self.ui_inspect {
+            egui::Window::new("UI Inspect Log")
+                .default_width(560.0)
+                .default_pos(egui::pos2(60.0, 90.0))
+                .show(ctx, |ui| {
+                    let full = self.ui_inspect_log.join("\n");
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 Copy dump").clicked() {
+                            ui.output_mut(|o| o.copied_text = full.clone());
+                        }
+                        if ui.button("Clear").clicked() { self.ui_inspect_log.clear(); }
+                        ui.label(format!("{} lines — click an element, Copy, paste to me",
+                            self.ui_inspect_log.len()));
+                    });
+                    let mut text = full;
+                    egui::ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(14)
+                            .desired_width(f32::INFINITY));
+                    });
+                });
+        }
+
         if self.props_layout_capture {
             let buf: Vec<(String, egui::Rect)> = ctx.data(|d|
                 d.get_temp(egui::Id::new("pp_cap_buf")).unwrap_or_default());
