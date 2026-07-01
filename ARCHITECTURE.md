@@ -26,6 +26,7 @@ independent architecture axes**, and code must respect both:
 | [COMMAND_SYSTEM.md](COMMAND_SYSTEM.md) | `CommandRegistry` as the single source of truth for every command surface. |
 | [PANEL_SYSTEM.md](PANEL_SYSTEM.md) | Panel trait, registration, lifecycle, docking/floating, persistence, taxonomy. |
 | [THEME_SYSTEM.md](THEME_SYSTEM.md) | Design tokens, Theme Editor, inheritance, live updates, the locked token registry. |
+| [CONTENT_STYLE.md](CONTENT_STYLE.md) | Content half of the design system: terminology, capitalization, number/unit formatting, message copy. |
 | [PLUGIN_API.md](PLUGIN_API.md) | Panel + command registration, extension points, future FFI plugin contract. |
 
 Supporting existing docs: [MODULES.md](MODULES.md) (cad_app module map),
