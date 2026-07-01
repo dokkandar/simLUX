@@ -25,17 +25,21 @@ mod pedit;
 // 5 million pairs is roughly half a second on this CPU.
 const PAIR_LIMIT: usize = 5_000_000;
 
-// ── Properties-panel chrome (app-layer only — no kernel involvement) ──────
-const PP_BG_LO:  egui::Color32 = egui::Color32::from_rgb(0x14, 0x1c, 0x25);
-const PP_BG_HI:  egui::Color32 = egui::Color32::from_rgb(0x22, 0x2b, 0x34);
-const PP_BORDER: egui::Color32 = egui::Color32::from_rgb(0x3b, 0x49, 0x4c);
-const PP_TEXT:   egui::Color32 = egui::Color32::from_rgb(0xda, 0xe3, 0xef);
-const PP_LABEL:  egui::Color32 = egui::Color32::from_rgb(0xba, 0xc9, 0xcc);
-const PP_MUTED:  egui::Color32 = egui::Color32::from_rgb(0xb4, 0xb5, 0xb7);
-const PP_ACCENT: egui::Color32 = egui::Color32::from_rgb(0x00, 0xda, 0xf3);
-const PP_LABEL_W: f32 = 84.0;   // fixed left-label column width
-const PP_ROW_H:   f32 = 24.0;   // uniform field height
-const PP_ROW_GAP: f32 = 7.0;    // vertical gap between rows
+// ── Properties-panel chrome ────────────────────────────────────────────────
+// These now ALIAS the design-token module (`crate::theme`) — the single source
+// of truth (THEME_SYSTEM.md §5). Do not put raw hex here; change values in
+// `theme.rs`. Kept as `PP_*` names so the (many) existing call sites are
+// untouched while the token migration proceeds panel-by-panel.
+const PP_BG_LO:  egui::Color32 = crate::theme::color::SURFACE_0;
+const PP_BG_HI:  egui::Color32 = crate::theme::color::SURFACE_2;
+const PP_BORDER: egui::Color32 = crate::theme::color::BORDER;
+const PP_TEXT:   egui::Color32 = crate::theme::color::TEXT_PRIMARY;
+const PP_LABEL:  egui::Color32 = crate::theme::color::TEXT_MUTED;
+const PP_MUTED:  egui::Color32 = crate::theme::color::TEXT_SECONDARY;
+const PP_ACCENT: egui::Color32 = crate::theme::color::ACCENT;
+const PP_LABEL_W: f32 = 84.0;                       // fixed left-label column width
+const PP_ROW_H:   f32 = crate::theme::space::CONTROL_H;  // uniform field height (24)
+const PP_ROW_GAP: f32 = crate::theme::space::ROW_GAP;    // vertical gap between rows (8)
 
 /// A labelled property row: muted fixed-width label on the left, a value
 /// area that fills the rest. `add` receives the value-cell width so every
