@@ -814,14 +814,21 @@ pub struct CadApp {
     /// command name for the active-icon highlight.
     draw_rail_open:      bool,
     modify_rail_open:    bool,
-    /// A rail is either docked (SidePanel, canvas reflows after it) or
-    /// floating (draggable Area over the canvas). Drag the strip to undock;
-    /// drag back to the left edge to re-dock.
-    draw_rail_floating:  bool,
-    modify_rail_floating: bool,
-    draw_rail_pos:       egui::Pos2,
-    modify_rail_pos:     egui::Pos2,
+    /// Rail docking state (docked Left vs floating), driven by the unified dock
+    /// host (dock.rs) — the SAME engine as the Inspector and command bar. Rails
+    /// dock only to the Left edge; drag the header out to float, drag to the left
+    /// edge to re-dock.
+    draw_rail_dock_state:   crate::dock::DockState,
+    modify_rail_dock_state: crate::dock::DockState,
     rail_active:         String,
+    /// Two-click rail-icon remove: which `(is_draw, idx)` is armed for the
+    /// "Confirm — remove" second click. Reset when a menu re-opens.
+    rail_remove_confirm: Option<(bool, usize)>,
+    /// Last docked rail's panel height (menu→status, captured each frame). Drives
+    /// the 1-vs-2-column decision from the rail's OWN stable height — NOT the
+    /// canvas, which shrinks when the command bar docks (so docking the command
+    /// bar no longer reflows the rails).
+    rail_panel_h:        f32,
     /// Per-rail visible command lists (indices into DRAW_CMDS / MODIFY_CMDS)
     /// so the user can delete (right-click) and re-add (+) commands.
     draw_items:          Vec<usize>,
@@ -2383,11 +2390,11 @@ impl Default for CadApp {
             props_layout_capture: false,
             draw_rail_open:      true,
             modify_rail_open:    true,
-            draw_rail_floating:  false,
-            modify_rail_floating: false,
-            draw_rail_pos:       egui::pos2(120.0, 90.0),
-            modify_rail_pos:     egui::pos2(190.0, 90.0),
+            draw_rail_dock_state:   crate::dock::DockState::Docked(crate::dock::DockRegion::Left),
+            modify_rail_dock_state: crate::dock::DockState::Docked(crate::dock::DockRegion::Left),
             rail_active:         "line".to_string(),
+            rail_remove_confirm: None,
+            rail_panel_h:        600.0,
             draw_items:          (0..DRAW_CMDS.len()).collect(),
             modify_items:        (0..MODIFY_CMDS.len()).collect(),
             rail_last_method:    std::collections::HashMap::new(),
@@ -9781,7 +9788,7 @@ impl CadApp {
             id: "inspector", title: "Inspector",
             dock_region: crate::dock::DockRegion::Right,
             size: 264.0, min: 220.0, max: 520.0,
-            resizable: true, float_w: 264.0, float_max_h_frac: 0.5,
+            resizable: true, flush_body: false, float_w: 264.0, float_max_h_frac: 0.5,
         };
         let mut state = self.inspector_dock_state;
         let mut open = self.info_window_open;
@@ -9977,17 +9984,21 @@ impl CadApp {
     /// The scrolling icon list + pinned footer (+ / reset) for one rail.
     /// Right-click an icon to remove it. `ui.available_height()` must be
     /// bounded (docked panel height, or the floating rail's set_height).
-    fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool) {
+    fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize) {
         let muted = egui::Color32::from_rgb(0x88, 0x93, 0xab);
-        let footer_h = 48.0;
-        let body_h = (ui.available_height() - footer_h).max(48.0);
         let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
         let mut del: Option<usize> = None;
         // (from_slot, to_slot) when an icon is dropped onto another to reorder.
         let mut reorder: Option<(usize, usize)> = None;
-        ui.allocate_ui(egui::vec2(ui.available_width(), body_h), |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                ui.add_space(3.0);
+        // Icons flow top-to-bottom in `cols` columns (1 or 2) — NO scrollbar; the
+        // rail widens to a second column when they won't fit the height. Small
+        // inset (the body is edge-to-edge so the footer below can be full-width).
+        egui::Frame::none()
+            .inner_margin(egui::Margin { left: 6.0, right: 6.0, top: 4.0, bottom: 0.0 })
+            .show(ui, |ui| {
+        egui::Grid::new(if is_draw { "rail_grid_draw" } else { "rail_grid_modify" })
+            .spacing(egui::vec2(4.0, 4.0))
+            .show(ui, |ui| {
                 for (pos, &idx) in items.iter().enumerate() {
                     let (cmd, nm) = if is_draw { (DRAW_CMDS[idx].1, DRAW_CMDS[idx].2) }
                                     else { (MODIFY_CMDS[idx].1, MODIFY_CMDS[idx].2) };
@@ -10009,17 +10020,15 @@ impl CadApp {
                     // ONE response drives everything: click = run command,
                     // right-click = remove menu, drag = reorder. The payload
                     // tags the rail so a Draw icon can't drop onto Modify.
-                    let resp = ui.vertical_centered(|ui| {
-                        rail_icon_btn(ui, active, &tip_owned, |p, c, pen, ink| {
-                            if let Some(k) = &last_m {
-                                draw_method_glyph(p, c, cmd, k, pen, ink);
-                            } else {
-                                let dot = |q| { p.circle_filled(q, 1.6, ink); };
-                                if is_draw { draw_draw_glyph(p, c, DRAW_CMDS[idx].0, pen, dot, ink); }
-                                else { draw_cmd_glyph(p, c, MODIFY_CMDS[idx].0, pen, dot, ink); }
-                            }
-                        })
-                    }).inner;
+                    let resp = rail_icon_btn(ui, active, &tip_owned, |p, c, pen, ink| {
+                        if let Some(k) = &last_m {
+                            draw_method_glyph(p, c, cmd, k, pen, ink);
+                        } else {
+                            let dot = |q| { p.circle_filled(q, 1.6, ink); };
+                            if is_draw { draw_draw_glyph(p, c, DRAW_CMDS[idx].0, pen, dot, ink); }
+                            else { draw_cmd_glyph(p, c, MODIFY_CMDS[idx].0, pen, dot, ink); }
+                        }
+                    });
                     // Arm the drag payload only while THIS icon is being dragged.
                     resp.dnd_set_drag_payload(RailDnd { is_draw, pos });
                     // ▼ method flyout: commands with multiple creation methods
@@ -10122,23 +10131,38 @@ impl CadApp {
                         }
                     }
                     let short = nm.split("  ").next().unwrap_or(nm).to_string();
+                    // Opening the menu (right-click) always restarts at step 1.
+                    if resp.secondary_clicked() { self.rail_remove_confirm = None; }
                     resp.context_menu(|ui| {
-                        // Two-step, both next to the icon: "Remove <command>"
-                        // opens a "Confirm" submenu. Both items name the actual
-                        // command (not "the icon"). Click-outside cancels at
-                        // either level without removing.
-                        ui.menu_button(format!("Remove  {}", short), |ui| {
-                            if ui.button(format!("Confirm — remove  {}", short)).clicked() {
-                                del = Some(idx); ui.close_menu();
+                        ui.set_min_width(150.0);
+                        // Two CLICKS in place (no hover submenu): click "Remove X"
+                        // and the row swaps to a red "Confirm — remove X"; click
+                        // that to actually remove. Click-outside cancels.
+                        let confirming = self.rail_remove_confirm == Some((is_draw, idx));
+                        let (txt, col) = if confirming {
+                            (format!("Confirm — remove  {}", short), crate::theme::color::DANGER)
+                        } else {
+                            (format!("Remove  {}", short), ui.visuals().text_color())
+                        };
+                        let item = ui.add(egui::Label::new(egui::RichText::new(txt).color(col))
+                            .sense(egui::Sense::click()))
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if item.clicked() {
+                            if confirming {
+                                del = Some(idx);
+                                self.rail_remove_confirm = None;
+                                ui.close_menu();
+                            } else {
+                                self.rail_remove_confirm = Some((is_draw, idx));
                             }
-                            pp_cap_ui(ui, &format!("rail remove confirm · {}", short));
-                        });
+                        }
                         pp_cap_ui(ui, &format!("rail remove menu · {}", short));
                     });
+                    // Break to the next grid row after every `cols` icons.
+                    if (pos + 1) % cols == 0 { ui.end_row(); }
                 }
-                ui.add_space(4.0);
             });
-        });
+            });
         if let Some((from, to)) = reorder {
             let v = if is_draw { &mut self.draw_items } else { &mut self.modify_items };
             if from < v.len() && to < v.len() {
@@ -10150,9 +10174,17 @@ impl CadApp {
             if is_draw { self.draw_items.retain(|&x| x != idx); }
             else { self.modify_items.retain(|&x| x != idx); }
         }
-        // ---- footer: + opens an anchored add-popup; reset below ----
-        ui.add_space(3.0);
+        // ---- footer band (same chrome look as the header) PINNED to the bottom
+        // so both rails' footers line up; the gap above it varies with each
+        // rail's icon count. Two lines: "+" (add) then "reset". ----
+        let footer_h = 52.0;
+        let pad = (ui.available_height() - footer_h).max(0.0);
+        ui.add_space(pad);
         let mut add: Option<usize> = None;
+        let fr = egui::Frame::none()
+            .fill(crate::theme::color::CHROME)
+            .inner_margin(egui::Margin::symmetric(4.0, 6.0))
+            .show(ui, |ui| {
         ui.vertical_centered(|ui| {
             let plus = ui.add(egui::Label::new(
                 egui::RichText::new("+").size(20.0).color(muted))
@@ -10187,12 +10219,17 @@ impl CadApp {
                             let (r, painter) = ui.allocate_painter(egui::vec2(46.0, 42.0), sense);
                             let rect = r.rect;
                             let hov = r.hovered() && !on_rail;
-                            // Hovered tile = teal-tinted raised surface; idle = panel raised bg.
-                            painter.rect(rect, 5.0,
-                                if hov { egui::Color32::from_rgb(0x1c, 0x3a, 0x40) }
-                                else { PP_BG_HI },
-                                egui::Stroke::new(1.0, PP_BORDER));
-                            let ink = if on_rail { PP_MUTED }
+                            // Addable = raised tile + bright ink; already-on-rail =
+                            // flat (recedes into the panel) + disabled ink, so the
+                            // two states read very differently.
+                            let tile_bg = if hov { egui::Color32::from_rgb(0x1c, 0x3a, 0x40) }
+                                          else if on_rail { PP_BG_LO }
+                                          else { PP_BG_HI };
+                            let tile_stroke = egui::Stroke::new(1.0,
+                                if on_rail { egui::Color32::from_rgb(0x24, 0x2c, 0x35) }
+                                else { PP_BORDER });
+                            painter.rect(rect, 5.0, tile_bg, tile_stroke);
+                            let ink = if on_rail { crate::theme::color::TEXT_DISABLED }
                                       else { PP_TEXT };
                             let pen = egui::Stroke::new(1.6, ink);
                             let c = rect.center() - egui::vec2(0.0, 5.0);
@@ -10220,50 +10257,13 @@ impl CadApp {
                 else { self.modify_items = (0..MODIFY_CMDS.len()).collect(); }
             }
         });
+            });
+        // Top hairline — mirrors the header's bottom border.
+        ui.painter().hline(fr.response.rect.x_range(), fr.response.rect.top(),
+            egui::Stroke::new(1.0, crate::theme::color::BORDER));
         if let Some(j) = add {
             if is_draw { if !self.draw_items.contains(&j) { self.draw_items.push(j); } }
             else if !self.modify_items.contains(&j) { self.modify_items.push(j); }
-        }
-    }
-
-    /// A floating (undocked) rail — a draggable Area over the canvas. Fixed
-    /// height (so its footer pins + scroll behaves). Drop near the left edge
-    /// to re-dock.
-    fn rail_floating(&mut self, ctx: &egui::Context, name: &str, is_draw: bool,
-                     side: egui::Color32, strip: egui::Color32,
-                     line: egui::Color32, muted: egui::Color32) {
-        let id = if is_draw { "cmd_rail_draw_float" } else { "cmd_rail_modify_float" };
-        let pos = if is_draw { self.draw_rail_pos } else { self.modify_rail_pos };
-        let h = (ctx.screen_rect().height() - pos.y - 30.0).clamp(220.0, 560.0);
-        let mut collapse = false;
-        let mut delta = egui::Vec2::ZERO;
-        egui::Area::new(egui::Id::new(id)).order(egui::Order::Middle).fixed_pos(pos)
-            .show(ctx, |ui| {
-                egui::Frame::none().fill(side).stroke(egui::Stroke::new(1.0, line))
-                    .shadow(egui::epaint::Shadow {
-                        offset: egui::vec2(0.0, 4.0), blur: 16.0, spread: 0.0,
-                        color: egui::Color32::from_black_alpha(110) })
-                    .show(ui, |ui| {
-                        ui.set_width(46.0);
-                        ui.set_height(h);
-                        let (c, dr) = rail_strip(ui, name, strip, line, muted);
-                        collapse = c;
-                        if dr.dragged() { delta = dr.drag_delta(); }
-                        self.rail_inner(ui, is_draw);
-                        pp_cap_ui(ui, &format!("{} rail (floating)", name));
-                    });
-            });
-        let np = pos + delta;
-        let np = egui::pos2(np.x.max(0.0), np.y.max(44.0));
-        let dock = np.x < 28.0;
-        if is_draw {
-            self.draw_rail_pos = np;
-            if collapse { self.draw_rail_open = false; self.draw_rail_floating = false; }
-            else if dock { self.draw_rail_floating = false; }
-        } else {
-            self.modify_rail_pos = np;
-            if collapse { self.modify_rail_open = false; self.modify_rail_floating = false; }
-            else if dock { self.modify_rail_floating = false; }
         }
     }
 
@@ -10343,71 +10343,81 @@ impl CadApp {
         });
     }
 
-    /// Left command rails (Draw + Modify). Docked (SidePanel) by default;
-    /// dragging the strip undocks to a floating Area.
+    /// Left command rails (Draw + Modify), rendered through the UNIFIED dock host
+    /// (dock.rs) — the SAME swappable engine as the Inspector and command bar.
+    /// Rails dock only to the LEFT edge and carry NO title in their header. Icons
+    /// flow into 1 or 2 columns so they always fit the height WITHOUT a scrollbar.
     fn render_command_rails(&mut self, ctx: &egui::Context) {
-        // Palette matches the Properties panel (PP_*) so every surface reads as
-        // one theme. side = panel bg, strip = a slightly darker header band,
-        // line = panel border, muted = label text.
-        let side  = PP_BG_LO;                                     // #141c25 panel bg
-        let strip = egui::Color32::from_rgb(0x0d, 0x14, 0x1b);    // darker header band
-        let line  = PP_BORDER;                                    // #3b494c panel border
-        let muted = PP_LABEL;                                     // #bac9cc label text
-        let frame = egui::Frame::none().fill(side).stroke(egui::Stroke::new(1.0, line));
+        // Rows that fit in the rail body (rail height minus header + footer)
+        // decide 1 vs 2 columns — never a scrollbar. Uses the rail's OWN height
+        // (captured below), which spans menu→status and is UNAFFECTED by the
+        // command bar docking — so docking it doesn't reflow the rails.
+        let rows_fit = (((self.rail_panel_h - 88.0) / 36.0).floor() as usize).max(3);
+        let cols_for = |n: usize| if n <= rows_fit { 1usize } else { 2usize };
+        let width_for = |cols: usize| if cols == 1 { 50.0 } else { 92.0 };
 
         // DRAW
         if self.draw_rail_open {
-            if self.draw_rail_floating {
-                self.rail_floating(ctx, "DRAW", true, side, strip, line, muted);
-            } else {
-                egui::SidePanel::left("cmd_rail_draw").exact_width(46.0)
-                    .frame(frame).show(ctx, |ui| {
-                        let (collapse, dr) = rail_strip(ui, "DRAW", strip, line, muted);
-                        if collapse { self.draw_rail_open = false; }
-                        if dr.drag_started() {
-                            let pp = dr.interact_pointer_pos().unwrap_or(dr.rect.center());
-                            self.draw_rail_pos = pp - egui::vec2(23.0, 12.0);
-                            self.draw_rail_floating = true;
-                        }
-                        self.rail_inner(ui, true);
-                        pp_cap_ui(ui, "DRAW rail (docked)");
-                    });
+            let cols = cols_for(self.draw_items.len());
+            let w = width_for(cols);
+            let cfg = crate::dock::DockConfig {
+                id: "rail_draw", title: "",
+                dock_region: crate::dock::DockRegion::Left,
+                size: w, min: w, max: w, resizable: false,
+                flush_body: true, float_w: w, float_max_h_frac: 0.92,
+            };
+            let mut state = self.draw_rail_dock_state;
+            let mut open = self.draw_rail_open;
+            let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
+                self.rail_inner(ui, true, cols);
+                pp_cap_ui(ui, "DRAW rail");
+            });
+            self.draw_rail_dock_state = state;
+            self.draw_rail_open = open;
+            // Capture the DOCKED rail height (full menu→status) to drive the
+            // column decision from a height that doesn't move with the command bar.
+            if matches!(state, crate::dock::DockState::Docked(_)) && rect.is_finite() {
+                self.rail_panel_h = rect.height();
             }
         }
         // MODIFY
         if self.modify_rail_open {
-            if self.modify_rail_floating {
-                self.rail_floating(ctx, "MODIFY", false, side, strip, line, muted);
-            } else {
-                egui::SidePanel::left("cmd_rail_modify").exact_width(46.0)
-                    .frame(frame).show(ctx, |ui| {
-                        let (collapse, dr) = rail_strip(ui, "MODIFY", strip, line, muted);
-                        if collapse { self.modify_rail_open = false; }
-                        if dr.drag_started() {
-                            let pp = dr.interact_pointer_pos().unwrap_or(dr.rect.center());
-                            self.modify_rail_pos = pp - egui::vec2(23.0, 12.0);
-                            self.modify_rail_floating = true;
-                        }
-                        self.rail_inner(ui, false);
-                        pp_cap_ui(ui, "MODIFY rail (docked)");
-                    });
-            }
+            let cols = cols_for(self.modify_items.len());
+            let w = width_for(cols);
+            let cfg = crate::dock::DockConfig {
+                id: "rail_modify", title: "",
+                dock_region: crate::dock::DockRegion::Left,
+                size: w, min: w, max: w, resizable: false,
+                flush_body: true, float_w: w, float_max_h_frac: 0.92,
+            };
+            let mut state = self.modify_rail_dock_state;
+            let mut open = self.modify_rail_open;
+            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, _cap| {
+                self.rail_inner(ui, false, cols);
+                pp_cap_ui(ui, "MODIFY rail");
+            });
+            self.modify_rail_dock_state = state;
+            self.modify_rail_open = open;
         }
-        // Reopen handles for collapsed rails.
+        // Reopen handles for collapsed (closed) rails.
         if !self.draw_rail_open || !self.modify_rail_open {
+            let strip = egui::Color32::from_rgb(0x0d, 0x14, 0x1b);
+            let line  = PP_BORDER;
             egui::SidePanel::left("cmd_rail_reopen").exact_width(18.0)
                 .frame(egui::Frame::none().fill(strip).stroke(egui::Stroke::new(1.0, line)))
                 .show(ctx, |ui| {
                     ui.add_space(8.0);
+                    let dock_left =
+                        crate::dock::DockState::Docked(crate::dock::DockRegion::Left);
                     if !self.draw_rail_open
                         && ui.small_button("D").on_hover_text("Show Draw rail").clicked() {
                         self.draw_rail_open = true;
-                        self.draw_rail_floating = false;
+                        self.draw_rail_dock_state = dock_left;
                     }
                     if !self.modify_rail_open
                         && ui.small_button("M").on_hover_text("Show Modify rail").clicked() {
                         self.modify_rail_open = true;
-                        self.modify_rail_floating = false;
+                        self.modify_rail_dock_state = dock_left;
                     }
                 });
         }
@@ -18866,42 +18876,6 @@ fn rail_icon_btn(
     resp.on_hover_text(tip)
 }
 
-/// Small painted ✕ (collapse) button — never depends on a font glyph.
-fn rail_xbtn(ui: &mut egui::Ui, col: egui::Color32) -> bool {
-    let (resp, p) = ui.allocate_painter(egui::vec2(14.0, 14.0), egui::Sense::click());
-    let r = resp.rect; let c = r.center(); let s = 3.5;
-    let st = egui::Stroke::new(1.4,
-        if resp.hovered() { egui::Color32::from_rgb(231, 236, 246) } else { col });
-    p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
-    p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
-    resp.clicked()
-}
-
-/// Two-row rail strip (✕ collapse top-right, category name below) that ALSO
-/// acts as a drag handle. Returns (collapse_clicked, strip_drag_response).
-fn rail_strip(ui: &mut egui::Ui, name: &str, strip: egui::Color32,
-              line: egui::Color32, muted: egui::Color32) -> (bool, egui::Response) {
-    let w = ui.available_width();
-    let (rect, dragr) = ui.allocate_exact_size(
-        egui::vec2(w, 30.0), egui::Sense::click_and_drag());
-    let p = ui.painter_at(rect);
-    p.rect_filled(rect, 0.0, strip);
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], egui::Stroke::new(1.0, line));
-    p.text(egui::pos2(rect.center().x, rect.bottom() - 8.0),
-        egui::Align2::CENTER_CENTER, name, egui::FontId::proportional(8.0), muted);
-    // Collapse ✕ (top-right), interacted on top of the drag area.
-    let xr = egui::Rect::from_min_size(
-        egui::pos2(rect.right() - 16.0, rect.top() + 3.0), egui::vec2(13.0, 13.0));
-    let xresp = ui.interact(xr.expand(1.0), ui.id().with((name, "railx")), egui::Sense::click());
-    let xc = xr.center(); let s = 3.3;
-    let xcol = if xresp.hovered() { egui::Color32::from_rgb(231, 236, 246) } else { muted };
-    let xs = egui::Stroke::new(1.4, xcol);
-    p.line_segment([egui::pos2(xc.x - s, xc.y - s), egui::pos2(xc.x + s, xc.y + s)], xs);
-    p.line_segment([egui::pos2(xc.x - s, xc.y + s), egui::pos2(xc.x + s, xc.y - s)], xs);
-    let dragr = dragr.on_hover_cursor(egui::CursorIcon::Grab);
-    (xresp.clicked(), dragr)
-}
-
 fn cmd_button(
     ui: &mut egui::Ui,
     label: &str,
@@ -21623,7 +21597,7 @@ impl eframe::App for CadApp {
                 id: "command", title: "Command",
                 dock_region: crate::dock::DockRegion::Bottom,
                 size: 150.0, min: 96.0, max: 320.0,
-                resizable: true, float_w: 720.0, float_max_h_frac: 0.5,
+                resizable: true, flush_body: false, float_w: 720.0, float_max_h_frac: 0.5,
             };
             let mut state = self.cmd_dock_state;
             let mut open = self.cmd_window_open;

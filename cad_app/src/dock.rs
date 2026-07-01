@@ -35,6 +35,10 @@ pub struct DockConfig<'a> {
     pub min: f32,
     pub max: f32,
     pub resizable: bool,
+    /// When true the body is rendered EDGE-TO-EDGE (no inset frame) so the panel
+    /// can paint full-width, flush chrome of its own (the rails' bottom footer
+    /// band). Content panels leave this false and get the standard inset.
+    pub flush_body: bool,
     /// Content width when floating. For an L/R panel this usually equals
     /// `size`; a Bottom-docking panel (whose `size` is a height) floats wider.
     pub float_w: f32,
@@ -58,61 +62,60 @@ pub trait DockHost {
 const BG:     Color32 = Color32::from_rgb(0x18, 0x20, 0x29);
 fn border() -> Color32 { crate::theme::color::BORDER }
 fn chrome() -> Color32 { crate::theme::color::CHROME }
-const TEXT:  Color32 = Color32::from_rgb(0xda, 0xe3, 0xef);
-const MUTED: Color32 = Color32::from_rgb(0xb4, 0xb5, 0xb7);
+const TEXT:  Color32 = Color32::from_rgb(0xda, 0xe3, 0xef); // theme text-primary
+const MUTED: Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // theme text-muted
 
-/// Chrome header for a DOCKED panel (Frame-based). Returns
-/// `(close_clicked, undock_to)` where `undock_to` is `Some(pos)` when the title
-/// area was dragged out.
+/// The ONE chrome header used by every docked/floating bar — unified per the
+/// design system (title Geist 16/500 on `surface-chrome`, THEME_SYSTEM §5.7/§5.3;
+/// × close at the right). The whole band is the drag handle; a *click* over the
+/// × closes instead of dragging. `cfg.title` may be empty (the icon rails carry
+/// no name) — then only the × and the drag band show. Returns
+/// `(close_clicked, band_response)`; callers derive undock/drag from the band.
+fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
+    let w = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 32.0), Sense::hover());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 0.0, chrome());
+    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
+    if !cfg.title.is_empty() {
+        p.text(egui::pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER,
+            cfg.title, FontId::proportional(16.0), TEXT);
+    }
+    // × close hit-box (right). The whole band senses click+drag; a click landing
+    // on the × closes, everything else drags.
+    let xr = Rect::from_center_size(
+        egui::pos2(rect.right() - 15.0, rect.center().y), egui::vec2(20.0, 20.0));
+    let band = ui.interact(rect, Id::new((cfg.id, "hdr")), Sense::click_and_drag());
+    let over_x = ui.rect_contains_pointer(xr);
+    if band.hovered() {
+        ui.ctx().set_cursor_icon(
+            if over_x { CursorIcon::PointingHand } else { CursorIcon::Grab });
+    }
+    let xcol = if over_x { TEXT } else { MUTED };
+    let c = xr.center(); let s = 5.0;
+    let st = Stroke::new(1.5, xcol);
+    p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
+    p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
+    (band.clicked() && over_x, band)
+}
+
+/// Docked-panel header — drag the band out to undock. Returns
+/// `(close_clicked, undock_to)`.
 fn docked_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Option<Pos2>) {
-    let mut close = false;
-    let hdr = egui::Frame::none().fill(chrome())
-        .inner_margin(egui::Margin::symmetric(12.0, 9.0))
-        .show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(cfg.title).size(15.0).color(TEXT));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.add(egui::Label::new(egui::RichText::new("×").size(18.0).color(MUTED))
-                        .sense(Sense::click()))
-                        .on_hover_cursor(CursorIcon::PointingHand)
-                        .on_hover_text("Close").clicked() { close = true; }
-                });
-            });
-        });
-    ui.painter().hline(hdr.response.rect.x_range(), hdr.response.rect.bottom(),
-        Stroke::new(1.0, border()));
-    let mut dr = hdr.response.rect; dr.max.x -= 34.0; // leave × clickable
-    let hd = ui.interact(dr, Id::new((cfg.id, "hdrdrag")), Sense::click_and_drag())
-        .on_hover_cursor(CursorIcon::Grab);
-    let undock = if hd.drag_started() {
-        hd.interact_pointer_pos()
+    let (close, band) = header_band(ui, cfg);
+    let undock = if band.drag_started() {
+        band.interact_pointer_pos()
             .map(|p| egui::pos2((p.x - 130.0).max(0.0), (p.y - 12.0).max(48.0)))
     } else { None };
     (close, undock)
 }
 
-/// Chrome header for a FLOATING panel (painted; the whole band drags the
-/// window). Returns `(close_clicked, drag_delta, drag_released)`. `drag_released`
-/// is the single frame the drag ends on — the host docks only then, so a panel
-/// follows the pointer during the drag and snaps only when let go on its edge.
+/// Floating-panel header — the band drags the window. Returns
+/// `(close_clicked, drag_delta, drag_released)`; the host docks only on release.
 fn float_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Vec2, bool) {
-    let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 34.0), Sense::hover());
-    let p = ui.painter_at(rect);
-    p.rect_filled(rect, 0.0, chrome());
-    p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
-    p.text(egui::pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER,
-        cfg.title, FontId::proportional(15.0), TEXT);
-    let xr = Rect::from_center_size(
-        egui::pos2(rect.right() - 16.0, rect.center().y), egui::vec2(16.0, 16.0));
-    let xresp = ui.interact(xr, Id::new((cfg.id, "fx")), Sense::click());
-    p.text(xr.center(), Align2::CENTER_CENTER, "×", FontId::proportional(18.0),
-        if xresp.hovered() { TEXT } else { MUTED });
-    let mut dr = rect; dr.max.x -= 34.0;
-    let dresp = ui.interact(dr, Id::new((cfg.id, "fdrag")), Sense::click_and_drag())
-        .on_hover_cursor(CursorIcon::Grab);
-    let delta = if dresp.dragged() { dresp.drag_delta() } else { Vec2::ZERO };
-    (xresp.clicked(), delta, dresp.drag_stopped())
+    let (close, band) = header_band(ui, cfg);
+    let delta = if band.dragged() { band.drag_delta() } else { Vec2::ZERO };
+    (close, delta, band.drag_stopped())
 }
 
 /// The hand-rolled egui docking engine.
@@ -145,9 +148,13 @@ impl DockHost for EguiDockHost {
                             .show(ctx, |ui| {
                                 let (c, u) = docked_header(ui, cfg);
                                 close = c; undock = u;
-                                egui::Frame::none()
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                    .show(ui, |ui| body(ui, None));
+                                if cfg.flush_body {
+                                    body(ui, None);
+                                } else {
+                                    egui::Frame::none()
+                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| body(ui, None));
+                                }
                             }).response.rect
                     }
                     DockRegion::Bottom => {
@@ -158,9 +165,13 @@ impl DockHost for EguiDockHost {
                             .show(ctx, |ui| {
                                 let (c, u) = docked_header(ui, cfg);
                                 close = c; undock = u;
-                                egui::Frame::none()
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                    .show(ui, |ui| body(ui, None));
+                                if cfg.flush_body {
+                                    body(ui, None);
+                                } else {
+                                    egui::Frame::none()
+                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| body(ui, None));
+                                }
                             }).response.rect
                     }
                 };
@@ -207,9 +218,13 @@ impl DockHost for EguiDockHost {
                                 ui.set_width(cfg.float_w);
                                 let (c, d, r) = float_header(ui, cfg);
                                 close = c; delta = d; released = r;
-                                egui::Frame::none()
-                                    .inner_margin(egui::Margin::symmetric(10.0, 8.0))
-                                    .show(ui, |ui| body(ui, Some(cap)));
+                                if cfg.flush_body {
+                                    body(ui, Some(cap));
+                                } else {
+                                    egui::Frame::none()
+                                        .inner_margin(egui::Margin::symmetric(10.0, 8.0))
+                                        .show(ui, |ui| body(ui, Some(cap)));
+                                }
                             });
                     });
                 let wr = area.response.rect;
