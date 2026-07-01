@@ -177,11 +177,28 @@ glyphs (need true geometry) + Lucide UI icons. Replace all legacy emoji glyphs.
   exactly 2 lines"); recoverable = re-prompt in the command flow; file/IO =
   danger banner. Toasts/notifications deferred to the reserved Bottom Dock.
 
-> The 16-point design-system review is **complete** (spacing, radius, elevation,
-> colour, text, states, type, accessibility, navigation, tables, menus, motion,
-> dark-only, layout/architecture, icons, global states). Still undefined and
-> owed before the Theme Editor's matching sub-sections ship: **Charts** (no
-> spec yet) and the deeper **Forms** patterns beyond inputs/states.
+### 5.14 Forms
+Field types: text · number+unit · dropdown · checkbox (stroked box) · segmented ·
+slider · read-only/computed · **Mixed** (multi-value). Specialized renderers:
+**layer** = color swatch + name · **color** = swatch + name · **linetype** =
+dashed-line preview + name · **lineweight** = thickness preview + value (9px gap
+from preview to text). Coordinate pair = two boxes in Start/End columns; derived
+values (Length, Angle) = read-only, muted, no border. **Value text left-aligned
+to a unified start.** Layouts: label-left (Inspector/dense) · stacked (dialogs) ·
+two-column grids. **Commit:** Inspector = live-apply + Ctrl+Z; dialogs =
+commit-on-Enter/OK; Esc reverts. **Validate** on commit/blur = red border +
+message below; number fields drag-to-scrub; no "required" asterisk. Sections
+separated by **hairline dividers**; collapsed = `▸` header. The **dobject type
+shows in the Inspector header**, not as a field. (Per-type property schema →
+[Dobject_Properties.md](Dobject_Properties.md); wording/number formatting →
+[CONTENT_STYLE.md](CONTENT_STYLE.md).)
+
+> **Design-system review complete.** All 16 points + Forms locked; the content
+> half lives in [CONTENT_STYLE.md](CONTENT_STYLE.md). **Charts are deferred** —
+> not useful for this app yet (diagnostics only); a lean set (line/area, bar,
+> donut, sparkline; 1px lines, cyan + violet/amber categorical) was sketched but
+> is unbuilt. The Theme Editor's Charts sub-section stays a placeholder until a
+> diagnostics/analysis panel needs it.
 
 ---
 
