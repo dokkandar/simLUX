@@ -4,7 +4,16 @@ A living list of bugs that are NOT fully fixed and jobs not finished. Updated as
 work progresses. Ask any time and I'll give you the current list.
 
 Branch: `windows-ui-session-2026-06-20`
-Last updated: 2026-06-25
+Last updated: 2026-07-01
+
+## ⏸ HELD — come back to fix
+- **Inspector dock resize won't stick.** When a dobject is selected, dragging
+  the docked Inspector's left-edge splitter snaps back to the content's natural
+  width and won't accept a smaller size (works fine when nothing is selected).
+  Root cause: egui refuses to shrink a `SidePanel` below its content min width;
+  fixing needs `render_props_body` rows to allow shrinking (ellipsis/clip values,
+  flexible label column) or a self-managed width. User said hold and revisit
+  after the rest of the dock system is in.
 
 ## ▶ RESUME HERE (next session)
 UI redesign of the top bar is in progress and looking good. Done so far: two-line

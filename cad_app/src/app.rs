@@ -2,6 +2,7 @@
 // All geometry comes from cad_kernel — no math defined in this file.
 
 use eframe::egui;
+use crate::dock::DockHost;   // brings `.show()` into scope for the dock host
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -793,13 +794,18 @@ pub struct CadApp {
     /// keep a hover-opened category menu open while the pointer is still over
     /// its button, and close it once the pointer leaves both bar and popup.
     menubar_rect:        egui::Rect,
-    /// When true the command bar is docked as a bottom strip (above the status
-    /// bar, under the canvas) instead of floating. Drag the floating window to
-    /// the bottom edge to dock; the ⏏ button in the docked strip undocks.
-    cmd_docked:          bool,
+    /// Command-bar docking state (docked region vs floating), driven by the
+    /// unified dock host (see dock.rs) — the same engine the Inspector uses.
+    /// Defaults to floating lower-left; drag its header to an edge to dock
+    /// (Bottom = the AutoCAD-style command strip), drag out to float again.
+    cmd_dock_state:      crate::dock::DockState,
     layers_window_open:  bool,
     pens_window_open:    bool,
     info_window_open:    bool,
+    /// Inspector docking state (docked region vs floating), driven by the
+    /// unified dock host (see dock.rs). Drag the header out to float; drag the
+    /// float to an edge to re-dock.
+    inspector_dock_state: crate::dock::DockState,
     /// One-shot: when true, the next Properties-panel render records the
     /// pixel geometry of every element into the session recorder, then
     /// clears the flag. Activated from the recorder window.
@@ -2369,10 +2375,11 @@ impl Default for CadApp {
             press_pos:           None,
             cmd_window_open:     true,
             menubar_rect:        egui::Rect::NOTHING,
-            cmd_docked:          false,
+            cmd_dock_state:      crate::dock::DockState::Floating(egui::pos2(360.0, 560.0)),
             layers_window_open:  false,
             pens_window_open:    false,
             info_window_open:    false,
+            inspector_dock_state: crate::dock::DockState::Docked(crate::dock::DockRegion::Right),
             props_layout_capture: false,
             draw_rail_open:      true,
             modify_rail_open:    true,
@@ -4347,9 +4354,9 @@ impl CadApp {
                             self.selection.len()
                         } else if self.selected.is_some() { 1 } else { 0 };
                         self.history.push(if n == 0 {
-                            "  Properties — select dobject(s) to edit".into()
+                            "  Inspector — select dobject(s) to edit".into()
                         } else {
-                            format!("  Properties — editing {} dobject(s)", n)
+                            format!("  Inspector — editing {} dobject(s)", n)
                         });
                     }
                     Some((prop, val)) => {
@@ -9767,157 +9774,141 @@ impl CadApp {
     //      bulk-edit layer / visibility / color.
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
-        // Scoped "Properties" palette (dark teal-grey, cyan accent) — applied
-        // only to this window's ui so the rest of the app is untouched.
-        let bg     = egui::Color32::from_rgb(0x18, 0x20, 0x29);
+        if !self.info_window_open { return; }
+        // Rendered through the UNIFIED dock host (dock.rs) — same docking
+        // behaviour as every other dockable panel, and the engine is swappable.
+        let cfg = crate::dock::DockConfig {
+            id: "inspector", title: "Inspector",
+            dock_region: crate::dock::DockRegion::Right,
+            size: 264.0, min: 220.0, max: 520.0,
+            resizable: true, float_w: 264.0, float_max_h_frac: 0.5,
+        };
+        let mut state = self.inspector_dock_state;
+        let mut open = self.info_window_open;
+        let capturing = self.props_layout_capture;
+        let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
+            self.inspector_body(ui, cap);
+        });
+        self.inspector_dock_state = state;
+        self.info_window_open = open;
+        if capturing && rect.is_finite() {
+            ctx.data_mut(|d| {
+                let id = egui::Id::new("pp_cap_buf");
+                let mut v: Vec<(String, egui::Rect)> = d.get_temp(id).unwrap_or_default();
+                v.push(("Inspector · PANEL FRAME".to_string(), rect));
+                d.insert_temp(id, v);
+            });
+        }
+    }
+
+    /// The Inspector's CONTENT — scoped visuals, selection badge, search box,
+    /// and the property body. Shared by the docked and floating renderers.
+    /// `scroll_max_h`: Some caps the property scroll area (floating, ≤50% screen);
+    /// None lets it fill (docked).
+    fn inspector_body(&mut self, ui: &mut egui::Ui, scroll_max_h: Option<f32>) {
         let bg_lo  = egui::Color32::from_rgb(0x14, 0x1c, 0x25);
         let bg_hi  = egui::Color32::from_rgb(0x22, 0x2b, 0x34);
         let border = egui::Color32::from_rgb(0x3b, 0x49, 0x4c);
         let text   = egui::Color32::from_rgb(0xda, 0xe3, 0xef);
         let muted  = egui::Color32::from_rgb(0xb4, 0xb5, 0xb7);
         let accent = egui::Color32::from_rgb(0x00, 0xda, 0xf3);
-
-        if !self.info_window_open { return; }
-
-        // A right-docked, width-stable panel (egui SidePanel). Its width is
-        // driven by the resize handle / default_width — content NEVER auto-
-        // grows the panel (the bug we had with a resizable Window + fill-width
-        // ScrollArea). The CentralPanel canvas reflows to the left of it.
-        let frame = egui::Frame::none()
-            .fill(bg)
-            .stroke(egui::Stroke::new(1.0, border))
-            .inner_margin(egui::Margin::symmetric(10.0, 8.0));
-
-        // Capture is armed once per frame at the TOP of update() (so it works
-        // for EVERY open menu, not just this panel). Here we only note whether
-        // it's active so we can add the panel-frame rect below.
-        let capturing = self.props_layout_capture;
-
-        // Floating, DRAGGABLE window (drag its title bar). Width is FIXED —
-        // resizable(false) + an explicit content width below — so it can't
-        // auto-stretch (the bug we hit with a resizable fill-width window).
-        let mut open = self.info_window_open;
-        let resp = egui::Window::new("Properties")
-            .open(&mut open)
-            .resizable(false)
-            .collapsible(false)
-            .frame(frame)
-            .default_pos(egui::pos2(900.0, 70.0))
-            .show(ctx, |ui| {
-                ui.set_width(300.0);   // lock content width → no stretch
-                {
-                    let v = ui.visuals_mut();
-                    v.override_text_color = Some(text);
-                    v.widgets.inactive.weak_bg_fill = bg_lo;
-                    v.widgets.inactive.bg_fill = bg_lo;
-                    v.widgets.hovered.weak_bg_fill = bg_hi;
-                    v.widgets.hovered.bg_fill = bg_hi;
-                    v.widgets.active.weak_bg_fill = bg_hi;
-                    v.widgets.active.bg_fill = bg_hi;
-                    v.widgets.open.weak_bg_fill = bg_lo;
-                    v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
-                    v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
-                    v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0, 218, 243, 60);
-                    v.selection.stroke = egui::Stroke::new(1.0, accent);
-                    v.hyperlink_color = accent;
-                    v.indent_has_left_vline = false;
-                    // TextEdit / DragValue backgrounds use extreme_bg_color, not
-                    // widgets.*.bg_fill — match it to the painted boxes. Square
-                    // the widget corners too so all fields look identical.
-                    v.extreme_bg_color = bg_lo;
-                    v.widgets.inactive.rounding = egui::Rounding::ZERO;
-                    v.widgets.hovered.rounding  = egui::Rounding::ZERO;
-                    v.widgets.active.rounding   = egui::Rounding::ZERO;
-                }
-                ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
-
-                // Target set: the basket (group) takes priority; otherwise
-                // the single click-selected dobject. Deduped + sorted so the
-                // "shared value / *VARIES*" scan and the apply loop agree.
-                let mut targets: Vec<usize> = if !self.selection.is_empty() {
-                    self.selection.clone()
-                } else if let Some(i) = self.selected {
-                    vec![i]
-                } else {
-                    Vec::new()
-                };
-                targets.retain(|&i| i < self.doc.dobjects.len());
-                targets.sort_unstable();
-                targets.dedup();
-
-                // ---- Header: selection-count badge (title + close are on
-                // the draggable window title bar) ----
-                ui.add_space(2.0);
-                if !targets.is_empty() {
-                    ui.horizontal(|ui| {
-                        let label = if targets.len() == 1 {
-                            self.doc.dobjects.get(targets[0])
-                                .map(|d| dobject_kind_name(&d.geom).to_uppercase())
-                                .unwrap_or_else(|| "DOBJECT".into())
-                        } else if self.targets_uniform_tag(&targets).is_some() {
-                            let k = self.doc.dobjects.get(targets[0])
-                                .map(|d| dobject_kind_name(&d.geom).to_uppercase())
-                                .unwrap_or_else(|| "DOBJECT".into());
-                            format!("{} ({})", k, targets.len())
-                        } else {
-                            format!("MIXED ({})", targets.len())
-                        };
-                        let br = egui::Frame::none()
-                            .fill(egui::Color32::from_rgb(0x2d, 0x36, 0x3f))
-                            .rounding(8.0)
-                            .inner_margin(egui::Margin::symmetric(7.0, 1.0))
-                            .show(ui, |ui| {
-                                ui.label(egui::RichText::new(label).monospace().size(10.0).color(accent));
-                            });
-                        pp_capture(ui, "selection badge", br.response.rect);
-                    });
-                    ui.add_space(2.0);
-                }
-                pp_divider(ui);
-                ui.add_space(8.0);
-
-                if targets.is_empty() {
-                    ui.colored_label(muted,
-                        "No selection — click a dobject, or use select / props.");
-                    return;
-                }
-
-                // ---- Search ----
-                let search_id = egui::Id::new("props_search_box");
-                let mut q: String = ui.data_mut(|d| d.get_temp::<String>(search_id).unwrap_or_default());
-                let avail = ui.available_width();
-                let sr = egui::Frame::none().fill(bg_lo).stroke(egui::Stroke::new(1.0, border))
-                    .rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 3.0))
-                    .show(ui, |ui| {
-                        ui.add_sized([avail - 16.0, 16.0], egui::TextEdit::singleline(&mut q)
-                            .hint_text("Search parameters…")
-                            .frame(false));
-                    });
-                pp_capture(ui, "search box", sr.response.rect);
-                ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
-                ui.add_space(6.0);
-
-                // Body fills remaining height; the panel width is stable, so
-                // the fill-width ScrollArea can't grow it. Changes auto-apply;
-                // Ctrl+Z undoes.
-                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
-                    self.render_props_body(ui, &targets, &q);
-                });
-            });
-        self.info_window_open = open;
-
-        // Add this panel's outer frame rect into the shared capture buffer.
-        // The actual dump (all menus together) happens at frame-end in update().
-        if capturing {
-            let frame_rect = resp.as_ref().map(|r| r.response.rect)
-                .unwrap_or(egui::Rect::NOTHING);
-            ctx.data_mut(|d| {
-                let id = egui::Id::new("pp_cap_buf");
-                let mut v: Vec<(String, egui::Rect)> = d.get_temp(id).unwrap_or_default();
-                v.push(("Properties · PANEL FRAME".to_string(), frame_rect));
-                d.insert_temp(id, v);
-            });
+        {
+            let v = ui.visuals_mut();
+            v.override_text_color = Some(text);
+            v.widgets.inactive.weak_bg_fill = bg_lo;
+            v.widgets.inactive.bg_fill = bg_lo;
+            v.widgets.hovered.weak_bg_fill = bg_hi;
+            v.widgets.hovered.bg_fill = bg_hi;
+            v.widgets.active.weak_bg_fill = bg_hi;
+            v.widgets.active.bg_fill = bg_hi;
+            v.widgets.open.weak_bg_fill = bg_lo;
+            v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
+            v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
+            v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0, 218, 243, 60);
+            v.selection.stroke = egui::Stroke::new(1.0, accent);
+            v.hyperlink_color = accent;
+            v.indent_has_left_vline = false;
+            v.extreme_bg_color = bg_lo;
+            v.widgets.inactive.rounding = egui::Rounding::ZERO;
+            v.widgets.hovered.rounding  = egui::Rounding::ZERO;
+            v.widgets.active.rounding   = egui::Rounding::ZERO;
         }
+        ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+
+        // Target set: the basket (group) takes priority; otherwise the single
+        // click-selected dobject. Deduped + sorted so the shared-value scan and
+        // the apply loop agree.
+        let mut targets: Vec<usize> = if !self.selection.is_empty() {
+            self.selection.clone()
+        } else if let Some(i) = self.selected {
+            vec![i]
+        } else {
+            Vec::new()
+        };
+        targets.retain(|&i| i < self.doc.dobjects.len());
+        targets.sort_unstable();
+        targets.dedup();
+
+        // ---- selection-count badge ----
+        ui.add_space(2.0);
+        if !targets.is_empty() {
+            ui.horizontal(|ui| {
+                let label = if targets.len() == 1 {
+                    self.doc.dobjects.get(targets[0])
+                        .map(|d| dobject_kind_name(&d.geom).to_uppercase())
+                        .unwrap_or_else(|| "DOBJECT".into())
+                } else if self.targets_uniform_tag(&targets).is_some() {
+                    let k = self.doc.dobjects.get(targets[0])
+                        .map(|d| dobject_kind_name(&d.geom).to_uppercase())
+                        .unwrap_or_else(|| "DOBJECT".into());
+                    format!("{} ({})", k, targets.len())
+                } else {
+                    format!("MIXED ({})", targets.len())
+                };
+                let br = egui::Frame::none()
+                    .fill(egui::Color32::from_rgb(0x2d, 0x36, 0x3f))
+                    .rounding(8.0)
+                    .inner_margin(egui::Margin::symmetric(7.0, 1.0))
+                    .show(ui, |ui| {
+                        ui.label(egui::RichText::new(label).monospace().size(10.0).color(accent));
+                    });
+                pp_capture(ui, "selection badge", br.response.rect);
+            });
+            ui.add_space(2.0);
+        }
+        pp_divider(ui);
+        ui.add_space(8.0);
+
+        if targets.is_empty() {
+            ui.colored_label(muted,
+                "No selection — click a dobject to edit its properties.");
+            return;
+        }
+
+        // ---- Search ----
+        let search_id = egui::Id::new("props_search_box");
+        let mut q: String = ui.data_mut(|d| d.get_temp::<String>(search_id).unwrap_or_default());
+        let avail = ui.available_width();
+        let sr = egui::Frame::none().fill(bg_lo).stroke(egui::Stroke::new(1.0, border))
+            .rounding(4.0).inner_margin(egui::Margin::symmetric(6.0, 3.0))
+            .show(ui, |ui| {
+                ui.add_sized([avail - 16.0, 16.0], egui::TextEdit::singleline(&mut q)
+                    .hint_text("Search parameters…")
+                    .frame(false));
+            });
+        pp_capture(ui, "search box", sr.response.rect);
+        ui.data_mut(|d| d.insert_temp(search_id, q.clone()));
+        ui.add_space(6.0);
+
+        // Docked: fill the panel's full height (no vertical shrink). Floating:
+        // grow to content height but cap at ~50% of the screen (float_max_h_frac)
+        // — a long property list then scrolls instead of pushing past the cap.
+        let shrink_v = scroll_max_h.is_some();
+        let mut sa = egui::ScrollArea::vertical().auto_shrink([false, shrink_v]);
+        if let Some(h) = scroll_max_h { sa = sa.max_height(h); }
+        sa.show(ui, |ui| {
+            self.render_props_body(ui, &targets, &q);
+        });
     }
 
     /// Dispatch a rail command. Most go through `run_command`; `array` opens
@@ -10277,16 +10268,19 @@ impl CadApp {
     }
 
     /// Shared body of the command bar — the history scroll, the current-prompt
-    /// line, and the input row. Used by BOTH the floating Command window and the
-    /// docked-at-bottom panel so the two can't drift.
-    fn command_bar_body(&mut self, ui: &mut egui::Ui) {
+    /// line, and the input row. Used by BOTH docking modes through the unified
+    /// dock host so the two can't drift. `scroll_cap`: `Some` when floating
+    /// (the Area imposes no height, so cap the history to ≤50% of the screen);
+    /// `None` when docked (fill the panel).
+    fn command_bar_body(&mut self, ui: &mut egui::Ui, scroll_cap: Option<f32>) {
         // Reserve space at the bottom for: prompt line (always shown) +
         // the input row.
         let bottom_reserve = 32.0 + 18.0;
+        let avail_h = scroll_cap.unwrap_or_else(|| ui.available_height());
         egui::ScrollArea::vertical()
             .id_salt("hist_scroll")
             .stick_to_bottom(true)
-            .max_height((ui.available_height() - bottom_reserve).max(24.0))
+            .max_height((avail_h - bottom_reserve).max(24.0))
             .show(ui, |ui| {
                 for h in &self.history {
                     ui.monospace(h);
@@ -13278,7 +13272,7 @@ impl CadApp {
         self.gpu_dirty = true;
         self.index_dirty = true;
         self.history.push(format!(
-            "  ✔ block '{}' is now parametric — {} param(s). Insert it, then set values in Properties.",
+            "  ✔ block '{}' is now parametric — {} param(s). Insert it, then set values in the Inspector.",
             name, n));
     }
 
@@ -20687,7 +20681,7 @@ impl eframe::App for CadApp {
                         self.run_command("explode");
                         ui.close_menu();
                     }
-                    if ui.button("Properties…")
+                    if ui.button("Inspector…")
                         .on_hover_text("Edit common properties of the selected \
                                         dobject(s) — layer, color, linetype, \
                                         lineweight, and type-specific style")
@@ -20875,7 +20869,7 @@ impl eframe::App for CadApp {
                     ui.checkbox(&mut self.cmd_window_open,      "Command palette");
                     ui.checkbox(&mut self.layers_window_open,   "Layers");
                     ui.checkbox(&mut self.pens_window_open,     "Pens");
-                    ui.checkbox(&mut self.info_window_open,     "Info / Properties");
+                    ui.checkbox(&mut self.info_window_open,     "Inspector");
                     ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
                     ui.separator();
                     ui.label(egui::RichText::new("Command rails").small().color(
@@ -21277,11 +21271,6 @@ impl eframe::App for CadApp {
             self.render_pen_palette(ctx);
         }
 
-        // ---- left panel: Entity Info (Slice D) --------------------------
-        if self.info_panel_open {
-            self.render_info_panel(ctx);
-        }
-
         // ---- floating: Trim Debug log (instrumentation) ----------------
         if self.trim_debug_open {
             self.render_trim_debug_window(ctx);
@@ -21614,179 +21603,36 @@ impl eframe::App for CadApp {
                 });
             });
 
-        // ---- Cmd palette — floating Window (AutoCAD-style) -------------
-        // History + prompt + input combined in one draggable, resizable
-        // window. Default position: lower-left of the screen.
-        let cmd_default_pos = {
-            let r = ctx.screen_rect();
-            egui::pos2(r.left() + 360.0, r.bottom() - 220.0)
-        };
-        let mut cmd_open = self.cmd_window_open;
-        // ---- Docked variant: a bottom strip ABOVE the status bar, under the
-        // canvas (status_bar is added first, so this bottom panel stacks above
-        // it). Full width — the AutoCAD-style command line position. ----
-        if self.cmd_docked {
-            egui::TopBottomPanel::bottom("cmd_dock")
-                .resizable(true)
-                .default_height(150.0)
-                .min_height(96.0)
-                .show(ctx, |ui| {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Command").strong().color(PP_LABEL));
-                        ui.with_layout(
-                            egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.small_button("⏏ undock")
-                                    .on_hover_text("Float the command bar again")
-                                    .clicked()
-                                {
-                                    self.cmd_docked = false;
-                                }
-                            });
-                    });
-                    self.command_bar_body(ui);
-                });
-        }
-        // ---- Floating variant: the draggable Command window ----
-        let resp = if self.cmd_docked { None } else {
-            let win = egui::Window::new("Command")
-                .open(&mut cmd_open)
-                .default_pos(cmd_default_pos)
-                .default_size(egui::vec2(720.0, 180.0))
-                .min_width(360.0)
-                .min_height(120.0)
-                .resizable(true)
-                .collapsible(true);
-            win.show(ctx, |ui| {
-                // Reserve space at the bottom for: prompt line (always shown) +
-                // the input row.
-                let bottom_reserve = 32.0 + 18.0;
-                egui::ScrollArea::vertical()
-                    .id_salt("hist_scroll")
-                    .stick_to_bottom(true)
-                    .max_height(ui.available_height() - bottom_reserve)
-                    .show(ui, |ui| {
-                        for h in &self.history {
-                            ui.monospace(h);
-                        }
-                    });
-                // The line directly above the input is the CURRENT prompt for
-                // the active command — or the idle "command:" ready prompt when
-                // nothing is active (e.g. right after Esc). It always shows, so
-                // the user always knows what the line expects.
-                if self.current_prompt.is_empty() {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(150, 200, 235),
-                        "command:",
-                    );
-                } else {
-                    // Active-command prompt line — green #184C04.
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0x18, 0x4c, 0x04),
-                        &self.current_prompt,
-                    );
-                }
-                ui.horizontal(|ui| {
-                    ui.label(">");
-                    let btn_w = 56.0_f32;
-                    let row_h = ui.spacing().interact_size.y;
-                    let text_resp = ui.add_sized(
-                        [(ui.available_width() - btn_w - 8.0).max(40.0), row_h],
-                        egui::TextEdit::singleline(&mut self.cmd),
-                    );
-                    let run_clicked = ui.button("run").clicked();
-                    // Enter is detected both via the lost-focus pattern AND
-                    // by a global pressed-this-frame check while focused, so
-                    // the input never silently drops.
-                    let enter_pressed = (text_resp.lost_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Enter)))
-                        || (text_resp.has_focus()
-                            && ui.input(|i| i.key_pressed(egui::Key::Enter)));
-                    // AutoCAD-style "Space submits". In the cmd line — and
-                    // only in the cmd line — any non-empty input commits
-                    // when the user presses Space, exactly as Enter would.
-                    // (Other text edits like layer rename or the picker's
-                    // manual ACI box still treat Space as a literal char,
-                    // because this check is scoped to `text_resp.has_focus()`.)
-                    //
-                    // Trade-off: one-liner syntax like `line 0,0 10,10`
-                    // cannot be typed at the prompt — the first space
-                    // commits `line` and enters draw mode. The user can
-                    // still feed multi-arg commands via menu actions or
-                    // by typing each arg followed by Space at the next
-                    // prompt (the AutoCAD interaction model).
-                    let space_pressed = text_resp.has_focus()
-                        && ui.input(|i| i.key_pressed(egui::Key::Space));
-                    // CRITICAL: while typing a text body, Space is a
-                    // literal space character — NOT a submit. Otherwise
-                    // "Hello world" gets committed as "Hello" on the
-                    // first space, and Backspace can't recover it
-                    // (commit already happened). Same gate applies to
-                    // the height-entry sub-state.
-                    let in_text_body = matches!(self.text_draft,
-                        TextDraftState::WaitingForString(_))
-                        || self.text_waiting_height;
-                    let submit_via_space = space_pressed
-                        && !self.cmd.trim_end_matches(' ').is_empty()
-                        && !in_text_body;
-                    if submit_via_space {
-                        // Strip the trailing space the TextEdit already
-                        // appended to self.cmd before we got control.
-                        self.cmd = self.cmd.trim_end_matches(' ').to_string();
-                    }
-                    if enter_pressed || run_clicked || submit_via_space {
-                        if !self.cmd.trim().is_empty() {
-                            let c = std::mem::take(&mut self.cmd);
-                            self.run_command(&c);
-                        }
-                        self.refocus_cmd = true;
-                    }
-                    // Always-listen: keep keyboard focus on the command line
-                    // by default. We yield it only when some other widget
-                    // ACTIVELY has focus (a DragValue being edited, another
-                    // TextEdit). Canvas clicks land without grabbing focus
-                    // themselves, but the OS may have dropped it — the
-                    // `refocus_cmd` flag (set after canvas clicks) forces a
-                    // reclaim on the next frame.
-                    let other_focused = ctx.memory(|m| {
-                        m.focused().is_some_and(|id| id != text_resp.id)
-                    });
-                    // Modal text edits elsewhere in the UI must own focus
-                    // exclusively (layer rename today; will grow as more
-                    // dialogs land). Suppress the always-listen reclaim
-                    // while any are active.
-                    let modal_textedit_active = self.layer_rename.is_some();
-                    if modal_textedit_active {
-                        self.refocus_cmd = false;
-                    } else if self.refocus_cmd && !other_focused {
-                        text_resp.request_focus();
-                        self.refocus_cmd = false;
-                        // Force the focus-grant frame NOW so it settles before
-                        // the user types — egui applies focus at end-of-frame,
-                        // so without this the first keystroke right after a
-                        // drag-select can be dropped (intermittent erase bug).
-                        ui.ctx().request_repaint();
-                    } else if !other_focused && !text_resp.has_focus() {
-                        text_resp.request_focus();
-                        ui.ctx().request_repaint();
-                    }
-                });
-            })
-        };
-        self.cmd_window_open = cmd_open;
-        // Drag-to-dock: when the floating window's bottom edge is dragged down
-        // near the canvas bottom (just above the status bar), dock it as a strip.
-        if let Some(r) = &resp {
-            if let Some(canvas) = self.canvas_screen_rect {
-                let wr = r.response.rect;
-                if r.response.dragged() && wr.bottom() >= canvas.bottom() - 26.0 {
-                    self.cmd_docked = true;
-                }
-            }
+        // ---- left command rails + right Inspector dock — added BEFORE the
+        // command bar so the rails + dock span full height (menu → status) and
+        // the command bar stays confined to the CENTER column (WORKSPACE_SYSTEM).
+        self.render_command_rails(ctx);
+        if self.info_panel_open {
+            self.render_info_panel(ctx);
         }
 
-        // ---- left command rails (Draw / Modify) — before the CentralPanel
-        // so the canvas reflows to their right.
-        self.render_command_rails(ctx);
+        // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
+        // the same swappable engine the Inspector uses. Floats by default
+        // (lower-left); drag its header to the bottom edge to dock it as the
+        // AutoCAD-style command strip above the status bar. Because it renders
+        // after the left rails + right Inspector, the docked strip is confined
+        // to the CENTER column (WORKSPACE_SYSTEM). The history/prompt/input body
+        // is `command_bar_body` — one implementation for both docking modes.
+        {
+            let cfg = crate::dock::DockConfig {
+                id: "command", title: "Command",
+                dock_region: crate::dock::DockRegion::Bottom,
+                size: 150.0, min: 96.0, max: 320.0,
+                resizable: true, float_w: 720.0, float_max_h_frac: 0.5,
+            };
+            let mut state = self.cmd_dock_state;
+            let mut open = self.cmd_window_open;
+            crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
+                self.command_bar_body(ui, cap);
+            });
+            self.cmd_dock_state = state;
+            self.cmd_window_open = open;
+        }
 
         // ---- central panel: canvas --------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -21863,7 +21709,7 @@ impl eframe::App for CadApp {
                         });
                     });
                     ui.separator();
-                    if ui.button("Properties").clicked() {
+                    if ui.button("Inspector").clicked() {
                         self.info_window_open = true;
                         ui.close_menu();
                     }
