@@ -114,6 +114,33 @@ fn pp_cap_ui(ui: &egui::Ui, name: &str) {
     pp_capture(ui, name, ui.min_rect());
 }
 
+/// A lightweight text-only "button" with a UNIFIED hover affordance: the label
+/// brightens (muted → primary) and gets a faint rounded highlight, so plain
+/// clickable text (rail footer + / reset, etc.) reads as pressable — matching
+/// the header × treatment. Returns the click response.
+fn text_button(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
+    let galley = ui.fonts(|f| f.layout_no_wrap(
+        text.to_owned(), egui::FontId::proportional(size), egui::Color32::PLACEHOLDER));
+    let pad = egui::vec2(8.0, 3.0);
+    let (rect, resp) = ui.allocate_exact_size(galley.size() + pad * 2.0, egui::Sense::click());
+    let hov = resp.hovered();
+    if hov {
+        ui.painter().rect_filled(rect, crate::theme::radius::SM,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14));
+    }
+    let col = if hov { crate::theme::color::TEXT_PRIMARY }
+              else { crate::theme::color::TEXT_MUTED };
+    ui.painter().galley(rect.min + pad, galley, col);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A menu section heading — readable caption size + a legible muted token
+/// (the old `.small()` at ~9px was too small/low-contrast to read).
+fn menu_heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).size(11.0)
+        .color(crate::theme::color::TEXT_SECONDARY));
+}
+
 /// A 1px full-width divider line in the panel border colour.
 fn pp_divider(ui: &mut egui::Ui) {
     let w = ui.available_width();
@@ -9813,12 +9840,14 @@ impl CadApp {
     /// `scroll_max_h`: Some caps the property scroll area (floating, ≤50% screen);
     /// None lets it fill (docked).
     fn inspector_body(&mut self, ui: &mut egui::Ui, scroll_max_h: Option<f32>) {
-        let bg_lo  = egui::Color32::from_rgb(0x14, 0x1c, 0x25);
-        let bg_hi  = egui::Color32::from_rgb(0x22, 0x2b, 0x34);
-        let border = egui::Color32::from_rgb(0x3b, 0x49, 0x4c);
-        let text   = egui::Color32::from_rgb(0xda, 0xe3, 0xef);
-        let muted  = egui::Color32::from_rgb(0xb4, 0xb5, 0xb7);
-        let accent = egui::Color32::from_rgb(0x00, 0xda, 0xf3);
+        // Design tokens (THEME_SYSTEM §5) — no raw hex; the Inspector's widget
+        // visuals now read the SAME palette as its property rows (which use PP_*).
+        let bg_lo  = crate::theme::color::SURFACE_0;
+        let bg_hi  = crate::theme::color::SURFACE_2;
+        let border = crate::theme::color::BORDER;
+        let text   = crate::theme::color::TEXT_PRIMARY;
+        let muted  = crate::theme::color::TEXT_SECONDARY;
+        let accent = crate::theme::color::ACCENT;
         {
             let v = ui.visuals_mut();
             v.override_text_color = Some(text);
@@ -9831,7 +9860,7 @@ impl CadApp {
             v.widgets.open.weak_bg_fill = bg_lo;
             v.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border);
             v.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, accent);
-            v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0, 218, 243, 60);
+            v.selection.bg_fill = egui::Color32::from_rgba_unmultiplied(0, 0xe5, 0xff, 60);
             v.selection.stroke = egui::Stroke::new(1.0, accent);
             v.hyperlink_color = accent;
             v.indent_has_left_vline = false;
@@ -9985,7 +10014,6 @@ impl CadApp {
     /// Right-click an icon to remove it. `ui.available_height()` must be
     /// bounded (docked panel height, or the floating rail's set_height).
     fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize) {
-        let muted = egui::Color32::from_rgb(0x88, 0x93, 0xab);
         let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
         let mut del: Option<usize> = None;
         // (from_slot, to_slot) when an icon is dropped onto another to reorder.
@@ -10177,20 +10205,16 @@ impl CadApp {
         // ---- footer band (same chrome look as the header) PINNED to the bottom
         // so both rails' footers line up; the gap above it varies with each
         // rail's icon count. Two lines: "+" (add) then "reset". ----
-        let footer_h = 52.0;
+        let footer_h = 58.0;
         let pad = (ui.available_height() - footer_h).max(0.0);
         ui.add_space(pad);
         let mut add: Option<usize> = None;
         let fr = egui::Frame::none()
             .fill(crate::theme::color::CHROME)
-            .inner_margin(egui::Margin::symmetric(4.0, 6.0))
+            .inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 10.0 })
             .show(ui, |ui| {
         ui.vertical_centered(|ui| {
-            let plus = ui.add(egui::Label::new(
-                egui::RichText::new("+").size(20.0).color(muted))
-                .sense(egui::Sense::click()))
-                .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("Add commands");
+            let plus = text_button(ui, "+", 20.0).on_hover_text("Add commands");
             let popup_id = ui.make_persistent_id(
                 if is_draw { "rail_add_draw" } else { "rail_add_modify" });
             if plus.clicked() { ui.memory_mut(|m| m.toggle_popup(popup_id)); }
@@ -10247,10 +10271,7 @@ impl CadApp {
                     });
                     pp_cap_ui(ui, "rail add popup");
                 });
-            let reset = ui.add(egui::Label::new(
-                egui::RichText::new("reset").size(10.0).underline().color(muted))
-                .sense(egui::Sense::click()))
-                .on_hover_cursor(egui::CursorIcon::PointingHand);
+            let reset = text_button(ui, "reset", 11.0);
             pp_capture(ui, "rail footer · reset", reset.rect);
             if reset.clicked() {
                 if is_draw { self.draw_items = (0..DRAW_CMDS.len()).collect(); }
@@ -18860,12 +18881,12 @@ fn rail_icon_btn(
     let (resp, painter) = ui.allocate_painter(egui::vec2(38.0, 32.0), egui::Sense::click_and_drag());
     let rect = resp.rect;
     if active {
-        // Teal accent (PP_ACCENT #00daf3) translucent fill + solid edge.
+        // Accent (PP_ACCENT #00E5FF) translucent fill + solid edge.
         painter.rect(rect, 4.0,
-            egui::Color32::from_rgba_unmultiplied(0x00, 0xda, 0xf3, 38),
+            egui::Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 38),
             egui::Stroke::new(1.0, PP_ACCENT));
     } else if resp.dragged() {
-        painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(0x00, 0xda, 0xf3, 28));
+        painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 28));
     } else if resp.hovered() {
         painter.rect_filled(rect, 4.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16));
     }
@@ -19742,11 +19763,10 @@ impl eframe::App for CadApp {
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
 
-        // Square corners on ALL menus, popups, and tooltips (menu_rounding
-        // drives Frame::menu + Frame::popup; windows keep their own rounding).
-        if ctx.style().visuals.menu_rounding != egui::Rounding::ZERO {
-            ctx.style_mut(|s| s.visuals.menu_rounding = egui::Rounding::ZERO);
-        }
+        // Install the global design-token Visuals so every default-styled widget
+        // (menus, dialogs, buttons, checkboxes, fields) reads the one teal-navy
+        // theme. Also fixes square menu corners (menu_rounding = ZERO).
+        crate::theme::apply(ctx);
 
         // Menu-layout recorder: arm geometry capture for THIS whole frame and
         // reset the shared buffer BEFORE any panel/menu renders. Every menu that
@@ -20846,8 +20866,7 @@ impl eframe::App for CadApp {
                     ui.checkbox(&mut self.info_window_open,     "Inspector");
                     ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
                     ui.separator();
-                    ui.label(egui::RichText::new("Command rails").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
+                    menu_heading(ui, "Command rails");
                     ui.checkbox(&mut self.draw_rail_open,   "Draw rail (left)");
                     ui.checkbox(&mut self.modify_rail_open, "Modify rail (left)");
                     ui.separator();
@@ -20878,8 +20897,7 @@ impl eframe::App for CadApp {
                         ui.close_menu();
                     }
                     ui.separator();
-                    ui.label(egui::RichText::new("Inquiry").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
+                    menu_heading(ui, "Inquiry");
                     if ui.button("Distance (2 clicks)").clicked() {
                         self.run_command("dist");
                         ui.close_menu();
@@ -20917,8 +20935,7 @@ impl eframe::App for CadApp {
                         ui.separator();
                         // Intersection visualizer (diagnostic — shows ∩
                         // points so the user can verify a query).
-                        ui.label(egui::RichText::new("Intersect visualizer").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
+                        menu_heading(ui, "Intersect visualizer");
                         if ui.button("∩ view (whole viewport)").clicked() {
                             self.intersect_view_pending = true;
                             ui.close_menu();

@@ -57,13 +57,12 @@ pub trait DockHost {
             open: &mut bool, body: impl FnOnce(&mut Ui, Option<f32>)) -> Rect;
 }
 
-// ── local palette (reads theme tokens; the panel bg keeps its slightly warmer
-// tone until the full token migration lands) ───────────────────────────────
-const BG:     Color32 = Color32::from_rgb(0x18, 0x20, 0x29);
+// ── palette — all design tokens (THEME_SYSTEM §5); no raw hex here ──────────
+const BG:     Color32 = crate::theme::color::SURFACE_1;     // panel surface
 fn border() -> Color32 { crate::theme::color::BORDER }
 fn chrome() -> Color32 { crate::theme::color::CHROME }
-const TEXT:  Color32 = Color32::from_rgb(0xda, 0xe3, 0xef); // theme text-primary
-const MUTED: Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // theme text-muted
+const TEXT:  Color32 = crate::theme::color::TEXT_PRIMARY;
+const MUTED: Color32 = crate::theme::color::TEXT_MUTED;
 
 /// The ONE chrome header used by every docked/floating bar — unified per the
 /// design system (title Geist 16/500 on `surface-chrome`, THEME_SYSTEM §5.7/§5.3;
@@ -73,7 +72,10 @@ const MUTED: Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // theme text-muted
 /// `(close_clicked, band_response)`; callers derive undock/drag from the band.
 fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
     let w = ui.available_width();
-    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, 32.0), Sense::hover());
+    // ONE widget senses the whole band (click + drag) — allocating a separate
+    // hover widget over the same rect made the two fight for the pointer and
+    // swallowed the drag in docked panels (close worked, undock didn't).
+    let (rect, band) = ui.allocate_exact_size(egui::vec2(w, 32.0), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, chrome());
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
@@ -81,11 +83,10 @@ fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
         p.text(egui::pos2(rect.left() + 12.0, rect.center().y), Align2::LEFT_CENTER,
             cfg.title, FontId::proportional(16.0), TEXT);
     }
-    // × close hit-box (right). The whole band senses click+drag; a click landing
-    // on the × closes, everything else drags.
+    // × close hit-box (right). A click landing on the × closes; everything else
+    // drags.
     let xr = Rect::from_center_size(
         egui::pos2(rect.right() - 15.0, rect.center().y), egui::vec2(20.0, 20.0));
-    let band = ui.interact(rect, Id::new((cfg.id, "hdr")), Sense::click_and_drag());
     let over_x = ui.rect_contains_pointer(xr);
     if band.hovered() {
         ui.ctx().set_cursor_icon(
@@ -191,8 +192,13 @@ impl DockHost for EguiDockHost {
                         DockRegion::Bottom =>
                             egui::pos2(sr.center().x - cfg.float_w * 0.5,
                                        (sr.bottom() - 220.0).max(sr.top() + 56.0)),
+                        // Centre horizontally on undock (like Bottom) so the
+                        // float lands clear of the right edge. Otherwise a wide
+                        // panel's right edge stays in the snap zone and it
+                        // re-docks the instant the drag is released.
                         DockRegion::Right =>
-                            egui::pos2(p.x.min(sr.right() - cfg.float_w - 60.0), p.y),
+                            egui::pos2((sr.center().x - cfg.float_w * 0.5).max(20.0), p.y),
+                        // Left (rails) are narrow and float fine near where grabbed.
                         DockRegion::Left =>
                             egui::pos2(p.x.max(sr.left() + 60.0), p.y),
                     };
@@ -216,6 +222,7 @@ impl DockHost for EguiDockHost {
                                 color: Color32::from_black_alpha(120) })
                             .show(ui, |ui| {
                                 ui.set_width(cfg.float_w);
+                                ui.set_max_width(cfg.float_w);
                                 let (c, d, r) = float_header(ui, cfg);
                                 close = c; delta = d; released = r;
                                 if cfg.flush_body {

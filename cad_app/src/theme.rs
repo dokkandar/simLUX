@@ -72,3 +72,50 @@ pub mod radius {
     pub const LG:   f32 = 12.0; // cards, panels, menus
     pub const FULL: f32 = 9999.0; // pills, toggles
 }
+
+/// Install the token palette as egui's GLOBAL `Visuals`, so every default-styled
+/// widget — menus, dialogs, buttons, checkboxes, dropdowns, text fields — reads
+/// the one teal-navy theme instead of egui's stock grey. Panels/canvas that set
+/// their own frame fill are unaffected. Call once per frame (cheap; idempotent).
+pub fn apply(ctx: &egui::Context) {
+    use color as c;
+    use egui::{Rounding, Stroke};
+    let mut v = egui::Visuals::dark();
+
+    // Windows (dialogs) + menus share `window_fill` in egui — use the popover
+    // surface so both read as a raised panel.
+    v.window_fill = c::SURFACE_2;
+    v.window_stroke = Stroke::new(1.0, c::BORDER);
+    v.window_rounding = Rounding::same(radius::LG);
+    v.menu_rounding = Rounding::ZERO;                 // square menus (kept)
+    v.extreme_bg_color = c::SURFACE_0;                // text-field / scroll bg
+    v.faint_bg_color = c::SURFACE_2;
+    v.hyperlink_color = c::ACCENT;
+    v.selection.bg_fill = Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 60);
+    v.selection.stroke = Stroke::new(1.0, c::ACCENT);
+
+    // Widget state ladder.
+    let w = &mut v.widgets;
+    w.noninteractive.bg_stroke = Stroke::new(1.0, c::BORDER);
+    w.noninteractive.fg_stroke = Stroke::new(1.0, c::TEXT_PRIMARY);
+    w.inactive.bg_fill = c::SURFACE_2;
+    w.inactive.weak_bg_fill = c::SURFACE_2;
+    w.inactive.bg_stroke = Stroke::new(1.0, c::BORDER);
+    w.inactive.fg_stroke = Stroke::new(1.0, c::TEXT_PRIMARY);
+    w.inactive.rounding = Rounding::same(radius::MD);
+    w.hovered.bg_fill = c::SURFACE_3;
+    w.hovered.weak_bg_fill = c::SURFACE_3;
+    w.hovered.bg_stroke = Stroke::new(1.0, c::ACCENT);
+    w.hovered.fg_stroke = Stroke::new(1.0, c::TEXT_PRIMARY);
+    w.hovered.rounding = Rounding::same(radius::MD);
+    w.active.bg_fill = c::SURFACE_3;
+    w.active.weak_bg_fill = c::SURFACE_3;
+    w.active.bg_stroke = Stroke::new(1.0, c::ACCENT);
+    w.active.fg_stroke = Stroke::new(1.0, c::TEXT_PRIMARY);
+    w.active.rounding = Rounding::same(radius::MD);
+    w.open.bg_fill = c::SURFACE_2;
+    w.open.weak_bg_fill = c::SURFACE_2;
+    w.open.bg_stroke = Stroke::new(1.0, c::BORDER);
+
+    ctx.set_visuals(v);
+}
