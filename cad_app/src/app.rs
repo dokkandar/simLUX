@@ -11059,19 +11059,49 @@ impl CadApp {
             if let Some(v) = pick { self.props_apply(targets, true, |d| d.style.lineweight = v); }
         }
 
-        // ---- Visible (click toggles) ----
+        // ---- Visible (16×16 checkbox — INSPECTOR_DESIGN_MENTOR §5) ----
         if show("Visible") {
             let shared_vis = self.shared_style(targets, |s| s.visible);
-            let on = matches!(shared_vis, Some(true) | None);
-            let txt = match shared_vis { Some(true) => "shown", Some(false) => "hidden", None => "(varies)" };
+            let on    = matches!(shared_vis, Some(true));
+            let mixed = shared_vis.is_none();
             let mut toggle = false;
             pp_row(ui, "Visible", |ui, w| {
-                let (rect, resp) = pp_box(ui, w, true);
-                let p = ui.painter_at(rect);
-                let vcol = if on { PP_TEXT } else { PP_MUTED };
-                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, txt, crate::theme::typ::body(), vcol);
-                pp_cap_field(ui, "Visible", rect, tr, txt, vcol, 13.0, false);
+                // 16×16 box at the value start; the rest of the row is empty.
+                let (cell, resp) =
+                    ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::click());
+                let sz = 16.0;
+                let bx = egui::Rect::from_min_size(
+                    egui::pos2(cell.left(), cell.center().y - sz / 2.0),
+                    egui::vec2(sz, sz));
+                let p = ui.painter_at(cell);
+                let r4 = egui::Rounding::same(crate::theme::radius::SM);
+                let on_acc = crate::theme::color::ON_ACCENT;
+                if on || mixed {
+                    p.rect(bx, r4, PP_ACCENT, egui::Stroke::new(1.0, PP_ACCENT));
+                    if on {
+                        // check glyph in on-accent
+                        let c = bx.center();
+                        p.line_segment(
+                            [egui::pos2(bx.left() + 3.5, c.y + 0.5),
+                             egui::pos2(bx.left() + 6.5, c.y + 3.5)],
+                            egui::Stroke::new(1.6, on_acc));
+                        p.line_segment(
+                            [egui::pos2(bx.left() + 6.5, c.y + 3.5),
+                             egui::pos2(bx.right() - 3.0, c.y - 3.5)],
+                            egui::Stroke::new(1.6, on_acc));
+                    } else {
+                        // indeterminate (Mixed): a horizontal dash in on-accent
+                        let c = bx.center();
+                        p.line_segment(
+                            [egui::pos2(bx.left() + 3.5, c.y), egui::pos2(bx.right() - 3.5, c.y)],
+                            egui::Stroke::new(2.0, on_acc));
+                    }
+                } else {
+                    let edge = if resp.hovered() { PP_ACCENT } else { PP_BORDER };
+                    p.rect(bx, r4, PP_BG_LO, egui::Stroke::new(1.0, edge));
+                }
+                pp_capture(ui, &format!("Visible · checkbox 16x16 radius=4 state={}",
+                    if on { "on" } else if mixed { "mixed" } else { "off" }), bx);
                 if resp.clicked() { toggle = true; }
             });
             if toggle {
