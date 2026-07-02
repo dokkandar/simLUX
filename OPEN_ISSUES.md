@@ -112,6 +112,26 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🔵 NOT STARTED / DEFERRED
 
+### E1. Ellipse & Ellipse-arc rail commands don't start an interactive tool 🔴
+- **Symptom (session dump 2026-07-02):** picking/typing `ellipse` errors
+  `usage: ellipse cx,cy …` (it's a **parametric** command needing coords, no
+  interactive click-tool); typing `ellipsearc` → `unknown command 'ellipsearc'`
+  (the parser has no such command). Because the tool never switches, the next
+  canvas click draws with the **previously-active tool** — e.g. a Rectangle.
+- **Where:** `DRAW_CMDS` dispatch tokens `("ellipse","ellipse",…)` and
+  `("ellarc","ellipsearc",…)` in `cad_app/src/app.rs`; the parser/`run_command`
+  don't provide an interactive ellipse / ellipse-arc tool for these tokens.
+- **Status:** PRE-EXISTING; surfaced by the Command-Registry work (the registry
+  faithfully mirrors the arrays). **Out of scope for the registry migration** —
+  `run_command`/parser are frozen there. Needs a dedicated tool/parser fix
+  (add interactive ellipse + ellipse-arc tools, or correct the dispatch tokens).
+
+### E2. DObject-snap extension / tracking lines not implemented
+- **Symptom:** object snaps don't project **extension lines** (AutoCAD-style
+  osnap tracking — hovering an endpoint/edge should rubber-band an alignment
+  guide). Requested 2026-07-02; not part of the original UI/registry work.
+- **Status:** pending feature — parked for later.
+
 ### 5. Groups not persisted to `.rsm`
 - Groups are in-session only; saving/reloading drops them.
 
