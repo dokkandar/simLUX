@@ -354,7 +354,12 @@ fn pp_divider(ui: &mut egui::Ui) {
 /// (label colour, 30% larger than the title) + caps title. No body indent /
 /// left vline. Open state persists per `id_src`.
 fn pp_section(ui: &mut egui::Ui, id_src: &str, title: &str,
-              default_open: bool, body: impl FnOnce(&mut egui::Ui)) {
+              default_open: bool, divider: bool, body: impl FnOnce(&mut egui::Ui)) {
+    // 1px hairline above every section header except the first (MENTOR §3).
+    if divider {
+        pp_divider(ui);
+        ui.add_space(crate::theme::space::SM);
+    }
     let id = ui.make_persistent_id(id_src);
     let mut open = ui.data_mut(|d| d.get_temp::<bool>(id)).unwrap_or(default_open);
     let w = ui.available_width();
@@ -10751,13 +10756,13 @@ impl CadApp {
         let uniform = self.targets_uniform_tag(targets);
 
         // ---- GENERAL (common Style) ----------------------------------
-        pp_section(ui, "pp_sec_general", "GENERAL", true, |ui| {
+        pp_section(ui, "pp_sec_general", "GENERAL", true, false, |ui| {
             self.render_props_general(ui, targets, query);
         });
 
         // ---- GEOMETRY (per-type coordinate pairs + read-only derived) -
         if n == 1 {
-            pp_section(ui, "pp_sec_geometry", "GEOMETRY", true, |ui| {
+            pp_section(ui, "pp_sec_geometry", "GEOMETRY", true, true, |ui| {
                 self.render_props_geometry(ui, targets[0]);
             });
         } else if uniform.is_none() {
@@ -10770,7 +10775,7 @@ impl CadApp {
         // ---- Type-specific extras (hatch fill, etc.) -----------------
         if let Some(tag) = uniform {
             if matches!(tag, 7) {
-                pp_section(ui, "pp_sec_hatch", "HATCH", false, |ui| {
+                pp_section(ui, "pp_sec_hatch", "HATCH", false, true, |ui| {
                     self.render_props_type_specific(ui, targets, tag);
                 });
             }
@@ -10778,7 +10783,7 @@ impl CadApp {
 
         // ---- MISC (handle / index) -----------------------------------
         if n == 1 {
-            pp_section(ui, "pp_sec_misc", "MISC", false, |ui| {
+            pp_section(ui, "pp_sec_misc", "MISC", false, true, |ui| {
                 let idx = targets[0];
                 let handle = self.doc.dobjects.get(idx).map(|d| d.handle).unwrap_or(0);
                 pp_kv(ui, "Handle", &format!("0x{:X}", handle));
