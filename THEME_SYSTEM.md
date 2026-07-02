@@ -133,9 +133,11 @@ Two faces: **Geist** (UI) + **JetBrains Mono** (data). Two weights (400/500).
 `title Geist 16/500 · body 13/400 · body-strong 13/500 · caption 11/500 ·
 hint Geist 11/400 · data-value Mono 12/400 · data-code Mono 11/400`. Cap at 16px.
 Geist for UI text incl. layer/style names; Mono for numbers, coordinates, units,
-handles, badges. **`hint`** is the secondary/subtitle role — the only 11/400
-style (e.g. settings subtitles); `caption` stays 11/500 for headings/column
-headers. Code side = `theme::typ` (one fn per role).
+handles, badges.
+
+> **Post-lock addition (2026-07-02, owner-approved):** `hint` (Geist 11/400) —
+> the secondary / subtitle role. It is the only 11px Regular style; `caption`
+> stays 11/500 for headings.
 
 ### 5.8 Motion
 `instant 0 (canvas/cursor/values) · fast 80 (hover/focus/press) · snap 120
@@ -196,7 +198,8 @@ shows in the Inspector header**, not as a field. (Per-type property schema →
 [Dobject_Properties.md](Dobject_Properties.md); wording/number formatting →
 [CONTENT_STYLE.md](CONTENT_STYLE.md).)
 
-> **Design-system review complete.** All 16 points + Forms locked; the content
+> **Design-system review complete.** All 16 points + Forms locked
+> (Post-lock additions are dated inline — see §5.7 `hint`.); the content
 > half lives in [CONTENT_STYLE.md](CONTENT_STYLE.md). **Charts are deferred** —
 > not useful for this app yet (diagnostics only); a lean set (line/area, bar,
 > donut, sparkline; 1px lines, cyan + violet/amber categorical) was sketched but
