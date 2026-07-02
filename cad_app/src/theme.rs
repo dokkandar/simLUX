@@ -89,20 +89,26 @@ pub mod radius {
 }
 
 /// Install the brand fonts (THEME_SYSTEM §5.7): **Geist** for UI text and
-/// **JetBrains Mono** for data/numbers. Both `.ttf`s are embedded in the binary
+/// **JetBrains Mono** for data/numbers. All `.ttf`s are embedded in the binary
 /// (`include_bytes!`) so they always ship with the exe regardless of the working
 /// directory. Call ONCE at startup, before the first frame.
 ///
-/// The app already calls `FontId::proportional(..)` for UI text and `.monospace()`
-/// for numbers/coordinates everywhere, so placing each face at the FRONT of its
-/// egui family re-points all existing text at once — no per-widget change. egui's
-/// bundled fonts remain behind ours as glyph fallbacks.
+/// egui's `FontId` selects a family + size only — it has **no weight axis** and
+/// no synthetic bold. So the spec's weight-500 roles (title, body-strong,
+/// caption) cannot come from the Regular face; Geist **Medium** is registered as
+/// its own named family `GeistMedium` and routed to via the [`typ`] tokens. The
+/// weight-400 UI face (Geist Regular) sits at the FRONT of `Proportional` and
+/// JetBrains Mono at the FRONT of `Monospace`, so all existing default-family
+/// text re-points at once. egui's bundled fonts remain behind ours as glyph
+/// fallbacks. Monospace gets no Medium — both mono styles are weight 400 (§5.7).
 pub fn install_fonts(ctx: &egui::Context) {
     use egui::{FontData, FontDefinitions, FontFamily};
     use std::sync::Arc;
 
     const GEIST: &[u8] =
         include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Geist-Regular.ttf"));
+    const GEIST_MEDIUM: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Geist-Medium.ttf"));
     const JETBRAINS_MONO: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/assets/fonts/JetBrainsMono-Regular.ttf"
@@ -112,6 +118,10 @@ pub fn install_fonts(ctx: &egui::Context) {
     fonts
         .font_data
         .insert("Geist".to_owned(), Arc::new(FontData::from_static(GEIST)));
+    fonts.font_data.insert(
+        "GeistMedium".to_owned(),
+        Arc::new(FontData::from_static(GEIST_MEDIUM)),
+    );
     fonts.font_data.insert(
         "JetBrainsMono".to_owned(),
         Arc::new(FontData::from_static(JETBRAINS_MONO)),
@@ -130,7 +140,56 @@ pub fn install_fonts(ctx: &egui::Context) {
         .or_default()
         .insert(0, "JetBrainsMono".to_owned());
 
+    // Medium is a *separate named family* (egui has no weight axis). Its fallback
+    // chain = GeistMedium, then whatever Proportional resolves to (Geist Regular +
+    // egui defaults), so missing glyphs still render.
+    let mut medium_chain = vec!["GeistMedium".to_owned()];
+    medium_chain.extend(fonts.families[&FontFamily::Proportional].iter().cloned());
+    fonts
+        .families
+        .insert(FontFamily::Name("GeistMedium".into()), medium_chain);
+
     ctx.set_fonts(fonts);
+}
+
+/// Type scale — the six §5.7 text roles as tokens. Each returns the egui
+/// [`egui::FontId`] (size + family) for that role; components call these instead
+/// of constructing `FontId`s or passing raw sizes inline (§1). Weight-500 roles
+/// resolve to the `GeistMedium` family registered in [`install_fonts`]; weight-400
+/// UI text uses `Proportional` (Geist Regular); all data text uses `Monospace`
+/// (JetBrains Mono). Nothing exceeds the 16px cap (§5.7).
+pub mod typ {
+    use egui::{FontFamily, FontId};
+
+    /// Geist Medium — the weight-500 UI family (see [`super::install_fonts`]).
+    fn medium() -> FontFamily {
+        FontFamily::Name("GeistMedium".into())
+    }
+
+    /// Panel / section titles — Geist Medium **16/500**.
+    pub fn title() -> FontId {
+        FontId::new(16.0, medium())
+    }
+    /// Plain field labels + general body text — Geist Regular **13/400**.
+    pub fn body() -> FontId {
+        FontId::new(13.0, FontFamily::Proportional)
+    }
+    /// Emphasis body — Geist Medium **13/500**.
+    pub fn body_strong() -> FontId {
+        FontId::new(13.0, medium())
+    }
+    /// Section headers, column headers, units — Geist Medium **11/500**.
+    pub fn caption() -> FontId {
+        FontId::new(11.0, medium())
+    }
+    /// Numbers, coordinates, Length / Angle — JetBrains Mono **12/400**.
+    pub fn data_value() -> FontId {
+        FontId::new(12.0, FontFamily::Monospace)
+    }
+    /// Handles, small badges — JetBrains Mono **11/400**.
+    pub fn data_code() -> FontId {
+        FontId::new(11.0, FontFamily::Monospace)
+    }
 }
 
 /// Install the token palette as egui's GLOBAL `Visuals`, so every default-styled
