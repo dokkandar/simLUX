@@ -88,13 +88,13 @@ fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
     if !cfg.title.is_empty() {
         p.text(egui::pos2(rect.left() + edge, rect.center().y), Align2::LEFT_CENTER,
-            cfg.title, FontId::proportional(16.0), TEXT);
+            cfg.title, crate::theme::typ::title(), TEXT);
     }
     // Place from the right: type pill (12px from the edge), then × to its left.
     let mut right_x = rect.right() - 12.0;
     if let Some(b) = cfg.badge {
         let accent = crate::theme::color::ACCENT;
-        let font = FontId::proportional(11.0);
+        let font = crate::theme::typ::caption();
         let tw = ui.fonts(|f| f.layout_no_wrap(b.to_owned(), font.clone(), accent)).size().x;
         let pw = tw + 16.0;
         let pill = Rect::from_min_size(

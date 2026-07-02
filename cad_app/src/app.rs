@@ -51,7 +51,7 @@ fn pp_row(ui: &mut egui::Ui, label: &str, add: impl FnOnce(&mut egui::Ui, f32)) 
             egui::vec2(PP_LABEL_W, PP_ROW_H), egui::Sense::hover());
         let ltr = ui.painter().text(egui::pos2(lr.left(), lr.center().y),
             egui::Align2::LEFT_CENTER, label,
-            egui::FontId::proportional(13.0), PP_LABEL);
+            crate::theme::typ::body(), PP_LABEL);
         pp_capture(ui, &format!(
             "{lbl} · LABEL  text='{lbl}' color={} font=13px  col-width={:.0}  pad-top={:.1}",
             pp_hex(PP_LABEL), PP_LABEL_W, ltr.top() - lr.top(), lbl = label), lr);
@@ -105,7 +105,7 @@ text='{txt}' color={tc} font={ft:.0}px  pad-left={:.1} pad-top={:.1} pad-bottom=
 fn pp_kv(ui: &mut egui::Ui, label: &str, value: &str) {
     pp_row(ui, label, |ui, _w| {
         let r = ui.add(egui::Label::new(
-            egui::RichText::new(value).monospace().size(12.0).color(PP_MUTED)));
+            egui::RichText::new(value).font(crate::theme::typ::data_value()).color(PP_MUTED)));
         pp_capture(ui, &format!(
             "{lbl} · READ-ONLY  value='{val}' color={} font=12px-mono  NO box/border",
             pp_hex(PP_MUTED), lbl = label, val = value), r.rect);
@@ -124,9 +124,9 @@ fn pp_pair_headers(ui: &mut egui::Ui, a: &str, b: &str) {
         let y = lr.center().y;
         let p = ui.painter();
         p.text(egui::pos2(vx, y), egui::Align2::LEFT_CENTER, a,
-            egui::FontId::proportional(11.0), PP_LABEL);
+            crate::theme::typ::caption(), PP_LABEL);
         p.text(egui::pos2(vx + half + gap, y), egui::Align2::LEFT_CENTER, b,
-            egui::FontId::proportional(11.0), PP_LABEL);
+            crate::theme::typ::caption(), PP_LABEL);
     });
     ui.add_space(2.0);
 }
@@ -279,7 +279,7 @@ fn pp_section(ui: &mut egui::Ui, id_src: &str, title: &str,
     p.add(egui::Shape::convex_polygon(tri, PP_LABEL, egui::Stroke::NONE));
     // Caption 11/500 (THEME_SYSTEM §5.7), not the old monospace 10.
     p.text(egui::pos2(rect.left() + 20.0, rect.center().y),
-        egui::Align2::LEFT_CENTER, title, egui::FontId::proportional(11.0), PP_LABEL);
+        egui::Align2::LEFT_CENTER, title, crate::theme::typ::caption(), PP_LABEL);
     pp_capture(ui, &format!(
         "SECTION '{title}' · HEADER  h=18  caption color={} font=11px  chevron={}",
         pp_hex(PP_LABEL), if open { "▼ open" } else { "▸ collapsed" }, title = title), rect);
@@ -9215,7 +9215,7 @@ impl CadApp {
             .collapsible(true);
         let win = self.apply_dock_pos("Screen Stats", ctx, win);
         let resp = win.show(ctx, |ui| {
-            ui.style_mut().override_font_id = Some(egui::FontId::monospace(12.0));
+            ui.style_mut().override_font_id = Some(crate::theme::typ::data_value());
             let cull_ratio = if stats.total > 0 {
                 100.0 * stats.in_viewport as f32 / stats.total as f32
             } else { 0.0 };
@@ -10773,7 +10773,7 @@ impl CadApp {
                 p.rect_filled(sw, egui::Rounding::same(crate::theme::radius::XS), lcol);
                 pp_capture(ui, &format!("Layer · swatch  size=13 radius=2 color={}", pp_hex(lcol)), sw);
                 let tr = p.text(egui::pos2(sw.right() + 9.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
+                    egui::Align2::LEFT_CENTER, &name, crate::theme::typ::body(), PP_TEXT);
                 pp_arrow(&p, rect);
                 pp_cap_field(ui, "Layer", rect, tr, &name, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_layer_popup");
@@ -10818,7 +10818,7 @@ impl CadApp {
                 pp_capture(ui, &format!("Color · swatch  size=13 radius=2 color={}", pp_hex(c32)), sw);
                 let col = if italic { PP_MUTED } else { PP_TEXT };
                 let tr = p.text(egui::pos2(sw.right() + 9.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &label, egui::FontId::proportional(13.0), col);
+                    egui::Align2::LEFT_CENTER, &label, crate::theme::typ::body(), col);
                 pp_arrow(&p, rect);
                 pp_cap_field(ui, "Color", rect, tr, &label, col, 13.0, true);
                 let resp = resp.on_hover_text("Click to choose a colour (ACI / TrueColor)");
@@ -10848,7 +10848,7 @@ impl CadApp {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
                 let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &name, egui::FontId::proportional(13.0), PP_TEXT);
+                    egui::Align2::LEFT_CENTER, &name, crate::theme::typ::body(), PP_TEXT);
                 let y = rect.center().y;
                 let (x0, x1) = (rect.center().x + 6.0, rect.right() - 20.0);
                 let s = egui::Stroke::new(1.4, PP_LABEL);
@@ -10924,7 +10924,7 @@ impl CadApp {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
                 let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &lw_text, egui::FontId::proportional(13.0), PP_TEXT);
+                    egui::Align2::LEFT_CENTER, &lw_text, crate::theme::typ::body(), PP_TEXT);
                 pp_arrow(&p, rect);
                 pp_cap_field(ui, "Line Weight", rect, tr, &lw_text, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_lw_popup");
@@ -10955,7 +10955,7 @@ impl CadApp {
                 let p = ui.painter_at(rect);
                 let vcol = if on { PP_TEXT } else { PP_MUTED };
                 let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, txt, egui::FontId::proportional(13.0), vcol);
+                    egui::Align2::LEFT_CENTER, txt, crate::theme::typ::body(), vcol);
                 pp_cap_field(ui, "Visible", rect, tr, txt, vcol, 13.0, false);
                 if resp.clicked() { toggle = true; }
             });
@@ -10988,7 +10988,7 @@ impl CadApp {
                 let (rect, _) = pp_box(ui, half, false);
                 ui.painter_at(rect).text(egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, "various",
-                    egui::FontId::proportional(13.0), PP_MUTED);
+                    crate::theme::typ::body(), PP_MUTED);
                 pp_capture(ui, name, rect);
             };
             ui.horizontal(|ui| {
@@ -11737,7 +11737,7 @@ impl CadApp {
             fp.doc = Some(pdoc);
         } else {
             painter.text(prect.center(), egui::Align2::CENTER_CENTER,
-                "no preview", egui::FontId::monospace(11.0),
+                "no preview", crate::theme::typ::data_code(),
                 egui::Color32::from_gray(140));
         }
         self.file_preview = Some(fp);
@@ -11996,7 +11996,7 @@ impl CadApp {
                                             egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
                                         ui.painter().text(prect.center(),
                                             egui::Align2::CENTER_CENTER, "(select a file)",
-                                            egui::FontId::monospace(11.0),
+                                            crate::theme::typ::data_code(),
                                             egui::Color32::from_gray(140));
                                     }
                                 }
@@ -12829,7 +12829,7 @@ impl CadApp {
                                 pc.text(w2s(b) + egui::vec2(8.0, -8.0),
                                     egui::Align2::LEFT_BOTTOM,
                                     format!("{:.1}", (b - a0).len()),
-                                    egui::FontId::monospace(12.0), mcol);
+                                    crate::theme::typ::data_value(), mcol);
                             }
                         }
                         if gesturing && cresp.clicked() {
@@ -24036,7 +24036,7 @@ impl eframe::App for CadApp {
                 format!("FPS {:>5.1}    drawn {}  sub-px-skip {}  /{}    {}    {}",
                     self.fps_smooth, drawn, skipped, self.doc.dobjects.len(),
                     idx_state, mode_str),
-                egui::FontId::monospace(11.0),
+                crate::theme::typ::data_code(),
                 egui::Color32::from_rgb(200, 220, 240),
             );
             // Snapshot for the Screen Stats panel — covers both CPU
@@ -24073,7 +24073,7 @@ impl eframe::App for CadApp {
                         cur + egui::vec2(0.0, 60.0),
                         egui::Align2::CENTER_CENTER,
                         "click to ∩ here (Esc cancels)",
-                        egui::FontId::monospace(11.0),
+                        crate::theme::typ::data_code(),
                         egui::Color32::from_rgb(255, 220, 100),
                     );
                 }
@@ -24201,7 +24201,7 @@ impl eframe::App for CadApp {
                     sp + egui::vec2(12.0, -12.0),
                     egui::Align2::LEFT_BOTTOM,
                     label,
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     glyph_col,
                 );
                 if snap_candidates.len() > 1 {
@@ -24387,7 +24387,7 @@ impl eframe::App for CadApp {
                         format!(
                             "d={:.3}  Δ=({:+.3},{:+.3})  ∠{:+.2}°",
                             d, dx, dy, ang),
-                        egui::FontId::monospace(11.0),
+                        crate::theme::typ::data_code(),
                         egui::Color32::from_rgb(255, 220, 140));
                 }
             }
@@ -24408,7 +24408,7 @@ impl eframe::App for CadApp {
                         cur_s + egui::vec2(12.0, 12.0),
                         egui::Align2::LEFT_TOP,
                         "zoom window",
-                        egui::FontId::monospace(11.0),
+                        crate::theme::typ::data_code(),
                         egui::Color32::from_rgb(255, 220, 140));
                     // Keep the preview tracking the cursor smoothly.
                     ctx.request_repaint();
@@ -24606,7 +24606,7 @@ impl eframe::App for CadApp {
                             cur_s + egui::vec2(12.0, -12.0),
                             egui::Align2::LEFT_BOTTOM,
                             format!("{:.1}°{}", deg, if self.rotate_copy { "  (copy)" } else { "" }),
-                            egui::FontId::monospace(12.0), mark);
+                            crate::theme::typ::data_value(), mark);
                     }
                 }
                 RotateState::WaitingForRefSrc2(_, s1) => {
@@ -24658,7 +24658,7 @@ impl eframe::App for CadApp {
                             egui::Align2::LEFT_BOTTOM,
                             format!("{:.1}°{}", dtheta.to_degrees(),
                                 if self.rotate_copy { "  (copy)" } else { "" }),
-                            egui::FontId::monospace(12.0), mark);
+                            crate::theme::typ::data_value(), mark);
                     }
                 }
                 _ => {}
@@ -24704,7 +24704,7 @@ impl eframe::App for CadApp {
                             egui::Align2::LEFT_BOTTOM,
                             format!("×{:.3}{}", factor,
                                 if self.scale_copy { "  (copy)" } else { "" }),
-                            egui::FontId::monospace(12.0), mark);
+                            crate::theme::typ::data_value(), mark);
                     }
                 }
                 ScaleState::WaitingForRefEnd(_, s) => {
@@ -25137,7 +25137,7 @@ impl eframe::App for CadApp {
                         "cursor: ({:>9.3}, {:>9.3})   scale: {:>6.2} px/u",
                         w.x, w.y, self.scale
                     ),
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(200, 220, 240),
                 );
             }
@@ -25145,7 +25145,7 @@ impl eframe::App for CadApp {
                 rect.left_top() + egui::vec2(10.0, 28.0),
                 egui::Align2::LEFT_TOP,
                 current_hint(self.tool, self.arc_method, self.pending.len()),
-                egui::FontId::monospace(11.0),
+                crate::theme::typ::data_code(),
                 egui::Color32::from_rgb(255, 220, 120),
             );
 
@@ -25164,7 +25164,7 @@ impl eframe::App for CadApp {
                     rect.left_top() + egui::vec2(10.0, 48.0),
                     egui::Align2::LEFT_TOP,
                     hint_text,
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(255, 200, 100),
                 );
 
@@ -25211,7 +25211,7 @@ impl eframe::App for CadApp {
                     rect.left_top() + egui::vec2(10.0, 48.0),
                     egui::Align2::LEFT_TOP,
                     hint_text,
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(150, 230, 170),
                 );
 
@@ -25255,7 +25255,7 @@ impl eframe::App for CadApp {
                     rect.left_top() + egui::vec2(10.0, 48.0),
                     egui::Align2::LEFT_TOP,
                     hint_text,
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(150, 230, 170),
                 );
                 if let PasteState::WaitingForDest(base) = self.paste_state {
@@ -25320,7 +25320,7 @@ impl eframe::App for CadApp {
                 };
                 painter.text(rect.left_top() + egui::vec2(10.0, 48.0),
                     egui::Align2::LEFT_TOP, hint,
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(200, 160, 255));
             }
 
@@ -25381,7 +25381,7 @@ impl eframe::App for CadApp {
                     rect.left_top() + egui::vec2(10.0, 48.0),
                     egui::Align2::LEFT_TOP,
                     format!("{}    [{} selected]", label, self.selection.len()),
-                    egui::FontId::monospace(11.0),
+                    crate::theme::typ::data_code(),
                     egui::Color32::from_rgb(255, 220, 120),
                 );
 
@@ -25489,7 +25489,7 @@ impl eframe::App for CadApp {
                     let mut lines = vec![format!("▸ {:.0}×{:.0}   @({:.0}, {:.0})",
                         r.width(), r.height(), r.left(), r.top())];
                     for part in name.split(" | ") { lines.push(part.trim().to_string()); }
-                    let font = egui::FontId::monospace(11.0);
+                    let font = crate::theme::typ::data_code();
                     let galley = painter.layout(lines.join("\n"), font,
                         egui::Color32::from_rgb(0xda, 0xe3, 0xef), 360.0);
                     let sz = galley.size();
@@ -26020,7 +26020,7 @@ fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
         x_tip + egui::vec2(4.0, -4.0),
         egui::Align2::LEFT_BOTTOM,
         "X",
-        egui::FontId::monospace(12.0),
+        crate::theme::typ::data_value(),
         label,
     );
 
@@ -26034,7 +26034,7 @@ fn draw_ucs_icon(painter: &egui::Painter, rect: egui::Rect, app: &CadApp) {
         y_tip + egui::vec2(-4.0, -2.0),
         egui::Align2::RIGHT_BOTTOM,
         "Y",
-        egui::FontId::monospace(12.0),
+        crate::theme::typ::data_value(),
         label,
     );
 
@@ -26377,7 +26377,7 @@ fn graphical_linetype_combo(
                 ui.painter().text(
                     egui::pos2(sr.right() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER, name,
-                    egui::FontId::proportional(13.0), ui.visuals().text_color());
+                    crate::theme::typ::body(), ui.visuals().text_color());
                 if resp.clicked() { picked = Some(*id); }
             }
         });
