@@ -43,8 +43,8 @@ const PP_ROW_H:   f32 = crate::theme::space::CONTROL_H;  // uniform field height
 const PP_ROW_GAP: f32 = crate::theme::space::ROW_GAP;    // vertical gap between rows (8)
 /// Trailing area (name/value + dropdown arrow) reserved to the right of the
 /// linetype dash / lineweight bar preview, so both previews share one length.
-/// Wide enough for a 6-letter linetype name + variant (e.g. "Border (l)").
-const PP_PREVIEW_TRAIL: f32 = 90.0;
+/// Wide enough for a 10-letter linetype name + variant (e.g. "Continuous").
+const PP_PREVIEW_TRAIL: f32 = 96.0;
 
 /// A labelled property row: muted fixed-width label on the left, a value
 /// area that fills the rest. `add` receives the value-cell width so every
@@ -224,17 +224,17 @@ fn pp_box(ui: &mut egui::Ui, w: f32, clickable: bool) -> (egui::Rect, egui::Resp
 }
 
 /// Abbreviate a linetype name for the Inspector field (INSPECTOR_DESIGN_MENTOR
-/// §5): first 6 letters of the base + the size-variant's first letter in parens.
+/// §5): first 10 letters of the base + the size-variant's first letter in parens.
 /// Real names are like "Divide" / "Divide (small)" / "Center (tiny)", so
 /// "Divide (small)" → "Divide (s)", "Dot" → "Dot". Full name is shown on hover.
 fn abbrev_linetype(name: &str) -> String {
     if let Some(open) = name.find('(') {
-        let base: String = name[..open].trim().chars().take(6).collect();
+        let base: String = name[..open].trim().chars().take(10).collect();
         let variant = name[open + 1..].trim_start();
         let first = variant.chars().next().unwrap_or(' ').to_ascii_lowercase();
         format!("{} ({})", base, first)
     } else {
-        name.chars().take(6).collect()
+        name.chars().take(10).collect()
     }
 }
 
