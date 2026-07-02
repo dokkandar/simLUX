@@ -152,7 +152,7 @@ pub fn install_fonts(ctx: &egui::Context) {
     ctx.set_fonts(fonts);
 }
 
-/// Type scale — the six §5.7 text roles as tokens. Each returns the egui
+/// Type scale — the §5.7 text roles as tokens. Each returns the egui
 /// [`egui::FontId`] (size + family) for that role; components call these instead
 /// of constructing `FontId`s or passing raw sizes inline (§1). Weight-500 roles
 /// resolve to the `GeistMedium` family registered in [`install_fonts`]; weight-400
@@ -181,6 +181,12 @@ pub mod typ {
     /// Section headers, column headers, units — Geist Medium **11/500**.
     pub fn caption() -> FontId {
         FontId::new(11.0, medium())
+    }
+    /// Secondary / subtitle 11px text (e.g. settings subtitles) — Geist Regular
+    /// **11/400**. The lighter 11px counterpart to [`caption`] (11/500); use this
+    /// when 11px text is *not* a heading.
+    pub fn hint() -> FontId {
+        FontId::new(11.0, FontFamily::Proportional)
     }
     /// Numbers, coordinates, Length / Angle — JetBrains Mono **12/400**.
     pub fn data_value() -> FontId {

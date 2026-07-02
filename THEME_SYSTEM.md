@@ -131,8 +131,11 @@ dark on success/warning. **Status = icon + text + color**, never color alone.
 ### 5.7 Type
 Two faces: **Geist** (UI) + **JetBrains Mono** (data). Two weights (400/500).
 `title Geist 16/500 · body 13/400 · body-strong 13/500 · caption 11/500 ·
-data-value Mono 12/400 · data-code Mono 11/400`. Cap at 16px. Geist for UI text
-incl. layer/style names; Mono for numbers, coordinates, units, handles, badges.
+hint Geist 11/400 · data-value Mono 12/400 · data-code Mono 11/400`. Cap at 16px.
+Geist for UI text incl. layer/style names; Mono for numbers, coordinates, units,
+handles, badges. **`hint`** is the secondary/subtitle role — the only 11/400
+style (e.g. settings subtitles); `caption` stays 11/500 for headings/column
+headers. Code side = `theme::typ` (one fn per role).
 
 ### 5.8 Motion
 `instant 0 (canvas/cursor/values) · fast 80 (hover/focus/press) · snap 120
