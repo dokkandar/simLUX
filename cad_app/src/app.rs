@@ -9989,7 +9989,7 @@ impl CadApp {
         let cfg = crate::dock::DockConfig {
             id: "inspector", title: "Inspector", badge: badge_txt.as_deref(),
             dock_region: crate::dock::DockRegion::Right,
-            size: 264.0, min: 220.0, max: 520.0,
+            size: 264.0, min: 264.0, max: 520.0,
             // flush_body: the Inspector paints its own padding (panel-edge 16,
             // panel-header→content 24) per INSPECTOR_DESIGN §2.
             resizable: true, flush_body: true, float_w: 264.0, float_max_h_frac: 0.5,

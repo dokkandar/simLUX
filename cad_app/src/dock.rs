@@ -75,14 +75,17 @@ const MUTED: Color32 = crate::theme::color::TEXT_MUTED;
 /// no name) — then only the × and the drag band show. Returns
 /// `(close_clicked, band_response)`; callers derive undock/drag from the band.
 fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
-    // INSPECTOR_DESIGN §2: header band height 40, chrome fill, bottom hairline,
-    // title at panel-edge (16), type pill (full radius, accent @10%) at the right.
+    // INSPECTOR_DESIGN_MENTOR §0/§2: shared header band height 32 (all docked
+    // panels: Inspector, command bar, rails), chrome fill, bottom hairline, title
+    // at panel-edge (16). (The Inspector type pill now lives below the header, not
+    // here — see inspector_body; command bar/rails may still set a `badge`.)
     let edge = crate::theme::space::PANEL_EDGE;
     let w = ui.available_width();
     // ONE widget senses the whole band (click + drag) — a separate hover widget
     // over the same rect made the two fight for the pointer and swallowed the
     // docked undock drag (close worked, undock didn't).
-    let (rect, band) = ui.allocate_exact_size(egui::vec2(w, 40.0), Sense::click_and_drag());
+    let (rect, band) = ui.allocate_exact_size(
+        egui::vec2(w, crate::theme::space::HEADER_BAND), Sense::click_and_drag());
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, chrome());
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));

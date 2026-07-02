@@ -62,6 +62,9 @@ pub mod space {
     pub const ROW_GAP: f32 = 8.0;
     /// Icon hit-box.
     pub const ICON_BOX: f32 = 24.0;
+    /// Shared docked-panel header band height (Inspector, command bar, rails).
+    /// INSPECTOR_DESIGN_MENTOR §0/§2.
+    pub const HEADER_BAND: f32 = 32.0;
 
     // ── Relationship spacings (THEME_SYSTEM §5.1, finalized compact scale) ──
     /// Horizontal label → input gap, and the inside-field edge → text padding.
