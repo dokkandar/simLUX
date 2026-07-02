@@ -43,7 +43,8 @@ const PP_ROW_H:   f32 = crate::theme::space::CONTROL_H;  // uniform field height
 const PP_ROW_GAP: f32 = crate::theme::space::ROW_GAP;    // vertical gap between rows (8)
 /// Trailing area (name/value + dropdown arrow) reserved to the right of the
 /// linetype dash / lineweight bar preview, so both previews share one length.
-const PP_PREVIEW_TRAIL: f32 = 78.0;
+/// Wide enough for a 6-letter linetype name + variant (e.g. "Border (l)").
+const PP_PREVIEW_TRAIL: f32 = 90.0;
 
 /// A labelled property row: muted fixed-width label on the left, a value
 /// area that fills the rest. `add` receives the value-cell width so every
@@ -136,17 +137,20 @@ fn pp_pair_headers(ui: &mut egui::Ui, a: &str, b: &str) {
     ui.add_space(2.0);
 }
 
-/// Place a numeric editor that looks EXACTLY like a `pp_box` field (surface-0,
-/// radius 4, border, Mono 12) instead of egui's default DragValue chrome
-/// (radius 8 / surface-2 / proportional). Paints a `pp_box`, then a frameless
-/// mono DragValue inside it. Widget-visual + font overrides are saved/restored
-/// so they don't leak to sibling fields. INSPECTOR_DESIGN_MENTOR §5.
-fn pp_num_field(ui: &mut egui::Ui, w: f32, v: &mut f64) -> (egui::Rect, egui::Response) {
-    let (rect, _) = pp_box(ui, w, false);
+/// Paint a numeric field that looks EXACTLY like a `pp_box` field (surface-0,
+/// radius 4, 1px border drawn UNCLIPPED so the whole border shows) with a
+/// frameless Mono-12 DragValue inside, instead of egui's default DragValue
+/// chrome. The caller supplies the exact `rect`, so a Start/End pair gets precise
+/// geometry (equal halves + an 8px gap summing to the full field width).
+/// Widget-visual + font overrides are saved/restored so they don't leak.
+/// INSPECTOR_DESIGN_MENTOR §5.
+fn pp_num_field(ui: &mut egui::Ui, rect: egui::Rect, v: &mut f64) -> egui::Response {
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM),
+        PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
     let pad = crate::theme::space::INPUT_PAD;
     let inner = egui::Rect::from_min_size(
         egui::pos2(rect.left() + pad, rect.center().y - 8.0),
-        egui::vec2((w - 2.0 * pad).max(10.0), 16.0));
+        egui::vec2((rect.width() - 2.0 * pad).max(10.0), 16.0));
     let saved_font = ui.style().override_font_id.clone();
     let saved_widgets = ui.visuals().widgets.clone();
     ui.style_mut().override_font_id = Some(crate::theme::typ::data_value());
@@ -162,7 +166,7 @@ fn pp_num_field(ui: &mut egui::Ui, w: f32, v: &mut f64) -> (egui::Rect, egui::Re
     let r = ui.put(inner, egui::DragValue::new(v).speed(0.5).max_decimals(2));
     ui.style_mut().override_font_id = saved_font;
     ui.visuals_mut().widgets = saved_widgets;
-    (rect, r)
+    r
 }
 
 /// A label + two side-by-side numeric fields (Start/End or X/Y). Returns
@@ -174,21 +178,22 @@ fn pp_pair_row(ui: &mut egui::Ui, label: &str, a: &mut f64, b: &mut f64)
     pp_row(ui, label, |ui, w| {
         let gap = crate::theme::space::COLUMN_GAP;
         let half = ((w - gap) / 2.0).max(40.0);
-        ui.horizontal(|ui| {
-            ui.spacing_mut().item_spacing.x = gap;
-            let (ra_rect, ra) = pp_num_field(ui, half, a);
-            let (rb_rect, rb) = pp_num_field(ui, half, b);
-            changed = ra.changed() || rb.changed();
-            // Capture the REAL look now: a pp_box (surface-0, radius 4, border)
-            // with a Mono-12 value — matches what is actually drawn.
-            let cap = |ui: &egui::Ui, tag: &str, r: &egui::Rect, v: f64| pp_capture(ui,
-                &format!("{lbl} {tag} · FIELD  w={:.0} h={:.0} @({:.0},{:.0})  |  box \
+        // Explicit rects so the pair spans the full value width exactly:
+        // [half] + gap(8) + [half] = w, matching the GENERAL bars.
+        let (row, _) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::hover());
+        let a_rect = egui::Rect::from_min_size(row.min, egui::vec2(half, PP_ROW_H));
+        let b_rect = egui::Rect::from_min_size(
+            egui::pos2(row.left() + half + gap, row.top()), egui::vec2(half, PP_ROW_H));
+        let ra = pp_num_field(ui, a_rect, a);
+        let rb = pp_num_field(ui, b_rect, b);
+        changed = ra.changed() || rb.changed();
+        let cap = |ui: &egui::Ui, tag: &str, r: &egui::Rect, v: f64| pp_capture(ui,
+            &format!("{lbl} {tag} · FIELD  w={:.0} h={:.0} @({:.0},{:.0})  |  box \
 pp_box fill=#141C25 border=#34414B radius=4  |  value='{:.2}' color={} font=12px-mono  |  arrow=none",
-                    r.width(), r.height(), r.left(), r.top(), v, pp_hex(PP_TEXT), lbl=label, tag=tag), *r);
-            cap(ui, "start", &ra_rect, *a);
-            cap(ui, "end", &rb_rect, *b);
-            resps.push(ra); resps.push(rb);
-        });
+                r.width(), r.height(), r.left(), r.top(), v, pp_hex(PP_TEXT), lbl=label, tag=tag), *r);
+        cap(ui, "start", &a_rect, *a);
+        cap(ui, "end", &b_rect, *b);
+        resps.push(ra); resps.push(rb);
     });
     (changed, resps)
 }
@@ -197,8 +202,8 @@ pp_box fill=#141C25 border=#34414B radius=4  |  value='{:.2}' color={} font=12px
 fn pp_num_row(ui: &mut egui::Ui, label: &str, v: &mut f64) -> (bool, egui::Response) {
     let mut out = None;
     pp_row(ui, label, |ui, w| {
-        let (_rect, r) = pp_num_field(ui, w, v);
-        out = Some(r);
+        let (rect, _) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), egui::Sense::hover());
+        out = Some(pp_num_field(ui, rect, v));
     });
     let r = out.expect("pp_row always invokes the body");
     (r.changed(), r)
@@ -209,26 +214,27 @@ fn pp_num_row(ui: &mut egui::Ui, label: &str, v: &mut f64) -> (bool, egui::Respo
 fn pp_box(ui: &mut egui::Ui, w: f32, clickable: bool) -> (egui::Rect, egui::Response) {
     let sense = if clickable { egui::Sense::click() } else { egui::Sense::hover() };
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(w, PP_ROW_H), sense);
-    let p = ui.painter_at(rect);
-    // surface-0 fill, 1px border, radius sm(4) — INSPECTOR_DESIGN §4.
+    // Draw with the UNCLIPPED ui painter: `painter_at(rect)` clips a boundary
+    // stroke to its inner half, so the 1px border showed only faintly at the
+    // rounded corners. surface-0 fill, 1px border, radius sm(4) — MENTOR §4.
     let edge = if clickable && resp.hovered() { PP_ACCENT } else { PP_BORDER };
-    p.rect(rect, egui::Rounding::same(crate::theme::radius::SM), PP_BG_LO,
+    ui.painter().rect(rect, egui::Rounding::same(crate::theme::radius::SM), PP_BG_LO,
         egui::Stroke::new(1.0, edge));
     (rect, resp)
 }
 
 /// Abbreviate a linetype name for the Inspector field (INSPECTOR_DESIGN_MENTOR
-/// §5): first 3 letters of the base + the size-variant's first letter in parens.
+/// §5): first 6 letters of the base + the size-variant's first letter in parens.
 /// Real names are like "Divide" / "Divide (small)" / "Center (tiny)", so
-/// "Divide (small)" → "Div (s)", "Dot" → "Dot". Full name is shown on hover.
+/// "Divide (small)" → "Divide (s)", "Dot" → "Dot". Full name is shown on hover.
 fn abbrev_linetype(name: &str) -> String {
     if let Some(open) = name.find('(') {
-        let base: String = name[..open].trim().chars().take(3).collect();
+        let base: String = name[..open].trim().chars().take(6).collect();
         let variant = name[open + 1..].trim_start();
         let first = variant.chars().next().unwrap_or(' ').to_ascii_lowercase();
         format!("{} ({})", base, first)
     } else {
-        name.chars().take(3).collect()
+        name.chars().take(6).collect()
     }
 }
 
