@@ -48,7 +48,7 @@ Cargo workspace, members:
 | **`app.rs`** | **The monolith (~27,500 lines).** `CadApp` struct + `eframe::App::update`, every tool, the canvas, all panels/menus, the Inspector. Most work happens here. |
 | `main.rs` | Entry point + module list + `eframe` window setup. |
 | `dock.rs` | **Unified docking abstraction** (`DockHost` trait + `EguiDockHost`). See §5. |
-| `theme.rs` | **Design tokens** (color/spacing/radius) + `theme::apply(ctx)` global Visuals + `theme::install_fonts(ctx)` (embeds Geist + JetBrains Mono). Single source for the look. |
+| `theme.rs` | **Design tokens** (color/spacing/radius + `typ` type-scale tokens) + `theme::apply(ctx)` global Visuals + `theme::install_fonts(ctx)` (embeds Geist + Geist Medium + JetBrains Mono). Single source for the look. |
 | `gpu.rs` | GPU instance buffers / render path. |
 | `settings.rs` | Settings/variables page. |
 | `varreg.rs` | Variable registry (240 vars; single source of truth for settings). |
@@ -175,8 +175,24 @@ values that were documented but never turned into tokens/applied.
   before first frame) — Geist at front of Proportional, Mono at front of
   Monospace, egui defaults kept as fallbacks (THEME_SYSTEM §5.7). The app already
   uses `FontId::proportional()`/`.monospace()` everywhere, so this re-points all
-  text at once. Only Regular (400) is loaded; weight 500 (Medium) awaits the
-  type-token task (egui can't pick weight within a family via `FontId`).
+  text at once. (Weight 500 was added next — see below.)
+- **Geist Medium + `theme::typ` type tokens** (2026-07-02, commit `90443ed`):
+  egui's `FontId` has no weight axis, so the spec's 500-weight roles couldn't
+  render from Regular. Geist-Medium is embedded as its own named family
+  `GeistMedium` (fallback chain GeistMedium → Geist → egui defaults); Monospace
+  gets no Medium (both mono styles are 400, §5.7). A new `theme::typ` module
+  exposes the six §5.7 roles as `FontId` tokens — `title` (Medium 16), `body`
+  (Regular 13), `body_strong` (Medium 13), `caption` (Medium 11), `data_value`
+  (Mono 12), `data_code` (Mono 11). Components call these instead of inline
+  `FontId`s (§1). Infra only — no consumers in this commit.
+- **Type-token sweep** (2026-07-02, commit `d2f00f6`): 36 clean call sites
+  routed onto `theme::typ` — all `monospace(11/12)` → `data_code`/`data_value`
+  (size-preserving, weight-unambiguous); Inspector labels/values (prop 13) →
+  `body` (INSPECTOR_DESIGN §4); column/section headers (prop 11) → `caption`;
+  dock header title → `title`, type pill → `caption`. Section/column headers
+  now render **Medium** vs Regular body labels. Off-spec sizes, ambiguous
+  weights, canvas text-entity rendering, and modifier-laden mono `RichText`
+  were **left untouched** and reported for owner decisions (see §8).
 
 ---
 
@@ -190,6 +206,24 @@ fix the token). Known remaining finish items:
 - **Visible**: render as a real **checkbox** (16×16, 4px, accent-on), not text.
 - **Coordinate fields**: verify vertical centering (DragValue path).
 - Sweep every element's measured values against §7 of the spec.
+
+**Type-token follow-ups (awaiting owner decisions from the `d2f00f6` sweep):**
+- **Ambiguous weight** — `menu_heading` (app.rs:245, prop 11), settings subtitle
+  (15498, prop 11 — note NO 11/400 token exists yet), hatch canvas name labels
+  (7138/7424), dialog buttons "✔ Confirm"/"✗ Discard" (7515/7520, prop 13):
+  body-vs-Medium / caption-vs-hint is a design call, not guessed.
+- **Numbers in proportional** — angle readout `"{:.1}°"` (17884) and thickness
+  preview `"t = {:.3}"` (27135) are prop 13; moving to Mono `data_value` changes
+  the face (not a no-op) → needs OK.
+- **Off-spec sizes** (no matching token; left as-is): prop **12** (10238, 18814,
+  13061, 24007) and 7/7.5/9/9.5/10/12.5/13.5/14/15/11.5 across command-rail
+  glyphs, badges, dialog titles, settings rows, logo glyphs; mono **9/10** debug
+  HUD readouts. Decide whether command-glyph/badge sizes get their own tokens.
+- **Modifier-laden mono `RichText`** (`.monospace().small()/.strong()`, no explicit
+  size): status-bar items + debug section headers — mapping would drop `.small`/
+  `.strong` semantics; needs a token story for those.
+- **Out of scope:** CAD text-*entity* rendering (`font_id_for_font_name`, dim
+  previews) is user-sized canvas text, not UI chrome — not governed by §5.7.
 
 Then: the broader roadmap — CommandRegistry/PanelRegistry (registry-driven rails
 + menus), a Theme Editor panel, window min/max/close buttons, and the parked
