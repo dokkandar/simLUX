@@ -9987,7 +9987,10 @@ impl CadApp {
             } else { Some(format!("Mixed ({})", t.len())) }
         };
         let cfg = crate::dock::DockConfig {
-            id: "inspector", title: "Inspector", badge: badge_txt.as_deref(),
+            // INSPECTOR_DESIGN_MENTOR §2: the type pill is no longer in the header
+            // — it's a centered full-width capsule below it, painted in
+            // `inspector_body`. So the shared header carries no badge here.
+            id: "inspector", title: "Inspector", badge: None,
             dock_region: crate::dock::DockRegion::Right,
             size: 264.0, min: 264.0, max: 520.0,
             // flush_body: the Inspector paints its own padding (panel-edge 16,
@@ -9997,8 +10000,9 @@ impl CadApp {
         let mut state = self.inspector_dock_state;
         let mut open = self.info_window_open;
         let capturing = self.props_layout_capture;
+        let pill = badge_txt.clone();
         let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
-            self.inspector_body(ui, cap);
+            self.inspector_body(ui, cap, pill.as_deref());
         });
         self.inspector_dock_state = state;
         self.info_window_open = open;
@@ -10016,7 +10020,8 @@ impl CadApp {
     /// and the property body. Shared by the docked and floating renderers.
     /// `scroll_max_h`: Some caps the property scroll area (floating, ≤50% screen);
     /// None lets it fill (docked).
-    fn inspector_body(&mut self, ui: &mut egui::Ui, scroll_max_h: Option<f32>) {
+    fn inspector_body(&mut self, ui: &mut egui::Ui, scroll_max_h: Option<f32>,
+                      pill: Option<&str>) {
         // Design tokens (THEME_SYSTEM §5) — no raw hex; the Inspector's widget
         // visuals now read the SAME palette as its property rows (which use PP_*).
         let bg_lo  = crate::theme::color::SURFACE_0;
@@ -10068,13 +10073,14 @@ impl CadApp {
         targets.sort_unstable();
         targets.dedup();
 
-        // Content padded per INSPECTOR_DESIGN §2 (type is in the header chip):
-        // sides = panel-edge (16), top = panel-header→content (24), bottom = 16.
+        // Content padded per INSPECTOR_DESIGN_MENTOR §2: sides = panel-edge (16),
+        // top = header→pill (12) — the pill row sits here, above the sections —
+        // bottom = 16.
         egui::Frame::none()
             .inner_margin(egui::Margin {
                 left:   crate::theme::space::PANEL_EDGE,
                 right:  crate::theme::space::PANEL_EDGE,
-                top:    crate::theme::space::PANEL_HEADER,
+                top:    crate::theme::space::HEADER_TO_PILL,
                 bottom: crate::theme::space::PANEL_EDGE,
             })
             .show(ui, |ui| {
@@ -10082,6 +10088,25 @@ impl CadApp {
                     ui.colored_label(muted,
                         "No selection — click a dobject to edit its properties.");
                     return;
+                }
+                // Type pill (INSPECTOR_DESIGN_MENTOR §2): a full-content-width,
+                // full-radius capsule, type text centered, accent @ ~10% fill.
+                // Painted ABOVE the scroll area so it stays put; 12px below the
+                // header (frame top margin) and 12px above GENERAL.
+                if let Some(txt) = pill {
+                    let pw = ui.available_width();
+                    let (pr, _) = ui.allocate_exact_size(
+                        egui::vec2(pw, crate::theme::space::PILL_H), egui::Sense::hover());
+                    let p = ui.painter();
+                    p.rect_filled(pr,
+                        egui::Rounding::same(crate::theme::space::PILL_H / 2.0),
+                        egui::Color32::from_rgba_unmultiplied(0x00, 0xe5, 0xff, 26));
+                    p.text(pr.center(), egui::Align2::CENTER_CENTER, txt,
+                        crate::theme::typ::caption(), accent);
+                    pp_capture(ui, &format!(
+                        "Type pill · '{}'  full-width capsule h={}", txt,
+                        crate::theme::space::PILL_H), pr);
+                    ui.add_space(crate::theme::space::PILL_TO_SECTION);
                 }
                 // Docked: fill height. Floating: grow to content, cap ~50% screen.
                 let shrink_v = scroll_max_h.is_some();

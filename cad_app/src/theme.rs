@@ -80,6 +80,14 @@ pub mod space {
     pub const PANEL_EDGE:  f32 = 16.0;
     /// Panel header band → first content.
     pub const PANEL_HEADER: f32 = 24.0;
+
+    // ── Type-pill row (INSPECTOR_DESIGN_MENTOR §2) ──────────────────────
+    /// Type-pill capsule height.
+    pub const PILL_H: f32 = 18.0;
+    /// Header bottom → type pill.
+    pub const HEADER_TO_PILL: f32 = 12.0;
+    /// Type pill → first section (GENERAL).
+    pub const PILL_TO_SECTION: f32 = 12.0;
 }
 
 /// Corner-radius scale. See THEME_SYSTEM §5.2.
