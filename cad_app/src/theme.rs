@@ -97,9 +97,12 @@ pub fn apply(ctx: &egui::Context) {
     use egui::{Rounding, Stroke};
     let mut v = egui::Visuals::dark();
 
-    // Windows (dialogs) + menus share `window_fill` in egui — use the popover
-    // surface so both read as a raised panel.
-    v.window_fill = c::SURFACE_2;
+    // egui shares one `window_fill` between dialog windows AND menus/popups
+    // (Frame::window / Frame::menu / Frame::popup all read it — there is no
+    // menu-specific fill in Visuals 0.30). Per THEME_SYSTEM §5.3/§5.10 menus are
+    // the popover tone (surface-3); §5.9 treats dialogs as overlay layers too, so
+    // both share surface-3 and lift off the surface-1 panels behind them.
+    v.window_fill = c::SURFACE_3;
     v.window_stroke = Stroke::new(1.0, c::BORDER);
     v.window_rounding = Rounding::same(radius::LG);
     v.menu_rounding = Rounding::ZERO;                 // square menus (kept)
