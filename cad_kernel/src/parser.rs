@@ -312,6 +312,13 @@ pub fn parse(line: &str) -> Result<Command, String> {
         "line"   | "l"  => parse_line(&toks[1..]),
         "circle" | "ci" => parse_circle(&toks[1..]),
         "ellipse" | "el" => parse_ellipse(&toks[1..]),
+        // Elliptical arc has no typed-coordinate form — it's a 5-click
+        // interactive tool. Always enter the tool. Reached by the Draw menu /
+        // command rail ("ellipsearc") and by repeat-last (`tool_command_word`
+        // returns "ellipsearc" for Tool::EllipseArc). Without this arm those
+        // all failed with "unknown command 'ellipsearc'".
+        "ellipsearc" | "ellipticalarc" | "ellarc" | "ea"
+            => Ok(Command::SetTool(ToolKind::EllipseArc)),
         "point"   | "po" => parse_point(&toks[1..]),
         "polyline" | "pl" | "pline" => parse_polyline(&toks[1..]),
         "spline"   | "spl"          => Ok(Command::SetTool(ToolKind::Spline)),
@@ -627,8 +634,13 @@ fn parse_circle(args: &[&str]) -> Result<Command, String> {
 /// semi-major axis (relative to the centre, that gives both direction and
 /// length). `minor_len` is the semi-minor axis length.
 fn parse_ellipse(args: &[&str]) -> Result<Command, String> {
+    // Bare `ellipse` / `el` → enter the interactive draw tool (matches
+    // line/circle/arc/polyline). With args, build the ellipse now.
+    if args.is_empty() {
+        return Ok(Command::SetTool(ToolKind::Ellipse));
+    }
     if args.len() != 3 {
-        return Err("usage: ellipse cx,cy major_end_x,major_end_y minor_len".into());
+        return Err("usage: ellipse  OR  ellipse cx,cy major_end_x,major_end_y minor_len".into());
     }
     let center = parse_pt(args[0])?;
     let major_end = parse_pt(args[1])?;
