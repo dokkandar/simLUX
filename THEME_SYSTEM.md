@@ -100,8 +100,9 @@ The decided values (dark theme). These seed the built-in default theme.
 `xxs 2 · xs 4 · sm 8 · md 12 · lg 16 · xl 24 · xxl 32`
 Relationships: field/control height **24**, row→row **8** (pitch 32), label→input
 **8**, input padding **8**, section header→content **12**, group gap **12**,
-Start↔End column gap **12**, panel edge **16**, panel header→content **24**.
-Icon box **24**.
+Start↔End column gap **8** (INSPECTOR_DESIGN_MENTOR §5.1; was 12), panel edge
+**16**, panel header→content **24**. Icon box **24**. Shared docked-panel header
+band **32** (INSPECTOR_DESIGN_MENTOR §0).
 
 ### 5.2 Radius
 `xs 2 (swatches/micro) · sm 4 (inputs, value boxes, chips) · md 8 (buttons, icon

@@ -1,5 +1,9 @@
 # INSPECTOR — Design Rule (single source for the panel)
 
+> ⚠️ **Superseded by INSPECTOR_DESIGN_MENTOR.md** (`mentor MD/INSPECTOR_DESIGN_MENTOR.md`).
+> That doc is the current authority for the Inspector; where the two differ, it
+> wins. This file stays as historical reference.
+
 The finalized rule for the **Inspector** panel (formerly "Properties"). This is the
 authority the build must match; the companion `inspector_mockup.html` implements
 these exact values so they can be inspected in a browser. Parent tokens live in

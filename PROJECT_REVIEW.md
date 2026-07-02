@@ -208,19 +208,35 @@ values that were documented but never turned into tokens/applied.
   two captured boxes — amber fill + measure line + px label, vertical and/or
   horizontal. Lets row/section spacing be read directly and checked against the
   §5.1 tokens. New `pp_gap_dim` helper + overlay logic in `app.rs` (see §11).
+- **Inspector template revision** (2026-07-02, per `INSPECTOR_DESIGN_MENTOR.md`,
+  7 commits `16724c8`→`76f5eca`): shared docked-panel header band 40→**32**
+  (`HEADER_BAND` token, affects Inspector + command bar + rails); Inspector min
+  width 220→**264**; the **type pill** moved out of the header to a centered
+  full-width capsule below it (`HEADER_TO_PILL`/`PILL_H`/`PILL_TO_SECTION`);
+  **Line Type** = dash-preview-first + abbreviated name (`Div (s)`, full on hover);
+  **Line Weight** = matched thickness bar + Mono value (shared `pp_preview_len`);
+  **Visible** = 16×16 checkbox (accent/on-accent, Mixed=indeterminate);
+  **coordinate fields** repainted as `pp_box` + frameless Mono-12 DragValue
+  (`pp_num_field`, no more egui-default chrome), **column gap 12→8**, Start/End
+  headers lighter (`COLUMN_HEADER` #66707A, 11/400); **1px section dividers** above
+  every section but GENERAL. Type-specific sections (§6) deliberately left for
+  later. Awaiting owner visual verification.
 
 ---
 
 ## 8. In progress / next
 
-The active thread is **making the Inspector exactly match `INSPECTOR_DESIGN.md`**,
-verified with the UI-inspect tool (owner clicks a wrong box → Copy dump → paste →
-fix the token). Known remaining finish items:
-- **Linetype** field: reorder to **dashed-preview-first**, then name.
-- **Lineweight** field: add the **thickness-bar** preview.
-- **Visible**: render as a real **checkbox** (16×16, 4px, accent-on), not text.
-- **Coordinate fields**: verify vertical centering (DragValue path).
-- Sweep every element's measured values against §7 of the spec.
+The active thread is **making the Inspector match `INSPECTOR_DESIGN_MENTOR.md`**
+(the current authority — supersedes `INSPECTOR_DESIGN.md`), verified with the
+UI-inspect tool (owner clicks a wrong box → Copy dump → paste → fix the token).
+
+The template revision (shell, header, pill, GENERAL/GEOMETRY renderers) landed
+2026-07-02 — see §7. Resolved there: ~~Linetype dash-first~~, ~~Lineweight bar~~,
+~~Visible checkbox~~, ~~coordinate-field styling~~, ~~section dividers~~, header 32,
+pill below header, min 264, column gap 8. **Remaining Inspector finish items:**
+- Sweep every element's measured values against the spec with UI-inspect (owner).
+- **Type-specific dobject sections** (spec §6) — defined later, one dobject type
+  at a time (Hatch, Text, Wall, Dim, Block, Circle/Arc/…). Not yet built.
 
 **Type-token follow-ups — OWNER-DEFERRED** (the ambiguous-weight + proportional-
 number decisions from the `d2f00f6` sweep were resolved and applied 2026-07-02;
@@ -303,7 +319,8 @@ Living tracker: **[OPEN_ISSUES.md](OPEN_ISSUES.md)**. Highlights:
 | [COMMAND_SYSTEM.md](COMMAND_SYSTEM.md) | CommandRegistry (commands drive rails + menus) |
 | [PANEL_SYSTEM.md](PANEL_SYSTEM.md) | Panel trait/registry, Inspector as a panel |
 | [THEME_SYSTEM.md](THEME_SYSTEM.md) | **Locked design tokens (§5)** |
-| [INSPECTOR_DESIGN.md](INSPECTOR_DESIGN.md) | **Inspector pixel-level rule** (current build target) |
+| [INSPECTOR_DESIGN_MENTOR.md](mentor%20MD/INSPECTOR_DESIGN_MENTOR.md) | **Inspector rule — CURRENT AUTHORITY** (supersedes INSPECTOR_DESIGN.md) |
+| [INSPECTOR_DESIGN.md](INSPECTOR_DESIGN.md) | Inspector pixel-level rule — **superseded**, historical reference |
 | [inspector_mockup.html](inspector_mockup.html) | Browser-inspectable Inspector mockup |
 | [PLUGIN_API.md](PLUGIN_API.md) | Plugin surface |
 | [CONTENT_STYLE.md](CONTENT_STYLE.md) | Wording / number formatting |
