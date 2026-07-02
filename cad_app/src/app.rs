@@ -1083,6 +1083,12 @@ pub struct CadApp {
     /// so the user can delete (right-click) and re-add (+) commands.
     draw_items:          Vec<usize>,
     modify_items:        Vec<usize>,
+    /// Command metadata registry (COMMAND_REGISTRY_MENTOR). Derived from
+    /// `DRAW_CMDS`/`MODIFY_CMDS` at startup (Phase 2). Nothing renders/executes
+    /// from it yet; rails still read the arrays until Phase 3.
+    command_registry:    crate::command::CommandRegistry,
+    /// Temporary Phase-2 verification: Tools ▸ Debug ▸ "Command registry dump".
+    cmd_dump_open:       bool,
     /// Last method picked from a command's ▼ flyout (cmd → method key). The
     /// rail icon renders THAT method's glyph so the button reflects the last
     /// variant used (e.g. circle shows the 3-Point glyph after picking 3P).
@@ -2649,6 +2655,8 @@ impl Default for CadApp {
             rail_panel_h:        600.0,
             draw_items:          (0..DRAW_CMDS.len()).collect(),
             modify_items:        (0..MODIFY_CMDS.len()).collect(),
+            command_registry:    crate::command::build(DRAW_CMDS, MODIFY_CMDS),
+            cmd_dump_open:        false,
             rail_last_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
@@ -19289,7 +19297,7 @@ fn cmd_button_resp(
 /// Placeholder glyphs for `cmd_button`. Each variant is a few
 /// strokes — gets the idea across; we'll swap to real icons later.
 /// `pub(crate)` so the command registry ([`crate::command::IconId`]) can name it.
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug)]
 pub(crate) enum GlyphKind {
     Move, Copy, Rotate, Scale, Mirror, Stretch, Align,
     Trim, Extend, Fillet, Chamfer, Offset, Join, Break, Lengthen,
@@ -21269,6 +21277,9 @@ impl eframe::App for CadApp {
                         ui.checkbox(&mut self.ui_inspect, "UI inspect (element sizes)")
                             .on_hover_text("Devtools ruler: hover any panel element to read its \
                                 exact w×h + position, to compare the build against the design spec");
+                        ui.checkbox(&mut self.cmd_dump_open, "Command registry dump")
+                            .on_hover_text("Phase-2 verify: list every command the registry was \
+                                derived from (id / dispatch / title / category / icon)");
                         ui.separator();
                         // Spatial index — rebuild + status
                         let idx_label = if self.index_dirty || self.index.is_none() {
@@ -25795,6 +25806,49 @@ impl eframe::App for CadApp {
                 });
             // Closing the window turns the inspector off entirely.
             if !open { self.ui_inspect = false; }
+        }
+
+        // ---- Command registry dump (Phase-2 verification, temporary) ------
+        // Proof the registry populated from DRAW_CMDS/MODIFY_CMDS. Nothing else
+        // reads the registry yet (rails still use the arrays until Phase 3).
+        if self.cmd_dump_open {
+            let mut entries: Vec<&crate::command::CommandInfo> =
+                self.command_registry.commands.values().collect();
+            // HashMap is unordered — sort for a stable dump (category, then id).
+            entries.sort_by(|a, b|
+                (a.category as u8, &a.id).cmp(&(b.category as u8, &b.id)));
+            let mut text = format!("Command registry — {} entries\n\n", entries.len());
+            text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} icon\n",
+                "id", "dispatch", "title", "cat"));
+            for e in &entries {
+                let cat = match e.category {
+                    crate::command::CommandCategory::Draw => "Draw",
+                    crate::command::CommandCategory::Modify => "Modify",
+                };
+                text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} {:?}\n",
+                    e.id, e.dispatch, e.title, cat, e.icon));
+            }
+            let mut open = true;
+            egui::Window::new("Command registry dump")
+                .open(&mut open)
+                .default_width(600.0)
+                .default_pos(egui::pos2(90.0, 120.0))
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("📋 Copy").clicked() {
+                            ui.output_mut(|o| o.copied_text = text.clone());
+                        }
+                        ui.label(format!("{} commands (Draw + Modify)", entries.len()));
+                    });
+                    let mut body = text.clone();
+                    egui::ScrollArea::vertical().max_height(360.0).show(ui, |ui| {
+                        ui.add(egui::TextEdit::multiline(&mut body)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(20)
+                            .desired_width(f32::INFINITY));
+                    });
+                });
+            if !open { self.cmd_dump_open = false; }
         }
 
         if self.props_layout_capture {

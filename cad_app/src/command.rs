@@ -31,7 +31,7 @@ pub type CommandId = String;
 /// `DrawGlyph(id)` → `draw_draw_glyph` (the draw-rail id string, col 1 of
 /// `DRAW_CMDS`); `ModifyGlyph(kind)` → `draw_cmd_glyph` (col 1 of `MODIFY_CMDS`).
 /// A flat id could not serve both. Lucide icons arrive later (Phase 7 refactor).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum IconId {
     DrawGlyph(&'static str),
     ModifyGlyph(GlyphKind),
@@ -48,7 +48,7 @@ pub enum CommandCategory {
 ///
 /// Phase 1 shape. This struct is EXTENDED in later phases, never re-declared.
 /// Holds no closures / `FnMut` / `&mut CadApp`.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct CommandInfo {
     /// Namespaced identity, e.g. `"draw.line"` (the HashMap key). See [`CommandId`].
     pub id: CommandId,
@@ -86,4 +86,53 @@ impl CommandRegistry {
     pub fn get(&self, id: &str) -> Option<&CommandInfo> {
         self.commands.get(id)
     }
+}
+
+/// Derive the display `title` from a rail tooltip by stripping a trailing
+/// `(KEY)` hint: `"Line  (L)"` → `"Line"`, `"Rectangle  (REC)"` → `"Rectangle"`,
+/// `"Wall"` → `"Wall"` (no hint), `"Elliptical arc"` → `"Elliptical arc"`.
+/// (Wording is refined in a later phase; this is the derived seed.)
+fn derive_title(tooltip: &str) -> String {
+    match (tooltip.rfind('('), tooltip.ends_with(')')) {
+        (Some(i), true) => tooltip[..i].trim_end().to_string(),
+        _ => tooltip.trim().to_string(),
+    }
+}
+
+/// Build the registry by DERIVING every entry from the existing rail arrays
+/// (`DRAW_CMDS` / `MODIFY_CMDS`) — the arrays stay the single source of truth
+/// (Phase 2). Called once at startup by `CadApp`. Nothing renders from the
+/// result yet.
+///
+/// Per entry (all derived, no hand-typing): `dispatch` = col 2; `id` =
+/// `"<category>." + dispatch`; `tooltip` = col 3; `title` = [`derive_title`];
+/// `icon` = `DrawGlyph`/`ModifyGlyph` of col 1.
+pub fn build(
+    draw: &[(&'static str, &'static str, &'static str)],
+    modify: &[(GlyphKind, &'static str, &'static str)],
+) -> CommandRegistry {
+    let mut reg = CommandRegistry::new();
+    for &(icon_id, dispatch, tooltip) in draw {
+        let info = CommandInfo {
+            id: format!("draw.{}", dispatch),
+            dispatch,
+            title: derive_title(tooltip),
+            tooltip: tooltip.to_string(),
+            category: CommandCategory::Draw,
+            icon: IconId::DrawGlyph(icon_id),
+        };
+        reg.commands.insert(info.id.clone(), info);
+    }
+    for &(kind, dispatch, tooltip) in modify {
+        let info = CommandInfo {
+            id: format!("modify.{}", dispatch),
+            dispatch,
+            title: derive_title(tooltip),
+            tooltip: tooltip.to_string(),
+            category: CommandCategory::Modify,
+            icon: IconId::ModifyGlyph(kind),
+        };
+        reg.commands.insert(info.id.clone(), info);
+    }
+    reg
 }

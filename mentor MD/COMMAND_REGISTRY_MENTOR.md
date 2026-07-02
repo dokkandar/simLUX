@@ -143,8 +143,12 @@ CommandInfo {
   "enabled only when 2 lines are selected").
 
 **Four types, pinned:**
-1. **`CommandId` = the `run_command` dispatch string** (`&'static str` or a thin
-   newtype). Never a new int/enum — that breaks "reuse existing dispatch."
+1. **`CommandId` = the namespaced id, an OWNED `String`** (`"draw.line"`). It must be
+   `String`, not `&'static str`, because Phase 2 DERIVES it by concatenation
+   (`"<category>." + dispatch`), which allocates. The **`dispatch`** token stays
+   `&'static str`. `CommandId` is a string, never a new int/enum (an enum would break
+   "reuse existing dispatch"). *(Corrected 2026-07-02 — the earlier "&'static str"
+   note predated the runtime-derived id.)*
 2. **`IconId` = enum over BOTH glyph families** → `DrawGlyph(…)` |
    `ModifyGlyph(GlyphKind)` (Lucide later). A flat id can't serve both; Phase 3
    needs this.
