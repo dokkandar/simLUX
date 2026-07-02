@@ -242,7 +242,7 @@ fn text_button(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
 /// A menu section heading — readable caption size + a legible muted token
 /// (the old `.small()` at ~9px was too small/low-contrast to read).
 fn menu_heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).size(11.0)
+    ui.label(egui::RichText::new(text).font(crate::theme::typ::caption())
         .color(crate::theme::color::TEXT_SECONDARY));
 }
 
@@ -7135,7 +7135,7 @@ impl CadApp {
                                 p.text(label_pos,
                                     egui::Align2::CENTER_CENTER,
                                     *name,
-                                    egui::FontId::proportional(11.0),
+                                    crate::theme::typ::body(),
                                     label_col);
                                 if resp.clicked() {
                                     self.hatch_dialog_name =
@@ -7421,7 +7421,7 @@ impl CadApp {
                             p.text(label_pos,
                                 egui::Align2::CENTER_CENTER,
                                 *name,
-                                egui::FontId::proportional(11.0),
+                                crate::theme::typ::body(),
                                 label_col);
                             if resp.clicked() {
                                 self.hatch_dialog_name = (*name).to_string();
@@ -7512,12 +7512,12 @@ impl CadApp {
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     if ui.add_sized([110.0, 28.0],
-                        egui::Button::new(egui::RichText::new("✔ Confirm").size(13.0))
+                        egui::Button::new(egui::RichText::new("✔ Confirm").font(crate::theme::typ::body_strong()))
                             .fill(egui::Color32::from_rgb(40, 110, 60)))
                         .on_hover_text("Accept this hatch and end the hatch flow  [cmd: c / y / Enter]")
                         .clicked() { do_confirm = true; }
                     if ui.add_sized([110.0, 28.0],
-                        egui::Button::new(egui::RichText::new("✗ Discard").size(13.0))
+                        egui::Button::new(egui::RichText::new("✗ Discard").font(crate::theme::typ::body_strong()))
                             .fill(egui::Color32::from_rgb(140, 50, 50)))
                         .on_hover_text("Revert to the state BEFORE this hatch flow started  [cmd: d / n]")
                         .clicked() { do_discard = true; }
@@ -15495,7 +15495,7 @@ impl CadApp {
                             ui.label(egui::RichText::new(format!(
                                 "{} variables  ·  edits to Active/Planned vars persist to ~/.config/rust_cad/user_env.txt",
                                 crate::varreg::VARS.iter().filter(|v| v.section == self.settings_section).count()))
-                                .size(11.0).color(egui::Color32::from_rgb(140, 150, 165)));
+                                .font(crate::theme::typ::hint()).color(egui::Color32::from_rgb(140, 150, 165)));
                             ui.separator();
                             let sec = self.settings_section.clone();
                             egui::ScrollArea::vertical().id_salt("set_rows")
@@ -17881,7 +17881,7 @@ fn polar_angle_picker(ui: &mut egui::Ui, angle_deg: &mut f64, size: f32) -> egui
         egui::pos2(rect.center().x, rect.bottom() - 14.0),
         egui::Align2::CENTER_CENTER,
         format!("{:.1}°", *angle_deg),
-        egui::FontId::proportional(13.0),
+        crate::theme::typ::data_value(),
         egui::Color32::from_rgb(220, 230, 240));
     response
 }
@@ -27132,7 +27132,7 @@ fn draw_wall_style_preview(painter: &egui::Painter, rect: egui::Rect, style: &ca
     }
     painter.text(egui::pos2(cx, r.bottom() + 14.0), egui::Align2::CENTER_TOP,
         format!("t = {:.3}", style.thickness),
-        egui::FontId::proportional(13.0), face_col);
+        crate::theme::typ::data_value(), face_col);
 }
 
 fn draw_dim_style_preview(

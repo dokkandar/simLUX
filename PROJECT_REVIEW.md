@@ -193,6 +193,16 @@ values that were documented but never turned into tokens/applied.
   now render **Medium** vs Regular body labels. Off-spec sizes, ambiguous
   weights, canvas text-entity rendering, and modifier-laden mono `RichText`
   were **left untouched** and reported for owner decisions (see §8).
+- **`typ::hint` role added** (2026-07-02, commit `059e11d`): §5.7 gained a
+  seventh role — `hint` = Geist Regular **11/400**, the lighter 11px counterpart
+  to `caption` (11/500) for secondary/subtitle text. Doc + infra only.
+- **Parked type-token decisions applied** (2026-07-02): owner
+  calls from §8 landed — `menu_heading` → `caption`; settings subtitle → `hint`;
+  Hatch-library picker name labels (verified UI chrome, not canvas entities) →
+  `body` (**note: 11px → 13px**, verify grid labels don't overflow); "✔ Confirm"
+  /"✗ Discard" dialog buttons → `body_strong`; angle `"{:.1}°"` and thickness
+  `"t = …"` readouts → `data_value` (proportional → **Mono**, intended). Off-spec
+  sizes + modifier-laden mono `RichText` remain owner-deferred (see §8).
 
 ---
 
@@ -207,14 +217,10 @@ fix the token). Known remaining finish items:
 - **Coordinate fields**: verify vertical centering (DragValue path).
 - Sweep every element's measured values against §7 of the spec.
 
-**Type-token follow-ups (awaiting owner decisions from the `d2f00f6` sweep):**
-- **Ambiguous weight** — `menu_heading` (app.rs:245, prop 11), settings subtitle
-  (15498, prop 11 — note NO 11/400 token exists yet), hatch canvas name labels
-  (7138/7424), dialog buttons "✔ Confirm"/"✗ Discard" (7515/7520, prop 13):
-  body-vs-Medium / caption-vs-hint is a design call, not guessed.
-- **Numbers in proportional** — angle readout `"{:.1}°"` (17884) and thickness
-  preview `"t = {:.3}"` (27135) are prop 13; moving to Mono `data_value` changes
-  the face (not a no-op) → needs OK.
+**Type-token follow-ups — OWNER-DEFERRED** (the ambiguous-weight + proportional-
+number decisions from the `d2f00f6` sweep were resolved and applied 2026-07-02;
+see §7. What remains is deferred to a later "size-normalization + §5.12 icon-
+token" pass):
 - **Off-spec sizes** (no matching token; left as-is): prop **12** (10238, 18814,
   13061, 24007) and 7/7.5/9/9.5/10/12.5/13.5/14/15/11.5 across command-rail
   glyphs, badges, dialog titles, settings rows, logo glyphs; mono **9/10** debug
