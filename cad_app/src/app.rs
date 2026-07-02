@@ -126,12 +126,43 @@ fn pp_pair_headers(ui: &mut egui::Ui, a: &str, b: &str) {
         let half = (ui.available_width() - gap) / 2.0;
         let y = lr.center().y;
         let p = ui.painter();
+        // Lighter than field labels: dim colour, 11/400 regular (MENTOR §5.1).
+        let hdr = crate::theme::color::COLUMN_HEADER;
         p.text(egui::pos2(vx, y), egui::Align2::LEFT_CENTER, a,
-            crate::theme::typ::caption(), PP_LABEL);
+            crate::theme::typ::hint(), hdr);
         p.text(egui::pos2(vx + half + gap, y), egui::Align2::LEFT_CENTER, b,
-            crate::theme::typ::caption(), PP_LABEL);
+            crate::theme::typ::hint(), hdr);
     });
     ui.add_space(2.0);
+}
+
+/// Place a numeric editor that looks EXACTLY like a `pp_box` field (surface-0,
+/// radius 4, border, Mono 12) instead of egui's default DragValue chrome
+/// (radius 8 / surface-2 / proportional). Paints a `pp_box`, then a frameless
+/// mono DragValue inside it. Widget-visual + font overrides are saved/restored
+/// so they don't leak to sibling fields. INSPECTOR_DESIGN_MENTOR §5.
+fn pp_num_field(ui: &mut egui::Ui, w: f32, v: &mut f64) -> (egui::Rect, egui::Response) {
+    let (rect, _) = pp_box(ui, w, false);
+    let pad = crate::theme::space::INPUT_PAD;
+    let inner = egui::Rect::from_min_size(
+        egui::pos2(rect.left() + pad, rect.center().y - 8.0),
+        egui::vec2((w - 2.0 * pad).max(10.0), 16.0));
+    let saved_font = ui.style().override_font_id.clone();
+    let saved_widgets = ui.visuals().widgets.clone();
+    ui.style_mut().override_font_id = Some(crate::theme::typ::data_value());
+    {
+        let vis = ui.visuals_mut();
+        for st in [&mut vis.widgets.inactive, &mut vis.widgets.hovered,
+                   &mut vis.widgets.active] {
+            st.weak_bg_fill = egui::Color32::TRANSPARENT;
+            st.bg_fill = egui::Color32::TRANSPARENT;
+            st.bg_stroke = egui::Stroke::NONE;
+        }
+    }
+    let r = ui.put(inner, egui::DragValue::new(v).speed(0.5).max_decimals(2));
+    ui.style_mut().override_font_id = saved_font;
+    ui.visuals_mut().widgets = saved_widgets;
+    (rect, r)
 }
 
 /// A label + two side-by-side numeric fields (Start/End or X/Y). Returns
@@ -145,17 +176,17 @@ fn pp_pair_row(ui: &mut egui::Ui, label: &str, a: &mut f64, b: &mut f64)
         let half = ((w - gap) / 2.0).max(40.0);
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = gap;
-            let ra = ui.add_sized([half, PP_ROW_H],
-                egui::DragValue::new(a).speed(0.5).max_decimals(2));
-            let rb = ui.add_sized([half, PP_ROW_H],
-                egui::DragValue::new(b).speed(0.5).max_decimals(2));
+            let (ra_rect, ra) = pp_num_field(ui, half, a);
+            let (rb_rect, rb) = pp_num_field(ui, half, b);
             changed = ra.changed() || rb.changed();
+            // Capture the REAL look now: a pp_box (surface-0, radius 4, border)
+            // with a Mono-12 value — matches what is actually drawn.
             let cap = |ui: &egui::Ui, tag: &str, r: &egui::Rect, v: f64| pp_capture(ui,
                 &format!("{lbl} {tag} · FIELD  w={:.0} h={:.0} @({:.0},{:.0})  |  box \
-egui-DragValue radius=4 fill=#141C25 border=#34414B  |  value='{:.2}' color={} font=12px-mono  |  arrow=none",
+pp_box fill=#141C25 border=#34414B radius=4  |  value='{:.2}' color={} font=12px-mono  |  arrow=none",
                     r.width(), r.height(), r.left(), r.top(), v, pp_hex(PP_TEXT), lbl=label, tag=tag), *r);
-            cap(ui, "start", &ra.rect, *a);
-            cap(ui, "end", &rb.rect, *b);
+            cap(ui, "start", &ra_rect, *a);
+            cap(ui, "end", &rb_rect, *b);
             resps.push(ra); resps.push(rb);
         });
     });
@@ -166,8 +197,8 @@ egui-DragValue radius=4 fill=#141C25 border=#34414B  |  value='{:.2}' color={} f
 fn pp_num_row(ui: &mut egui::Ui, label: &str, v: &mut f64) -> (bool, egui::Response) {
     let mut out = None;
     pp_row(ui, label, |ui, w| {
-        out = Some(ui.add_sized([w, PP_ROW_H],
-            egui::DragValue::new(v).speed(0.5).max_decimals(2)));
+        let (_rect, r) = pp_num_field(ui, w, v);
+        out = Some(r);
     });
     let r = out.expect("pp_row always invokes the body");
     (r.changed(), r)

@@ -31,6 +31,9 @@ pub mod color {
     pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(0xae, 0xb9, 0xc4);
     pub const TEXT_MUTED:     Color32 = Color32::from_rgb(0x93, 0xa1, 0xac); // labels, placeholders
     pub const TEXT_DISABLED:  Color32 = Color32::from_rgb(0x5c, 0x69, 0x75);
+    /// Coordinate column headers (Start/End, X/Y) — dimmer than muted, 11/400.
+    /// INSPECTOR_DESIGN_MENTOR §1/§5.1.
+    pub const COLUMN_HEADER:  Color32 = Color32::from_rgb(0x66, 0x70, 0x7a);
 
     // ── Semantic (no `info` — cyan carries it) ─────────────────────────
     pub const SUCCESS: Color32 = Color32::from_rgb(0x34, 0xd3, 0x99);
@@ -74,8 +77,8 @@ pub mod space {
     pub const SECTION_GAP: f32 = 12.0;
     /// Gap between property groups / sections.
     pub const GROUP_GAP:   f32 = 12.0;
-    /// Start ↔ End (coordinate) column gap.
-    pub const COLUMN_GAP:  f32 = 12.0;
+    /// Start ↔ End (coordinate) column gap (INSPECTOR_DESIGN_MENTOR §5.1).
+    pub const COLUMN_GAP:  f32 = 8.0;
     /// Panel inner edge padding.
     pub const PANEL_EDGE:  f32 = 16.0;
     /// Panel header band → first content.
