@@ -194,7 +194,8 @@ two-column grids. **Commit:** Inspector = live-apply + Ctrl+Z; dialogs =
 commit-on-Enter/OK; Esc reverts. **Validate** on commit/blur = red border +
 message below; number fields drag-to-scrub; no "required" asterisk. Sections
 separated by **hairline dividers**; collapsed = `▸` header. The **dobject type
-shows in the Inspector header**, not as a field. (Per-type property schema →
+shows in the Inspector header**, not as a field. Button labels use **body-strong**
+(Medium 13) — actions carry emphasis over plain labels. (Per-type property schema →
 [Dobject_Properties.md](Dobject_Properties.md); wording/number formatting →
 [CONTENT_STYLE.md](CONTENT_STYLE.md).)
 
