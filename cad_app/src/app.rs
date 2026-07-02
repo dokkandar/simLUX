@@ -197,6 +197,44 @@ fn pp_capture(ui: &egui::Ui, name: &str, rect: egui::Rect) {
     });
 }
 
+/// UI-inspect: draw a devtools-style spacing dimension across a gap `band`
+/// between two captured boxes — a translucent amber fill, a centered measure
+/// line with end ticks, and a px label chip. `vertical` = the gap is measured
+/// top↕bottom (else left↔right). Amber so it reads distinct from the cyan box
+/// outlines. Used to verify row/section spacing against the §5.1 tokens.
+fn pp_gap_dim(painter: &egui::Painter, band: egui::Rect, vertical: bool, gap: f32) {
+    let amber = egui::Color32::from_rgb(0xF2, 0xB5, 0x3D);
+    painter.rect_filled(band, 0.0,
+        egui::Color32::from_rgba_unmultiplied(0xF2, 0xB5, 0x3D, 36));
+    let stroke = egui::Stroke::new(1.0, amber);
+    if vertical {
+        let x = band.center().x;
+        painter.line_segment([egui::pos2(x, band.top()), egui::pos2(x, band.bottom())], stroke);
+        for y in [band.top(), band.bottom()] {
+            painter.line_segment([egui::pos2(x - 4.0, y), egui::pos2(x + 4.0, y)], stroke);
+        }
+    } else {
+        let y = band.center().y;
+        painter.line_segment([egui::pos2(band.left(), y), egui::pos2(band.right(), y)], stroke);
+        for x in [band.left(), band.right()] {
+            painter.line_segment([egui::pos2(x, y - 4.0), egui::pos2(x, y + 4.0)], stroke);
+        }
+    }
+    // px label — integer when the gap is (near) whole, else one decimal.
+    let label = if (gap - gap.round()).abs() < 0.05 {
+        format!("{:.0}", gap)
+    } else {
+        format!("{:.1}", gap)
+    };
+    let galley = painter.layout_no_wrap(label, crate::theme::typ::data_code(), egui::Color32::BLACK);
+    let c = band.center();
+    let lp = egui::pos2(c.x - galley.size().x / 2.0, c.y - galley.size().y / 2.0);
+    let chip = egui::Rect::from_min_size(lp - egui::vec2(4.0, 2.0),
+        galley.size() + egui::vec2(8.0, 4.0));
+    painter.rect_filled(chip, 3.0, amber);
+    painter.galley(lp, galley, egui::Color32::BLACK);
+}
+
 /// Auto-close a top category menu once the pointer has left BOTH the menu bar
 /// (`bar_rect`) and this menu's popup. Call at the END of a top-level menu
 /// closure. NOTE: only safe for menus WITHOUT submenus — a side-opening submenu
@@ -25502,6 +25540,50 @@ impl eframe::App for CadApp {
                     painter.rect(bg, 4.0, egui::Color32::from_black_alpha(238),
                         egui::Stroke::new(1.0, egui::Color32::from_rgb(0, 0xe5, 0xff)));
                     painter.galley(lp, galley, egui::Color32::WHITE);
+                }
+                // ---- Spacing: pointer in the whitespace BETWEEN two boxes →
+                // draw the gap (px) so row/section spacing can be checked against
+                // the §5.1 tokens (ROW_GAP 8, GROUP_GAP 12, SECTION_GAP 12, …).
+                let containing: Vec<egui::Rect> =
+                    buf.iter().map(|(_, r)| *r).filter(|r| r.contains(p)).collect();
+                let cmpf = |a: &f32, b: &f32|
+                    a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal);
+                // Vertical gap: nearest box above & below along the pointer column.
+                let up = buf.iter().map(|(_, r)| *r)
+                    .filter(|r| !r.contains(p) && r.left() <= p.x && p.x <= r.right() && r.bottom() <= p.y)
+                    .max_by(|a, b| cmpf(&a.bottom(), &b.bottom()));
+                let down = buf.iter().map(|(_, r)| *r)
+                    .filter(|r| !r.contains(p) && r.left() <= p.x && p.x <= r.right() && r.top() >= p.y)
+                    .min_by(|a, b| cmpf(&a.top(), &b.top()));
+                if let (Some(u), Some(d)) = (up, down) {
+                    let gap = d.top() - u.bottom();
+                    // Only when it's true whitespace — no leaf box sits in the band.
+                    let inside_leaf = containing.iter()
+                        .any(|c| c.top() >= u.bottom() - 1.0 && c.bottom() <= d.top() + 1.0);
+                    if gap > 0.5 && gap <= 400.0 && !inside_leaf {
+                        let l = u.left().max(d.left());
+                        let rgt = u.right().min(d.right());
+                        pp_gap_dim(&painter, egui::Rect::from_min_max(
+                            egui::pos2(l, u.bottom()), egui::pos2(rgt, d.top())), true, gap);
+                    }
+                }
+                // Horizontal gap: nearest box left & right along the pointer row.
+                let lft = buf.iter().map(|(_, r)| *r)
+                    .filter(|r| !r.contains(p) && r.top() <= p.y && p.y <= r.bottom() && r.right() <= p.x)
+                    .max_by(|a, b| cmpf(&a.right(), &b.right()));
+                let rgh = buf.iter().map(|(_, r)| *r)
+                    .filter(|r| !r.contains(p) && r.top() <= p.y && p.y <= r.bottom() && r.left() >= p.x)
+                    .min_by(|a, b| cmpf(&a.left(), &b.left()));
+                if let (Some(a), Some(b)) = (lft, rgh) {
+                    let gap = b.left() - a.right();
+                    let inside_leaf = containing.iter()
+                        .any(|c| c.left() >= a.right() - 1.0 && c.right() <= b.left() + 1.0);
+                    if gap > 0.5 && gap <= 400.0 && !inside_leaf {
+                        let t = a.top().max(b.top());
+                        let bot = a.bottom().min(b.bottom());
+                        pp_gap_dim(&painter, egui::Rect::from_min_max(
+                            egui::pos2(a.right(), t), egui::pos2(b.left(), bot)), false, gap);
+                    }
                 }
             }
             // ---- Click-to-log: record the clicked element + its box hierarchy.

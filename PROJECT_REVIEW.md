@@ -203,6 +203,11 @@ values that were documented but never turned into tokens/applied.
   Discard" dialog buttons → `body_strong`; angle `"{:.1}°"` and thickness
   `"t = …"` readouts → `data_value` (proportional → **Mono**, intended). Off-spec
   sizes + modifier-laden mono `RichText` remain owner-deferred (see §8).
+- **UI-inspect spacing readout** (2026-07-02): the inspector now shows a
+  devtools-style **gap dimension** when the pointer is in the whitespace between
+  two captured boxes — amber fill + measure line + px label, vertical and/or
+  horizontal. Lets row/section spacing be read directly and checked against the
+  §5.1 tokens. New `pp_gap_dim` helper + overlay logic in `app.rs` (see §11).
 
 ---
 
@@ -275,6 +280,12 @@ Living tracker: **[OPEN_ISSUES.md](OPEN_ISSUES.md)**. Highlights:
 
 - **UI inspect** (Tools ▸ Debug ▸ "UI inspect (element sizes)") — the ruler + the
   copyable "UI Inspect Log". Best way to check the Inspector against the spec.
+  Hovering a box highlights it (cyan) with a size/detail tooltip; **pointing in
+  the whitespace between two boxes draws an amber spacing dimension** (fill +
+  ticks + px label) for the vertical and/or horizontal gap — so row/section gaps
+  can be read straight off the screen and checked against the §5.1 tokens
+  (`ROW_GAP` 8, `GROUP_GAP`/`SECTION_GAP` 12). Impl: `pp_gap_dim` + the overlay
+  block in `app.rs`.
 - **Session recorder** (`dbg_recorder.rs`) — Start/Stop, then the owner pastes
   `=== SESSION DUMP ===` text. Gestures/geometry are logged for bug repros.
 - **Screen Stats / Render mode / Trim & Hatch debug logs** — under the same
