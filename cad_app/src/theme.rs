@@ -88,6 +88,51 @@ pub mod radius {
     pub const FULL: f32 = 9999.0; // pills, toggles
 }
 
+/// Install the brand fonts (THEME_SYSTEM §5.7): **Geist** for UI text and
+/// **JetBrains Mono** for data/numbers. Both `.ttf`s are embedded in the binary
+/// (`include_bytes!`) so they always ship with the exe regardless of the working
+/// directory. Call ONCE at startup, before the first frame.
+///
+/// The app already calls `FontId::proportional(..)` for UI text and `.monospace()`
+/// for numbers/coordinates everywhere, so placing each face at the FRONT of its
+/// egui family re-points all existing text at once — no per-widget change. egui's
+/// bundled fonts remain behind ours as glyph fallbacks.
+pub fn install_fonts(ctx: &egui::Context) {
+    use egui::{FontData, FontDefinitions, FontFamily};
+    use std::sync::Arc;
+
+    const GEIST: &[u8] =
+        include_bytes!(concat!(env!("CARGO_MANIFEST_DIR"), "/assets/fonts/Geist-Regular.ttf"));
+    const JETBRAINS_MONO: &[u8] = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/assets/fonts/JetBrainsMono-Regular.ttf"
+    ));
+
+    let mut fonts = FontDefinitions::default();
+    fonts
+        .font_data
+        .insert("Geist".to_owned(), Arc::new(FontData::from_static(GEIST)));
+    fonts.font_data.insert(
+        "JetBrainsMono".to_owned(),
+        Arc::new(FontData::from_static(JETBRAINS_MONO)),
+    );
+
+    // Front of the family = the default face; keep egui's stock fonts after ours
+    // so any glyph the brand faces lack still renders.
+    fonts
+        .families
+        .entry(FontFamily::Proportional)
+        .or_default()
+        .insert(0, "Geist".to_owned());
+    fonts
+        .families
+        .entry(FontFamily::Monospace)
+        .or_default()
+        .insert(0, "JetBrainsMono".to_owned());
+
+    ctx.set_fonts(fonts);
+}
+
 /// Install the token palette as egui's GLOBAL `Visuals`, so every default-styled
 /// widget — menus, dialogs, buttons, checkboxes, dropdowns, text fields — reads
 /// the one teal-navy theme instead of egui's stock grey. Panels/canvas that set

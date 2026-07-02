@@ -19,6 +19,10 @@ fn main() -> Result<(), eframe::Error> {
     eframe::run_native(
         "rust_cad",
         options,
-        Box::new(|_cc| Ok(Box::new(app::CadApp::default()))),
+        Box::new(|cc| {
+            // Load Geist + JetBrains Mono before the first frame (THEME_SYSTEM §5.7).
+            theme::install_fonts(&cc.egui_ctx);
+            Ok(Box::new(app::CadApp::default()))
+        }),
     )
 }
