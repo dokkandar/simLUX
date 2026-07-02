@@ -3,8 +3,8 @@
 Read this first. It is a status + orientation brief so another agent can pick up
 the project without re-discovering everything. It states **what the project is,
 how it's built, what's done, what's in flight, what's parked, and the rules that
-must not be broken.** Written 2026-07-01 against branch
-`windows-ui-session-2026-06-20`.
+must not be broken.** Written 2026-07-01, last updated 2026-07-02, against
+branch `windows-ui-session-2026-06-20`.
 
 For deep detail, follow the links into the topic docs (indexed in §12). This doc
 is the map, not the territory.
@@ -48,7 +48,7 @@ Cargo workspace, members:
 | **`app.rs`** | **The monolith (~27,500 lines).** `CadApp` struct + `eframe::App::update`, every tool, the canvas, all panels/menus, the Inspector. Most work happens here. |
 | `main.rs` | Entry point + module list + `eframe` window setup. |
 | `dock.rs` | **Unified docking abstraction** (`DockHost` trait + `EguiDockHost`). See §5. |
-| `theme.rs` | **Design tokens** (color/spacing/radius) + `theme::apply(ctx)` global Visuals. Single source for the look. |
+| `theme.rs` | **Design tokens** (color/spacing/radius) + `theme::apply(ctx)` global Visuals + `theme::install_fonts(ctx)` (embeds Geist + JetBrains Mono). Single source for the look. |
 | `gpu.rs` | GPU instance buffers / render path. |
 | `settings.rs` | Settings/variables page. |
 | `varreg.rs` | Variable registry (240 vars; single source of truth for settings). |
@@ -164,6 +164,19 @@ values that were documented but never turned into tokens/applied.
   Hover = multi-line readout; click = logged with full box hierarchy into a
   copyable "UI Inspect Log" window (Copy-dump button). Built specifically so the
   owner can click a mis-sized box and paste an exact report.
+- **Menus/popups on surface-3** (2026-07-02, commit `f071617`): `theme::apply`
+  set `window_fill = SURFACE_3` (was SURFACE_2). egui 0.30 shares one
+  `window_fill` across `Frame::window`/`menu`/`popup` (no menu-specific fill),
+  so menus + comboboxes + dialogs all now read the popover tone and lift off the
+  surface-1 panels (THEME_SYSTEM §5.3/§5.10; §5.9 treats dialogs as overlay too).
+- **Real fonts loaded** (2026-07-02, commit `9898dca`): `theme::install_fonts()`
+  embeds **Geist** (UI) + **JetBrains Mono** (data) via `include_bytes!` from
+  `cad_app/assets/fonts/` and installs a `FontDefinitions` at startup (main.rs,
+  before first frame) — Geist at front of Proportional, Mono at front of
+  Monospace, egui defaults kept as fallbacks (THEME_SYSTEM §5.7). The app already
+  uses `FontId::proportional()`/`.monospace()` everywhere, so this re-points all
+  text at once. Only Regular (400) is loaded; weight 500 (Medium) awaits the
+  type-token task (egui can't pick weight within a family via `FontId`).
 
 ---
 
