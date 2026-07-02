@@ -19288,8 +19288,9 @@ fn cmd_button_resp(
 
 /// Placeholder glyphs for `cmd_button`. Each variant is a few
 /// strokes — gets the idea across; we'll swap to real icons later.
+/// `pub(crate)` so the command registry ([`crate::command::IconId`]) can name it.
 #[derive(Copy, Clone)]
-enum GlyphKind {
+pub(crate) enum GlyphKind {
     Move, Copy, Rotate, Scale, Mirror, Stretch, Align,
     Trim, Extend, Fillet, Chamfer, Offset, Join, Break, Lengthen,
     Erase, MatchProps, ChangeLayer, ArrayGrid, Reverse,

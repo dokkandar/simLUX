@@ -1,5 +1,6 @@
 mod aci_picker;
 mod app;
+mod command;
 mod dbg_recorder;
 mod dock;
 mod gpu;
