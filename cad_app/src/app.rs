@@ -41,6 +41,9 @@ const PP_ACCENT: egui::Color32 = crate::theme::color::ACCENT;
 const PP_LABEL_W: f32 = 84.0;                       // fixed left-label column width
 const PP_ROW_H:   f32 = crate::theme::space::CONTROL_H;  // uniform field height (24)
 const PP_ROW_GAP: f32 = crate::theme::space::ROW_GAP;    // vertical gap between rows (8)
+/// Trailing area (name/value + dropdown arrow) reserved to the right of the
+/// linetype dash / lineweight bar preview, so both previews share one length.
+const PP_PREVIEW_TRAIL: f32 = 78.0;
 
 /// A labelled property row: muted fixed-width label on the left, a value
 /// area that fills the rest. `add` receives the value-cell width so every
@@ -181,6 +184,29 @@ fn pp_box(ui: &mut egui::Ui, w: f32, clickable: bool) -> (egui::Rect, egui::Resp
     p.rect(rect, egui::Rounding::same(crate::theme::radius::SM), PP_BG_LO,
         egui::Stroke::new(1.0, edge));
     (rect, resp)
+}
+
+/// Abbreviate a linetype name for the Inspector field (INSPECTOR_DESIGN_MENTOR
+/// §5): first 3 letters of the base + the size-variant's first letter in parens.
+/// Real names are like "Divide" / "Divide (small)" / "Center (tiny)", so
+/// "Divide (small)" → "Div (s)", "Dot" → "Dot". Full name is shown on hover.
+fn abbrev_linetype(name: &str) -> String {
+    if let Some(open) = name.find('(') {
+        let base: String = name[..open].trim().chars().take(3).collect();
+        let variant = name[open + 1..].trim_start();
+        let first = variant.chars().next().unwrap_or(' ').to_ascii_lowercase();
+        format!("{} ({})", base, first)
+    } else {
+        name.chars().take(3).collect()
+    }
+}
+
+/// Shared preview length `L` for the linetype dash and the lineweight bar so
+/// they stay matched at any field width (INSPECTOR_DESIGN_MENTOR §5): starts at
+/// the input pad and stretches with the box, reserving a fixed trailing area
+/// (`PP_PREVIEW_TRAIL`) for the abbreviated name / value + the dropdown arrow.
+fn pp_preview_len(box_w: f32) -> f32 {
+    (box_w - crate::theme::space::INPUT_PAD - 9.0 - PP_PREVIEW_TRAIL).max(24.0)
 }
 
 /// Record one element's rect into the layout-capture buffer (egui temp
@@ -10903,21 +10929,29 @@ impl CadApp {
             };
             let solid = matches!(shared_lt, Some(id)
                 if self.doc.linetypes.get(id).map(|l| l.pattern.is_empty()).unwrap_or(true));
+            // Abbreviated field name (+ full name for the hover tooltip).
+            let (full, abbr) = match shared_lt {
+                Some(_) => (name.clone(), abbrev_linetype(&name)),
+                None    => ("Mixed".to_string(), "Mixed".to_string()),
+            };
             let lts: Vec<(u32, String)> = (0..self.doc.linetypes.len() as u32)
                 .filter_map(|id| self.doc.linetypes.get(id).map(|l| (id, l.name.clone())))
                 .collect();
             let mut pick: Option<u32> = None;
             pp_row(ui, "Line Type", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
+                let resp = resp.on_hover_text(full.as_str());
                 let p = ui.painter_at(rect);
-                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &name, crate::theme::typ::body(), PP_TEXT);
                 let y = rect.center().y;
-                let (x0, x1) = (rect.center().x + 6.0, rect.right() - 20.0);
-                let s = egui::Stroke::new(1.4, PP_LABEL);
+                // Preview FIRST: dash/solid stroke of the shared length L, then
+                // 9px, then the abbreviated name (INSPECTOR_DESIGN_MENTOR §5).
+                let x0 = rect.left() + crate::theme::space::INPUT_PAD;
+                let l  = pp_preview_len(rect.width());
+                let s  = egui::Stroke::new(1.5, PP_TEXT);
                 if solid {
-                    p.line_segment([egui::pos2(x0, y), egui::pos2(x1, y)], s);
+                    p.line_segment([egui::pos2(x0, y), egui::pos2(x0 + l, y)], s);
                 } else {
+                    let x1 = x0 + l;
                     let mut x = x0;
                     while x < x1 {
                         let e = (x + 7.0).min(x1);
@@ -10925,8 +10959,11 @@ impl CadApp {
                         x += 11.0;
                     }
                 }
+                let name_x = x0 + l + 9.0;
+                let tr = p.text(egui::pos2(name_x, y),
+                    egui::Align2::LEFT_CENTER, &abbr, crate::theme::typ::body(), PP_TEXT);
                 pp_arrow(&p, rect);
-                pp_cap_field(ui, "Line Type", rect, tr, &name, PP_TEXT, 13.0, true);
+                pp_cap_field(ui, "Line Type", rect, tr, &abbr, PP_TEXT, 13.0, true);
                 let pid = ui.make_persistent_id("pp_lt_popup");
                 if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
                 egui::popup_below_widget(ui, pid, &resp,
@@ -10986,10 +11023,25 @@ impl CadApp {
             pp_row(ui, "Line Weight", |ui, w| {
                 let (rect, resp) = pp_box(ui, w, true);
                 let p = ui.painter_at(rect);
-                let tr = p.text(egui::pos2(rect.left() + 8.0, rect.center().y),
-                    egui::Align2::LEFT_CENTER, &lw_text, crate::theme::typ::body(), PP_TEXT);
+                let y = rect.center().y;
+                // Thickness bar FIRST (same length L as the linetype dash so they
+                // stay matched); height encodes the weight, capped ~4px. Then the
+                // value in Mono 12 (INSPECTOR_DESIGN_MENTOR §5).
+                let x0 = rect.left() + crate::theme::space::INPUT_PAD;
+                let l  = pp_preview_len(rect.width());
+                let h  = match shared_lw {
+                    Some(Lineweight::Custom(mm)) => (mm * 4.0).clamp(1.0, 4.0),
+                    _ => 1.0,
+                };
+                p.rect_filled(
+                    egui::Rect::from_min_max(egui::pos2(x0, y - h / 2.0),
+                                             egui::pos2(x0 + l, y + h / 2.0)),
+                    0.0, PP_TEXT);
+                let vx = x0 + l + 9.0;
+                let tr = p.text(egui::pos2(vx, y),
+                    egui::Align2::LEFT_CENTER, &lw_text, crate::theme::typ::data_value(), PP_TEXT);
                 pp_arrow(&p, rect);
-                pp_cap_field(ui, "Line Weight", rect, tr, &lw_text, PP_TEXT, 13.0, true);
+                pp_cap_field(ui, "Line Weight", rect, tr, &lw_text, PP_TEXT, 12.0, true);
                 let pid = ui.make_persistent_id("pp_lw_popup");
                 if resp.clicked() { ui.memory_mut(|m| m.toggle_popup(pid)); }
                 egui::popup_below_widget(ui, pid, &resp,
