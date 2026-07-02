@@ -285,7 +285,8 @@ Living tracker: **[OPEN_ISSUES.md](OPEN_ISSUES.md)**. Highlights:
   ticks + px label) for the vertical and/or horizontal gap — so row/section gaps
   can be read straight off the screen and checked against the §5.1 tokens
   (`ROW_GAP` 8, `GROUP_GAP`/`SECTION_GAP` 12). Impl: `pp_gap_dim` + the overlay
-  block in `app.rs`.
+  block in `app.rs`. The **UI Inspect Log** window has a title-bar **× close**
+  that turns the whole tool off (overlay + window); re-enable from Tools ▸ Debug.
 - **Session recorder** (`dbg_recorder.rs`) — Start/Stop, then the owner pastes
   `=== SESSION DUMP ===` text. Gestures/geometry are logged for bug repros.
 - **Screen Stats / Render mode / Trim & Hatch debug logs** — under the same

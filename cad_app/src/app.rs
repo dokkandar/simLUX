@@ -25617,7 +25617,12 @@ impl eframe::App for CadApp {
 
         // ---- UI Inspect Log window (copyable report) ----------------------
         if self.ui_inspect {
+            // The title-bar × closes the whole UI-inspect tool (overlay + window);
+            // re-enable via Tools ▸ Debug ▸ "UI inspect". `open` is a local so the
+            // window's &mut borrow doesn't clash with the body closure's &mut self.
+            let mut open = true;
             egui::Window::new("UI Inspect Log")
+                .open(&mut open)
                 .default_width(560.0)
                 .default_pos(egui::pos2(60.0, 90.0))
                 .show(ctx, |ui| {
@@ -25638,6 +25643,8 @@ impl eframe::App for CadApp {
                             .desired_width(f32::INFINITY));
                     });
                 });
+            // Closing the window turns the inspector off entirely.
+            if !open { self.ui_inspect = false; }
         }
 
         if self.props_layout_capture {
