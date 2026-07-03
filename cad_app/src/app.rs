@@ -11925,6 +11925,8 @@ impl CadApp {
                 self.intersections.clear();
                 self.index_dirty = true;
                 self.gpu_dirty = true;
+                // Jump straight to the drawing — no manual ZOOM needed.
+                self.fit_view_to_drawing();
                 self.current_file = Some(std::path::PathBuf::from(path));
                 self.history.push(format!(
                     "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
@@ -14570,6 +14572,56 @@ impl CadApp {
         if !s.is_finite() { s = self.scale as f64; }   // degenerate (point) bbox
         self.scale = ((s * frac as f64) as f32).clamp(0.01, 5000.0);
         self.world_offset = egui::vec2(-center.x as f32, -center.y as f32);
+    }
+
+    /// Fit the view to the drawing on OPEN — no manual ZOOM needed. Uses
+    /// RESOLVED block bboxes (so block-heavy drawings frame correctly, unlike
+    /// raw `doc_extents`, which sees only block insert points). If a few stray
+    /// entities sit far from the bulk (making the real content tiny / the view
+    /// look blank), it falls back to a robust, outlier-trimmed extent so we zoom
+    /// to where the drawing actually is.
+    fn fit_view_to_drawing(&mut self) {
+        let fin = |v: Vec2| v.x.is_finite() && v.y.is_finite();
+        let boxes: Vec<(Vec2, Vec2)> = self.doc.dobjects.iter().filter_map(|d| {
+            let (a, b) = match &d.geom {
+                Geom::BlockRef(br) => self.resolved_blockref_bbox(br),
+                _ => d.bbox(),
+            };
+            if fin(a) && fin(b) { Some((a, b)) } else { None }
+        }).collect();
+        if boxes.is_empty() { return; }   // nothing to display → leave the view
+
+        let union = |bs: &[(Vec2, Vec2)]| -> (Vec2, Vec2) {
+            let (mut mn, mut mx) = (bs[0].0, bs[0].1);
+            for (a, b) in bs {
+                mn.x = mn.x.min(a.x); mn.y = mn.y.min(a.y);
+                mx.x = mx.x.max(b.x); mx.y = mx.y.max(b.y);
+            }
+            (mn, mx)
+        };
+        let full = union(&boxes);
+
+        // Robust extent: central 90% of entity centres, padded by a typical
+        // entity size — trims far-away strays.
+        let mut xs: Vec<f64> = boxes.iter().map(|(a, b)| (a.x + b.x) * 0.5).collect();
+        let mut ys: Vec<f64> = boxes.iter().map(|(a, b)| (a.y + b.y) * 0.5).collect();
+        let mut sz: Vec<f64> = boxes.iter()
+            .map(|(a, b)| (b.x - a.x).abs().max((b.y - a.y).abs())).collect();
+        xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        ys.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        sz.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let pct = |v: &[f64], p: f64| v[(((v.len() - 1) as f64) * p).round() as usize];
+        let pad = sz[sz.len() / 2].max(1e-6);
+        let robust = (
+            Vec2::new(pct(&xs, 0.05) - pad, pct(&ys, 0.05) - pad),
+            Vec2::new(pct(&xs, 0.95) + pad, pct(&ys, 0.95) + pad),
+        );
+
+        // Use the robust box only when strays blow the full extent up (≫16×).
+        let area = |bb: (Vec2, Vec2)|
+            ((bb.1.x - bb.0.x).abs() + 1e-9) * ((bb.1.y - bb.0.y).abs() + 1e-9);
+        let pick = if boxes.len() >= 8 && area(full) > area(robust) * 16.0 { robust } else { full };
+        self.zoom_fit_bbox(pick.0, pick.1, 0.9);
     }
 
     /// ZOOM Extents — fit all objects.
