@@ -15,6 +15,23 @@ use crate::text::TextStyleTable;
 use crate::dim::DimStyleTable;
 use crate::wallstyle::WallStyleTable;
 use crate::block::BlockTable;
+use crate::math::Vec2;
+use std::sync::Arc;
+
+/// An embedded reference raster image — an underlay you draft over (NOT
+/// vectorized). `data` is the ORIGINAL encoded file bytes (PNG/JPEG/…), shared
+/// via `Arc` so cloning the Document for undo stays cheap. Placement is in world
+/// units: `insert` is the image's TOP-LEFT corner, the image spans `world_w`
+/// to the right and `world_h` downward (1 world unit per source pixel by
+/// default). Persisted in the native RSM file (v4+); DXF does not embed it.
+#[derive(Clone, Debug)]
+pub struct RasterImage {
+    pub name:    String,
+    pub data:    Arc<Vec<u8>>,
+    pub insert:  Vec2,
+    pub world_w: f64,
+    pub world_h: f64,
+}
 
 #[derive(Clone)]
 pub struct Document {
@@ -38,6 +55,9 @@ pub struct Document {
     /// Block definitions. Dobjects with `Geom::BlockRef(br)` reference an
     /// entry via `br.block`. No reserved id-0 entry — starts empty.
     pub blocks:      BlockTable,
+    /// Embedded reference raster underlays. Drafted over, not vectorized;
+    /// persisted in RSM (v4+). Empty by default.
+    pub raster_images: Vec<RasterImage>,
     // Reserved for future slices — leave the field list extensible:
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
@@ -56,6 +76,7 @@ impl Default for Document {
             dim_styles:  DimStyleTable::with_defaults(),
             wall_styles: WallStyleTable::with_defaults(),
             blocks:      BlockTable::default(),
+            raster_images: Vec::new(),
         }
     }
 }

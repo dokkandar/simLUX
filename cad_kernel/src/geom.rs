@@ -495,6 +495,85 @@ pub enum Geom {
 
 impl Geom {
     /// Return a copy rotated by `angle` radians around `pivot` (CCW).
+    /// Non-uniform scale about `pivot` by POSITIVE magnitudes (sx, sy). Signs
+    /// (mirroring) are handled by the caller (block insert) via a reflection +
+    /// rotation, so this never reflects. When sx≈sy it's a uniform scale
+    /// (delegates to `scaled`, keeping circles/arcs). When they differ a
+    /// circle/arc/ellipse becomes an ellipse / elliptical-arc — matching
+    /// AutoCAD/LibreCAD block-insert behaviour for stretched blocks.
+    pub fn scaled_xy(&self, pivot: Vec2, sx: f64, sy: f64) -> Geom {
+        if (sx - sy).abs() < 1e-9 { return self.scaled(pivot, sx); }
+        let sc  = |p: Vec2| Vec2::new(pivot.x + (p.x - pivot.x) * sx,
+                                      pivot.y + (p.y - pivot.y) * sy);
+        let scd = |v: Vec2| Vec2::new(v.x * sx, v.y * sy);   // linear part (no shift)
+        // Two CONJUGATE semi-diameters u,v (point = cos t·u + sin t·v) → axis
+        // form: (major vector, ratio, param phase). The image param t maps to
+        // ellipse param (t − phase). sx,sy>0 ⇒ orientation preserved.
+        let to_axes = |u: Vec2, v: Vec2| -> (Vec2, f64, f64) {
+            let (a, b, c) = (u.dot(u), v.dot(v), u.dot(v));
+            let sstar = 0.5 * (2.0 * c).atan2(a - b);
+            let pp = |s: f64| u * s.cos() + v * s.sin();
+            let (mut major, mut minor, mut phase) =
+                (pp(sstar), pp(sstar + std::f64::consts::FRAC_PI_2), sstar);
+            if minor.len() > major.len() {
+                std::mem::swap(&mut major, &mut minor);
+                phase += std::f64::consts::FRAC_PI_2;
+            }
+            let ratio = (minor.len() / major.len().max(1e-12)).clamp(1e-6, 1.0);
+            (major, ratio, phase)
+        };
+        match self {
+            Geom::Line(l) => Geom::Line(Line { a: sc(l.a), b: sc(l.b) }),
+            Geom::Point(pt) => Geom::Point(Point { location: sc(pt.location),
+                style: pt.style, size: pt.size }),
+            Geom::Polyline(p) => {
+                // Width is a perpendicular thickness with no single axis under
+                // anisotropic scale → use the average of the two factors.
+                let wf = 0.5 * (sx.abs() + sy.abs());
+                Geom::Polyline(Polyline {
+                    vertices: p.vertices.iter()
+                        .map(|v| PolyVertex { pos: sc(v.pos), bulge: v.bulge }).collect(),
+                    closed: p.closed,
+                    widths: p.widths.iter().map(|&(a, b)| (a * wf, b * wf)).collect() })
+            }
+            Geom::Spline(s) => Geom::Spline(Spline { degree: s.degree,
+                control_points: s.control_points.iter().map(|p| sc(*p)).collect(),
+                weights: s.weights.clone() }),
+            Geom::Circle(c) => {
+                let (major, ratio, _) = to_axes(
+                    Vec2::new(sx * c.radius, 0.0), Vec2::new(0.0, sy * c.radius));
+                Geom::Ellipse(Ellipse { center: sc(c.center), major, ratio })
+            }
+            Geom::Arc(arc) => {
+                let (major, ratio, phase) = to_axes(
+                    Vec2::new(sx * arc.radius, 0.0), Vec2::new(0.0, sy * arc.radius));
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: Ellipse { center: sc(arc.center), major, ratio },
+                    start_param: arc.start_angle - phase, sweep_param: arc.sweep_angle })
+            }
+            Geom::Ellipse(e) => {
+                let (major, ratio, _) = to_axes(scd(e.major), scd(e.major.perp() * e.ratio));
+                Geom::Ellipse(Ellipse { center: sc(e.center), major, ratio })
+            }
+            Geom::EllipseArc(ea) => {
+                let (major, ratio, phase) =
+                    to_axes(scd(ea.ellipse.major), scd(ea.ellipse.major.perp() * ea.ellipse.ratio));
+                Geom::EllipseArc(EllipseArc {
+                    ellipse: Ellipse { center: sc(ea.ellipse.center), major, ratio },
+                    start_param: ea.start_param - phase, sweep_param: ea.sweep_param })
+            }
+            Geom::Dimension(d) => Geom::Dimension(d.with_points_mapped(sc)),
+            Geom::Hatch(h) => Geom::Hatch(h.clone()),
+            // Best-effort for the rare cases — non-uniform on these is approximate.
+            Geom::Wall(w) => Geom::Wall(Wall { start: sc(w.start), end: sc(w.end),
+                thickness: w.thickness * 0.5 * (sx + sy), style: w.style, bulge: w.bulge }),
+            Geom::Text(t) => { let mut nt = t.clone(); nt.position = sc(t.position);
+                nt.height *= sy; Geom::Text(nt) }
+            Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
+                insert: sc(br.insert), scale: br.scale * sx, scale_y: br.scale_y * sy, ..*br }),
+        }
+    }
+
     pub fn rotated(&self, pivot: Vec2, angle: f64) -> Geom {
         let c = angle.cos();
         let s = angle.sin();
@@ -661,7 +740,8 @@ impl Geom {
             // thickness; negative factors don't reflect a block in v1).
             Geom::BlockRef(br) => Geom::BlockRef(crate::block::BlockRef {
                 insert: sc(br.insert),
-                scale:  br.scale * f_abs,
+                scale:   br.scale   * f_abs,
+                scale_y: br.scale_y * f_abs,
                 ..*br
             }),
         }
@@ -767,6 +847,7 @@ impl Geom {
                 Geom::BlockRef(crate::block::BlockRef {
                     insert:   mirror(br.insert),
                     rotation: 2.0 * axis_angle - br.rotation,
+                    mirror_x: !br.mirror_x,   // reflecting flips the parity
                     ..*br
                 })
             }
@@ -1308,6 +1389,36 @@ impl Ellipse {
     pub fn distance_to_point(&self, p: Vec2) -> f64 {
         let t = self.nearest_param(p);
         self.point_at(t).dist(p)
+    }
+}
+
+#[cfg(test)]
+mod wall_explode_tests {
+    use super::*;
+
+    #[test]
+    fn straight_wall_faces_are_offset_by_half_thickness() {
+        // A horizontal wall of thickness 4 → two faces at y = ±2, both 2-point
+        // (lines), which is exactly what `explode` turns into face Lines + caps.
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 4.0, style: 0, bulge: 0.0 };
+        let (left, right) = w.face_polylines(48).expect("faces");
+        assert_eq!(left.len(), 2);
+        assert_eq!(right.len(), 2);
+        // faces sit ±2 off the centerline
+        assert!((left[0].y.abs() - 2.0).abs() < 1e-9 && (right[0].y.abs() - 2.0).abs() < 1e-9);
+        assert!((left[0].y * right[0].y) < 0.0, "faces must be on opposite sides");
+        // end caps span the full thickness (4)
+        let start_cap = (left[0] - right[0]).len();
+        assert!((start_cap - 4.0).abs() < 1e-9, "cap width {start_cap}");
+    }
+
+    #[test]
+    fn curved_wall_faces_are_sampled_polylines() {
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0),
+                       thickness: 2.0, style: 0, bulge: 0.5 };
+        let (left, right) = w.face_polylines(16).expect("faces");
+        assert!(left.len() > 2 && right.len() > 2, "curved faces should sample many points");
     }
 }
 

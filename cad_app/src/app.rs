@@ -13751,7 +13751,8 @@ impl CadApp {
         }
         self.selection.clear();
         let geom = Geom::BlockRef(cad_kernel::BlockRef {
-            block: id, insert: base, scale: 1.0, rotation: 0.0,
+            block: id, insert: base, scale: 1.0, scale_y: 1.0, rotation: 0.0,
+            mirror_x: false,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         });
         let mut d = match inst_style {
@@ -14831,7 +14832,8 @@ impl CadApp {
             // Plain block — place now, then cut the host opening (if any).
             self.snapshot_doc();
             let br = cad_kernel::BlockRef {
-                block, insert, scale: 1.0, rotation,
+                block, insert, scale: 1.0, scale_y: 1.0, rotation,
+                mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             };
             self.add_dobject(Geom::BlockRef(br), "insert");
@@ -14855,7 +14857,8 @@ impl CadApp {
             if k < cad_kernel::MAX_BLOCK_PARAMS { param_values[k] = *v; }
         }
         let br = cad_kernel::BlockRef {
-            block: p.block, insert: p.insert, scale: 1.0, rotation: p.rotation, param_values,
+            block: p.block, insert: p.insert, scale: 1.0, scale_y: 1.0,
+            rotation: p.rotation, mirror_x: false, param_values,
         };
         self.add_dobject(Geom::BlockRef(br), "insert");
         self.apply_block_cut(br);

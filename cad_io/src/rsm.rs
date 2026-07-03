@@ -56,15 +56,23 @@
 use cad_kernel::{
     Arc, Circle, Color, DObject, Document, Ellipse, EllipseArc, Geom, Hatch,
     HatchPattern, Layer, LayerTable, Line, Lineweight, Linetype, LinetypeTable,
-    Pen, PenTable, Point, PolyVertex, Polyline, Spline, Style, Vec2, Wall,
+    Pen, PenTable, Point, PolyVertex, Polyline, RasterImage, Spline, Style, Vec2, Wall,
 };
+use std::sync::Arc as StdArc;
 
 const MAGIC: [u8; 4] = *b"RSM\x01";
 // v2: + blocks table (after dobjects) and geom tag 12 = BlockRef. The
 // reader accepts ANY version <= VERSION and skips sections newer files
 // would have — old drawings keep loading.
 // v3: + block `smart` flag, + text/dim/wall style tables (after blocks).
-const VERSION: u16  = 4;   // v4: per-segment polyline widths
+// v4: + embedded raster-image underlays section (after wall styles).
+// v5: + BlockRef `mirror_x` flag (after rotation in the geom-12 record).
+// v6: + BlockRef `scale_y` (after mirror_x) — per-axis scale / stretched blocks.
+// v7: + per-segment polyline widths (in the geom polyline record). NOTE: the
+//     HSI windows-ui branch shipped this as "v4"; renumbered to v7 here because
+//     our v4/v5/v6 were already taken by raster / mirror_x / scale_y. The width
+//     reader is therefore gated on ver >= 7 so v4..v6 files (no widths) load.
+const VERSION: u16  = 7;
 
 // =============================================================================
 //   WRITER
@@ -86,8 +94,23 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_text_style_table(&mut w, &doc.text_styles);
     write_dim_style_table(&mut w, &doc.dim_styles);
     write_wall_style_table(&mut w, &doc.wall_styles);
+    write_raster_images(&mut w, &doc.raster_images);          // v4
 
     w
+}
+
+/// v4 — embedded raster underlays. Per image: name, placement (insert + world
+/// size), then the raw encoded file bytes (PNG/JPEG/…) length-prefixed.
+fn write_raster_images(w: &mut Vec<u8>, imgs: &[RasterImage]) {
+    write_u32(w, imgs.len() as u32);
+    for img in imgs {
+        write_str(w, &img.name);
+        write_vec2(w, img.insert);
+        write_f64(w, img.world_w);
+        write_f64(w, img.world_h);
+        write_u64(w, img.data.len() as u64);
+        w.extend_from_slice(&img.data);
+    }
 }
 
 /// v2 — block definitions. Per block: name, base point, then the
@@ -382,7 +405,7 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
                 write_vec2(w, v.pos);
                 write_f64(w, v.bulge);
             }
-            // v4: per-segment (start,end) widths. Empty = thin (count 0).
+            // v7: per-segment (start,end) widths. Empty = thin (count 0).
             write_u32(w, p.widths.len() as u32);
             for &(sw, ew) in &p.widths {
                 write_f64(w, sw);
@@ -493,12 +516,14 @@ fn write_geom(w: &mut Vec<u8>, g: &Geom) {
         }
         Geom::BlockRef(br) => {
             // tag 12 = BlockRef (v2): block id + insert + uniform scale
-            // + rotation.
+            // + rotation; v5 adds the mirror_x flag.
             write_u8(w, 12);
             write_u32(w, br.block);
             write_vec2(w, br.insert);
             write_f64(w, br.scale);
             write_f64(w, br.rotation);
+            write_u8(w, br.mirror_x as u8);          // v5
+            write_f64(w, br.scale_y);                // v6
         }
     }
 }
@@ -590,10 +615,28 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
          cad_kernel::DimStyleTable::default(),
          cad_kernel::WallStyleTable::default())
     };
+    // v4 — embedded raster underlays. Older files have no section.
+    let raster_images = if ver >= 4 { read_raster_images(&mut r)? } else { Vec::new() };
     Ok(Document {
         dobjects, layers, linetypes, pens, truecolors,
-        text_styles, dim_styles, wall_styles, blocks,
+        text_styles, dim_styles, wall_styles, blocks, raster_images,
     })
+}
+
+/// v4 — embedded raster underlays (mirror of `write_raster_images`).
+fn read_raster_images(r: &mut R) -> Result<Vec<RasterImage>, String> {
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name    = r.str()?;
+        let insert  = r.vec2()?;
+        let world_w = r.f64()?;
+        let world_h = r.f64()?;
+        let len     = r.u64()? as usize;
+        let data    = r.take(len)?.to_vec();
+        out.push(RasterImage { name, data: StdArc::new(data), insert, world_w, world_h });
+    }
+    Ok(out)
 }
 
 fn read_color(r: &mut R, tc: &mut cad_kernel::TrueColorTable) -> Result<Color, String> {
@@ -790,8 +833,9 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             for _ in 0..n {
                 vertices.push(PolyVertex { pos: r.vec2()?, bulge: r.f64()? });
             }
-            // v4: per-segment (start,end) widths (absent / empty in older files).
-            let widths = if ver >= 4 {
+            // v7: per-segment (start,end) widths (absent / empty in v4..v6 and
+            // older files — see the VERSION note about the renumber from HSI v4).
+            let widths = if ver >= 7 {
                 let wn = r.u32()? as usize;
                 let mut ws = Vec::with_capacity(wn);
                 for _ in 0..wn { ws.push((r.f64()?, r.f64()?)); }
@@ -902,8 +946,10 @@ fn read_geom(r: &mut R, ver: u16) -> Result<Geom, String> {
             let insert   = r.vec2()?;
             let scale    = r.f64()?;
             let rotation = r.f64()?;
-            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, rotation,
-                param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS] })
+            let mirror_x = if ver >= 5 { r.u8()? != 0 } else { false };
+            let scale_y  = if ver >= 6 { r.f64()? } else { scale };
+            Geom::BlockRef(cad_kernel::BlockRef { block, insert, scale, scale_y, rotation,
+                mirror_x, param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS] })
         }
         t => return Err(format!("RSM: unknown geom tag {}", t)),
     })
@@ -920,6 +966,28 @@ mod tests {
     fn round_trip(doc: &Document) -> Document {
         let bytes = write_rsm(doc);
         read_rsm(&bytes).expect("rsm round-trip")
+    }
+
+    #[test]
+    fn raster_images_round_trip() {
+        // v4 — an embedded raster underlay: name, placement and raw bytes must
+        // survive the save/load byte-for-byte.
+        let mut doc = Document::default();
+        let data = vec![137u8, 80, 78, 71, 1, 2, 3, 4, 250, 0, 99];   // fake PNG-ish bytes
+        doc.raster_images.push(RasterImage {
+            name: "site_scan.png".into(),
+            data: StdArc::new(data.clone()),
+            insert: Vec2::new(-5.0, 42.0),
+            world_w: 1408.0, world_h: 768.0,
+        });
+        let back = round_trip(&doc);
+        assert_eq!(back.raster_images.len(), 1);
+        let r = &back.raster_images[0];
+        assert_eq!(r.name, "site_scan.png");
+        assert_eq!(&*r.data, &data);
+        assert_eq!(r.insert, Vec2::new(-5.0, 42.0));
+        assert_eq!(r.world_w, 1408.0);
+        assert_eq!(r.world_h, 768.0);
     }
 
     #[test]
@@ -943,7 +1011,7 @@ mod tests {
         let inner = vec![cad_kernel::DObject::new(Geom::BlockRef(
             cad_kernel::BlockRef {
                 block: id, insert: Vec2::new(1.0, 1.0),
-                scale: 0.5, rotation: 0.25,
+                scale: 0.5, scale_y: 0.5, rotation: 0.25, mirror_x: false,
                 param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
             }))];
         doc.blocks.add(cad_kernel::Block {
@@ -952,7 +1020,7 @@ mod tests {
         });
         doc.push(DObject::new(Geom::BlockRef(cad_kernel::BlockRef {
             block: id, insert: Vec2::new(10.0, -3.0),
-            scale: 2.0, rotation: std::f64::consts::FRAC_PI_4,
+            scale: 2.0, scale_y: 1.5, rotation: std::f64::consts::FRAC_PI_4, mirror_x: true,
             param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
         })));
 
@@ -972,7 +1040,10 @@ mod tests {
         assert_eq!(br.block, id);
         assert!((br.insert - Vec2::new(10.0, -3.0)).len() < 1e-12);
         assert!((br.scale - 2.0).abs() < 1e-12);
+        assert!((br.scale_y - 1.5).abs() < 1e-12, "scale_y must survive the v6 round-trip");
         assert!((br.rotation - std::f64::consts::FRAC_PI_4).abs() < 1e-12);
+        assert!(br.mirror_x, "mirror_x must survive the v5 round-trip");
+        assert!(!nb.mirror_x, "nested instance was not mirrored");
     }
 
     #[test]

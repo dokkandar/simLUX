@@ -92,6 +92,108 @@ pub fn solve_faces(this: &Wall, all: &[Wall]) -> Option<WallFaces> {
     Some(WallFaces { left, right })
 }
 
+/// Parametric crossing of two centerlines `a0→a1` and `b0→b1`. Returns
+/// `(u, v)` where the lines cross — `u` along a, `v` along b. `None` if parallel.
+fn centerline_cross(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> Option<(f64, f64)> {
+    let da = a1 - a0;
+    let db = b1 - b0;
+    let denom = da.x * db.y - da.y * db.x;
+    if denom.abs() < 1e-12 { return None; }
+    let dx = b0.x - a0.x;
+    let dy = b0.y - a0.y;
+    let u = (dx * db.y - dy * db.x) / denom;
+    let v = (dx * da.y - dy * da.x) / denom;
+    Some((u, v))
+}
+
+/// Interval `(t_in, t_out)` of segment `p0→p1` that lies INSIDE the convex
+/// polygon `poly` (CCW). `None` if the segment misses the polygon. Liang–Barsky
+/// against each edge's inward (left) half-plane.
+fn clip_segment_convex(p0: Vec2, p1: Vec2, poly: &[Vec2]) -> Option<(f64, f64)> {
+    let d = p1 - p0;
+    let (mut t0, mut t1) = (0.0_f64, 1.0_f64);
+    let n = poly.len();
+    for i in 0..n {
+        let a = poly[i];
+        let b = poly[(i + 1) % n];
+        let edge = b - a;
+        let nrm = Vec2::new(-edge.y, edge.x); // inward normal for a CCW polygon
+        let c0 = nrm.x * (p0.x - a.x) + nrm.y * (p0.y - a.y);
+        let den = nrm.x * d.x + nrm.y * d.y;
+        if den.abs() < 1e-12 {
+            if c0 < 0.0 { return None; } // parallel to edge and outside
+        } else {
+            let t = -c0 / den;
+            if den > 0.0 { if t > t0 { t0 = t; } } else if t < t1 { t1 = t; }
+            if t0 > t1 { return None; }
+        }
+    }
+    Some((t0, t1))
+}
+
+/// Subtract a set of `removed` (t_in, t_out) intervals from `[0,1]`, returning
+/// the surviving sub-intervals.
+fn subtract_intervals(mut removed: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    removed.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut kept = Vec::new();
+    let mut cursor = 0.0_f64;
+    for (a, b) in removed {
+        let a = a.clamp(0.0, 1.0);
+        let b = b.clamp(0.0, 1.0);
+        if a > cursor + 1e-9 { kept.push((cursor, a)); }
+        if b > cursor { cursor = b; }
+    }
+    if cursor < 1.0 - 1e-9 { kept.push((cursor, 1.0)); }
+    kept
+}
+
+/// Face footprint quad of a wall (CCW): left.a → right.a → right.b → left.b.
+fn wall_quad(w: &Wall) -> Option<[Vec2; 4]> {
+    let l = w.left_line()?;
+    let r = w.right_line()?;
+    Some([l.a, r.a, r.b, l.b])
+}
+
+/// Wall faces broken into SEGMENTS, with X-crossings cleaned: where this wall
+/// passes straight through another straight wall (both centerlines cross in
+/// each other's interior), the part of each face inside the other wall's
+/// footprint is removed — leaving a clear opening at the junction. L-corner
+/// miters from [`solve_faces`] are applied first. Returns `(left, right)` lists
+/// of face pieces. Straight walls only.
+pub fn solve_face_segments(this: &Wall, all: &[Wall]) -> Option<(Vec<(Vec2, Vec2)>, Vec<(Vec2, Vec2)>)> {
+    if this.is_curved() { return None; }
+    let faces = solve_faces(this, all)?; // L-corner mitered single segments
+
+    // Walls that this one CROSSES through (pure X: both params interior).
+    let crossers: Vec<&Wall> = all.iter().filter(|n| {
+        !same_wall(this, n) && !n.is_curved()
+            && centerline_cross(this.start, this.end, n.start, n.end)
+                .map(|(u, v)| u > 1e-6 && u < 1.0 - 1e-6 && v > 1e-6 && v < 1.0 - 1e-6)
+                .unwrap_or(false)
+    }).collect();
+
+    let trim = |seg: (Vec2, Vec2)| -> Vec<(Vec2, Vec2)> {
+        let (s0, s1) = seg;
+        let mut removed: Vec<(f64, f64)> = Vec::new();
+        for n in &crossers {
+            if let Some(quad) = wall_quad(n) {
+                if let Some((ti, to)) = clip_segment_convex(s0, s1, &quad) {
+                    // only an INTERIOR bite (a through-crossing), never an end
+                    if ti > 1e-6 && to < 1.0 - 1e-6 && to - ti > 1e-9 {
+                        removed.push((ti, to));
+                    }
+                }
+            }
+        }
+        let d = s1 - s0;
+        subtract_intervals(removed).into_iter()
+            .map(|(a, b)| (s0 + d * a, s0 + d * b))
+            .collect()
+    };
+
+    Some((trim(faces.left), trim(faces.right)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,5 +243,40 @@ mod tests {
             "A inner {:?} not shared by B {:?}", a_inner, b_ends);
         assert!(b_ends.iter().any(|p| close(*p, a_outer)),
             "A outer {:?} not shared by B {:?}", a_outer, b_ends);
+    }
+
+    #[test]
+    fn lone_wall_faces_are_single_segments() {
+        let w = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0), thickness: 2.0, style: 0, bulge: 0.0 };
+        let (l, r) = solve_face_segments(&w, &[w]).unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(r.len(), 1);
+        assert!(close(l[0].0, Vec2::new(0.0, 1.0)) && close(l[0].1, Vec2::new(10.0, 1.0)));
+    }
+
+    #[test]
+    fn x_crossing_breaks_each_face_into_two_with_a_gap() {
+        // Horizontal wall A (thickness 2) crossed mid-span by vertical wall B
+        // (thickness 4, spanning y=-10..10 at x=5). Each of A's faces must be
+        // cut into two pieces, with the gap = B's width (x = 5±2).
+        let a = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0), thickness: 2.0, style: 0, bulge: 0.0 };
+        let b = Wall { start: Vec2::new(5.0, -10.0), end: Vec2::new(5.0, 10.0), thickness: 4.0, style: 0, bulge: 0.0 };
+        let all = vec![a, b];
+        let (l, r) = solve_face_segments(&a, &all).unwrap();
+        assert_eq!(l.len(), 2, "left face should split in two, got {l:?}");
+        assert_eq!(r.len(), 2, "right face should split in two");
+        // first piece ends at x≈3, second starts at x≈7 (B half-width = 2)
+        assert!((l[0].1.x - 3.0).abs() < 1e-6, "gap start {:?}", l[0].1);
+        assert!((l[1].0.x - 7.0).abs() < 1e-6, "gap end {:?}", l[1].0);
+    }
+
+    #[test]
+    fn parallel_neighbour_does_not_trim() {
+        // A second wall running parallel and apart must NOT bite the faces.
+        let a = Wall { start: Vec2::new(0.0, 0.0), end: Vec2::new(10.0, 0.0), thickness: 2.0, style: 0, bulge: 0.0 };
+        let b = Wall { start: Vec2::new(0.0, 20.0), end: Vec2::new(10.0, 20.0), thickness: 2.0, style: 0, bulge: 0.0 };
+        let (l, r) = solve_face_segments(&a, &vec![a, b]).unwrap();
+        assert_eq!(l.len(), 1);
+        assert_eq!(r.len(), 1);
     }
 }
