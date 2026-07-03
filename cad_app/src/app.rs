@@ -4871,7 +4871,7 @@ impl CadApp {
                     self.begin_selection(SelectMode::ForSelect);
                     self.queued_op = QueuedOp::Explode;
                     self.set_prompt(
-                        "explode: select blocks / polylines / rectangles, Enter to apply  [Esc=cancel]");
+                        "explode: select blocks / walls / polylines, Enter to apply  [Esc=cancel]");
                 } else {
                     self.apply_explode();
                 }
@@ -15067,6 +15067,35 @@ impl CadApp {
                             to_add.push(DObject::with_style(g, dstyle));
                         }
                         to_remove.push(i);
+                    }
+                }
+                // Wall → its boundary "particles": the two faces (lines for a
+                // straight wall, arc-sampled polylines for a curved one) plus
+                // the two end caps — a closed outline inheriting the wall style.
+                Geom::Wall(w) => {
+                    let mk_face = |pts: &Vec<Vec2>| -> Geom {
+                        if pts.len() == 2 {
+                            Geom::Line(Line { a: pts[0], b: pts[1] })
+                        } else {
+                            Geom::Polyline(cad_kernel::Polyline {
+                                vertices: pts.iter().map(|p| cad_kernel::PolyVertex { pos: *p, bulge: 0.0 }).collect(),
+                                closed: false,
+                                widths: Vec::new(),
+                            })
+                        }
+                    };
+                    if let Some((left, right)) = w.face_polylines(48) {
+                        to_add.push(DObject::with_style(mk_face(&left), dstyle));
+                        to_add.push(DObject::with_style(mk_face(&right), dstyle));
+                        if let (Some(&l0), Some(&r0), Some(&l1), Some(&r1)) =
+                            (left.first(), right.first(), left.last(), right.last())
+                        {
+                            to_add.push(DObject::with_style(Geom::Line(Line { a: l0, b: r0 }), dstyle)); // start cap
+                            to_add.push(DObject::with_style(Geom::Line(Line { a: l1, b: r1 }), dstyle)); // end cap
+                        }
+                        to_remove.push(i);
+                    } else {
+                        skipped += 1;   // degenerate wall (start ≈ end)
                     }
                 }
                 _ => skipped += 1,   // not explodable (line/circle/arc/…)
