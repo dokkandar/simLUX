@@ -112,7 +112,7 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🔵 NOT STARTED / DEFERRED
 
-### E1. Ellipse, Ellipse-arc & Point commands don't start an interactive tool 🔴
+### E1. Ellipse, Ellipse-arc & Point commands don't start an interactive tool 🟡
 - **Symptom (session dumps 2026-07-02/03):** `ellipse` errors `usage: ellipse
   cx,cy …`, `point` errors `usage: point x,y` (both **parametric**, needing
   coords — no interactive click-tool); `ellipsearc` → `unknown command`. Because
@@ -121,9 +121,10 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
   rail — the rail dispatches the identical token.
 - **Where:** `DRAW_CMDS` tokens `ellipse` / `ellipsearc` / `point`; the parser/
   `run_command` provide no interactive tool for them.
-- **Status:** PRE-EXISTING; surfaced by the Command-Registry work (the registry
-  faithfully mirrors the arrays). **Out of scope for the registry migration** —
-  `run_command`/parser are frozen there. Needs a dedicated tool/parser fix.
+- **Status:** **ellipse/ellipsearc FIX MERGED** from dokkandar (`f15b0c6`,
+  parser.rs: bare `ellipse` enters the tool + adds `ellipsearc`) — pending owner
+  visual verification. `point` may still need its own tool. Was surfaced by the
+  Command-Registry work (the registry faithfully mirrors the arrays).
 
 ### E3. PLINE has no interactive sub-options 🔴
 - **Symptom:** while the Polyline tool is active, typing `l` runs the global
@@ -200,6 +201,14 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 ---
 
 ## ✅ RESOLVED THIS SESSION (for reference — move out when superseded)
+- **dokkandar/Auto_RASM merge (2026-07-03, `7aecd7d`..`8ecbe47`, 13 commits on
+  `windows-ui-session-2026-06-20`):** full GPU renderer (circle/arc/ellipse/line/
+  fill pipelines + APX mode + hatch cache), backend crates wholesale +
+  **cad_param & cad_raster**, ellipse parser fix (E1), hatch .pat, grips drag-only,
+  open zoom-to-fit, PLINE Esc, wall X-junction + explode, DWG open (+ Windows
+  dwgconv.cmd), raster→vector editor, parametric constraint mode. Whole workspace
+  builds green. **Pending owner visual verification of each feature.** See memory
+  `project_autorasm_dokkandar_merge`.
 - EXTEND line → tangent circle (line∩circle tangent on large/long lines) `0afaa97`
 - TTR tangent-object pick: object-snap suppressed `0afaa97`
 - DIMENSION click-pick on the dim line `68e80c7`
