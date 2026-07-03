@@ -25866,15 +25866,16 @@ impl eframe::App for CadApp {
             entries.sort_by(|a, b|
                 (a.category as u8, &a.id).cmp(&(b.category as u8, &b.id)));
             let mut text = format!("Command registry — {} entries\n\n", entries.len());
-            text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} icon\n",
-                "id", "dispatch", "title", "cat"));
+            text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} {:<22} {:<8} keywords\n",
+                "id", "dispatch", "title", "cat", "icon", "section"));
             for e in &entries {
                 let cat = match e.category {
                     crate::command::CommandCategory::Draw => "Draw",
                     crate::command::CommandCategory::Modify => "Modify",
                 };
-                text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} {:?}\n",
-                    e.id, e.dispatch, e.title, cat, e.icon));
+                text.push_str(&format!("{:<16} {:<14} {:<18} {:<7} {:<22} {:<8} [{}]\n",
+                    e.id, e.dispatch, e.title, cat, format!("{:?}", e.icon),
+                    e.section.unwrap_or("—"), e.keywords.join(", ")));
             }
             let mut open = true;
             egui::Window::new("Command registry dump")

@@ -64,6 +64,15 @@ pub struct CommandInfo {
     pub category: CommandCategory,
     /// How the command's icon is painted.
     pub icon: IconId,
+    /// Phase 5 — hand-authored UI **search terms** for the palette (`segment`,
+    /// `straight` → Line). Single-source app metadata; **NOT parser aliases**
+    /// (D6 — they never read or touch the parser). Nothing consumes these yet
+    /// (the palette does, Phase 7).
+    pub keywords: &'static [&'static str],
+    /// Phase 5 — optional sub-group *within* a category (`Category → Section →
+    /// Command`, e.g. Draw ▸ Curves ▸ Circle/Arc). `None` for all commands for
+    /// now; Phase 6 menus assign and consume it.
+    pub section: Option<&'static str>,
 }
 
 /// The metadata registry: lookup by [`CommandId`]. **Empty in Phase 1**
@@ -114,6 +123,56 @@ fn derive_title(tooltip: &str) -> String {
     }
 }
 
+/// Hand-authored UI **search keywords** per command (Phase 5), keyed on the
+/// `dispatch` token. These are app-side discovery metadata for the palette
+/// (Phase 7) — synonyms and related terms a user might type. They live in this
+/// ONE place (no drift) and are **NOT parser aliases** (D6): they never touch or
+/// read the parser. Unlisted commands get an empty slice.
+fn keywords_for(dispatch: &str) -> &'static [&'static str] {
+    match dispatch {
+        // ── Draw ─────────────────────────────────────────────────────────
+        "pointer"    => &["select", "selection", "pick", "escape"],
+        "line"       => &["segment", "straight", "edge", "draw"],
+        "pline"      => &["polyline", "connected", "chain", "multi-segment"],
+        "circle"     => &["round", "ring", "radius", "diameter"],
+        "arc"        => &["curve", "bend", "segment"],
+        "rectangle"  => &["rect", "box", "square"],
+        "ellipse"    => &["oval", "elliptical"],
+        "ellipsearc" => &["oval", "elliptical", "arc", "curve"],
+        "point"      => &["node", "dot", "vertex", "marker"],
+        "spline"     => &["curve", "nurbs", "freeform", "bezier"],
+        "wall"       => &["partition", "architectural", "double-line"],
+        "text"       => &["label", "annotation", "note", "mtext"],
+        "dim"        => &["dimension", "measure", "distance"],
+        "hatch"      => &["fill", "pattern", "shade", "crosshatch"],
+        // ── Modify ───────────────────────────────────────────────────────
+        "move"       => &["translate", "shift", "relocate"],
+        "copy"       => &["duplicate", "clone"],
+        "rotate"     => &["turn", "spin", "angle"],
+        "scale"      => &["resize", "size"],
+        "mirror"     => &["flip", "reflect", "symmetry"],
+        "stretch"    => &["extend", "resize", "deform"],
+        "align"      => &["arrange", "line up"],
+        "trim"       => &["cut", "clip", "shorten"],
+        "extend"     => &["lengthen", "grow", "reach"],
+        "fillet"     => &["round", "corner", "radius"],
+        "chamfer"    => &["bevel", "corner", "angle"],
+        "offset"     => &["parallel", "duplicate", "spacing"],
+        "join"       => &["merge", "connect", "weld"],
+        "break"      => &["split", "cut", "divide"],
+        "lengthen 1" => &["lengthen", "extend", "shorten", "resize"],
+        "reverse"    => &["flip", "invert", "direction"],
+        "array"      => &["grid", "pattern", "repeat", "duplicate"],
+        "matchprop"  => &["match", "properties", "copy format", "paint"],
+        "chlayer"    => &["change layer", "move layer"],
+        "erase"      => &["delete", "remove", "del"],
+        "block"      => &["group", "symbol", "make block"],
+        "insert"     => &["place", "block", "symbol"],
+        "explode"    => &["ungroup", "break apart", "separate"],
+        _            => &[],
+    }
+}
+
 /// Build the registry by DERIVING every entry from the existing rail arrays
 /// (`DRAW_CMDS` / `MODIFY_CMDS`) — the arrays stay the single source of truth
 /// (Phase 2). Called once at startup by `CadApp`. Nothing renders from the
@@ -135,6 +194,8 @@ pub fn build(
             tooltip: tooltip.to_string(),
             category: CommandCategory::Draw,
             icon: IconId::DrawGlyph(icon_id),
+            keywords: keywords_for(dispatch),
+            section: None,   // Phase 6 assigns sub-groups; none yet
         };
         reg.order.push(info.id.clone());          // canonical (array) order
         reg.commands.insert(info.id.clone(), info);
@@ -147,6 +208,8 @@ pub fn build(
             tooltip: tooltip.to_string(),
             category: CommandCategory::Modify,
             icon: IconId::ModifyGlyph(kind),
+            keywords: keywords_for(dispatch),
+            section: None,   // Phase 6 assigns sub-groups; none yet
         };
         reg.order.push(info.id.clone());
         reg.commands.insert(info.id.clone(), info);
