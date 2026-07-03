@@ -5,6 +5,7 @@ mod dbg_recorder;
 mod dock;
 mod gpu;
 mod hatch_trace;
+mod param_editor;
 mod settings;
 mod theme;
 mod varreg;
