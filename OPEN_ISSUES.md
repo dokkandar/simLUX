@@ -153,6 +153,16 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
   guide). Requested 2026-07-02; not part of the original UI/registry work.
 - **Status:** pending feature — parked for later.
 
+### R1. Command-registry Phase-2 debug dump — issue to revisit ⚪
+- **Reported (2026-07-03):** owner hit an issue with the temporary
+  **Tools ▸ Debug ▸ "Command registry dump"** window (Phase 2 verification).
+  Details to be captured when we revisit.
+- **Status:** DEFERRED by owner — **revisit after the registry migration
+  (Phases 5/6/6b/7) is finished**, then check it together. The dump is a
+  temporary diagnostic, so this does not block the registry phases.
+- **Where:** dump block in `cad_app/src/app.rs` (search `cmd_dump_open` /
+  "Command registry dump"); data from `cad_app/src/command.rs` `build()`.
+
 ### 5. Groups not persisted to `.rsm`
 - Groups are in-session only; saving/reloading drops them.
 
