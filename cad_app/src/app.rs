@@ -1090,10 +1090,12 @@ pub struct CadApp {
     command_registry:    crate::command::CommandRegistry,
     /// Temporary Phase-2 verification: Tools ▸ Debug ▸ "Command registry dump".
     cmd_dump_open:       bool,
-    /// Last method picked from a command's ▼ flyout (cmd → method key). The
-    /// rail icon renders THAT method's glyph so the button reflects the last
-    /// variant used (e.g. circle shows the 3-Point glyph after picking 3P).
-    rail_last_method:    std::collections::HashMap<String, String>,
+    /// Per-command **preferred method** (dispatch token → method key), session
+    /// level. Set by a command's ▼ flyout; APPLIED by `execute(id)` so every
+    /// surface (menu, rail, palette, shortcut) runs the remembered method. The
+    /// rail icon also renders that method's glyph. (Command line is exempt — it
+    /// runs base/explicit until the deferred command-methods track.)
+    command_method:      std::collections::HashMap<String, String>,
     dobjects_window_open: bool,
     /// Pattern args for the in-progress hatch op — set when the user
     /// runs `hatch [NAME] [scale] [angle]`, consumed by `apply_hatch`
@@ -2664,7 +2666,7 @@ impl Default for CadApp {
             modify_items,
             command_registry,
             cmd_dump_open:        false,
-            rail_last_method:    std::collections::HashMap::new(),
+            command_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
                 let mut p = crate::aci_picker::AciPickerState::default();
@@ -10201,20 +10203,25 @@ impl CadApp {
             });
     }
 
-    /// Dispatch a rail command. Most go through `run_command`; `array` opens
-    /// its own dialog instead of a command flow.
-    /// The ONE execution seam (Phase 3, COMMAND_REGISTRY_MENTOR): resolve a
-    /// registry `id` (`"draw.line"`) → its `dispatch` token and run it. EVERY UI
-    /// surface dispatches through this — **never `run_command(id)`** (an id isn't
-    /// a dispatch token; it would no-op). Defensive: an unknown/stale id is a
-    /// graceful no-op. It runs the command's **base (default) form** via
-    /// `dispatch_base` — surface-agnostic (D2): menus, palette, and shortcuts all
-    /// get the base method, matching the command line. The rail's ▼-flyout method
-    /// memory (arc/circle/fillet) is **rail-local** — it lives in the rail click
-    /// handler, NOT here, so it never leaks to other surfaces.
+    /// The ONE execution seam (COMMAND_REGISTRY_MENTOR): resolve a registry `id`
+    /// (`"draw.line"`) → its `dispatch` token and run it. EVERY UI surface
+    /// dispatches through this — **never `run_command(id)`** (an id isn't a
+    /// dispatch token; it would no-op). Defensive: an unknown/stale id is a
+    /// graceful no-op.
+    ///
+    /// It **applies the command-level preferred method** (`command_method`, set
+    /// via a ▼ flyout): if this command has a remembered method, run it
+    /// (`rail_flyout_dispatch`); otherwise the base/default form (`dispatch_base`).
+    /// So the remembered method is honored consistently from every surface —
+    /// menu, rail, palette, shortcut. (The command line is exempt; it stays
+    /// base/explicit until the deferred command-methods track.)
     fn execute(&mut self, id: &str) {
         if let Some(dispatch) = self.command_registry.get(id).map(|c| c.dispatch) {
-            self.dispatch_base(dispatch);
+            if let Some(key) = self.command_method.get(dispatch).cloned() {
+                self.rail_flyout_dispatch(dispatch, &key);
+            } else {
+                self.dispatch_base(dispatch);
+            }
         }
     }
 
@@ -10235,12 +10242,11 @@ impl CadApp {
         }
     }
 
-    /// Universal, **surface-agnostic** dispatch of a command's BASE form (the
-    /// `execute(id)` seam runs this). Handles the non-`run_command` specials
-    /// every surface shares — `pointer` → selection mode, `array` → its dialog —
-    /// and otherwise runs `run_command(cmd)`. **No method memory here** (the
-    /// arc/circle/fillet last-used-method branch is rail-local, in the rail
-    /// click handler), so menus/palette/shortcuts get the default method.
+    /// Dispatch a command's **base (default) form** — the path `execute(id)` takes
+    /// when the command has no remembered method. Handles the non-`run_command`
+    /// specials every surface shares — `pointer` → selection mode, `array` → its
+    /// dialog — and otherwise runs `run_command(cmd)`. The preferred-method branch
+    /// lives in `execute` (`command_method`), not here.
     fn dispatch_base(&mut self, cmd: &str) {
         match cmd {
             "pointer" => { self.tool = Tool::None; }   // selection mode
@@ -10255,7 +10261,7 @@ impl CadApp {
     fn rail_flyout_dispatch(&mut self, cmd: &str, key: &str) {
         // Remember the chosen method so the rail icon shows its glyph.
         if matches!(cmd, "arc" | "circle" | "fillet") {
-            self.rail_last_method.insert(cmd.to_string(), key.to_string());
+            self.command_method.insert(cmd.to_string(), key.to_string());
         }
         match cmd {
             "arc" => {
@@ -10321,7 +10327,7 @@ impl CadApp {
                     // If a method was last picked from this command's flyout,
                     // the icon renders THAT method's glyph; otherwise the base
                     // command glyph.
-                    let last_m = self.rail_last_method.get(cmd).cloned();
+                    let last_m = self.command_method.get(cmd).cloned();
                     let methods = rail_flyout_items(cmd);
                     // Tooltip: "Circle (3P)" when a method is active, else the
                     // plain command label.
@@ -10374,15 +10380,9 @@ impl CadApp {
                             ui.memory_mut(|m| m.toggle_popup(fly_id));
                         } else {
                             self.rail_active = cmd.to_string();
-                            // Rail-local method memory: a command with a
-                            // remembered ▼-flyout method (arc/circle/fillet) runs
-                            // in that method; otherwise the base command via the
-                            // shared, surface-agnostic execute(id) seam.
-                            if let Some(key) = self.rail_last_method.get(cmd).cloned() {
-                                self.rail_flyout_dispatch(cmd, &key);
-                            } else {
-                                self.execute(id);
-                            }
+                            // execute(id) applies the command's remembered method
+                            // (command_method) itself — no rail-only branch needed.
+                            self.execute(id);
                         }
                     }
                     // Method flyout — a SQUARE popup to the RIGHT of the icon,
