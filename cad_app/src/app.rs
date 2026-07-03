@@ -11920,8 +11920,24 @@ impl CadApp {
                     return;
                 }
             }
+        } else if lower.ends_with(".dwg") {
+            // DWG isn't read natively — convert to DXF via the external
+            // converter (ACadSharp), then parse the DXF.
+            match self.convert_dwg_to_dxf(path) {
+                Ok(dxf) => match std::fs::read_to_string(&dxf) {
+                    Ok(text) => cad_io::dxf::read_dxf(&text),
+                    Err(e) => {
+                        self.history.push(format!("  ! open '{}' failed: {}", path, e));
+                        return;
+                    }
+                },
+                Err(e) => {
+                    self.history.push(format!("  ! DWG convert '{}': {}", path, e));
+                    return;
+                }
+            }
         } else {
-            Err(format!("unknown extension on '{}': expected .dxf or .rsm", path))
+            Err(format!("unknown extension on '{}': expected .dxf, .dwg or .rsm", path))
         };
         match doc_result {
             Ok(doc) => {
@@ -12260,9 +12276,18 @@ impl CadApp {
                         }
                     }
                     let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let lname = name.to_ascii_lowercase();
+                    // Open shows every readable drawing type (.dxf/.rsm/.dwg);
+                    // Save filters to the chosen output extension.
+                    let shows = match dlg.mode {
+                        FileDialogMode::Open =>
+                            lname.ends_with(".dxf") || lname.ends_with(".rsm")
+                            || lname.ends_with(".dwg"),
+                        FileDialogMode::Save => lname.ends_with(&dlg.ext),
+                    };
                     if is_dir {
                         dirs.push(name);
-                    } else if name.to_ascii_lowercase().ends_with(&dlg.ext) {
+                    } else if shows {
                         files.push(name);
                     }
                 }
@@ -12273,7 +12298,7 @@ impl CadApp {
         }
 
         let title = match dlg.mode {
-            FileDialogMode::Open => "Open  .dxf / .rsm",
+            FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::Save => "Save As",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
@@ -29013,4 +29038,77 @@ impl CadApp {
         }
     }
 
+}
+
+// ================= DWG open (from dokkandar/Auto_RASM, cross-platform) =================
+
+/// Locate a DWG→DXF converter. Order: `RUSTCAD_DWGCONV` env override, the repo
+/// `tools/dwgconv` wrapper (`.cmd` on Windows, `.sh` elsewhere), `~/.local/bin`,
+/// then PATH. Returns None if none found (DWG open then reports a clear error).
+fn dwg_converter() -> Option<String> {
+    if let Ok(c) = std::env::var("RUSTCAD_DWGCONV") {
+        let c = c.trim().to_string();
+        if !c.is_empty() { return Some(c); }
+    }
+    let wrapper = if cfg!(windows) { "dwgconv.cmd" } else { "dwgconv.sh" };
+    if let Ok(exe) = std::env::current_exe() {
+        for anc in exe.ancestors() {
+            let w = anc.join("tools/dwgconv").join(wrapper);
+            if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let w = std::path::Path::new(&home).join(".local/bin/dwgconv");
+        if w.is_file() { return Some(w.to_string_lossy().to_string()); }
+    }
+    for name in ["dwgconv", wrapper] {
+        if std::process::Command::new(name).output().is_ok() {
+            return Some(name.to_string());
+        }
+    }
+    None
+}
+
+/// Run the converter `conv` to turn `dwg` into `out` (a .dxf). A `{in}/{out}`
+/// template runs via the shell; a bare path is spawned directly. `.cmd`/`.bat`
+/// wrappers on Windows are launched through `cmd /c` (they are not PE exes).
+fn run_dwg_conversion(conv: &str, dwg: &str, out: &std::path::Path) -> Result<(), String> {
+    let _ = std::fs::remove_file(out);
+    let out_s = out.to_string_lossy().to_string();
+    let status = if conv.contains("{in}") {
+        let cmd = conv.replace("{in}", dwg).replace("{out}", &out_s);
+        if cfg!(windows) {
+            std::process::Command::new("cmd").arg("/c").arg(&cmd).status()
+        } else {
+            let q = |s: &str| format!("'{}'", s.replace('\'', "'\''"));
+            let shcmd = conv.replace("{in}", &q(dwg)).replace("{out}", &q(&out_s));
+            std::process::Command::new("sh").arg("-c").arg(&shcmd).status()
+        }
+    } else if cfg!(windows)
+        && (conv.to_ascii_lowercase().ends_with(".cmd")
+            || conv.to_ascii_lowercase().ends_with(".bat"))
+    {
+        std::process::Command::new("cmd").arg("/c").arg(conv).arg(dwg).arg(&out_s).status()
+    } else {
+        std::process::Command::new(conv).arg(dwg).arg(&out_s).status()
+    };
+    match status {
+        Ok(_) if out.exists() => Ok(()),
+        Ok(s) => Err(format!("converter exited {s} (no DXF produced)")),
+        Err(e) => Err(format!("could not run converter '{conv}': {e}")),
+    }
+}
+
+impl CadApp {
+    /// Convert a `.dwg` to a temp `.dxf` via the external converter (ACadSharp),
+    /// then the normal DXF reader parses it. Shared by do_open.
+    fn convert_dwg_to_dxf(&self, dwg: &str) -> Result<std::path::PathBuf, String> {
+        let conv = dwg_converter().ok_or_else(|| {
+            "no DWG converter found — set RUSTCAD_DWGCONV to \"cmd {in} {out}\" \
+             or build tools/dwgconv (see its README)".to_string()
+        })?;
+        let out = std::env::temp_dir().join("rustcad_dwg_open.dxf");
+        run_dwg_conversion(&conv, dwg, &out)?;
+        Ok(out)
+    }
 }
