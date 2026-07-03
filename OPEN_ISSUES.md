@@ -112,19 +112,40 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 
 ## 🔵 NOT STARTED / DEFERRED
 
-### E1. Ellipse & Ellipse-arc rail commands don't start an interactive tool 🔴
-- **Symptom (session dump 2026-07-02):** picking/typing `ellipse` errors
-  `usage: ellipse cx,cy …` (it's a **parametric** command needing coords, no
-  interactive click-tool); typing `ellipsearc` → `unknown command 'ellipsearc'`
-  (the parser has no such command). Because the tool never switches, the next
-  canvas click draws with the **previously-active tool** — e.g. a Rectangle.
-- **Where:** `DRAW_CMDS` dispatch tokens `("ellipse","ellipse",…)` and
-  `("ellarc","ellipsearc",…)` in `cad_app/src/app.rs`; the parser/`run_command`
-  don't provide an interactive ellipse / ellipse-arc tool for these tokens.
+### E1. Ellipse, Ellipse-arc & Point commands don't start an interactive tool 🔴
+- **Symptom (session dumps 2026-07-02/03):** `ellipse` errors `usage: ellipse
+  cx,cy …`, `point` errors `usage: point x,y` (both **parametric**, needing
+  coords — no interactive click-tool); `ellipsearc` → `unknown command`. Because
+  the tool never switches, the next canvas click draws with the **previously-
+  active tool** (e.g. a Rectangle). Same result whether typed OR clicked on the
+  rail — the rail dispatches the identical token.
+- **Where:** `DRAW_CMDS` tokens `ellipse` / `ellipsearc` / `point`; the parser/
+  `run_command` provide no interactive tool for them.
 - **Status:** PRE-EXISTING; surfaced by the Command-Registry work (the registry
   faithfully mirrors the arrays). **Out of scope for the registry migration** —
-  `run_command`/parser are frozen there. Needs a dedicated tool/parser fix
-  (add interactive ellipse + ellipse-arc tools, or correct the dispatch tokens).
+  `run_command`/parser are frozen there. Needs a dedicated tool/parser fix.
+
+### E3. PLINE has no interactive sub-options 🔴
+- **Symptom:** while the Polyline tool is active, typing `l` runs the global
+  **Line** command (parser alias `l→line`) instead of a PLINE sub-option
+  (AutoCAD: Line/Arc/Close/Undo/Length…). The tool switches to Line mid-run.
+- **Status:** PRE-EXISTING; the parser resolves single-letter aliases globally
+  and PLINE's tool state machine doesn't intercept them. Frozen (parser + tool
+  state) — separate from the registry migration.
+
+### E4. WALL tool — thickness sub-option + stale prompt line
+- **Symptom (2026-07-02):** wall prompt offers `(t = thickness)` but not a `d`
+  option the owner expects; and a **stale command-procedure line** renders above
+  the command bar/pill during the wall run.
+- **Status:** PRE-EXISTING; wall tool state machine + command-bar prompt render.
+  Frozen tool logic — separate track.
+
+### E5. DIM / osnap — vertex snap & radial dimensions
+- **Symptom (2026-07-02):** DIM snaps the two free ends of a standalone line, but
+  does NOT recognise the **shared joint vertex** of a continuous polyline;
+  picking an **arc/circle** gives no radial (radius) dimension.
+- **Status:** PRE-EXISTING; DIM tool + object-snap logic (related to E2). Frozen
+  tool/snap code — separate track.
 
 ### E2. DObject-snap extension / tracking lines not implemented
 - **Symptom:** object snaps don't project **extension lines** (AutoCAD-style
