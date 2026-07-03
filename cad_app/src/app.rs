@@ -27435,25 +27435,27 @@ fn wall_insulation_wave(w: &cad_kernel::Wall) -> Vec<Vec2> {
     out
 }
 
+/// Screen-space face polylines for a wall, as LISTS of pieces per side. A
+/// straight wall is normally one piece per side, but an X-crossing splits a
+/// face into several disjoint segments (the opening at the junction). Curved
+/// walls return one sampled polyline per side.
 fn wall_face_screen_pts(
     app:  &CadApp,
     rect: egui::Rect,
     w:    &cad_kernel::Wall,
-) -> (Vec<egui::Pos2>, Vec<egui::Pos2>) {
+) -> (Vec<Vec<egui::Pos2>>, Vec<Vec<egui::Pos2>>) {
     if w.is_curved() {
         let n = match cad_kernel::bulge_arc(w.start, w.end, w.bulge) {
             Some((_c, r, _a0, sweep)) => {
-                // Samples proportional to the on-screen OUTER arc length.
-                let arc_px = ((r + w.thickness * 0.5) * sweep.abs()) as f32
-                    * app.scale;
+                let arc_px = ((r + w.thickness * 0.5) * sweep.abs()) as f32 * app.scale;
                 (arc_px * 0.25).clamp(12.0, 256.0) as usize
             }
             None => 28,
         };
         match w.face_polylines(n) {
             Some((l, r)) => (
-                l.iter().map(|p| app.w2s(*p, rect)).collect(),
-                r.iter().map(|p| app.w2s(*p, rect)).collect(),
+                vec![l.iter().map(|p| app.w2s(*p, rect)).collect()],
+                vec![r.iter().map(|p| app.w2s(*p, rect)).collect()],
             ),
             None => (Vec::new(), Vec::new()),
         }
@@ -27462,15 +27464,15 @@ fn wall_face_screen_pts(
             .filter_map(|d| if let Geom::Wall(x) = &d.geom {
                 Some(x.clone()) } else { None })
             .collect();
-        match cad_wall::solve_faces(w, &walls) {
-            Some(f) => (
-                vec![app.w2s(f.left.0, rect),  app.w2s(f.left.1, rect)],
-                vec![app.w2s(f.right.0, rect), app.w2s(f.right.1, rect)],
-            ),
+        let to_screen = |segs: Vec<(Vec2, Vec2)>| -> Vec<Vec<egui::Pos2>> {
+            segs.iter().map(|(a, b)| vec![app.w2s(*a, rect), app.w2s(*b, rect)]).collect()
+        };
+        match cad_wall::solve_face_segments(w, &walls) {
+            Some((ls, rs)) => (to_screen(ls), to_screen(rs)),
             None => match (w.left_line(), w.right_line()) {
                 (Some(l), Some(r)) => (
-                    vec![app.w2s(l.a, rect), app.w2s(l.b, rect)],
-                    vec![app.w2s(r.a, rect), app.w2s(r.b, rect)],
+                    vec![vec![app.w2s(l.a, rect), app.w2s(l.b, rect)]],
+                    vec![vec![app.w2s(r.a, rect), app.w2s(r.b, rect)]],
                 ),
                 _ => (Vec::new(), Vec::new()),
             },
@@ -27596,36 +27598,39 @@ fn draw_dobject_thick(
             let face_stroke = egui::Stroke::new(width, face_col);
             let fill_aci = wstyle.map(|s| s.fill_color).unwrap_or(0);
 
-            // Faces from the shared derivation (mitred straights / exact
-            // concentric curved arcs, zoom-adaptive samples).
-            let (left_pts, right_pts) = wall_face_screen_pts(app, rect, w);
+            // Faces from the shared derivation (mitred straights, X-crossing
+            // cleaned, or exact concentric curved arcs). Each side is a LIST of
+            // pieces (a crossing splits a face at the junction opening).
+            let (left_faces, right_faces) = wall_face_screen_pts(app, rect, w);
 
-            // Poché fill — triangle-strip mesh between the two face
-            // polylines. One path for BOTH the straight quad and the
-            // concave curved band; shared vertices, so no AA seams
-            // between segments.
+            // Poché fill — only when the band is a single un-broken quad/strip
+            // (no crossing); a split face has an ambiguous interior, skip it.
             if fill_aci != 0
-                && left_pts.len() >= 2
-                && left_pts.len() == right_pts.len()
+                && left_faces.len() == 1 && right_faces.len() == 1
+                && left_faces[0].len() >= 2
+                && left_faces[0].len() == right_faces[0].len()
             {
+                let (lp, rp) = (&left_faces[0], &right_faces[0]);
                 let (fr, fg, fb) = aci_palette(fill_aci.min(255) as u8);
                 let fill = egui::Color32::from_rgba_unmultiplied(fr, fg, fb, 80);
                 let mut mesh = egui::Mesh::default();
-                for i in 0..left_pts.len() {
-                    mesh.colored_vertex(left_pts[i],  fill);
-                    mesh.colored_vertex(right_pts[i], fill);
+                for i in 0..lp.len() {
+                    mesh.colored_vertex(lp[i], fill);
+                    mesh.colored_vertex(rp[i], fill);
                 }
-                for i in 0..left_pts.len() - 1 {
+                for i in 0..lp.len() - 1 {
                     let a = (2 * i) as u32;
                     mesh.add_triangle(a, a + 1, a + 2);
                     mesh.add_triangle(a + 1, a + 3, a + 2);
                 }
                 painter.add(egui::Shape::mesh(mesh));
             }
-            // Faces.
-            let n_face = left_pts.len();
-            if left_pts.len()  >= 2 { painter.add(egui::Shape::line(left_pts,  face_stroke)); }
-            if right_pts.len() >= 2 { painter.add(egui::Shape::line(right_pts, face_stroke)); }
+            // Faces — draw every piece.
+            let n_face = left_faces.iter().chain(right_faces.iter())
+                .map(|p| p.len()).max().unwrap_or(2);
+            for pl in left_faces.into_iter().chain(right_faces.into_iter()) {
+                if pl.len() >= 2 { painter.add(egui::Shape::line(pl, face_stroke)); }
+            }
 
             // Batt-INSULATION symbol (sine wave) in the cavity.
             if wstyle.map(|s| s.insulation).unwrap_or(false) {
@@ -28401,9 +28406,10 @@ fn draw_dobject_dashed(
             // the highlight matches what is actually drawn. The old
             // left_line()/right_line() chords showed straight dashes
             // across curved walls.
-            let (l_pts, r_pts) = wall_face_screen_pts(app, rect, w);
-            if l_pts.len() >= 2 { push_dashed(l_pts); }
-            if r_pts.len() >= 2 { push_dashed(r_pts); }
+            let (l_faces, r_faces) = wall_face_screen_pts(app, rect, w);
+            for pl in l_faces.into_iter().chain(r_faces.into_iter()) {
+                if pl.len() >= 2 { push_dashed(pl); }
+            }
         }
         Geom::Text(t) => {
             // Dashed-selection overlay on Text isn't a dashed string
