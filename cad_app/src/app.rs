@@ -22840,30 +22840,24 @@ impl eframe::App for CadApp {
             // when egui later reports a tiny accidental drag_stopped.
             let drag_was_a_click = drag_was_a_click && !press_fires_click;
             // ---- Grip drag handling (v2: per-grip role semantics) -----------
-            // Two ways to grab a grip in pointer mode + GrpEnb:
-            //   (a) press-and-drag (release = commit)
-            //   (b) click-to-grab → cursor moves → click again to place
-            // Both paths set self.grip_drag with the GripRole; the kernel's
+            // Grips are DRAG-ONLY: press on a grip → drag → release commits.
+            // (Click-to-grab/click-to-place was removed: a plain click near a
+            // grip silently armed a stretch and a later stray click anywhere
+            // warped the dobject. A drag is an explicit, unambiguous gesture
+            // that a stray click can never trigger.) The kernel's
             // Geom::with_grip_moved() decides what changes (e.g. circle
             // quadrant → radius; line midpoint → translate whole line).
             let mut grip_drag_consumed_click = false;
             if pointer_mode_idle && self.env.GrpEnb && !rt_zoom {
                 let drag_started = resp.drag_started_by(egui::PointerButton::Primary)
                     && !canvas_locked;
-                // (a) Drag-grab: a primary-button drag begins near a grip.
-                // (b) Click-grab: a clicked() event lands near a grip AND
-                //     no grip is currently held.
-                //
-                // BUT NOT on the RELEASE tail of a press-fires-click gesture:
-                // a point-pick phase (block base / insert point) captures on
-                // PRESS and clears its phase flag, so by the release frame
-                // `pointer_mode_idle` has flipped back true and the release's
-                // `clicked()` would spuriously grab a grip. `pending_release_
-                // swallow` (set on the press, still set here on the release
-                // since the swallow bookkeeping runs LATER this frame) marks
-                // exactly that tail — the same guard the click cascade uses.
-                let try_grab = !self.pending_release_swallow
-                    && (drag_started || (click_now && self.grip_drag.is_none()));
+                // Drag-grab ONLY: a primary-button drag that begins near a grip.
+                // There is no click-grab (a plain click must never arm a grip —
+                // that was the warp bug). `pending_release_swallow` still guards
+                // the release tail of a press-fires-click gesture (a point-pick
+                // phase captures on PRESS; without this the release frame could
+                // spuriously start a grip).
+                let try_grab = !self.pending_release_swallow && drag_started;
                 if try_grab && self.grip_drag.is_none() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let cur_world = self.s2w(pos, rect);
@@ -22892,12 +22886,10 @@ impl eframe::App for CadApp {
                         }
                     }
                 }
-                // Commit on drag_stopped (path a) OR on a subsequent click
-                // anywhere on the canvas (path b).
+                // Commit on drag_stopped — releasing the drag ends the grip move.
                 if let Some(gd) = self.grip_drag {
-                    let drag_release  = resp.drag_stopped_by(egui::PointerButton::Primary);
-                    let click_release = click_now && !grip_drag_consumed_click;
-                    if drag_release || click_release {
+                    let drag_release = resp.drag_stopped_by(egui::PointerButton::Primary);
+                    if drag_release {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             // Honor running osnap (and CARD/grid) so the grip
                             // lands ON the highlighted END/MID/CEN/… instead of
@@ -22907,9 +22899,7 @@ impl eframe::App for CadApp {
                                 .unwrap_or_else(|| self.s2w(pos, rect));
                             let delta = drop_world - gd.grip_origin;
                             // Suppress accidental no-op drags (tiny mouse
-                            // jitter). Click-grab pairs may legitimately
-                            // have zero motion if user clicks twice on the
-                            // same spot — that's a no-op, just clear state.
+                            // jitter) — zero motion just clears the grip state.
                             if delta.len() > 1e-9 {
                                 self.snapshot_doc();
                                 if let Some(d) = self.doc.dobjects.get_mut(gd.dobject_idx) {
