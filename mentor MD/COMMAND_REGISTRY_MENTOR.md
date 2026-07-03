@@ -102,7 +102,9 @@ Supporting types:
   added when Lucide UI icons are wired in.
 - **`CommandRegistry`** — `HashMap<CommandId, CommandInfo>` for lookup, plus a
   **canonical ordered index** (`Vec<CommandId>` in source order) so `by_category`
-  is deterministic for menus. Rail order is separate (user-custom, in `draw_items`).
+  is deterministic for **enumeration surfaces** (palette / filtered views). **Menus and
+  rails do NOT use `by_category`** — each has its own curated ordered id-list (config):
+  rails = `draw_items`; menus = a per-menu `&[CommandId]` list (Phase 6).
 - **`Ctx`** — a read-only projection (D7), built once per frame by `CadApp`, holding
   only what predicates read (selection, active tool, clipboard, snap, mode).
 
@@ -190,19 +192,26 @@ context); no `aliases` field (D6).
 **Exit:** registry carries `keywords` + `section`; execution/parser untouched.
 
 ### Phase 6 — Convert menus (Draw & Modify only)
-Generate the **plain command buttons** of the Draw and Modify menus from the
-registry. Other menus (File/Edit/View/…) stay hand-authored — their items aren't
-registry commands.
-1. **Ordered `by_category`** — iterate the canonical ordered index, not raw
-   HashMap order (which is random). Menus use canonical order; rails keep their
-   custom order.
-2. **Hybrid, not flat** — convert only the plain command items; keep dialogs
-   (`Hatch…`, `Block…`, `Array…`), the `Insert Block ▸` submenu, separators, and
-   specials (`Wall`, `Inspector…`) hand-authored and interleaved.
-3. **Render `title`, dispatch via `execute(id)`** — menu labels use `title` (never
-   `dispatch`; keeps text localizable), and clicks go through the seam.
-**Exit:** plain commands render in canonical order; all special items preserved;
-other menus untouched; app behaves identically.
+Route the **plain command items** of the Draw and Modify menus through the registry,
+**preserving each menu's current arrangement**. Other menus (File/Edit/View/…) stay
+hand-authored — their items aren't registry commands.
+1. **Curated ordered id-list, NOT `by_category`.** A menu is a *designed arrangement*,
+   not a raw category dump (COMMAND_SYSTEM §4: the menu tree is configuration). Express
+   each menu's plain items as an explicit ordered `&[CommandId]` list — like the rails'
+   `draw_items` — preserving current order and membership, including cross-category
+   placement (e.g. `modify.block` / `modify.insert` live in the Draw menu; the id-list
+   doesn't care about category). `by_category` is for raw enumeration surfaces
+   (palette / filtered views), not the menus.
+2. **Hybrid, not flat** — only plain command items become id-list entries; keep dialogs
+   (`Hatch…`, `Block…`, `Array…`), the `Insert Block ▸` submenu, separators, and specials
+   (`Wall`, `Inspector…` — note `props` isn't a registry command) hand-authored and interleaved.
+3. **Dispatch via `execute(id)`; KEEP current labels.** Each item resolves its id →
+   `execute(id)`. Do NOT adopt registry `title`s yet — they're a temporary Phase-2 seed,
+   and adopting them would *regress* real wording (`Arc (3pt)` → `Arc`, `Change Layer to
+   Current` → `Change layer`). Menus keep their current labels until titles are properly
+   authored; then they may adopt them.
+**Exit:** plain menu items dispatch via `execute(id)` from a curated id-list; all special
+items preserved; order / membership / labels unchanged; **app behaves identically**.
 
 ### Phase 6b — Context predicates
 Turn `visible`/`enabled` into pure predicates over a read-only context (D7):
