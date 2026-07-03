@@ -123,8 +123,10 @@ Every property is one row: height **24**, separated by row-gap **8** → pitch *
 **Line Type / Line Weight specifics:**
 - **Matched preview length `L`:** the linetype dash line and the lineweight bar are the **same length**
   and **stretch together** with the field, so they stay matched at any width.
-- **Abbreviated linetype name:** first **3 letters** of the name; if the linetype has a size variant,
-  append its first letter in parentheses — e.g. `Div (s)`. **Show the full name on hover (tooltip).**
+- **Truncated linetype name:** first **10 letters** of the name (most names fit fully, e.g. `Continuous`);
+  if the linetype has a size variant, append its first letter in parentheses — e.g. `Divide (s)`; names
+  longer than 10 truncate. **Show the full name on hover (tooltip).** *(Revised from 3→10 letters, 2026-07-02,
+  to match the shipped build — 3 was too cryptic and the field has the room.)*
 
 ### 5.1 Coordinate block (GEOMETRY)
 ```
