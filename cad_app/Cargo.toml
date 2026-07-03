@@ -11,6 +11,9 @@ path = "src/main.rs"
 cad_kernel = { path = "../cad_kernel" }
 cad_io     = { path = "../cad_io" }
 cad_wall   = { path = "../cad_wall" }
+cad_raster = { path = "../cad_raster" }
+cad_param  = { path = "../cad_param" }
+image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }
 # Base eframe features shared across platforms. The Linux windowing backends
 # (wayland/x11) are added only on Linux below — on Windows eframe uses the
 # native Win32 backend automatically and those crates don't compile.
@@ -18,8 +21,8 @@ eframe     = { version = "0.30", default-features = false, features = ["default_
 egui       = "0.30"
 egui_glow  = "0.30"
 glow       = "0.14"
-# Logo: SVG (vector → crisp at any size) via resvg, with PNG as a fallback.
-image      = { version = "0.25", default-features = false, features = ["png"] }
+# Logo: SVG (vector → crisp at any size) via resvg; PNG fallback uses the
+# `image` dependency above (its feature set already includes "png").
 resvg      = { version = "0.44", default-features = false }
 
 # Linux-only windowing backends (the original Arch Linux build used these).
