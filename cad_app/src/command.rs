@@ -74,17 +74,32 @@ pub struct CommandInfo {
 #[derive(Default)]
 pub struct CommandRegistry {
     pub commands: HashMap<CommandId, CommandInfo>,
+    /// Canonical order (seed / array order) — populated in [`build`]. A raw
+    /// `HashMap` iterates randomly, so ordered surfaces (menus, the add-tool
+    /// list) iterate THIS, filtered. Rails keep their own custom order in
+    /// `draw_items` / `modify_items`. (Two orders: canonical vs custom.)
+    pub order: Vec<CommandId>,
 }
 
 impl CommandRegistry {
     /// A new, empty registry.
     pub fn new() -> Self {
-        Self { commands: HashMap::new() }
+        Self { commands: HashMap::new(), order: Vec::new() }
     }
 
     /// Defensive lookup by id — `None` for a stale / unknown id (never panics).
     pub fn get(&self, id: &str) -> Option<&CommandInfo> {
         self.commands.get(id)
+    }
+
+    /// Ids of one category in canonical (seed) order — for the add-tool list and
+    /// (later) menu generation. Iterates [`Self::order`], never the HashMap.
+    pub fn by_category(&self, cat: CommandCategory) -> Vec<CommandId> {
+        self.order
+            .iter()
+            .filter(|id| self.commands.get(*id).map(|c| c.category) == Some(cat))
+            .cloned()
+            .collect()
     }
 }
 
@@ -121,6 +136,7 @@ pub fn build(
             category: CommandCategory::Draw,
             icon: IconId::DrawGlyph(icon_id),
         };
+        reg.order.push(info.id.clone());          // canonical (array) order
         reg.commands.insert(info.id.clone(), info);
     }
     for &(kind, dispatch, tooltip) in modify {
@@ -132,6 +148,7 @@ pub fn build(
             category: CommandCategory::Modify,
             icon: IconId::ModifyGlyph(kind),
         };
+        reg.order.push(info.id.clone());
         reg.commands.insert(info.id.clone(), info);
     }
     reg

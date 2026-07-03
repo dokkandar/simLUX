@@ -1071,18 +1071,19 @@ pub struct CadApp {
     draw_rail_dock_state:   crate::dock::DockState,
     modify_rail_dock_state: crate::dock::DockState,
     rail_active:         String,
-    /// Two-click rail-icon remove: which `(is_draw, idx)` is armed for the
+    /// Two-click rail-icon remove: which `(is_draw, id)` is armed for the
     /// "Confirm — remove" second click. Reset when a menu re-opens.
-    rail_remove_confirm: Option<(bool, usize)>,
+    rail_remove_confirm: Option<(bool, crate::command::CommandId)>,
     /// Last docked rail's panel height (menu→status, captured each frame). Drives
     /// the 1-vs-2-column decision from the rail's OWN stable height — NOT the
     /// canvas, which shrinks when the command bar docks (so docking the command
     /// bar no longer reflows the rails).
     rail_panel_h:        f32,
-    /// Per-rail visible command lists (indices into DRAW_CMDS / MODIFY_CMDS)
-    /// so the user can delete (right-click) and re-add (+) commands.
-    draw_items:          Vec<usize>,
-    modify_items:        Vec<usize>,
+    /// Per-rail visible command lists — **registry ids** (`"draw.line"`), the
+    /// user-custom order (Phase 3). `registry.get(id)` supplies icon/tooltip;
+    /// order lives in the Vec. So the user can delete (right-click) / re-add (+).
+    draw_items:          Vec<crate::command::CommandId>,
+    modify_items:        Vec<crate::command::CommandId>,
     /// Command metadata registry (COMMAND_REGISTRY_MENTOR). Derived from
     /// `DRAW_CMDS`/`MODIFY_CMDS` at startup (Phase 2). Nothing renders/executes
     /// from it yet; rails still read the arrays until Phase 3.
@@ -2615,6 +2616,12 @@ pub enum AciPickRequest {
 
 impl Default for CadApp {
     fn default() -> Self {
+        // Build the command registry from the seed arrays FIRST, then derive the
+        // default rail lists as ids in canonical (array) order (Phase 3). One
+        // source: the arrays → registry → item ids.
+        let command_registry = crate::command::build(DRAW_CMDS, MODIFY_CMDS);
+        let draw_items   = command_registry.by_category(crate::command::CommandCategory::Draw);
+        let modify_items = command_registry.by_category(crate::command::CommandCategory::Modify);
         let mut s = Self {
             doc:           Document::default(),
             intersections: Vec::new(),
@@ -2653,9 +2660,9 @@ impl Default for CadApp {
             rail_active:         "line".to_string(),
             rail_remove_confirm: None,
             rail_panel_h:        600.0,
-            draw_items:          (0..DRAW_CMDS.len()).collect(),
-            modify_items:        (0..MODIFY_CMDS.len()).collect(),
-            command_registry:    crate::command::build(DRAW_CMDS, MODIFY_CMDS),
+            draw_items,
+            modify_items,
+            command_registry,
             cmd_dump_open:        false,
             rail_last_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
@@ -10196,6 +10203,20 @@ impl CadApp {
 
     /// Dispatch a rail command. Most go through `run_command`; `array` opens
     /// its own dialog instead of a command flow.
+    /// The ONE execution seam (Phase 3, COMMAND_REGISTRY_MENTOR): resolve a
+    /// registry `id` (`"draw.line"`) → its `dispatch` token and run it. EVERY UI
+    /// surface dispatches through this — **never `run_command(id)`** (an id isn't
+    /// a dispatch token; it would no-op). Defensive: an unknown/stale id is a
+    /// graceful no-op. Today it hands off to the rail's existing dispatch edge
+    /// (`rail_dispatch` → `run_command(cmd.dispatch)` plus the rail's
+    /// pointer/array/last-method handling); a future executor change touches
+    /// ONLY this helper.
+    fn execute(&mut self, id: &str) {
+        if let Some(dispatch) = self.command_registry.get(id).map(|c| c.dispatch) {
+            self.rail_dispatch(dispatch);
+        }
+    }
+
     fn rail_dispatch(&mut self, cmd: &str) {
         // A command with a remembered method (chosen via the ▼ flyout or a
         // shortkey) RUNS in that method by default — the last-used method is
@@ -10262,7 +10283,7 @@ impl CadApp {
     /// bounded (docked panel height, or the floating rail's set_height).
     fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize) {
         let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
-        let mut del: Option<usize> = None;
+        let mut del: Option<crate::command::CommandId> = None;
         // (from_slot, to_slot) when an icon is dropped onto another to reorder.
         let mut reorder: Option<(usize, usize)> = None;
         // Icons flow top-to-bottom in `cols` columns (1 or 2) — NO scrollbar; the
@@ -10274,9 +10295,14 @@ impl CadApp {
         egui::Grid::new(if is_draw { "rail_grid_draw" } else { "rail_grid_modify" })
             .spacing(egui::vec2(4.0, 4.0))
             .show(ui, |ui| {
-                for (pos, &idx) in items.iter().enumerate() {
-                    let (cmd, nm) = if is_draw { (DRAW_CMDS[idx].1, DRAW_CMDS[idx].2) }
-                                    else { (MODIFY_CMDS[idx].1, MODIFY_CMDS[idx].2) };
+                for (pos, id) in items.iter().enumerate() {
+                    // Defensive lookup (Phase 3): a stale/unknown id is SKIPPED on
+                    // render, never a panic. cmd = dispatch token · nm = tooltip.
+                    let (cmd, nm_owned, icon) = match self.command_registry.get(id) {
+                        Some(info) => (info.dispatch, info.tooltip.clone(), info.icon),
+                        None => continue,
+                    };
+                    let nm: &str = &nm_owned;
                     let active = self.rail_active == cmd;
                     // If a method was last picked from this command's flyout,
                     // the icon renders THAT method's glyph; otherwise the base
@@ -10300,8 +10326,12 @@ impl CadApp {
                             draw_method_glyph(p, c, cmd, k, pen, ink);
                         } else {
                             let dot = |q| { p.circle_filled(q, 1.6, ink); };
-                            if is_draw { draw_draw_glyph(p, c, DRAW_CMDS[idx].0, pen, dot, ink); }
-                            else { draw_cmd_glyph(p, c, MODIFY_CMDS[idx].0, pen, dot, ink); }
+                            match icon {
+                                crate::command::IconId::DrawGlyph(s) =>
+                                    draw_draw_glyph(p, c, s, pen, dot, ink),
+                                crate::command::IconId::ModifyGlyph(k) =>
+                                    draw_cmd_glyph(p, c, k, pen, dot, ink),
+                            }
                         }
                     });
                     // Arm the drag payload only while THIS icon is being dragged.
@@ -10310,7 +10340,7 @@ impl CadApp {
                     // (arc, circle, fillet) get a small triangle in the
                     // bottom-right corner. A click there opens the method list;
                     // a click anywhere else on the icon runs the default command.
-                    let fly_id = ui.make_persistent_id(("rail_fly", is_draw, idx));
+                    let fly_id = ui.make_persistent_id(("rail_fly", id.as_str()));
                     let corner = egui::Rect::from_min_max(
                         egui::pos2(resp.rect.right() - 12.0, resp.rect.bottom() - 12.0),
                         resp.rect.right_bottom());
@@ -10330,7 +10360,7 @@ impl CadApp {
                             ui.memory_mut(|m| m.toggle_popup(fly_id));
                         } else {
                             self.rail_active = cmd.to_string();
-                            self.rail_dispatch(cmd);
+                            self.execute(id);   // id-based execution seam
                         }
                     }
                     // Method flyout — a SQUARE popup to the RIGHT of the icon,
@@ -10413,7 +10443,8 @@ impl CadApp {
                         // Two CLICKS in place (no hover submenu): click "Remove X"
                         // and the row swaps to a red "Confirm — remove X"; click
                         // that to actually remove. Click-outside cancels.
-                        let confirming = self.rail_remove_confirm == Some((is_draw, idx));
+                        let confirming = matches!(&self.rail_remove_confirm,
+                            Some((d, i)) if *d == is_draw && i == id);
                         let (txt, col) = if confirming {
                             (format!("Confirm — remove  {}", short), crate::theme::color::DANGER)
                         } else {
@@ -10424,11 +10455,11 @@ impl CadApp {
                             .on_hover_cursor(egui::CursorIcon::PointingHand);
                         if item.clicked() {
                             if confirming {
-                                del = Some(idx);
+                                del = Some(id.clone());
                                 self.rail_remove_confirm = None;
                                 ui.close_menu();
                             } else {
-                                self.rail_remove_confirm = Some((is_draw, idx));
+                                self.rail_remove_confirm = Some((is_draw, id.clone()));
                             }
                         }
                         pp_cap_ui(ui, &format!("rail remove menu · {}", short));
@@ -10445,9 +10476,9 @@ impl CadApp {
                 v.insert(to, x);
             }
         }
-        if let Some(idx) = del {
-            if is_draw { self.draw_items.retain(|&x| x != idx); }
-            else { self.modify_items.retain(|&x| x != idx); }
+        if let Some(d) = del {
+            if is_draw { self.draw_items.retain(|x| x != &d); }
+            else { self.modify_items.retain(|x| x != &d); }
         }
         // ---- footer band (same chrome look as the header) PINNED to the bottom
         // so both rails' footers line up; the gap above it varies with each
@@ -10455,7 +10486,7 @@ impl CadApp {
         let footer_h = 58.0;
         let pad = (ui.available_height() - footer_h).max(0.0);
         ui.add_space(pad);
-        let mut add: Option<usize> = None;
+        let mut add: Option<crate::command::CommandId> = None;
         let fr = egui::Frame::none()
             .fill(crate::theme::color::CHROME)
             .inner_margin(egui::Margin { left: 4.0, right: 4.0, top: 6.0, bottom: 10.0 })
@@ -10473,8 +10504,21 @@ impl CadApp {
                 v.window_fill = PP_BG_LO;
                 v.window_stroke = egui::Stroke::new(1.0, PP_BORDER);
             }
-            let present: std::collections::HashSet<usize> = items.iter().copied().collect();
-            let n = if is_draw { DRAW_CMDS.len() } else { MODIFY_CMDS.len() };
+            let present: std::collections::HashSet<&str> =
+                items.iter().map(|s| s.as_str()).collect();
+            let cat = if is_draw { crate::command::CommandCategory::Draw }
+                      else { crate::command::CommandCategory::Modify };
+            // Precompute (id, short-name, icon) so the popup closure needs no
+            // registry borrow. "Available tools" = by_category (canonical order),
+            // defensively filtered.
+            let available: Vec<(crate::command::CommandId, String, crate::command::IconId)> =
+                self.command_registry.by_category(cat).into_iter()
+                    .filter_map(|aid| self.command_registry.get(&aid).map(|info| {
+                        let short = info.tooltip.split("  ").next()
+                            .unwrap_or(&info.tooltip).to_string();
+                        (aid, short, info.icon)
+                    }))
+                    .collect();
             egui::popup_above_or_below_widget(ui, popup_id, &plus,
                 egui::AboveOrBelow::Above, egui::PopupCloseBehavior::CloseOnClickOutside, |ui| {
                     ui.set_min_width(252.0);
@@ -10482,10 +10526,9 @@ impl CadApp {
                         .small().color(PP_LABEL));
                     ui.add_space(3.0);
                     egui::Grid::new("rail_add_grid").spacing([5.0, 5.0]).show(ui, |ui| {
-                        for j in 0..n {
-                            let on_rail = present.contains(&j);
-                            let nm = if is_draw { DRAW_CMDS[j].2 } else { MODIFY_CMDS[j].2 };
-                            let short = nm.split("  ").next().unwrap_or(nm);
+                        for (gi, (aid, short, icon)) in available.iter().enumerate() {
+                            let on_rail = present.contains(aid.as_str());
+                            let short = short.as_str();
                             let sense = if on_rail { egui::Sense::hover() } else { egui::Sense::click() };
                             let (r, painter) = ui.allocate_painter(egui::vec2(46.0, 42.0), sense);
                             let rect = r.rect;
@@ -10505,15 +10548,19 @@ impl CadApp {
                             let pen = egui::Stroke::new(1.6, ink);
                             let c = rect.center() - egui::vec2(0.0, 5.0);
                             let dot = |q| { painter.circle_filled(q, 1.5, ink); };
-                            if is_draw { draw_draw_glyph(&painter, c, DRAW_CMDS[j].0, pen, dot, ink); }
-                            else { draw_cmd_glyph(&painter, c, MODIFY_CMDS[j].0, pen, dot, ink); }
+                            match *icon {
+                                crate::command::IconId::DrawGlyph(s) =>
+                                    draw_draw_glyph(&painter, c, s, pen, dot, ink),
+                                crate::command::IconId::ModifyGlyph(k) =>
+                                    draw_cmd_glyph(&painter, c, k, pen, dot, ink),
+                            }
                             painter.text(egui::pos2(rect.center().x, rect.bottom() - 6.0),
                                 egui::Align2::CENTER_CENTER, short, egui::FontId::proportional(7.5), ink);
                             if !on_rail && r.on_hover_cursor(egui::CursorIcon::PointingHand).clicked() {
-                                add = Some(j);
+                                add = Some(aid.clone());
                             }
                             pp_capture(ui, &format!("rail add tile · {}", short), rect);
-                            if (j + 1) % 5 == 0 { ui.end_row(); }
+                            if (gi + 1) % 5 == 0 { ui.end_row(); }
                         }
                     });
                     pp_cap_ui(ui, "rail add popup");
@@ -10521,17 +10568,18 @@ impl CadApp {
             let reset = text_button(ui, "reset", 11.0);
             pp_capture(ui, "rail footer · reset", reset.rect);
             if reset.clicked() {
-                if is_draw { self.draw_items = (0..DRAW_CMDS.len()).collect(); }
-                else { self.modify_items = (0..MODIFY_CMDS.len()).collect(); }
+                // Reset = default rail (all commands of this category, canonical order).
+                let ids = self.command_registry.by_category(cat);
+                if is_draw { self.draw_items = ids; } else { self.modify_items = ids; }
             }
         });
             });
         // Top hairline — mirrors the header's bottom border.
         ui.painter().hline(fr.response.rect.x_range(), fr.response.rect.top(),
             egui::Stroke::new(1.0, crate::theme::color::BORDER));
-        if let Some(j) = add {
-            if is_draw { if !self.draw_items.contains(&j) { self.draw_items.push(j); } }
-            else if !self.modify_items.contains(&j) { self.modify_items.push(j); }
+        if let Some(aid) = add {
+            if is_draw { if !self.draw_items.contains(&aid) { self.draw_items.push(aid); } }
+            else if !self.modify_items.contains(&aid) { self.modify_items.push(aid); }
         }
     }
 
