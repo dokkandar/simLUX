@@ -10242,6 +10242,36 @@ impl CadApp {
         }
     }
 
+    /// The ONE canonical short-code (`"3P"`, `"CR"`, `"F"`, …) for a command's
+    /// CURRENT method — the remembered `command_method`, or the command's default
+    /// (first ▼-flyout item) when none is set. Sourced from `rail_flyout_items` /
+    /// `ArcMethod::short()` so the rail flyout, rail tooltip, and menus all use
+    /// the SAME notation. Empty for commands without methods.
+    fn current_method_short(&self, cmd: &str) -> String {
+        let methods = rail_flyout_items(cmd);
+        match self.command_method.get(cmd) {
+            Some(k) => methods.iter().find(|(_, _, key)| key == k)
+                .map(|(s, _, _)| s.clone()).unwrap_or_default(),
+            None => methods.first().map(|(s, _, _)| s.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// Render an arc/circle/fillet menu item whose label reflects the CURRENT
+    /// method via the canonical short-code — e.g. `"Circle (3P)"`, `"Arc (SCE)"`.
+    /// The default method is shown explicitly (e.g. `"Circle (CR)"`), so the label
+    /// always carries a method and never flickers in/out. (This deliberately
+    /// overrides "labels verbatim" for these three commands only.) Dispatches via
+    /// the `execute(id)` seam like any plain item.
+    fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, base: &str, id: &str, cmd: &str) {
+        let short = self.current_method_short(cmd);
+        let label = if short.is_empty() { base.to_string() }
+                    else { format!("{} ({})", base, short) };
+        if ui.button(label).clicked() {
+            self.execute(id);
+            ui.close_menu();
+        }
+    }
+
     /// Dispatch a command's **base (default) form** — the path `execute(id)` takes
     /// when the command has no remembered method. Handles the non-`run_command`
     /// specials every surface shares — `pointer` → selection mode, `array` → its
@@ -20999,10 +21029,13 @@ impl eframe::App for CadApp {
                     // preserved exactly; `block`/`insert` (Modify-category) still
                     // live below via the hand-authored Block…/Insert Block ▸.
                     self.menu_cmd_items(ui, &[
-                        ("Line",        "draw.line"),
-                        ("Rectangle",   "draw.rectangle"),
-                        ("Circle",      "draw.circle"),
-                        ("Arc (3pt)",   "draw.arc"),
+                        ("Line",      "draw.line"),
+                        ("Rectangle", "draw.rectangle"),
+                    ]);
+                    // Circle / Arc — dynamic label reflecting the current method.
+                    self.menu_cmd_item_method(ui, "Circle", "draw.circle", "circle");
+                    self.menu_cmd_item_method(ui, "Arc", "draw.arc", "arc");
+                    self.menu_cmd_items(ui, &[
                         ("Ellipse",     "draw.ellipse"),
                         ("Ellipse Arc", "draw.ellipsearc"),
                         ("Polyline",    "draw.pline"),
@@ -21067,9 +21100,12 @@ impl eframe::App for CadApp {
                     ui.separator();
                     // Edit-geometry group — plain items via execute(id).
                     self.menu_cmd_items(ui, &[
-                        ("Trim",     "modify.trim"),
-                        ("Extend",   "modify.extend"),
-                        ("Fillet",   "modify.fillet"),
+                        ("Trim",   "modify.trim"),
+                        ("Extend", "modify.extend"),
+                    ]);
+                    // Fillet — dynamic label reflecting the current method.
+                    self.menu_cmd_item_method(ui, "Fillet", "modify.fillet", "fillet");
+                    self.menu_cmd_items(ui, &[
                         ("Chamfer",  "modify.chamfer"),
                         ("Offset",   "modify.offset"),
                         ("Join",     "modify.join"),
