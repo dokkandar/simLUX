@@ -1,0 +1,21 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- DWG↔DXF converter for the RUST_CAD import sandbox, built on ACadSharp
+       (C#, MIT). RUST_CAD cannot link C#; it shells out to this binary, which
+       converts the foreign format to DXF (which cad_io reads natively). -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <!-- Matches the installed SDK (dotnet-sdk 10.x on this machine). -->
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AssemblyName>dwgconv</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pin to a known version once verified; "*" pulls the latest on restore. -->
+    <PackageReference Include="ACadSharp" Version="*" />
+  </ItemGroup>
+
+</Project>
