@@ -4291,6 +4291,15 @@ impl CadApp {
             raw.to_string()
         };
         let parsed = parse(&effective);
+        // Commit-on-interrupt: starting a real command while a PLINE/SPLINE draw
+        // is in progress FINISHES it — placed vertices are never discarded.
+        // (Snap overrides are mid-draw modifiers, not interrupts; pline
+        // sub-commands were already consumed + returned above.)
+        if matches!(self.tool, Tool::Polyline | Tool::Spline)
+            && matches!(&parsed, Ok(c) if !matches!(c, Command::SnapOverride(_)))
+        {
+            self.commit_active_draw();
+        }
         // Remember the line as the "last command" for Enter-on-empty
         // repeat — ONLY on a successful parse. Set BEFORE dispatch so
         // each Ok arm can clear / overwrite it if its own semantics
@@ -17605,6 +17614,34 @@ impl CadApp {
         (min, max)
     }
 
+    /// Commit an in-progress PLINE/SPLINE as a FINISHED open dobject when the
+    /// draw is ENDED or INTERRUPTED (Enter, switching tools, or starting another
+    /// command). Placed vertices are real geometry and are NEVER discarded — a
+    /// polyline with ≥2 verts becomes an open polyline, a spline with ≥3 control
+    /// points a curve. Clears the pending draw state. Returns true if it
+    /// committed. (Esc is the ONE exception — it drops only the last segment.)
+    fn commit_active_draw(&mut self) -> bool {
+        if self.tool == Tool::Polyline && self.pending.len() >= 2 {
+            let (verts, widths) = self.drain_pline_pending(false);
+            self.add_dobject(Geom::Polyline(Polyline {
+                vertices: verts, closed: false, widths,
+            }), "canvas");
+            true
+        } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
+            // Degree-3 (cubic) clamped/open uniform B-spline through the control
+            // points; lower degree for <4 controls so the curve stays well-formed.
+            let n = self.pending.len();
+            let degree = 3.min(n - 1);
+            let ctrls: Vec<Vec2> = self.pending.drain(..).collect();
+            self.pending_bulges.clear();
+            let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
+            self.add_dobject(Geom::Spline(spline), "canvas");
+            true
+        } else {
+            false
+        }
+    }
+
     // ---- interactive draw: finalise dobject from clicked points ---------
 
     fn try_finalise(&mut self) {
@@ -20526,6 +20563,36 @@ impl eframe::App for CadApp {
 
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // PLINE/SPLINE: Esc removes ONLY the last placed vertex (the last
+            // segment), never the whole run. Whatever is already drawn stays
+            // live and commits when the command ends/interrupts (see
+            // `commit_active_draw`). Esc leaves the tool only once no vertices
+            // remain. This is the one gesture that does NOT commit.
+            if matches!(self.tool, Tool::Polyline | Tool::Spline)
+                && !self.pending.is_empty()
+            {
+                self.pending.pop();
+                if self.tool == Tool::Polyline {
+                    self.pending_bulges.pop();
+                    if !self.pending_widths.is_empty() { self.pending_widths.pop(); }
+                    self.pline_arc_sub = PlineArcSub::Normal;
+                    self.pline_dir_override = None;
+                }
+                if self.pending.is_empty() {
+                    self.pline_mode = PlineMode::Line;
+                    self.pline_width_cap = PlineWidthCap::None;
+                    self.tool = Tool::None;
+                    self.clear_prompt();
+                    self.history.push("  draw ended (no vertices left)".into());
+                } else if self.tool == Tool::Polyline {
+                    self.update_pline_prompt();
+                    self.history.push("  ⎌ removed last vertex".into());
+                } else {
+                    self.set_prompt(current_hint(self.tool, self.arc_method, self.pending.len()));
+                    self.history.push("  ⎌ removed last control point".into());
+                }
+                return;
+            }
             self.pending.clear();
             self.pending_bulges.clear();
             self.pending_widths.clear();
@@ -20938,23 +21005,13 @@ impl eframe::App for CadApp {
                 self.trim_dbg("=== EXTEND session END (Enter) ===");
                 self.extend_state = ExtendState::Off;
                 self.clear_prompt();
-            } else if self.tool == Tool::Polyline && self.pending.len() >= 2 {
-                let (verts, widths) = self.drain_pline_pending(false);
-                self.add_dobject(Geom::Polyline(Polyline {
-                    vertices: verts, closed: false, widths,
-                }), "canvas");
-            } else if self.tool == Tool::Spline && self.pending.len() >= 3 {
-                // SPLINE commit — degree-3 (cubic) clamped/open uniform
-                // NURBS through the captured control points, all
-                // weights = 1.0 (non-rational B-spline). Cubic is the
-                // CAD default; smaller pending counts get a lower
-                // effective degree to keep the curve well-formed.
-                let n = self.pending.len();
-                let degree = 3.min(n - 1);
-                let ctrls: Vec<Vec2> = self.pending.drain(..).collect();
-                self.pending_bulges.clear();
-                let spline = cad_kernel::Spline::new_bspline(degree, ctrls);
-                self.add_dobject(Geom::Spline(spline), "canvas");
+            } else if (self.tool == Tool::Polyline && self.pending.len() >= 2)
+                || (self.tool == Tool::Spline && self.pending.len() >= 3)
+            {
+                // Enter FINISHES the in-progress polyline/spline as an OPEN
+                // dobject — the same commit used on interrupt (single source of
+                // truth in `commit_active_draw`).
+                self.commit_active_draw();
             } else if self.tool == Tool::Wall && !self.pending.is_empty() {
                 // Chained wall run: each segment is committed live, so Enter
                 // just ends the run. Tool stays active for a fresh run.
