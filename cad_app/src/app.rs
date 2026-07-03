@@ -10217,6 +10217,23 @@ impl CadApp {
         }
     }
 
+    /// Render a CURATED ordered list of plain command menu items (Phase 6):
+    /// `(menu label, registry id)` pairs. The menu is a *designed arrangement*
+    /// (COMMAND_SYSTEM §4), not a `by_category` dump — order/membership are the
+    /// caller's config. Labels are kept VERBATIM (not the registry `title`,
+    /// which is a temporary Phase-2 seed); each click dispatches through the
+    /// `execute(id)` seam. Defensive: `execute` no-ops on a stale/unknown id.
+    /// Special items (dialogs, submenus, custom-tooltip / non-registry commands)
+    /// stay hand-authored and interleaved by the caller.
+    fn menu_cmd_items(&mut self, ui: &mut egui::Ui, items: &[(&str, &str)]) {
+        for &(label, id) in items {
+            if ui.button(label).clicked() {
+                self.execute(id);
+                ui.close_menu();
+            }
+        }
+    }
+
     fn rail_dispatch(&mut self, cmd: &str) {
         // A command with a remembered method (chosen via the ▼ flyout or a
         // shortkey) RUNS in that method by default — the last-used method is
@@ -20972,22 +20989,25 @@ impl eframe::App for CadApp {
                     menu_autoclose(ui, bar_rect);
                 });
                 ui.menu_button("Draw", |ui| {
-                    for (label, cmd) in [
-                        ("Line",        "line"),
-                        ("Rectangle",   "rec"),
-                        ("Circle",      "circle"),
-                        ("Arc (3pt)",   "arc"),
-                        ("Ellipse",     "ellipse"),
-                        ("Ellipse Arc", "ellipsearc"),
-                        ("Polyline",    "polyline"),
-                        ("Spline",      "spline"),
-                        ("Point",       "point"),
-                        ("Hatch…",      "hatch"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.run_command(cmd);
-                            ui.close_menu();
-                        }
+                    // Plain command items — curated id-list (COMMAND_SYSTEM §4),
+                    // labels verbatim, dispatch via execute(id). Order/membership
+                    // preserved exactly; `block`/`insert` (Modify-category) still
+                    // live below via the hand-authored Block…/Insert Block ▸.
+                    self.menu_cmd_items(ui, &[
+                        ("Line",        "draw.line"),
+                        ("Rectangle",   "draw.rectangle"),
+                        ("Circle",      "draw.circle"),
+                        ("Arc (3pt)",   "draw.arc"),
+                        ("Ellipse",     "draw.ellipse"),
+                        ("Ellipse Arc", "draw.ellipsearc"),
+                        ("Polyline",    "draw.pline"),
+                        ("Spline",      "draw.spline"),
+                        ("Point",       "draw.point"),
+                    ]);
+                    // Hatch… — dialog special, hand-authored (unchanged).
+                    if ui.button("Hatch…").clicked() {
+                        self.run_command("hatch");
+                        ui.close_menu();
                     }
                     if ui.button("Wall  (chained run — t = thickness)")
                         .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
@@ -21029,41 +21049,33 @@ impl eframe::App for CadApp {
                     pp_cap_ui(ui, "menu: Draw");
                 });
                 ui.menu_button("Modify", |ui| {
-                    // Transform group
-                    for (label, cmd) in [
-                        ("Move",     "move"),
-                        ("Copy",     "copy"),
-                        ("Rotate",   "rotate"),
-                        ("Scale",    "scale"),
-                        ("Mirror",   "mirror"),
-                        ("Stretch",  "stretch"),
-                        ("Align",    "align"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.run_command(cmd);
-                            ui.close_menu();
-                        }
-                    }
+                    // Transform group — plain items via execute(id).
+                    self.menu_cmd_items(ui, &[
+                        ("Move",     "modify.move"),
+                        ("Copy",     "modify.copy"),
+                        ("Rotate",   "modify.rotate"),
+                        ("Scale",    "modify.scale"),
+                        ("Mirror",   "modify.mirror"),
+                        ("Stretch",  "modify.stretch"),
+                        ("Align",    "modify.align"),
+                    ]);
                     ui.separator();
-                    // Edit-geometry group
-                    for (label, cmd) in [
-                        ("Trim",         "trim"),
-                        ("Extend",       "extend"),
-                        ("Fillet",       "fillet"),
-                        ("Chamfer",      "chamfer"),
-                        ("Offset",       "offset"),
-                        ("Join",         "join"),
-                        ("Break",        "break"),
-                        ("Lengthen",     "lengthen 1"),
-                        ("Reverse",      "reverse"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.run_command(cmd);
-                            ui.close_menu();
-                        }
-                    }
+                    // Edit-geometry group — plain items via execute(id).
+                    self.menu_cmd_items(ui, &[
+                        ("Trim",     "modify.trim"),
+                        ("Extend",   "modify.extend"),
+                        ("Fillet",   "modify.fillet"),
+                        ("Chamfer",  "modify.chamfer"),
+                        ("Offset",   "modify.offset"),
+                        ("Join",     "modify.join"),
+                        ("Break",    "modify.break"),
+                        ("Lengthen", "modify.lengthen 1"),
+                        ("Reverse",  "modify.reverse"),
+                    ]);
                     ui.separator();
-                    // Multi-instance / properties group
+                    // Multi-instance / properties group. Array… (dialog),
+                    // Explode (custom tooltip), Inspector… (`props` — not a
+                    // registry command) stay hand-authored, interleaved.
                     if ui.button("Array…").clicked() {
                         self.array_open = true;
                         ui.close_menu();
@@ -21085,20 +21097,12 @@ impl eframe::App for CadApp {
                         self.run_command("props");
                         ui.close_menu();
                     }
-                    for (label, cmd) in [
-                        ("Match Properties", "matchprop"),
-                        ("Change Layer to Current", "chlayer"),
-                    ] {
-                        if ui.button(label).clicked() {
-                            self.run_command(cmd);
-                            ui.close_menu();
-                        }
-                    }
+                    self.menu_cmd_items(ui, &[
+                        ("Match Properties", "modify.matchprop"),
+                        ("Change Layer to Current", "modify.chlayer"),
+                    ]);
                     ui.separator();
-                    if ui.button("Erase").clicked() {
-                        self.run_command("erase");
-                        ui.close_menu();
-                    }
+                    self.menu_cmd_items(ui, &[("Erase", "modify.erase")]);
                     pp_cap_ui(ui, "menu: Modify");
                     menu_autoclose(ui, bar_rect);
                 });
