@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use crate::app::GlyphKind;
+use crate::app::{GlyphKind, Tool};
 
 /// Stable, namespaced command identity — e.g. `"draw.line"`. This is the
 /// registry / UI / palette identity, and the value persisted in `draw_items`
@@ -43,6 +43,33 @@ pub enum CommandCategory {
     Draw,
     Modify,
 }
+
+/// Read-only **projection** of `CadApp` state for context predicates (Phase 6b,
+/// D7). Built ONCE PER FRAME by `CadApp` (via `build_ctx`) and holds ONLY copied
+/// values a predicate reads — never a `&mut CadApp`, `Rc<RefCell>`, interior
+/// mutability, or a gateway back into the app (`ctx.app.*()` is forbidden). It
+/// is `Copy`, so surfaces read a cheap snapshot. Extend it with more fields
+/// (clipboard/snap/mode/…) only as a predicate actually needs them.
+#[derive(Clone, Copy)]
+pub struct Ctx {
+    /// Number of currently-selected dobjects.
+    pub selection_count: usize,
+    /// Whether anything is selected.
+    pub has_selection: bool,
+    /// The active tool.
+    pub active_tool: Tool,
+    /// Whether the clipboard holds dobjects to paste.
+    pub has_clipboard: bool,
+}
+
+/// Default visibility predicate — the command always appears. Most commands
+/// point at this (Phase 6b: ALL do, so the app is unchanged). A `fn` POINTER,
+/// never a capturing closure (D7 — no hidden state).
+pub fn always_visible(_ctx: &Ctx) -> bool { true }
+
+/// Default enabled predicate — the command is always clickable. Most commands
+/// point at this (Phase 6b: ALL do). A `fn` pointer, never a capturing closure.
+pub fn always_enabled(_ctx: &Ctx) -> bool { true }
 
 /// Metadata that DESCRIBES a command — never how it executes.
 ///
@@ -73,6 +100,13 @@ pub struct CommandInfo {
     /// Command`, e.g. Draw ▸ Curves ▸ Circle/Arc). `None` for all commands for
     /// now; Phase 6 menus assign and consume it.
     pub section: Option<&'static str>,
+    /// Phase 6b — should the command appear at all? A pure `fn(&Ctx) -> bool`
+    /// (fn pointer, never a capturing closure). Defaults to [`always_visible`].
+    pub visible: fn(&Ctx) -> bool,
+    /// Phase 6b — is the command clickable right now? A pure `fn(&Ctx) -> bool`.
+    /// Defaults to [`always_enabled`]. UI: `if visible { if enabled { active }
+    /// else { disabled } }`.
+    pub enabled: fn(&Ctx) -> bool,
 }
 
 /// The metadata registry: lookup by [`CommandId`]. **Empty in Phase 1**
@@ -196,6 +230,8 @@ pub fn build(
             icon: IconId::DrawGlyph(icon_id),
             keywords: keywords_for(dispatch),
             section: None,   // Phase 6 assigns sub-groups; none yet
+            visible: always_visible,   // Phase 6b: all default (app unchanged)
+            enabled: always_enabled,
         };
         reg.order.push(info.id.clone());          // canonical (array) order
         reg.commands.insert(info.id.clone(), info);
@@ -210,6 +246,8 @@ pub fn build(
             icon: IconId::ModifyGlyph(kind),
             keywords: keywords_for(dispatch),
             section: None,   // Phase 6 assigns sub-groups; none yet
+            visible: always_visible,   // Phase 6b: all default (app unchanged)
+            enabled: always_enabled,
         };
         reg.order.push(info.id.clone());
         reg.commands.insert(info.id.clone(), info);

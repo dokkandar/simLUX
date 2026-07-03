@@ -410,7 +410,7 @@ fn aci_mapping_path() -> std::path::PathBuf {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall, Text, Dim, Rectangle }
+pub(crate) enum Tool { None, Line, Circle, Arc, Ellipse, EllipseArc, Point, Polyline, Spline, Wall, Text, Dim, Rectangle }
 
 /// Sub-mode for the polyline draw tool — mirrors AutoCAD PLINE's Line /
 /// Arc toggle. `a` (or `arc`) switches Line→Arc; `l` (or `line`)
@@ -10225,6 +10225,27 @@ impl CadApp {
         }
     }
 
+    /// Build the read-only [`crate::command::Ctx`] projection for context
+    /// predicates (Phase 6b) — a cheap, `Copy` snapshot of the app state a
+    /// predicate may read. Pure (`&self`): no mutation, and it hands the registry
+    /// COPIED values, never a gateway back into `CadApp` (D7). Call once per
+    /// frame; surfaces read the snapshot to filter/grey commands.
+    fn build_ctx(&self) -> crate::command::Ctx {
+        let selection_count = if !self.selection.is_empty() {
+            self.selection.len()
+        } else if self.selected.is_some() {
+            1
+        } else {
+            0
+        };
+        crate::command::Ctx {
+            selection_count,
+            has_selection: selection_count > 0,
+            active_tool: self.tool,
+            has_clipboard: !self.clipboard_dobjects.is_empty(),
+        }
+    }
+
     /// Render a CURATED ordered list of plain command menu items (Phase 6):
     /// `(menu label, registry id)` pairs. The menu is a *designed arrangement*
     /// (COMMAND_SYSTEM §4), not a `by_category` dump — order/membership are the
@@ -10233,9 +10254,17 @@ impl CadApp {
     /// `execute(id)` seam. Defensive: `execute` no-ops on a stale/unknown id.
     /// Special items (dialogs, submenus, custom-tooltip / non-registry commands)
     /// stay hand-authored and interleaved by the caller.
-    fn menu_cmd_items(&mut self, ui: &mut egui::Ui, items: &[(&str, &str)]) {
+    fn menu_cmd_items(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
+                      items: &[(&str, &str)]) {
         for &(label, id) in items {
-            if ui.button(label).clicked() {
+            // Phase 6b: apply the command's predicates. visible==false hides the
+            // item; enabled==false renders it disabled (greyed, non-clickable via
+            // add_enabled). Pure — no mutation/execution here. (All default now.)
+            let (vis, ena) = self.command_registry.get(id)
+                .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
+                .unwrap_or((false, false));
+            if !vis { continue; }
+            if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
                 self.execute(id);
                 ui.close_menu();
             }
@@ -10262,11 +10291,16 @@ impl CadApp {
     /// always carries a method and never flickers in/out. (This deliberately
     /// overrides "labels verbatim" for these three commands only.) Dispatches via
     /// the `execute(id)` seam like any plain item.
-    fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, base: &str, id: &str, cmd: &str) {
+    fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
+                            base: &str, id: &str, cmd: &str) {
+        let (vis, ena) = self.command_registry.get(id)
+            .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
+            .unwrap_or((false, false));
+        if !vis { return; }
         let short = self.current_method_short(cmd);
         let label = if short.is_empty() { base.to_string() }
                     else { format!("{} ({})", base, short) };
-        if ui.button(label).clicked() {
+        if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
             self.execute(id);
             ui.close_menu();
         }
@@ -10333,6 +10367,9 @@ impl CadApp {
     /// bounded (docked panel height, or the floating rail's set_height).
     fn rail_inner(&mut self, ui: &mut egui::Ui, is_draw: bool, cols: usize) {
         let items = if is_draw { self.draw_items.clone() } else { self.modify_items.clone() };
+        // Phase 6b: one read-only Ctx snapshot; each rail item filters/greys
+        // against its predicates (all-default now → nothing hidden/greyed).
+        let cmd_ctx = self.build_ctx();
         let mut del: Option<crate::command::CommandId> = None;
         // (from_slot, to_slot) when an icon is dropped onto another to reorder.
         let mut reorder: Option<(usize, usize)> = None;
@@ -10348,10 +10385,12 @@ impl CadApp {
                 for (pos, id) in items.iter().enumerate() {
                     // Defensive lookup (Phase 3): a stale/unknown id is SKIPPED on
                     // render, never a panic. cmd = dispatch token · nm = tooltip.
-                    let (cmd, nm_owned, icon) = match self.command_registry.get(id) {
-                        Some(info) => (info.dispatch, info.tooltip.clone(), info.icon),
+                    let (cmd, nm_owned, icon, vis, ena) = match self.command_registry.get(id) {
+                        Some(info) => (info.dispatch, info.tooltip.clone(), info.icon,
+                                       (info.visible)(&cmd_ctx), (info.enabled)(&cmd_ctx)),
                         None => continue,
                     };
+                    if !vis { continue; }   // Phase 6b: hidden by its predicate
                     let nm: &str = &nm_owned;
                     let active = self.rail_active == cmd;
                     // If a method was last picked from this command's flyout,
@@ -10384,6 +10423,12 @@ impl CadApp {
                             }
                         }
                     });
+                    // Phase 6b: a disabled command is dimmed + non-clickable
+                    // (dormant now — all commands enabled).
+                    if !ena {
+                        ui.painter().rect_filled(resp.rect, crate::theme::radius::MD,
+                            egui::Color32::from_black_alpha(120));
+                    }
                     // Arm the drag payload only while THIS icon is being dragged.
                     resp.dnd_set_drag_payload(RailDnd { is_draw, pos });
                     // ▼ method flyout: commands with multiple creation methods
@@ -10408,7 +10453,8 @@ impl CadApp {
                             && resp.interact_pointer_pos().is_some_and(|p| corner.contains(p));
                         if on_corner {
                             ui.memory_mut(|m| m.toggle_popup(fly_id));
-                        } else {
+                        } else if ena {
+                            // Phase 6b: only dispatch when enabled by its predicate.
                             self.rail_active = cmd.to_string();
                             // execute(id) applies the command's remembered method
                             // (command_method) itself — no rail-only branch needed.
@@ -20924,6 +20970,9 @@ impl eframe::App for CadApp {
                     ui.add_space(1.0);
                     // --- line 2: fixed menu categories ---
                     egui::menu::bar(ui, |ui| {
+                // Phase 6b: one read-only Ctx snapshot per frame; the registry-
+                // driven Draw/Modify items filter/grey against it (all-default now).
+                let cmd_ctx = self.build_ctx();
                 ui.menu_button("File", |ui| {
                     if ui.button("New").clicked() {
                         self.run_command("clear");
@@ -21028,14 +21077,14 @@ impl eframe::App for CadApp {
                     // labels verbatim, dispatch via execute(id). Order/membership
                     // preserved exactly; `block`/`insert` (Modify-category) still
                     // live below via the hand-authored Block…/Insert Block ▸.
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Line",      "draw.line"),
                         ("Rectangle", "draw.rectangle"),
                     ]);
                     // Circle / Arc — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, "Circle", "draw.circle", "circle");
-                    self.menu_cmd_item_method(ui, "Arc", "draw.arc", "arc");
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_item_method(ui, &cmd_ctx, "Circle", "draw.circle", "circle");
+                    self.menu_cmd_item_method(ui, &cmd_ctx, "Arc", "draw.arc", "arc");
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Ellipse",     "draw.ellipse"),
                         ("Ellipse Arc", "draw.ellipsearc"),
                         ("Polyline",    "draw.pline"),
@@ -21088,7 +21137,7 @@ impl eframe::App for CadApp {
                 });
                 ui.menu_button("Modify", |ui| {
                     // Transform group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Move",     "modify.move"),
                         ("Copy",     "modify.copy"),
                         ("Rotate",   "modify.rotate"),
@@ -21099,13 +21148,13 @@ impl eframe::App for CadApp {
                     ]);
                     ui.separator();
                     // Edit-geometry group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Trim",   "modify.trim"),
                         ("Extend", "modify.extend"),
                     ]);
                     // Fillet — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, "Fillet", "modify.fillet", "fillet");
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_item_method(ui, &cmd_ctx, "Fillet", "modify.fillet", "fillet");
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Chamfer",  "modify.chamfer"),
                         ("Offset",   "modify.offset"),
                         ("Join",     "modify.join"),
@@ -21138,12 +21187,12 @@ impl eframe::App for CadApp {
                         self.run_command("props");
                         ui.close_menu();
                     }
-                    self.menu_cmd_items(ui, &[
+                    self.menu_cmd_items(ui, &cmd_ctx, &[
                         ("Match Properties", "modify.matchprop"),
                         ("Change Layer to Current", "modify.chlayer"),
                     ]);
                     ui.separator();
-                    self.menu_cmd_items(ui, &[("Erase", "modify.erase")]);
+                    self.menu_cmd_items(ui, &cmd_ctx, &[("Erase", "modify.erase")]);
                     pp_cap_ui(ui, "menu: Modify");
                     menu_autoclose(ui, bar_rect);
                 });
