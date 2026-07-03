@@ -1090,6 +1090,14 @@ pub struct CadApp {
     command_registry:    crate::command::CommandRegistry,
     /// Temporary Phase-2 verification: Tools ▸ Debug ▸ "Command registry dump".
     cmd_dump_open:       bool,
+    /// Command palette (Phase 7): registry-driven fuzzy command search.
+    /// Ctrl+Shift+P or Tools ▸ "Command palette". Searches title + keywords,
+    /// dispatches via `execute(id)` (D2), applies the 6b predicates.
+    palette_open:        bool,
+    palette_query:       String,
+    palette_sel:         usize,
+    /// One-shot: request focus on the search box the frame after opening.
+    palette_focus:       bool,
     /// Per-command **preferred method** (dispatch token → method key), session
     /// level. Set by a command's ▼ flyout; APPLIED by `execute(id)` so every
     /// surface (menu, rail, palette, shortcut) runs the remembered method. The
@@ -2666,6 +2674,10 @@ impl Default for CadApp {
             modify_items,
             command_registry,
             cmd_dump_open:        false,
+            palette_open:         false,
+            palette_query:        String::new(),
+            palette_sel:          0,
+            palette_focus:        false,
             command_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
@@ -10243,6 +10255,116 @@ impl CadApp {
             has_selection: selection_count > 0,
             active_tool: self.tool,
             has_clipboard: !self.clipboard_dobjects.is_empty(),
+        }
+    }
+
+    /// Command palette (Phase 7): registry-driven fuzzy search over `title` +
+    /// `keywords`, dispatch via `execute(id)` (D2 — so it also respects the
+    /// `command_method` memory, like menus). Opens on Ctrl+Shift+P or Tools ▸
+    /// "Command palette". Applies the 6b predicates (hidden if `!visible`, greyed
+    /// if `!enabled`). Keyboard: ↑/↓ move, Enter runs, Esc closes. It NEVER
+    /// touches the parser or parser aliases (D6).
+    fn render_command_palette(&mut self, ctx: &egui::Context) {
+        // A single hotkey to OPEN the palette (this is NOT the deferred
+        // per-command accel→id shortcut map).
+        if ctx.input(|i| i.modifiers.command && i.modifiers.shift
+                          && i.key_pressed(egui::Key::P)) {
+            self.palette_open = true;
+            self.palette_focus = true;
+            self.palette_query.clear();
+            self.palette_sel = 0;
+        }
+        if !self.palette_open { return; }
+
+        let cmd_ctx = self.build_ctx();
+        let q = self.palette_query.to_lowercase();
+
+        // Filtered, visible commands in canonical order (owned — the registry
+        // borrow drops before we execute).
+        struct Hit { id: String, title: String, icon: crate::command::IconId, enabled: bool }
+        let mut hits: Vec<Hit> = Vec::new();
+        for id in &self.command_registry.order {
+            if let Some(info) = self.command_registry.commands.get(id) {
+                if !(info.visible)(&cmd_ctx) { continue; }              // 6b: hidden
+                let hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
+                if palette_fuzzy(&q, &hay) {
+                    hits.push(Hit { id: id.clone(), title: info.title.clone(),
+                                    icon: info.icon, enabled: (info.enabled)(&cmd_ctx) });
+                }
+            }
+        }
+        if self.palette_sel >= hits.len() { self.palette_sel = hits.len().saturating_sub(1); }
+
+        // Keyboard nav (raw key events).
+        let (mut down, mut up, mut enter, mut esc) = (false, false, false, false);
+        ctx.input(|i| {
+            down  = i.key_pressed(egui::Key::ArrowDown);
+            up    = i.key_pressed(egui::Key::ArrowUp);
+            enter = i.key_pressed(egui::Key::Enter);
+            esc   = i.key_pressed(egui::Key::Escape);
+        });
+        if down && !hits.is_empty() { self.palette_sel = (self.palette_sel + 1).min(hits.len() - 1); }
+        if up { self.palette_sel = self.palette_sel.saturating_sub(1); }
+        if esc { self.palette_open = false; }
+
+        let sel = self.palette_sel;
+        let mut click: Option<usize> = None;
+        let mut open = self.palette_open;
+        egui::Window::new("Command palette")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(440.0)
+            .default_pos(egui::pos2(80.0, 70.0))
+            .show(ctx, |ui| {
+                let te = ui.add(egui::TextEdit::singleline(&mut self.palette_query)
+                    .hint_text("Search commands — title + keywords")
+                    .desired_width(f32::INFINITY));
+                if self.palette_focus { te.request_focus(); self.palette_focus = false; }
+                if te.changed() { self.palette_sel = 0; }
+                ui.separator();
+                if hits.is_empty() { ui.weak("No matching commands."); }
+                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        for (i, h) in hits.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                // small icon glyph (via IconId)
+                                let (r, _) = ui.allocate_exact_size(
+                                    egui::vec2(18.0, 18.0), egui::Sense::hover());
+                                let ink = if h.enabled { PP_TEXT }
+                                          else { crate::theme::color::TEXT_DISABLED };
+                                let p = ui.painter_at(r);
+                                let gc = r.center();
+                                let pen = egui::Stroke::new(1.4, ink);
+                                let dot = |q| { p.circle_filled(q, 1.3, ink); };
+                                match h.icon {
+                                    crate::command::IconId::DrawGlyph(s) =>
+                                        draw_draw_glyph(&p, gc, s, pen, dot, ink),
+                                    crate::command::IconId::ModifyGlyph(k) =>
+                                        draw_cmd_glyph(&p, gc, k, pen, dot, ink),
+                                }
+                                let resp = ui.add_enabled(h.enabled,
+                                    egui::SelectableLabel::new(i == sel, h.title.as_str()));
+                                if resp.clicked() { click = Some(i); }
+                            });
+                        }
+                    });
+            });
+
+        // Resolve the action: a click runs the clicked item; else Enter runs the
+        // highlighted one. Dispatch via execute(id) (never run_command).
+        let run: Option<String> = if let Some(i) = click {
+            hits.get(i).filter(|h| h.enabled).map(|h| { self.palette_sel = i; h.id.clone() })
+        } else if enter {
+            hits.get(sel).filter(|h| h.enabled).map(|h| h.id.clone())
+        } else {
+            None
+        };
+        self.palette_open = open;   // window × close
+        if let Some(id) = run {
+            self.execute(&id);
+            self.palette_open = false;
+            self.palette_query.clear();
         }
     }
 
@@ -19286,6 +19408,22 @@ struct RailDnd { is_draw: bool, pos: usize }
 /// `short` is the compact code shown next to the glyph (e.g. "3P", "TTR"),
 /// `full` is the hover tooltip, `key` is interpreted by `rail_flyout_dispatch`.
 /// Empty = the command has no methods (no ▼ shown).
+/// Command-palette fuzzy match: `true` if every char of `q` (already lowercased)
+/// appears IN ORDER (subsequence) within `hay` (lowercased `title` + `keywords`).
+/// Substring typing is a subset, so plain queries work too. Empty query matches
+/// all. UI metadata search ONLY — never the parser or parser aliases (D6).
+fn palette_fuzzy(q: &str, hay: &str) -> bool {
+    if q.is_empty() { return true; }
+    let mut hc = hay.chars();
+    'next: for qc in q.chars() {
+        for c in hc.by_ref() {
+            if c == qc { continue 'next; }
+        }
+        return false;   // ran out of haystack before matching qc
+    }
+    true
+}
+
 fn rail_flyout_items(cmd: &str) -> Vec<(String, String, String)> {
     match cmd {
         "arc" => ALL_ARC_METHODS.iter().enumerate()
@@ -21355,7 +21493,19 @@ impl eframe::App for CadApp {
                 ui.menu_button("Tools", |ui| {
                     ui.label(egui::RichText::new("Palettes").small().color(
                         egui::Color32::from_rgb(150, 165, 185)));
-                    ui.checkbox(&mut self.cmd_window_open,      "Command palette");
+                    // NOTE: this toggles the command-LINE dock (`cmd_window_open`),
+                    // not a palette — the old "Command palette" label was wrong.
+                    ui.checkbox(&mut self.cmd_window_open,      "Command line");
+                    if ui.button("Command palette…   (Ctrl+Shift+P)")
+                        .on_hover_text("Search all commands by name or keyword; ↑/↓ to move, Enter to run")
+                        .clicked()
+                    {
+                        self.palette_open = true;
+                        self.palette_focus = true;
+                        self.palette_query.clear();
+                        self.palette_sel = 0;
+                        ui.close_menu();
+                    }
                     ui.checkbox(&mut self.layers_window_open,   "Layers");
                     ui.checkbox(&mut self.pens_window_open,     "Pens");
                     ui.checkbox(&mut self.info_window_open,     "Inspector");
@@ -22102,6 +22252,8 @@ impl eframe::App for CadApp {
         if self.info_panel_open {
             self.render_info_panel(ctx);
         }
+        // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
+        self.render_command_palette(ctx);
 
         // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
         // the same swappable engine the Inspector uses. Floats by default
