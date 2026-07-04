@@ -165,23 +165,43 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
   "Command registry dump"); data from `cad_app/src/command.rs` `build()`.
 
 ### M1. Dropdown-menu conformance (MENU_DROPDOWN_MENTOR) 🟡
-- **Draw menu: DONE but UNCOMMITTED** (working tree, builds green). Custom-painted
-  rows (`paint_menu_row`): 20px icon box / 14 gap / 26 band, cyan `(CODE)`, no □,
-  surface-2 hover, aligned arrows, `Wall (t = thickness)`, dividers, hug width.
-  Method/Insert flyouts decoupled to top level (`menu_flyout` + `render_menu_flyout`),
-  **hover-open** (0.30s close delay), click=commit (`dispatch_method`). Edge-to-edge
-  hover via zeroed horizontal `menu_margin` + `ui.set_width(w)` + highlight at
-  `ui.max_rect().x_range()`. Flyout radius `radius::SM`(4).
-- **Pending:**
-  1. **Strip the TEMP measurement log** in `paint_menu_row` (the `std::fs::write`
-     guarded `name=="Line"`, writes scratchpad `menu_hover_measure.log`) before the
-     final commit. Owner still to visually confirm the hover reaches both borders
-     (Δ=0 by construction — highlight IS the frame's inner rect).
-  2. **COMMIT the Draw pass** (currently only in the working tree, not pushed).
-  3. **Convert Modify** (and File/Edit/View/etc.) dropdowns to the same rows —
-     they still use the old `menu_cmd_items`/plain-button style.
-- **Where:** `paint_menu_row` / `render_menu_flyout` / `MenuIcon`/`Trailing`/
-  `MenuFlyout` in `cad_app/src/app.rs`; Draw menu closure (`menu_button("Draw")`).
+- **ALL 9 category menus DONE** — File / Edit / Draw / Modify / View / Formative /
+  Utilities / Tools / Help all route through the ONE shared painter with the §1
+  metrics (12 pad, 14 gap, 26 band, 20 icon, aligned arrow column, SM(4) flyout).
+  Draw is committed+pushed (`5aba313`); the rest are working-tree (builds green,
+  **UNCOMMITTED**). Verified on-screen (File icons, Formative→Styles→picker nesting,
+  Tools headings+checkboxes, Import/Debug flyouts).
+- **Shared machinery** (`cad_app/src/app.rs`): `paint_menu_row` (row painter),
+  `menu_hug_geometry` (ONE width/arrow source, LINE vs ZONE trailing), `custom_menu`
+  (edge-to-edge chrome), `menu_divider`, `menu_heading_row` (§8 caption),
+  `RowT` (unified Code/Hint/Arrow/Shortcut/CodeArrow), `icon_for(key)` (§7 single
+  icon lookup — File reuses the QAT New/Open/Save glyphs via `MenuIcon::Qat`),
+  `MenuIcon::Check` (§8 cyan checkbox).
+- **§9 generalized flyout** — `FlyMenu`/`FlyFrame`/`FlyItem`/`FlyAct` + a frame
+  STACK (`menu_flyouts: Vec<FlyFrame>`), `flyout_items(&self)` (built fresh each
+  frame) + `flyout_activate(&mut self)` + `render_menu_flyouts`. Hosts Method,
+  Insert, Import, Dimension, Styles (→ nested DimStylePick / WallStylePick), Debug
+  (checkboxes + headings + dynamic labels + destructive). Hover-open, commit-on-
+  click, arbitrary nesting (verified 3 levels: Formative→Styles→picker).
+- **Label trims applied:** `Zoom Extents`, `Distance`, `List` (Tools + Utilities).
+  Kept verbatim (flagged): `Zoom Extents (fit all)`→done; Dimension flyout's
+  `Dimension  (smart: linear · radius · diameter)` — owner may trim. Edit shortcuts
+  `Ctrl+C/V/G` + Tools `Ctrl+Shift+P` now render right-aligned muted Mono (§1).
+- **Missing icons (reserved 20px slot — later icon-assign pass):** Edit → Paste,
+  Group, Add to Group, Ungroup, Select All, Deselect All, Settings…; Modify →
+  Inspector…; View → all 4 zoom; Help → both; File → Import/parametric/Exit;
+  Formative → Layers/Pens/Styles; most of Tools. (Add via one `icon_for` entry each.)
+- **Pending / notes:**
+  1. **Owner visual review** → then assign missing icons (one `icon_for` line each)
+     + confirm the Dimension-flyout label trim.
+  2. **Commit** the whole conversion once reviewed.
+  3. **`🛰` (Session Recorder) / `∩` (intersect) render as tofu □** — pre-existing
+     (glyphs absent from Geist/JetBrains Mono; original had the same). Swap to ASCII
+     or add an emoji fallback font if wanted.
+  4. **Tools checkbox rows** omit `close_menu` so you can flip several — confirm egui
+     keeps the menu open on a frameless-Button click (if it auto-closes, revisit).
+  5. **Parked global hover sliver** (§3) — untouched by design; fixes everywhere at
+     once when solved.
 
 ### M2. Dialog header conformance (HEADER_STANDARD_MENTOR §4) 🔵
 - The ~25 `egui::Window` dialogs (Hatch, Block, Insert Block, DWG, raster,

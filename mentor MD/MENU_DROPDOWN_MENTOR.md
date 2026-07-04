@@ -47,10 +47,30 @@ Every command is one row, left → right:
   (`METHOD_ACCESS` §1).
 - **Arrow ▸:** only where the row opens a submenu (method submenu OR real submenu like
   Insert Block). One **unified size + tone** for all arrows (`text-muted`).
+- **Shortcut hint (optional):** where a command has a keyboard shortcut (Edit:
+  `Ctrl+C` / `Ctrl+V` / `Ctrl+G`), show it **right-aligned, `text-muted`, Mono** in the
+  trailing zone. A row has **either** a shortcut **or** a submenu arrow, never both. The
+  trailing element (shortcut or arrow) is what the width + alignment rule measures.
 
-Metrics are **matched to the command palette**: same 13 text, same 20 icon box, same 14
-icon-gap, same **26 hover-band height** → the row / hover box is identical to a palette
-row.
+**Metrics (exact — the SINGLE source; the one shared row painter uses these, no menu
+overrides anything):**
+
+| Element | Value |
+|---|---|
+| Row / hover-band height | **26** |
+| Icon box | **20** (= band − 6, 3px inset top + bottom) |
+| Left pad — menu inner edge → icon | **12** |
+| Icon → name gap | **14** |
+| Name → (CODE) gap | **6** |
+| Longest line → trailing (arrow/shortcut) gap | **6** |
+| Trailing → right pad — arrow/shortcut → menu inner edge | **12** |
+| Group divider | 1px `border`, 5 above/below |
+| Flyout radius | `radius::SM` (4) |
+
+Left/right pads live **inside** the row, so hover is edge-to-edge (§3). **Every category
+menu goes through this one painter with these exact values.** A menu that "looks
+different" is a menu **not using the shared painter** — the fix is to route it through
+the painter, never to re-tune numbers locally.
 
 ---
 
@@ -158,3 +178,49 @@ remembered method; click the **▸** → method submenu (`METHOD_ACCESS` §2).
 - `Wall (t = thickness)` (no `chained run —`); `…` kept on dialog commands; group
   dividers intact.
 - No header band on the dropdown.
+
+---
+
+## 7. Icons — one swappable source (add later / redesign easily)
+
+**All app icons are slated for a full redesign, so icon wiring must be a single swap,
+never per-menu edits.**
+
+- Every row's glyph comes from **one icon lookup keyed by command id** (a stable key) —
+  `icon_for(command_id)`. Menus **never** hardcode a glyph inline.
+- Every row **reserves the 20px icon slot** whether or not a glyph exists (missing →
+  empty slot, present → glyph), so names stay aligned and a later icon drops in with
+  **zero layout change**.
+- **Add an icon later** = one entry in the lookup. **Redesign the whole set** = swap the
+  glyph implementations behind the keys, in one place — no menu touches them.
+- Where a glyph already exists elsewhere (New / Open / Save on the toolbar), wire it via
+  the lookup so the **File** menu (and others) show it too — don't leave existing icons
+  unused.
+
+---
+
+## 8. Non-command rows (Formative, Tools, …)
+
+Menus that aren't pure command lists still use the **same chrome + metrics + hover**.
+Two extra row types:
+
+- **Section heading** (`Palettes`, `Command rails`, `Inquiry`): non-interactive. Caption
+  **11/500 UPPERCASE**, dim (`#66707A`), at the **name column** (icon slot empty), small
+  top pad; a group divider above it (except the first). **No hover.**
+- **Checkbox / toggle row** (panel-visibility toggles: Command line, Layers, Pens,
+  Inspector, …): a normal 26 row; the **check indicator sits in the icon-column slot** —
+  **cyan (`accent`) check when ON**, empty when OFF. Name normal tone; full-width hover
+  like any row. *(If a toggle ever also needs a command icon, the check moves
+  right-aligned; default is check-in-slot.)*
+
+---
+
+## 9. Generalized flyout (real submenus)
+
+The `▸` flyout must host **any** submenu, not just method/insert lists — Import,
+Dimension, Styles, Debug tools, etc. Generalize it to render an **arbitrary list of
+rows** with the **same** row design (icon / name / (CODE) / shortcut / ▸), the **same**
+arrow-column + hug width, `SM(4)` radius, and **hover-open / commit-on-click** (§2.1).
+Submenus may **nest** (a flyout row opens a further flyout) — identical rules at every
+level. This is what lets File (Import), Formative, and Tools conform instead of staying
+native.

@@ -340,13 +340,6 @@ fn text_button(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A menu section heading — readable caption size + a legible muted token
-/// (the old `.small()` at ~9px was too small/low-contrast to read).
-fn menu_heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).font(crate::theme::typ::caption())
-        .color(crate::theme::color::TEXT_SECONDARY));
-}
-
 /// A 1px full-width divider line in the panel border colour.
 fn pp_divider(ui: &mut egui::Ui) {
     let w = ui.available_width();
@@ -1093,13 +1086,13 @@ pub struct CadApp {
     /// placed and persists for the session). Dragging the Floating header band
     /// moves it (§3.1).
     palette_pos:         Option<egui::Pos2>,
-    /// Open menu FLYOUT (method submenu or Insert-Block submenu), rendered at the
-    /// top level so it survives the parent dropdown closing (MENU_DROPDOWN §2.1).
-    /// Opens on HOVER of the ▸ arrow (§2) and stays open while the pointer is over
-    /// the arrow or the flyout; closes after a short delay once it leaves both.
-    menu_flyout:         Option<MenuFlyout>,
+    /// Open flyout STACK (§9) — frame 0 spawned by a menubar row's ▸, deeper frames
+    /// by a flyout row's ▸ (nesting). Rendered at the top level so it survives the
+    /// parent dropdown closing (MENU_DROPDOWN §2.1); opens on HOVER, closes after a
+    /// short delay once the pointer leaves the whole stack. Empty = nothing open.
+    menu_flyouts:        Vec<FlyFrame>,
     /// Set true each frame the pointer is over an arrow (by the menu) or the
-    /// flyout (by `render_menu_flyout`); drives the hover stay-open + close delay.
+    /// flyout (by `render_menu_flyouts`); drives the hover stay-open + close delay.
     menu_flyout_hot:     bool,
     /// `ctx.input().time` when the pointer left both the arrow and the flyout —
     /// the flyout closes `MENU_FLYOUT_CLOSE_DELAY` seconds later (travel tolerance).
@@ -2705,7 +2698,7 @@ impl Default for CadApp {
             palette_sel:          0,
             palette_focus:        false,
             palette_pos:          None,
-            menu_flyout:          None,
+            menu_flyouts:         Vec::new(),
             menu_flyout_hot:      false,
             menu_flyout_leave_t:  None,
             command_method:    std::collections::HashMap::new(),
@@ -10588,35 +10581,11 @@ impl CadApp {
         }
     }
 
-    /// Render a CURATED ordered list of plain command menu items (Phase 6):
-    /// `(menu label, registry id)` pairs. The menu is a *designed arrangement*
-    /// (COMMAND_SYSTEM §4), not a `by_category` dump — order/membership are the
-    /// caller's config. Labels are kept VERBATIM (not the registry `title`,
-    /// which is a temporary Phase-2 seed); each click dispatches through the
-    /// `execute(id)` seam. Defensive: `execute` no-ops on a stale/unknown id.
-    /// Special items (dialogs, submenus, custom-tooltip / non-registry commands)
-    /// stay hand-authored and interleaved by the caller.
-    fn menu_cmd_items(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
-                      items: &[(&str, &str)]) {
-        for &(label, id) in items {
-            // Phase 6b: apply the command's predicates. visible==false hides the
-            // item; enabled==false renders it disabled (greyed, non-clickable via
-            // add_enabled). Pure — no mutation/execution here. (All default now.)
-            let (vis, ena) = self.command_registry.get(id)
-                .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
-                .unwrap_or((false, false));
-            if !vis { continue; }
-            let resp = ui.add_enabled(ena, egui::Button::new(label));
-            if resp.clicked() { self.execute(id); ui.close_menu(); }
-            pp_capture(ui, &format!("menu · {}", label), resp.rect);   // UI-inspect
-        }
-    }
-
     /// The ONE canonical short-code (`"3P"`, `"CR"`, `"F"`, …) for a command's
     /// CURRENT method — the remembered `command_method`, or the command's default
-    /// (first ▼-flyout item) when none is set. Sourced from `rail_flyout_items` /
-    /// `ArcMethod::short()` so the rail flyout, rail tooltip, and menus all use
-    /// the SAME notation. Empty for commands without methods.
+    /// (first ▼-flyout item) when none is set. Sourced from `rail_flyout_items` so
+    /// the rail flyout, rail tooltip, and menus all use the SAME notation. Empty
+    /// for commands without methods.
     fn current_method_short(&self, cmd: &str) -> String {
         let methods = rail_flyout_items(cmd);
         match self.command_method.get(cmd) {
@@ -10629,92 +10598,13 @@ impl CadApp {
     /// The canonical KEY of a command's CURRENT method — the remembered
     /// `command_method`, or the default (first `rail_flyout_items` entry) when
     /// none is set. Empty for commands without methods. Companion to
-    /// `current_method_short` (short-code) — this returns the dispatch key the
-    /// glyph + `dispatch_method` need. Same ONE source, no per-surface lists.
+    /// `current_method_short` — returns the dispatch key the glyph +
+    /// `dispatch_method` need. Same ONE source, no per-surface lists.
     fn current_method_key(&self, cmd: &str) -> String {
         let methods = rail_flyout_items(cmd);
         match self.command_method.get(cmd) {
             Some(k) if methods.iter().any(|(_, _, key)| key == k) => k.clone(),
             _ => methods.first().map(|(_, _, key)| key.clone()).unwrap_or_default(),
-        }
-    }
-
-    /// Render an arc/circle/fillet menu item as a **split-click row** that mirrors
-    /// the rail's icon/▼ split (NOT a plain egui hover-submenu):
-    ///   * a thin, muted, method-aware glyph (recessive, §5.12);
-    ///   * the label `Circle (3P)` — clicking it runs the **remembered** method
-    ///     via `execute(id)` (one-click draw);
-    ///   * a `▸` opening a **method submenu** (full name + code, current marked ●)
-    ///     — picking runs AND sets it via `dispatch_method` (so rail + menu +
-    ///     palette all update from the shared `command_method`).
-    /// Non-method commands never reach here — they render as plain items.
-    fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
-                            base: &str, id: &str, cmd: &str) {
-        let (vis, ena) = self.command_registry.get(id)
-            .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
-            .unwrap_or((false, false));
-        if !vis { return; }
-        let methods = rail_flyout_items(cmd);
-        let short   = self.current_method_short(cmd);
-        let cur_key = self.current_method_key(cmd);
-        // §5.12: CAD glyph is recessive — thin (~0.9px) + muted (lighter than the
-        // primary-text label), so the label leads and the icon supports.
-        let glyph_ink = crate::theme::color::TEXT_MUTED;
-        let btn_font  = egui::TextStyle::Button.resolve(ui.style());
-        let txt_col   = ui.visuals().text_color();
-
-        let mut do_execute = false;
-        let mut pick: Option<String> = None;
-        ui.horizontal(|ui| {
-            // method-aware glyph (mirrors the rail icon — shows the CURRENT method)
-            let (gr, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
-            draw_method_glyph(&ui.painter_at(gr), gr.center(), cmd, &cur_key,
-                              egui::Stroke::new(0.9, glyph_ink), glyph_ink,
-                              20.0 / GLYPH_BOX_METHOD);   // §7 same icon box as palette
-            // label / body → run the remembered method. §5: the current-method
-            // `(code)` renders in CYAN (accent) — colour is the marker, no ●/□.
-            let mut job = egui::text::LayoutJob::default();
-            job.append(base, 0.0, egui::TextFormat {
-                font_id: btn_font.clone(), color: txt_col, ..Default::default() });
-            if !short.is_empty() {
-                job.append(&format!(" ({})", short), 0.0, egui::TextFormat {
-                    font_id: btn_font.clone(), color: PP_ACCENT, ..Default::default() });
-            }
-            let lresp = ui.add_enabled(ena, egui::Button::new(job).frame(false));
-            if lresp.clicked() { do_execute = true; }
-            pp_capture(ui, &format!("menu method · {} ({})", base, short), lresp.rect);
-            // ▸ → method submenu (each row: current-marker ● + method glyph + name)
-            ui.menu_button("▸", |ui| {
-                for (m_short, m_full, key) in &methods {
-                    let is_cur = &cur_key == key;
-                    let (rr, rp) = ui.allocate_painter(
-                        egui::vec2(188.0, 22.0), egui::Sense::click());
-                    let rect = rr.rect;
-                    let txt  = ui.visuals().text_color();
-                    if rr.hovered() {
-                        rp.rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
-                    }
-                    // §5: current method = CYAN label; NO ●/□ marker.
-                    let row_col = if is_cur { PP_ACCENT } else { txt };
-                    let gc = egui::pos2(rect.left() + 18.0, rect.center().y);
-                    draw_method_glyph(&rp, gc, cmd, key,
-                                      egui::Stroke::new(0.9, glyph_ink), glyph_ink,
-                                      20.0 / GLYPH_BOX_METHOD);
-                    rp.text(egui::pos2(rect.left() + 34.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER, format!("{} ({})", m_full, m_short),
-                        egui::FontId::proportional(12.0), row_col);
-                    pp_capture(ui, &format!("menu method row · {} ({})", m_full, m_short), rect);
-                    if rr.clicked() { pick = Some(key.clone()); }
-                }
-            });
-        });
-
-        if do_execute {
-            self.execute(id);
-            ui.close_menu();
-        } else if let Some(key) = pick {
-            self.dispatch_method(cmd, &key);
-            ui.close_menu();
         }
     }
 
@@ -19803,52 +19693,159 @@ const GLYPH_BOX_CMD:    f32 = 24.0;
 // ---- Category-dropdown row metrics (MENU_DROPDOWN_MENTOR) — matched to the
 // palette so a menu row is dimensionally identical (band 26 / icon box 20 /
 // icon-gap 14). Every value a named const; no magic numbers at the call sites.
-const MENU_ROW_H:   f32 = 26.0;   // row / hover band
-const MENU_PAD:     f32 = 10.0;   // menu edge padding (left + right)
+const MENU_ROW_H:   f32 = 26.0;   // row / hover band (§1)
+const MENU_PAD:     f32 = 12.0;   // inner pad — left (edge→icon) AND right (trailing→edge) (§1)
 const MENU_ICON:    f32 = 20.0;   // icon column width (box = ROW_H − 6 = 20)
 const MENU_ICON_GAP: f32 = 14.0;  // icon → name
-const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE)/hint, and longest-line → arrow
+const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE), and longest-line → trailing zone
 const MENU_ARROW_W: f32 = 10.0;   // arrow column width
 /// Grace period before a hover-opened flyout closes after the pointer leaves both
 /// the arrow and the flyout — lets the user travel diagonally onto it (§2).
 const MENU_FLYOUT_CLOSE_DELAY: f64 = 0.30;
 
-/// A dropdown FLYOUT that outlives its parent menu (rendered at the top level of
-/// `update` so it survives egui auto-closing the dropdown on the ▸ click). Anchor
-/// = the row rect the flyout hangs off. See `CadApp::render_menu_flyout`.
-#[derive(Clone)]
-enum MenuFlyout {
-    /// Method submenu for `cmd` (arc/circle/…) — pick → `dispatch_method`.
-    Method { cmd: String, anchor: egui::Rect },
-    /// Insert-Block submenu (the doc's block names) — pick → `insert <name>`.
-    Insert { anchor: egui::Rect },
+/// §9 — which generalized flyout a frame shows. Its rows are BUILT FRESH each frame
+/// from `&self` (`flyout_items`) so dynamic content (block names, current
+/// method/style, toggle state, live labels) is always current; a click commits via
+/// `flyout_activate`. Submenus nest: a `Styles` row opens `DimStylePick`, etc.
+#[derive(Clone, PartialEq)]
+enum FlyMenu {
+    Method(String),   // arc/circle/fillet method list
+    Insert,           // block names → `insert <name>`
+    Import,           // File → Import (raster / vector)
+    Dimension,        // Formative → Dimension
+    Styles,           // Formative → Styles
+    DimStylePick,     // Styles → current dim-style picker
+    WallStylePick,    // Styles → current wall-style picker
+    Debug,            // Tools → Debug tools
 }
 
-/// Icon spec for a custom-painted menu row. `Method` carries `(cmd, key)` so it
-/// shows the current method's construction glyph (method-aware); the others are
-/// the base draw/modify glyphs. `None` reserves the empty 20px slot.
-enum MenuIcon<'a> { Draw(&'static str), Cmd(GlyphKind), Method(&'a str, &'a str), None }
+/// One open flyout in the stack (`menu_flyouts`): which menu + the row rect it hangs
+/// off (the flyout is placed to that rect's right). Frame 0 is spawned by a menubar
+/// row's ▸; deeper frames by a flyout row's ▸ (§9 nesting).
+#[derive(Clone)]
+struct FlyFrame { menu: FlyMenu, anchor: egui::Rect }
 
-/// Trailing after the name: a cyan-or-tinted `(CODE)` in Mono (method marker,
-/// §4/§5) or a muted body-font hint (Wall). Measures into the longest line.
-enum Trailing<'a> { None, Code(&'a str, egui::Color32), Hint(&'a str) }
+/// The icon slot for a flyout row (§7). `Key` → `icon_for`; `Method` → the
+/// method-aware glyph; `None` → reserved empty slot (or overridden by a §8 check).
+enum FlyIcon { Key(&'static str), Method(String, String), None }
 
-/// Paint ONE conformant dropdown row (MENU_DROPDOWN_MENTOR §1): full-width
-/// surface-2 hover band (26), aligned 20px icon box (uniform scale), Geist-13
-/// name in `name_col`, a `Trailing`, and an optional ▸ painted on the shared
-/// `arrow_x` column (§2). Returns `(body_clicked, arrow_clicked, rect)` — body
-/// runs the command, ▸ opens a submenu.
+/// One generalized-flyout row (§9), built fresh from `&self`. `Row` renders through
+/// the shared `paint_menu_row`; `Heading`/`Divider`/`Disabled` are the §8 non-command
+/// rows. `check` = a §8 toggle (cyan check in the slot); `submenu` = opens a child
+/// flyout on hover; `act` = what a click commits (`flyout_activate`).
+enum FlyItem {
+    Row {
+        icon: FlyIcon,
+        name: String,
+        col: egui::Color32,
+        code: Option<(String, egui::Color32)>,
+        check: Option<bool>,
+        submenu: Option<FlyMenu>,
+        act: Option<FlyAct>,
+    },
+    Heading(String),
+    Divider,
+    Disabled(String),
+}
+
+impl FlyItem {
+    /// A plain command row: icon + name → `act` on click.
+    fn act(icon: FlyIcon, name: &str, act: FlyAct) -> Self {
+        FlyItem::Row { icon, name: name.into(), col: PP_TEXT, code: None,
+                       check: None, submenu: None, act: Some(act) }
+    }
+    /// A §8 checkbox row: cyan check in the slot when `on`; click toggles via `act`.
+    fn toggle(name: &str, on: bool, act: FlyAct) -> Self {
+        FlyItem::Row { icon: FlyIcon::None, name: name.into(), col: PP_TEXT, code: None,
+                       check: Some(on), submenu: None, act: Some(act) }
+    }
+    /// A submenu row: opens child `menu` on ▸ hover (§9 nesting).
+    fn sub(icon: FlyIcon, name: &str, menu: FlyMenu) -> Self {
+        FlyItem::Row { icon, name: name.into(), col: PP_TEXT, code: None,
+                       check: None, submenu: Some(menu), act: None }
+    }
+    /// The `(name, RowT)` this row measures + paints as (color-correct; §1/§2).
+    fn meas(&self) -> (&str, RowT<'_>) {
+        match self {
+            FlyItem::Divider => ("", RowT::Plain),
+            FlyItem::Heading(t) | FlyItem::Disabled(t) => (t.as_str(), RowT::Plain),
+            FlyItem::Row { name, code, submenu, .. } => {
+                let rt = match (code, submenu.is_some()) {
+                    (Some((c, cc)), true)  => RowT::CodeArrow(c, *cc),
+                    (Some((c, cc)), false) => RowT::Code(c, *cc),
+                    (None, true)  => RowT::Arrow,
+                    (None, false) => RowT::Plain,
+                };
+                (name.as_str(), rt)
+            }
+        }
+    }
+}
+
+/// What a flyout row commits on click (`flyout_activate`) — a data enum so flyout
+/// content stays pure data (no stored closures). Covers every submenu's actions:
+/// method pick, block insert, image import, style set, and the Tools→Debug toggles
+/// / index / intersect / destructive-clear.
+#[derive(Clone)]
+enum FlyAct {
+    Run(String),
+    Method(String, String),
+    Insert(String),
+    Import(bool),                 // true = raster underlay, false = vector trace
+    SetDimStyle(u32),
+    SetWallStyle(u32),
+    ToggleBool(BoolField),
+    EnsureIndex,
+    IntersectView,
+    IntersectArm,
+    IntersectClear,
+    ClearAll,
+}
+
+/// A `&mut self` bool a flyout toggle flips (Tools→Debug), named so `FlyAct` stays
+/// `Clone` data instead of a stored `&mut`.
+#[derive(Clone, Copy)]
+enum BoolField { ScreenStats, Debug, TrimDebug, HatchDebug, UiInspect, CmdDump }
+
+/// Icon spec for a custom-painted menu row (§7 — the caller resolves it via
+/// `icon_for`, never hardcoded inline). `Method` carries `(cmd, key)` for the
+/// method-aware glyph; `Qat` reuses the toolbar New/Open/Save art; `Check(on)` is
+/// a §8 toggle (cyan check in the slot when on). `None` reserves the empty 20px slot.
+enum MenuIcon<'a> { Draw(&'static str), Cmd(GlyphKind), Method(&'a str, &'a str),
+                    Qat(QatAction), Check(bool), None }
+
+/// A row's trailing content (§1) — ONE enum for both `menu_hug_geometry` (measure)
+/// and `paint_menu_row` (paint). LINE part (grouped right after the name): `Code` =
+/// cyan method (CODE) in Mono (§4), `Hint` = muted Wall parenthetical (§5). ZONE
+/// part (the trailing zone at/after the arrow column): `Arrow` = submenu ▸,
+/// `Shortcut` = right-aligned muted Mono keys. `CodeArrow` = a method row that ALSO
+/// opens a submenu (`Circle (CR) ▸`). Per §1 a row has at most one ZONE element
+/// (shortcut XOR arrow); the zone element is what the width rule measures.
+#[derive(Clone, Copy)]
+enum RowT<'a> {
+    Plain,
+    Code(&'a str, egui::Color32),
+    Hint(&'a str),
+    Arrow,
+    CodeArrow(&'a str, egui::Color32),
+    Shortcut(&'a str),
+}
+
+/// Paint ONE conformant dropdown row (MENU_DROPDOWN §1) — the SINGLE painter every
+/// category menu + flyout routes through. Full-width surface-2 hover band (26),
+/// aligned 20px icon box (`icon_for`-resolved), Geist-13 `name` in `name_col`, the
+/// `trail` line/zone content, on the shared `arrow_x` column (§2). Returns
+/// `(body_clicked, arrow_hovered, rect)` — body runs the command, the ▸ opens a
+/// submenu on hover.
 fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
-                  name: &str, name_col: egui::Color32, trailing: Trailing,
-                  arrow: bool) -> (bool, bool, egui::Rect) {
+                  name: &str, name_col: egui::Color32, trail: RowT)
+                  -> (bool, bool, egui::Rect) {
     // Interaction is a REAL frameless Button so egui's menu recognises it as an
     // item (keeps the menu open through the click, fires `clicked()` on release);
     // a bare allocated rect makes egui close the menu on press → clicks are lost.
-    // All visuals are custom-painted over its rect.
-    // §3 root fix: the highlight spans the FRAME's own inner x-range
-    // (`max_rect`), NOT the row's w-wide rect — so it reaches both borders even if
-    // the frame is a hair wider than `w`. With `ui.set_width(w)` upstream the two
-    // are equal, so the highlight physically touches both inner borders.
+    // §3: the highlight spans the FRAME's own inner x-range (`max_rect`), not the
+    // row's w-wide rect, so it reaches both borders. `ui.set_width(w)` upstream
+    // makes the two equal → the highlight physically touches both inner borders.
     let hl_x = ui.max_rect().x_range();
     let resp = ui.add_sized(egui::vec2(width, MENU_ROW_H),
         egui::Button::new("").frame(false));
@@ -19868,137 +19865,450 @@ fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
         MenuIcon::Cmd(k)  => draw_cmd_glyph(&p, gc, k, g_pen, dot, g_ink, ibox / GLYPH_BOX_CMD),
         MenuIcon::Method(cmd, key) =>
             draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink, ibox / GLYPH_BOX_METHOD),
+        MenuIcon::Qat(act) =>
+            paint_qat_icon(&p, egui::Rect::from_center_size(gc, egui::vec2(ibox, ibox)), act, g_ink),
+        MenuIcon::Check(on) => if on {
+            // §8: cyan check in the icon slot when the toggle is ON (empty when off).
+            p.add(egui::Shape::line(vec![
+                egui::pos2(gc.x - 5.0, gc.y + 0.5), egui::pos2(gc.x - 1.5, gc.y + 4.0),
+                egui::pos2(gc.x + 5.5, gc.y - 4.5)],
+                egui::Stroke::new(1.6, PP_ACCENT)));
+        },
         MenuIcon::None => {}
     }
 
-    // Name, then the trailing immediately after (left-grouped, never right-aligned).
+    // Name, then any LINE trailing right after it (Code cyan / Hint muted, §1/§5).
     let name_x = rect.left() + MENU_PAD + MENU_ICON + MENU_ICON_GAP;
     let nr = p.text(egui::pos2(name_x, rect.center().y), egui::Align2::LEFT_CENTER,
         name, crate::theme::typ::body(), name_col);
-    match trailing {
-        Trailing::Code(c, col) =>
+    match trail {
+        RowT::Code(c, col) | RowT::CodeArrow(c, col) =>
             { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
                 egui::Align2::LEFT_CENTER, format!("({})", c),
                 crate::theme::typ::data_code(), col); }
-        Trailing::Hint(h) =>
+        RowT::Hint(h) =>
             { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
                 egui::Align2::LEFT_CENTER, h,
                 crate::theme::typ::body(), crate::theme::color::TEXT_MUTED); }
-        Trailing::None => {}
+        _ => {}
     }
 
-    // ▸ on the aligned column (painted triangle — the ▸ char is tofu in our fonts).
-    if arrow {
+    // ZONE trailing (§1): a ▸ on the aligned arrow column, OR a right-aligned
+    // muted-Mono shortcut at the right inner edge. Never both.
+    let has_arrow = matches!(trail, RowT::Arrow | RowT::CodeArrow(..));
+    if has_arrow {
         let ax = rect.left() + arrow_x;
         let cy = rect.center().y;
         p.add(egui::Shape::convex_polygon(
             vec![egui::pos2(ax, cy - 3.5), egui::pos2(ax + 5.0, cy), egui::pos2(ax, cy + 3.5)],
             crate::theme::color::TEXT_MUTED, egui::Stroke::NONE));
     }
+    if let RowT::Shortcut(sc) = trail {
+        p.text(egui::pos2(rect.right() - MENU_PAD, rect.center().y),
+            egui::Align2::RIGHT_CENTER, sc,
+            crate::theme::typ::data_code(), crate::theme::color::TEXT_MUTED);
+    }
 
-    // §2 update: the ▸ opens the flyout on HOVER, not click. The whole row's
-    // CLICK runs the command (label = remembered method). Report `(body_clicked,
-    // arrow_hovered, rect)` — arrow_hovered = pointer over the arrow column.
-    let arrow_hovered = arrow && ui.ctx().pointer_hover_pos()
-        .is_some_and(|p| rect.contains(p) && p.x >= rect.left() + arrow_x - MENU_CODE_GAP);
+    // The ▸ opens the flyout on HOVER (§2); the row's CLICK runs the command.
+    let arrow_hovered = has_arrow && ui.ctx().pointer_hover_pos()
+        .is_some_and(|q| rect.contains(q) && q.x >= rect.left() + arrow_x - MENU_CODE_GAP);
     (resp.clicked(), arrow_hovered, rect)
+}
+
+/// The ONE hug-geometry source for every category dropdown + flyout (MENU_DROPDOWN
+/// §1/§2/§7): from each row's `(name, RowT)`, return `(arrow_x, width)` — the shared
+/// arrow column and the hug width. `line` = the longest icon→name(+CODE/hint) run
+/// (arrow column = line + gap, §2); `zone` = the widest trailing element (arrow OR
+/// shortcut). Every menu calls this so all hug + align identically, no per-menu
+/// math. Call under the popup `ui` (needs its fonts).
+fn menu_hug_geometry(ui: &egui::Ui, rows: &[(&str, RowT)]) -> (f32, f32) {
+    let fn_ = crate::theme::typ::body();
+    let fc_ = crate::theme::typ::data_code();
+    let nw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fn_.clone(), egui::Color32::WHITE).size().x);
+    let cw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fc_.clone(), egui::Color32::WHITE).size().x);
+    let mut line = 0.0_f32;   // icon → end of name (+ any left-grouped CODE/hint)
+    let mut zone = 0.0_f32;   // trailing zone: the widest arrow OR shortcut
+    for (name, trail) in rows {
+        let lt = match trail {
+            RowT::Code(c, _) | RowT::CodeArrow(c, _) => MENU_CODE_GAP + cw(&format!("({})", c)),
+            RowT::Hint(h) => MENU_CODE_GAP + nw(h),
+            _ => 0.0,
+        };
+        line = line.max(nw(name) + lt);
+        let zt = match trail {
+            RowT::Arrow | RowT::CodeArrow(..) => MENU_ARROW_W,
+            RowT::Shortcut(s) => cw(s),
+            _ => 0.0,
+        };
+        zone = zone.max(zt);
+    }
+    let arrow_x = MENU_PAD + MENU_ICON + MENU_ICON_GAP + line + MENU_CODE_GAP;
+    (arrow_x, arrow_x + zone + MENU_PAD)
+}
+
+/// Open a custom-painted category dropdown (MENU_DROPDOWN chrome, ONE place):
+/// zero the popup's horizontal inner margin so a full-width row reaches the frame
+/// border (edge-to-edge hover, §3) — saved + restored on the menubar `ui` around
+/// the button — and flush the row spacing to 0. The `body` then measures via
+/// `menu_hug_geometry`, `ui.set_width(w)`, and paints rows with `paint_menu_row`.
+fn custom_menu(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let saved_mm = ui.style().spacing.menu_margin;
+    ui.style_mut().spacing.menu_margin.left  = 0.0;
+    ui.style_mut().spacing.menu_margin.right = 0.0;
+    ui.menu_button(title, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        body(ui);
+    });
+    ui.style_mut().spacing.menu_margin = saved_mm;   // restore for native menus
+}
+
+/// A group-divider hairline spanning the menu's full content width (MENU_DROPDOWN
+/// §5) — 1px `border`, edge-to-edge like the hover (painted at `max_rect().x`),
+/// with a little vertical breathing room. `w` sizes the allocated spacer row.
+fn menu_divider(ui: &mut egui::Ui, w: f32) {
+    let x = ui.max_rect().x_range();
+    let (dr, _) = ui.allocate_exact_size(egui::vec2(w, 5.0), egui::Sense::hover());
+    ui.painter().hline(x, dr.center().y,
+        egui::Stroke::new(1.0, crate::theme::color::BORDER));
+}
+
+/// §8 section heading — a non-interactive caption row (`PALETTES`, `INQUIRY`, …):
+/// Geist-Medium **11/500 UPPERCASE**, dim (`#66707A`), at the NAME column (icon slot
+/// empty), no hover. The caller puts a `menu_divider` above it (except the first).
+fn menu_heading_row(ui: &mut egui::Ui, w: f32, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, MENU_ROW_H - 4.0), egui::Sense::hover());
+    let name_x = rect.left() + MENU_PAD + MENU_ICON + MENU_ICON_GAP;
+    ui.painter_at(rect).text(egui::pos2(name_x, rect.center().y + 1.0),
+        egui::Align2::LEFT_CENTER, text.to_uppercase(),
+        crate::theme::typ::caption(), egui::Color32::from_rgb(0x66, 0x70, 0x7A));
+}
+
+/// §7 — the ONE icon source, keyed by a stable command key. Returns the row's icon
+/// SLOT so a menu NEVER hardcodes a glyph inline; a later icon = one entry here, a
+/// full redesign = swap the glyph bodies behind these keys. Existing toolbar art
+/// (New/Open/Save/Undo/Redo) is reused via `Qat`. Missing → `None` (reserved slot).
+/// Method commands aren't keyed here — their row builds `MenuIcon::Method(cmd, key)`
+/// with the runtime current method (method-aware, §1); the glyph itself still lives
+/// in one place (`draw_method_glyph`).
+fn icon_for(key: &str) -> MenuIcon<'static> {
+    match key {
+        // File — reuse the QAT toolbar glyphs.
+        "file.new"     => MenuIcon::Qat(QatAction::New),
+        "file.open"    => MenuIcon::Qat(QatAction::Open),
+        "file.save"    => MenuIcon::Qat(QatAction::Save),
+        "file.saveas"  => MenuIcon::Qat(QatAction::SaveAs),
+        // Draw.
+        "draw.line"       => MenuIcon::Draw("line"),
+        "draw.rectangle"  => MenuIcon::Draw("rect"),
+        "draw.ellipse"    => MenuIcon::Draw("ellipse"),
+        "draw.ellipsearc" => MenuIcon::Draw("ellarc"),
+        "draw.pline"      => MenuIcon::Draw("pline"),
+        "draw.spline"     => MenuIcon::Draw("spline"),
+        "draw.point"      => MenuIcon::Draw("point"),
+        "draw.hatch"      => MenuIcon::Draw("hatch"),
+        "draw.wall"       => MenuIcon::Draw("wall"),
+        "draw.block"      => MenuIcon::Cmd(GlyphKind::Block),
+        "draw.insert"     => MenuIcon::Cmd(GlyphKind::Insert),
+        // Edit.
+        "edit.undo"      => MenuIcon::Cmd(GlyphKind::Undo),
+        "edit.redo"      => MenuIcon::Cmd(GlyphKind::Redo),
+        "edit.copy"      => MenuIcon::Cmd(GlyphKind::Copy),
+        "edit.erase"     => MenuIcon::Cmd(GlyphKind::Erase),
+        "edit.matchprop" => MenuIcon::Cmd(GlyphKind::MatchProps),
+        // Modify.
+        "modify.move"     => MenuIcon::Cmd(GlyphKind::Move),
+        "modify.copy"     => MenuIcon::Cmd(GlyphKind::Copy),
+        "modify.rotate"   => MenuIcon::Cmd(GlyphKind::Rotate),
+        "modify.scale"    => MenuIcon::Cmd(GlyphKind::Scale),
+        "modify.mirror"   => MenuIcon::Cmd(GlyphKind::Mirror),
+        "modify.stretch"  => MenuIcon::Cmd(GlyphKind::Stretch),
+        "modify.align"    => MenuIcon::Cmd(GlyphKind::Align),
+        "modify.trim"     => MenuIcon::Cmd(GlyphKind::Trim),
+        "modify.extend"   => MenuIcon::Cmd(GlyphKind::Extend),
+        "modify.chamfer"  => MenuIcon::Cmd(GlyphKind::Chamfer),
+        "modify.offset"   => MenuIcon::Cmd(GlyphKind::Offset),
+        "modify.join"     => MenuIcon::Cmd(GlyphKind::Join),
+        "modify.break"    => MenuIcon::Cmd(GlyphKind::Break),
+        "modify.lengthen" => MenuIcon::Cmd(GlyphKind::Lengthen),
+        "modify.reverse"  => MenuIcon::Cmd(GlyphKind::Reverse),
+        "modify.array"    => MenuIcon::Cmd(GlyphKind::ArrayGrid),
+        "modify.explode"  => MenuIcon::Cmd(GlyphKind::Explode),
+        "modify.matchprop"=> MenuIcon::Cmd(GlyphKind::MatchProps),
+        "modify.chlayer"  => MenuIcon::Cmd(GlyphKind::ChangeLayer),
+        "modify.erase"    => MenuIcon::Cmd(GlyphKind::Erase),
+        // Utilities / inquiry.
+        "util.dist" => MenuIcon::Cmd(GlyphKind::Dist),
+        "util.list" => MenuIcon::Cmd(GlyphKind::List),
+        // Formative.
+        "formative.dimension" => MenuIcon::Draw("dim"),
+        _ => MenuIcon::None,
+    }
 }
 
 /// Hand-rolled method submenu popup (MENU_DROPDOWN §2.1) — the rail's `Area`
 /// pattern reused inside a menubar dropdown: lists a command's methods (icon +
 /// `Name (CODE)`), current row cyan, click → `key`. Returns the picked key.
-/// Positioned to the RIGHT of `anchor`. `open` gates rendering; the caller owns
-/// the open flag via egui memory so it survives across frames.
 impl CadApp {
-    /// Render the open menu FLYOUT (method submenu or Insert-Block) at the TOP
-    /// LEVEL — independent of the parent dropdown, so it survives egui auto-closing
-    /// the dropdown on the ▸ click and captures its own clicks (no leak to the
-    /// canvas). Rows are the same custom-painted rows as the parent menu. Pick →
-    /// dispatch (method → `dispatch_method`, block → `insert`); outside-click
-    /// closes. §2.1.
-    fn render_menu_flyout(&mut self, ctx: &egui::Context) {
-        let fly = match &self.menu_flyout { Some(f) => f.clone(), None => return };
-        let anchor = match &fly {
-            MenuFlyout::Method { anchor, .. } => *anchor,
-            MenuFlyout::Insert { anchor }     => *anchor,
-        };
-        let mut method_pick: Option<(String, String)> = None;
-        let mut insert_pick: Option<String> = None;
-        let mut close = false;
-        let area = egui::Area::new(egui::Id::new("menu_flyout"))
-            .order(egui::Order::Foreground)
-            .fixed_pos(egui::pos2(anchor.right() + 2.0, anchor.top()))
-            .constrain(true)
-            .show(ctx, |ui| {
-                egui::Frame::popup(ui.style())
-                    .rounding(egui::Rounding::same(crate::theme::radius::SM))
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
-                        let fn_ = crate::theme::typ::body();
-                        let fc_ = crate::theme::typ::data_code();
-                        match &fly {
-                            MenuFlyout::Method { cmd, .. } => {
-                                let cur_key = self.current_method_key(cmd);
-                                let methods = rail_flyout_items(cmd);
-                                let mut longest = 0.0_f32;
-                                for (s, full, _) in &methods {
-                                    longest = longest.max(
-                                        ui.fonts(|f| f.layout_no_wrap(full.clone(), fn_.clone(), egui::Color32::WHITE).size().x)
-                                        + MENU_CODE_GAP
-                                        + ui.fonts(|f| f.layout_no_wrap(format!("({})", s), fc_.clone(), egui::Color32::WHITE).size().x));
+    /// Open (or re-anchor) a top-level flyout `menu` off `anchor` (§9). Called from a
+    /// menubar row's ▸ hover. If the SAME base menu is already open, only its anchor
+    /// updates (its child submenu is preserved); a different base resets the stack.
+    fn open_flyout(&mut self, menu: FlyMenu, anchor: egui::Rect) {
+        match self.menu_flyouts.first() {
+            Some(f) if f.menu == menu => { self.menu_flyouts[0].anchor = anchor; }
+            _ => { self.menu_flyouts = vec![FlyFrame { menu, anchor }]; }
+        }
+        self.menu_flyout_hot = true;
+    }
+
+    /// The rows a flyout shows — BUILT FRESH from `&self` each frame (§9) so dynamic
+    /// content (block names, current method/style, toggle state, live labels) is
+    /// always current. Pure data; a click's effect lives in `flyout_activate`.
+    fn flyout_items(&self, menu: &FlyMenu) -> Vec<FlyItem> {
+        let mut_ = crate::theme::color::TEXT_MUTED;
+        match menu {
+            FlyMenu::Method(cmd) => {
+                let cur = self.current_method_key(cmd);
+                rail_flyout_items(cmd).into_iter().map(|(short, full, key)| {
+                    let is_cur = key == cur;   // §5: current method row = cyan
+                    FlyItem::Row {
+                        icon: FlyIcon::Method(cmd.clone(), key.clone()),
+                        name: full,
+                        col: if is_cur { PP_ACCENT } else { PP_TEXT },
+                        code: Some((short, if is_cur { PP_ACCENT } else { mut_ })),
+                        check: None, submenu: None,
+                        act: Some(FlyAct::Method(cmd.clone(), key)),
+                    }
+                }).collect()
+            }
+            FlyMenu::Insert => {
+                let names: Vec<String> = self.doc.blocks.blocks.iter().map(|b| b.name.clone()).collect();
+                if names.is_empty() { return vec![FlyItem::Disabled("(no blocks defined)".into())]; }
+                names.into_iter().map(|n|
+                    FlyItem::act(FlyIcon::Key("draw.block"), &n, FlyAct::Insert(n.clone()))).collect()
+            }
+            FlyMenu::Import => vec![
+                FlyItem::act(FlyIcon::None, "Image as raster (underlay)…", FlyAct::Import(true)),
+                FlyItem::act(FlyIcon::None, "Image → vector (trace editor)…", FlyAct::Import(false)),
+            ],
+            FlyMenu::Dimension => vec![
+                FlyItem::act(FlyIcon::Key("formative.dimension"),
+                    "Dimension  (smart: linear · radius · diameter)", FlyAct::Run("dim".into())),
+                FlyItem::Divider,
+                FlyItem::act(FlyIcon::None, "Dimension Style…", FlyAct::Run("dimstyle".into())),
+            ],
+            FlyMenu::Styles => {
+                let dimn = self.doc.dim_styles.styles.get(self.current_dim_style as usize)
+                    .map(|s| s.name.clone()).unwrap_or_else(|| "STANDARD".into());
+                let walln = self.doc.wall_styles.styles.get(self.current_wall_style as usize)
+                    .map(|s| s.name.clone()).unwrap_or_else(|| "STANDARD".into());
+                vec![
+                    FlyItem::Heading("Managers".into()),
+                    FlyItem::act(FlyIcon::None, "Text Style…", FlyAct::Run("style".into())),
+                    FlyItem::act(FlyIcon::None, "Dimension Style…", FlyAct::Run("dimstyle".into())),
+                    FlyItem::act(FlyIcon::None, "Wall Style…", FlyAct::Run("wallstyle".into())),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Current".into()),
+                    FlyItem::sub(FlyIcon::None, &format!("Dim style:  {}", dimn), FlyMenu::DimStylePick),
+                    FlyItem::sub(FlyIcon::None, &format!("Wall style:  {}", walln), FlyMenu::WallStylePick),
+                    FlyItem::Divider,
+                    FlyItem::Disabled("Opening Style…  (planned)".into()),
+                ]
+            }
+            FlyMenu::DimStylePick => self.doc.dim_styles.styles.iter().enumerate().map(|(i, s)| {
+                let cur = i as u32 == self.current_dim_style;
+                FlyItem::Row { icon: FlyIcon::None, name: s.name.clone(),
+                    col: if cur { PP_ACCENT } else { PP_TEXT },
+                    code: None, check: None, submenu: None,
+                    act: Some(FlyAct::SetDimStyle(i as u32)) }
+            }).collect(),
+            FlyMenu::WallStylePick => self.doc.wall_styles.styles.iter().enumerate().map(|(i, s)| {
+                let cur = i as u32 == self.current_wall_style;
+                FlyItem::Row { icon: FlyIcon::None, name: s.name.clone(),
+                    col: if cur { PP_ACCENT } else { PP_TEXT },
+                    code: None, check: None, submenu: None,
+                    act: Some(FlyAct::SetWallStyle(i as u32)) }
+            }).collect(),
+            FlyMenu::Debug => {
+                let idx_fresh = !(self.index_dirty || self.index.is_none());
+                let idx_label = if idx_fresh { "Spatial index ✓ (fresh)" } else { "Rebuild spatial index ⟲" };
+                let click_label = if self.intersect_pending_click {
+                    "∩ click — waiting for click…" } else { "∩ click — arm for next click" };
+                vec![
+                    FlyItem::toggle("Screen Stats", self.screen_stats_open, FlyAct::ToggleBool(BoolField::ScreenStats)),
+                    FlyItem::toggle("Render mode (CPU/GPU + APX)", self.debug_open, FlyAct::ToggleBool(BoolField::Debug)),
+                    FlyItem::toggle("Trim Debug Log", self.trim_debug_open, FlyAct::ToggleBool(BoolField::TrimDebug)),
+                    FlyItem::toggle("Hatch Debug Log", self.hatch_debug_open, FlyAct::ToggleBool(BoolField::HatchDebug)),
+                    FlyItem::toggle("UI inspect (element sizes)", self.ui_inspect, FlyAct::ToggleBool(BoolField::UiInspect)),
+                    FlyItem::toggle("Command registry dump", self.cmd_dump_open, FlyAct::ToggleBool(BoolField::CmdDump)),
+                    FlyItem::Divider,
+                    FlyItem::act(FlyIcon::None, idx_label, FlyAct::EnsureIndex),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Intersect visualizer".into()),
+                    FlyItem::act(FlyIcon::None, "∩ view (whole viewport)", FlyAct::IntersectView),
+                    FlyItem::act(FlyIcon::None, click_label, FlyAct::IntersectArm),
+                    FlyItem::act(FlyIcon::None, "Clear ∩ overlay", FlyAct::IntersectClear),
+                    FlyItem::Divider,
+                    FlyItem::act(FlyIcon::None, "Clear all dobjects (DESTRUCTIVE)", FlyAct::ClearAll),
+                ]
+            }
+        }
+    }
+
+    /// Commit a flyout row's action (§9). Pure dispatch — `&mut self` here, so the
+    /// data-only `FlyAct` resolves against live state.
+    fn flyout_activate(&mut self, act: FlyAct) {
+        match act {
+            FlyAct::Run(cmd) => self.run_command(&cmd),
+            FlyAct::Method(cmd, key) => self.dispatch_method(&cmd, &key),
+            FlyAct::Insert(n) => self.run_command(&format!("insert {}", n)),
+            FlyAct::Import(raster) => self.open_file_dialog(
+                if raster { FileDialogMode::ImportRaster } else { FileDialogMode::ImportImage }, ""),
+            FlyAct::SetDimStyle(id) => {
+                let name = self.doc.dim_styles.styles.get(id as usize).map(|s| s.name.clone());
+                self.current_dim_style = id;
+                if let Some(n) = name {
+                    self.history.push(format!("  dim style: '{}' set current", n));
+                }
+            }
+            FlyAct::SetWallStyle(id) => {
+                // Capture thickness + name in ONE immutable borrow, then mutate env
+                // (the same WlThk sync the Wall Style Manager's Set Current does).
+                let info = self.doc.wall_styles.get(id).map(|s| (s.thickness, s.name.clone()));
+                self.current_wall_style = id;
+                if let Some((thk, name)) = info {
+                    self.env.WlThk = thk;
+                    let _ = self.env.save();
+                    self.history.push(format!("  wall style: '{}' set current", name));
+                }
+            }
+            FlyAct::ToggleBool(f) => {
+                let b = match f {
+                    BoolField::ScreenStats => &mut self.screen_stats_open,
+                    BoolField::Debug       => &mut self.debug_open,
+                    BoolField::TrimDebug   => &mut self.trim_debug_open,
+                    BoolField::HatchDebug  => &mut self.hatch_debug_open,
+                    BoolField::UiInspect   => &mut self.ui_inspect,
+                    BoolField::CmdDump     => &mut self.cmd_dump_open,
+                };
+                *b = !*b;
+            }
+            FlyAct::EnsureIndex   => { self.ensure_index(); }
+            FlyAct::IntersectView => self.intersect_view_pending = true,
+            FlyAct::IntersectArm  => self.intersect_pending_click = !self.intersect_pending_click,
+            FlyAct::IntersectClear=> { self.intersections.clear(); self.last_intersect_label.clear(); }
+            FlyAct::ClearAll      => { self.clear_all(); self.history.push("  cleared".into()); }
+        }
+    }
+
+    /// Render the open flyout STACK at the TOP LEVEL (§9) — independent of the parent
+    /// dropdown so it survives egui auto-closing the dropdown on the ▸, and captures
+    /// its own clicks (no leak to the canvas). Every frame is the SAME custom rows;
+    /// submenu ▸-hover opens a child frame; a click commits + closes; leaving the
+    /// whole stack for `MENU_FLYOUT_CLOSE_DELAY` closes it (travel-tolerant, §2).
+    fn render_menu_flyouts(&mut self, ctx: &egui::Context) {
+        if self.menu_flyouts.is_empty() { self.menu_flyout_hot = false; return; }
+        let frames = self.menu_flyouts.clone();
+        let mut frame_rects: Vec<egui::Rect> = Vec::with_capacity(frames.len());
+        // child[i] = the submenu (menu, anchor) whose ▸ is hovered in frame i.
+        let mut child: Vec<Option<(FlyMenu, egui::Rect)>> = vec![None; frames.len()];
+        let mut action: Option<FlyAct> = None;
+
+        for (i, frame) in frames.iter().enumerate() {
+            let anchor = frame.anchor;
+            let area = egui::Area::new(egui::Id::new(("menu_flyout", i)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(anchor.right() + 2.0, anchor.top()))
+                .constrain(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .rounding(egui::Rounding::same(crate::theme::radius::SM))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let items = self.flyout_items(&frame.menu);
+                            let rows: Vec<(&str, RowT)> = items.iter().map(|it| it.meas()).collect();
+                            let (arrow_x, w) = menu_hug_geometry(ui, &rows);
+                            ui.set_width(w);
+                            for it in &items {
+                                match it {
+                                    FlyItem::Divider   => menu_divider(ui, w),
+                                    FlyItem::Heading(t) => menu_heading_row(ui, w, t),
+                                    FlyItem::Disabled(t) => {
+                                        let _ = paint_menu_row(ui, w, arrow_x, MenuIcon::None, t,
+                                            crate::theme::color::TEXT_MUTED, RowT::Plain);
+                                    }
+                                    FlyItem::Row { icon, name, col, code, check, submenu, act } => {
+                                        let micon = if let Some(on) = check { MenuIcon::Check(*on) }
+                                            else { match icon {
+                                                FlyIcon::Key(k) => icon_for(k),
+                                                FlyIcon::Method(c, k) => MenuIcon::Method(c, k),
+                                                FlyIcon::None => MenuIcon::None,
+                                            } };
+                                        let rowt = match (code, submenu.is_some()) {
+                                            (Some((c, cc)), true)  => RowT::CodeArrow(c, *cc),
+                                            (Some((c, cc)), false) => RowT::Code(c, *cc),
+                                            (None, true)  => RowT::Arrow,
+                                            (None, false) => RowT::Plain,
+                                        };
+                                        let (clk, ahov, rrect) =
+                                            paint_menu_row(ui, w, arrow_x, micon, name, *col, rowt);
+                                        if let Some(sm) = submenu {
+                                            if ahov { child[i] = Some((sm.clone(), rrect)); }
+                                        }
+                                        if clk {
+                                            if let Some(a) = act { if action.is_none() { action = Some(a.clone()); } }
+                                        }
+                                    }
                                 }
-                                let w = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_PAD;
-                                for (short, full, key) in &methods {
-                                    // §5: current method row = cyan; others normal.
-                                    let cur = key == &cur_key;
-                                    let ncol = if cur { PP_ACCENT } else { PP_TEXT };
-                                    let ccol = if cur { PP_ACCENT } else { crate::theme::color::TEXT_MUTED };
-                                    if paint_menu_row(ui, w, w + 1.0, MenuIcon::Method(cmd, key),
-                                        full, ncol, Trailing::Code(short, ccol), false).0
-                                    { method_pick = Some((cmd.clone(), key.clone())); }
-                                }
-                                pp_cap_ui(ui, &format!("menu flyout · {}", cmd));
                             }
-                            MenuFlyout::Insert { .. } => {
-                                let names: Vec<String> = self.doc.blocks.blocks.iter()
-                                    .map(|b| b.name.clone()).collect();
-                                if names.is_empty() { ui.weak("(no blocks defined)"); }
-                                let longest = names.iter().map(|n|
-                                    ui.fonts(|f| f.layout_no_wrap(n.clone(), fn_.clone(), egui::Color32::WHITE).size().x))
-                                    .fold(80.0_f32, f32::max);
-                                let w = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_PAD;
-                                for n in &names {
-                                    if paint_menu_row(ui, w, w + 1.0, MenuIcon::Cmd(GlyphKind::Block),
-                                        n, PP_TEXT, Trailing::None, false).0
-                                    { insert_pick = Some(n.clone()); }
-                                }
-                                pp_cap_ui(ui, "menu flyout · Insert Block");
-                            }
-                        }
-                    });
-            });
-        // Hover stay-open (§2): keep open while the pointer is over the arrow
-        // (flag set by the menu) OR the flyout itself; once it leaves both, close
-        // after MENU_FLYOUT_CLOSE_DELAY (travel tolerance for the diagonal move).
-        let over_flyout = ctx.pointer_hover_pos()
-            .is_some_and(|p| area.response.rect.contains(p));
-        if self.menu_flyout_hot || over_flyout {
+                            pp_cap_ui(ui, "menu flyout");
+                        });
+                });
+            frame_rects.push(area.response.rect);
+        }
+
+        let ptr = ctx.pointer_hover_pos();
+        let over_any  = ptr.map_or(false, |p| frame_rects.iter().any(|r| r.contains(p)));
+        let arrow_any = child.iter().any(|c| c.is_some());
+
+        // Rebuild the stack from arrow-hovers: keep frame 0 (menubar-spawned), extend
+        // with any hovered submenu child (§9 nesting).
+        let mut new_stack: Vec<FlyFrame> = vec![frames[0].clone()];
+        for i in 0..frames.len() {
+            if i + 1 > new_stack.len() { break; }
+            if let Some((menu, anchor)) = &child[i] {
+                new_stack.truncate(i + 1);
+                new_stack.push(FlyFrame { menu: menu.clone(), anchor: *anchor });
+            }
+        }
+        // Travel tolerance: if no new arrow extended but the pointer is over a deeper
+        // existing frame, keep the deeper frames (don't trim while traversing them).
+        if new_stack.len() < frames.len() {
+            let deeper = ptr.map_or(false, |p|
+                frame_rects[new_stack.len()..].iter().any(|r| r.contains(p)));
+            if deeper { new_stack = frames.clone(); }
+        }
+
+        // Global close: pointer off everything, no top-arrow / submenu-arrow hovered.
+        let mut close_all = false;
+        if self.menu_flyout_hot || over_any || arrow_any {
             self.menu_flyout_leave_t = None;
         } else {
             let now = ctx.input(|i| i.time);
             match self.menu_flyout_leave_t {
-                Some(t) if now - t >= MENU_FLYOUT_CLOSE_DELAY => close = true,
+                Some(t) if now - t >= MENU_FLYOUT_CLOSE_DELAY => close_all = true,
                 _ => {
                     if self.menu_flyout_leave_t.is_none() { self.menu_flyout_leave_t = Some(now); }
                     ctx.request_repaint_after(std::time::Duration::from_millis(60));
                 }
             }
         }
-        self.menu_flyout_hot = false;   // re-armed each frame by the menu / flyout
-        // Clicking a flyout item commits (method → dispatch_method, block → insert).
-        if let Some((cmd, key)) = method_pick { self.dispatch_method(&cmd, &key); close = true; }
-        if let Some(n) = insert_pick { self.run_command(&format!("insert {}", n)); close = true; }
-        if close { self.menu_flyout = None; self.menu_flyout_leave_t = None; }
+        self.menu_flyout_hot = false;   // re-armed by the menubar each frame
+
+        if let Some(a) = action { self.flyout_activate(a); close_all = true; }
+        if close_all { self.menu_flyouts.clear(); self.menu_flyout_leave_t = None; }
+        else { self.menu_flyouts = new_stack; }
     }
 }
 
@@ -21793,51 +22103,42 @@ impl eframe::App for CadApp {
                 // Phase 6b: one read-only Ctx snapshot per frame; the registry-
                 // driven Draw/Modify items filter/grey against it (all-default now).
                 let cmd_ctx = self.build_ctx();
-                ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
-                        self.run_command("clear");
-                        ui.close_menu();
-                    }
-                    if ui.button("Open .rsm / .dxf…").clicked() {
-                        // Default the Open type filter to the native format.
-                        self.open_file_dialog(FileDialogMode::Open, ".rsm");
-                        ui.close_menu();
-                    }
-                    // Save to the current file (Save As if none yet). The label
-                    // shows the active file name so it's clear where it writes.
+                // File — custom rows (MENU_DROPDOWN). New/Open/Save/Save-As show the
+                // toolbar glyphs via `icon_for` (§7); Import opens the generalized
+                // flyout (§9). The Save label shows the active file so it's clear
+                // where it writes; the rest reserve the empty slot.
+                custom_menu(ui, "File", |ui| {
+                    let nc = PP_TEXT;
                     let save_label = match &self.current_file {
                         Some(p) => format!("Save  ({})", p.file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "current".into())),
                         None => "Save".to_string(),
                     };
-                    if ui.button(save_label).clicked() {
-                        self.do_save_current();
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As .dxf…").clicked() {
-                        self.open_file_dialog(FileDialogMode::Save, ".dxf");
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As .rsm…").clicked() {
-                        self.open_file_dialog(FileDialogMode::Save, ".rsm");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.menu_button("Import", |ui| {
-                        if ui.button("Image as raster (underlay)…").clicked() {
-                            self.open_file_dialog(FileDialogMode::ImportRaster, "");
-                            ui.close_menu();
-                        }
-                        if ui.button("Image → vector (trace editor)…").clicked() {
-                            self.open_file_dialog(FileDialogMode::ImportImage, "");
-                            ui.close_menu();
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("New parametric sketch").clicked() {
-                        // Parametric MODE: clear, then draw with the NORMAL tools;
-                        // the Parametric panel adds constraints + Solve.
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("New", RowT::Plain), ("Open .rsm / .dxf…", RowT::Plain),
+                        (save_label.as_str(), RowT::Plain),
+                        ("Save As .dxf…", RowT::Plain), ("Save As .rsm…", RowT::Plain),
+                        ("Import", RowT::Arrow),
+                        ("New parametric sketch", RowT::Plain), ("Exit", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.new"), "New", nc, RowT::Plain).0
+                        { self.run_command("clear"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.open"), "Open .rsm / .dxf…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Open, ".rsm"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.save"), &save_label, nc, RowT::Plain).0
+                        { self.do_save_current(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.saveas"), "Save As .dxf…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Save, ".dxf"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.saveas"), "Save As .rsm…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Save, ".rsm"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    // Import ▸ — generalized flyout (raster / vector).
+                    let (_ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Import", nc, RowT::Arrow);
+                    if ia { self.open_flyout(FlyMenu::Import, irect); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "New parametric sketch", nc, RowT::Plain).0 {
                         self.run_command("clear");
                         self.parametric = crate::param_editor::ParamSession::new();
                         self.parametric.active = true;
@@ -21846,526 +22147,371 @@ impl eframe::App for CadApp {
                              add constraints, then Solve".into();
                         ui.close_menu();
                     }
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Exit", nc, RowT::Plain).0
+                        { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
                     pp_cap_ui(ui, "menu: File");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo").clicked() {
-                        self.run_command("undo");
-                        ui.close_menu();
-                    }
-                    if ui.button("Redo").clicked() {
-                        self.run_command("redo");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Copy    Ctrl+C").clicked() {
+                // Edit — custom rows (MENU_DROPDOWN). Undo/Redo/Copy/Erase/Match
+                // have Cmd glyphs; the rest reserve the empty 20px slot (§1). The
+                // Ctrl+ shortcuts render as a muted hint (spec has no shortcut
+                // column — flagged for a label decision).
+                custom_menu(ui, "Edit", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Undo", RowT::Plain), ("Redo", RowT::Plain),
+                        ("Copy", RowT::Shortcut("Ctrl+C")),
+                        ("Paste", RowT::Shortcut("Ctrl+V")),
+                        ("Group", RowT::Shortcut("Ctrl+G")),
+                        ("Add to Group", RowT::Plain), ("Ungroup", RowT::Plain),
+                        ("Select All", RowT::Plain), ("Deselect All", RowT::Plain),
+                        ("Erase selection", RowT::Plain),
+                        ("Match Properties", RowT::Plain),
+                        ("Settings…", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.undo"), "Undo", nc, RowT::Plain).0
+                        { self.run_command("undo"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.redo"), "Redo", nc, RowT::Plain).0
+                        { self.run_command("redo"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.copy"), "Copy", nc, RowT::Shortcut("Ctrl+C")).0 {
                         self.copy_selection();
                         let n = self.clipboard_dobjects.len();
-                        ui.ctx().copy_text(format!(
-                            "RUST-AutoRASM: {} object(s) on clipboard", n));
+                        ui.ctx().copy_text(format!("RUST-AutoRASM: {} object(s) on clipboard", n));
                         ui.close_menu();
                     }
-                    if ui.button("Paste   Ctrl+V").clicked() {
-                        self.start_paste();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Group   Ctrl+G").clicked() {
-                        self.group_selection();
-                        ui.close_menu();
-                    }
-                    if ui.button("Add to Group").clicked() {
-                        self.add_to_group();
-                        ui.close_menu();
-                    }
-                    if ui.button("Ungroup").clicked() {
-                        self.ungroup_selection();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Select All").clicked() {
-                        self.run_command("select");
-                        self.run_command("all");
-                        ui.close_menu();
-                    }
-                    if ui.button("Deselect All").clicked() {
-                        self.selection.clear();
-                        self.selected = None;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Erase selection").clicked() {
-                        self.run_command("erase");
-                        ui.close_menu();
-                    }
-                    if ui.button("Match Properties").clicked() {
-                        self.run_command("matchprop");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Settings…").clicked() {
-                        self.settings_open = true;
-                        ui.close_menu();
-                    }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Paste", nc, RowT::Shortcut("Ctrl+V")).0
+                        { self.start_paste(); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Group", nc, RowT::Shortcut("Ctrl+G")).0
+                        { self.group_selection(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Add to Group", nc, RowT::Plain).0
+                        { self.add_to_group(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Ungroup", nc, RowT::Plain).0
+                        { self.ungroup_selection(); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Select All", nc, RowT::Plain).0
+                        { self.run_command("select"); self.run_command("all"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Deselect All", nc, RowT::Plain).0
+                        { self.selection.clear(); self.selected = None; ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.erase"), "Erase selection", nc, RowT::Plain).0
+                        { self.run_command("erase"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.matchprop"), "Match Properties", nc, RowT::Plain).0
+                        { self.run_command("matchprop"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Settings…", nc, RowT::Plain).0
+                        { self.settings_open = true; ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Edit");
-                    menu_autoclose(ui, bar_rect);
                 });
-                // Zero the popup's HORIZONTAL inner margin so a full-width row
-                // reaches the frame border (edge-to-edge hover, §3); each row's own
-                // MENU_PAD keeps the content off the edge. Vertical margin kept.
-                let saved_mm = ui.style().spacing.menu_margin;
-                ui.style_mut().spacing.menu_margin.left  = 0.0;
-                ui.style_mut().spacing.menu_margin.right = 0.0;
-                ui.menu_button("Draw", |ui| {
-                    // Custom-painted rows (MENU_DROPDOWN_MENTOR): every command
-                    // iconized in one aligned column, 26 band / 20 icon box / 14
-                    // gap (palette-identical), cyan (CODE) marker, surface-2 hover,
-                    // ▸ on one aligned column, hug width. Rows are flush (spacing 0).
-                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                // Draw — custom-painted rows (MENU_DROPDOWN_MENTOR): every command
+                // iconized in one aligned column, 26 band / 20 icon box / 14 gap
+                // (palette-identical), cyan (CODE) marker, surface-2 hover, ▸ on one
+                // aligned column, hug width. `custom_menu` owns the edge-to-edge
+                // chrome (§3); `menu_hug_geometry` owns the width (§2/§7).
+                custom_menu(ui, "Draw", |ui| {
                     let circle_key  = self.current_method_key("circle");
                     let circle_code = self.current_method_short("circle");
                     let arc_key     = self.current_method_key("arc");
                     let arc_code    = self.current_method_short("arc");
-
-                    // Pass 1 — measure the longest FULL line (incl. any (CODE)/hint)
-                    // → arrow column = longest + 6, and the hug width (§2).
-                    let fn_ = crate::theme::typ::body();
-                    let fc_ = crate::theme::typ::data_code();
-                    let nw = |ui: &egui::Ui, s: &str| ui.fonts(|f|
-                        f.layout_no_wrap(s.to_string(), fn_.clone(), egui::Color32::WHITE).size().x);
-                    let cw = |ui: &egui::Ui, s: &str| ui.fonts(|f|
-                        f.layout_no_wrap(s.to_string(), fc_.clone(), egui::Color32::WHITE).size().x);
-                    let mut longest = 0.0_f32;
-                    for (name, code, hint) in [
-                        ("Line", None, None), ("Rectangle", None, None),
-                        ("Circle", Some(circle_code.as_str()), None),
-                        ("Arc",    Some(arc_code.as_str()), None),
-                        ("Ellipse", None, None), ("Ellipse Arc", None, None),
-                        ("Polyline", None, None), ("Spline", None, None),
-                        ("Point", None, None), ("Hatch…", None, None),
-                        ("Wall", None, Some("(t = thickness)")),
-                        ("Block…", None, None), ("Insert Block", None, None),
-                    ] {
-                        let tw = if let Some(c) = code { MENU_CODE_GAP + cw(ui, &format!("({})", c)) }
-                                 else if let Some(h) = hint { MENU_CODE_GAP + nw(ui, h) }
-                                 else { 0.0 };
-                        longest = longest.max(nw(ui, name) + tw);
-                    }
-                    let arrow_x = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_CODE_GAP;
-                    let w = arrow_x + MENU_ARROW_W + MENU_PAD;
                     let nc = PP_TEXT;   // command-name colour
 
-                    // Pass 2 — render + dispatch. Rows fill the full menu
-                    // content width (edge-to-edge hover + click, §3): a w-wide
-                    // spacer sets the menu floor, then rows use available width.
-                    ui.set_width(w);   // §3: pin frame inner width to the hug width
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("line"), "Line", nc, Trailing::None, false).0
+                    // Pass 1 — hug geometry from every FULL line (incl. (CODE)/hint).
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Line", RowT::Plain), ("Rectangle", RowT::Plain),
+                        ("Circle", RowT::CodeArrow(&circle_code, PP_ACCENT)),
+                        ("Arc",    RowT::CodeArrow(&arc_code, PP_ACCENT)),
+                        ("Ellipse", RowT::Plain), ("Ellipse Arc", RowT::Plain),
+                        ("Polyline", RowT::Plain), ("Spline", RowT::Plain),
+                        ("Point", RowT::Plain), ("Hatch…", RowT::Plain),
+                        ("Wall", RowT::Hint("(t = thickness)")),
+                        ("Block…", RowT::Plain), ("Insert Block", RowT::Plain),
+                    ]);
+
+                    // Pass 2 — render + dispatch. §3: pin frame inner width to `w`.
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.line"), "Line", nc, RowT::Plain).0
                         { self.execute("draw.line"); ui.close_menu(); }
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("rect"), "Rectangle", nc, Trailing::None, false).0
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.rectangle"), "Rectangle", nc, RowT::Plain).0
                         { self.execute("draw.rectangle"); ui.close_menu(); }
                     // Circle — body runs remembered; ▸ opens the method flyout
                     // (top-level, survives the dropdown closing — §2.1).
                     let (cb, ca, crect) = paint_menu_row(ui, w, arrow_x,
                         MenuIcon::Method("circle", &circle_key), "Circle", nc,
-                        Trailing::Code(&circle_code, PP_ACCENT), true);
+                        RowT::CodeArrow(&circle_code, PP_ACCENT));
                     if cb { self.execute("draw.circle"); ui.close_menu(); }
-                    if ca { self.menu_flyout = Some(MenuFlyout::Method { cmd: "circle".into(), anchor: crect }); self.menu_flyout_hot = true; }
+                    if ca { self.open_flyout(FlyMenu::Method("circle".into()), crect); }
                     // Arc
                     let (ab, aa, arect) = paint_menu_row(ui, w, arrow_x,
                         MenuIcon::Method("arc", &arc_key), "Arc", nc,
-                        Trailing::Code(&arc_code, PP_ACCENT), true);
+                        RowT::CodeArrow(&arc_code, PP_ACCENT));
                     if ab { self.execute("draw.arc"); ui.close_menu(); }
-                    if aa { self.menu_flyout = Some(MenuFlyout::Method { cmd: "arc".into(), anchor: arect }); self.menu_flyout_hot = true; }
-                    for (icon, name, id) in [
-                        ("ellipse", "Ellipse",     "draw.ellipse"),
-                        ("ellarc",  "Ellipse Arc", "draw.ellipsearc"),
-                        ("pline",   "Polyline",    "draw.pline"),
-                        ("spline",  "Spline",      "draw.spline"),
-                        ("point",   "Point",       "draw.point"),
+                    if aa { self.open_flyout(FlyMenu::Method("arc".into()), arect); }
+                    for (name, id) in [
+                        ("Ellipse",     "draw.ellipse"),
+                        ("Ellipse Arc", "draw.ellipsearc"),
+                        ("Polyline",    "draw.pline"),
+                        ("Spline",      "draw.spline"),
+                        ("Point",       "draw.point"),
                     ] {
-                        if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw(icon), name, nc, Trailing::None, false).0
+                        if paint_menu_row(ui, w, arrow_x, icon_for(id), name, nc, RowT::Plain).0
                             { self.execute(id); ui.close_menu(); }
                     }
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("hatch"), "Hatch…", nc, Trailing::None, false).0
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.hatch"), "Hatch…", nc, RowT::Plain).0
                         { self.run_command("hatch"); ui.close_menu(); }
                     // Wall (t = thickness) — muted parenthetical hint.
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("wall"), "Wall", nc, Trailing::Hint("(t = thickness)"), false).0
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.wall"), "Wall", nc, RowT::Hint("(t = thickness)")).0
                         { self.run_command("wall"); ui.close_menu(); }
-                    // group divider hairline (kept)
-                    let (dr, _) = ui.allocate_exact_size(egui::vec2(w, 5.0), egui::Sense::hover());
-                    ui.painter().hline(dr.x_range(), dr.center().y, egui::Stroke::new(1.0, crate::theme::color::BORDER));
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Cmd(GlyphKind::Block), "Block…", nc, Trailing::None, false).0
+                    menu_divider(ui, w);   // group divider hairline (kept)
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.block"), "Block…", nc, RowT::Plain).0
                         { self.run_command("block"); ui.close_menu(); }
                     // Insert Block ▸ — opens the block-name flyout (top-level, §2.1).
-                    let (ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::Cmd(GlyphKind::Insert), "Insert Block", nc, Trailing::None, true);
-                    if ia { self.menu_flyout = Some(MenuFlyout::Insert { anchor: irect }); self.menu_flyout_hot = true; }
+                    let (ib, ia, irect) = paint_menu_row(ui, w, arrow_x, icon_for("draw.insert"), "Insert Block", nc, RowT::Arrow);
+                    if ia { self.open_flyout(FlyMenu::Insert, irect); }
                     let _ = ib;
                     pp_cap_ui(ui, "menu: Draw");
                 });
-                ui.style_mut().spacing.menu_margin = saved_mm;   // restore for other menus
-                ui.menu_button("Modify", |ui| {
-                    // Transform group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Move",     "modify.move"),
-                        ("Copy",     "modify.copy"),
-                        ("Rotate",   "modify.rotate"),
-                        ("Scale",    "modify.scale"),
-                        ("Mirror",   "modify.mirror"),
-                        ("Stretch",  "modify.stretch"),
-                        ("Align",    "modify.align"),
+                // Modify — custom rows (MENU_DROPDOWN). Every command has a Cmd
+                // glyph except Inspector (reserved slot). Fillet is the ONE method
+                // row: cyan (CODE) + ▸ hover flyout (MenuFlyout::Method), body runs
+                // the remembered method (§4). Explode/Inspector keep their hover
+                // tooltips. `cmd_ctx` predicates are all-default now (as in Draw) —
+                // dispatch straight through execute(id).
+                let _ = &cmd_ctx;
+                custom_menu(ui, "Modify", |ui| {
+                    let nc = PP_TEXT;
+                    let fillet_key  = self.current_method_key("fillet");
+                    let fillet_code = self.current_method_short("fillet");
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Move", RowT::Plain), ("Copy", RowT::Plain),
+                        ("Rotate", RowT::Plain), ("Scale", RowT::Plain),
+                        ("Mirror", RowT::Plain), ("Stretch", RowT::Plain),
+                        ("Align", RowT::Plain), ("Trim", RowT::Plain),
+                        ("Extend", RowT::Plain),
+                        ("Fillet", RowT::CodeArrow(&fillet_code, PP_ACCENT)),
+                        ("Chamfer", RowT::Plain), ("Offset", RowT::Plain),
+                        ("Join", RowT::Plain), ("Break", RowT::Plain),
+                        ("Lengthen", RowT::Plain), ("Reverse", RowT::Plain),
+                        ("Array…", RowT::Plain), ("Explode", RowT::Plain),
+                        ("Inspector…", RowT::Plain),
+                        ("Match Properties", RowT::Plain),
+                        ("Change Layer to Current", RowT::Plain),
+                        ("Erase", RowT::Plain),
                     ]);
-                    ui.separator();
-                    // Edit-geometry group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Trim",   "modify.trim"),
-                        ("Extend", "modify.extend"),
-                    ]);
-                    // Fillet — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Fillet", "modify.fillet", "fillet");
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Chamfer",  "modify.chamfer"),
-                        ("Offset",   "modify.offset"),
-                        ("Join",     "modify.join"),
-                        ("Break",    "modify.break"),
-                        ("Lengthen", "modify.lengthen 1"),
-                        ("Reverse",  "modify.reverse"),
-                    ]);
-                    ui.separator();
-                    // Multi-instance / properties group. Array… (dialog),
-                    // Explode (custom tooltip), Inspector… (`props` — not a
-                    // registry command) stay hand-authored, interleaved.
-                    if ui.button("Array…").clicked() {
-                        self.array_open = true;
-                        ui.close_menu();
+                    ui.set_width(w);
+                    // Transform group. Icon via `icon_for` on the id's base (before
+                    // any arg, e.g. "modify.lengthen 1"); dispatch via the full id.
+                    let icon_key = |id: &'static str| id.split(' ').next().unwrap_or(id);
+                    for (name, id) in [
+                        ("Move", "modify.move"), ("Copy", "modify.copy"),
+                        ("Rotate", "modify.rotate"), ("Scale", "modify.scale"),
+                        ("Mirror", "modify.mirror"), ("Stretch", "modify.stretch"),
+                        ("Align", "modify.align"),
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    if ui.button("Explode")
-                        .on_hover_text("Break selected block instances back \
-                                        into their component dobjects")
-                        .clicked()
-                    {
-                        self.run_command("explode");
-                        ui.close_menu();
+                    menu_divider(ui, w);
+                    // Edit-geometry group.
+                    for (name, id) in [("Trim", "modify.trim"), ("Extend", "modify.extend")] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    if ui.button("Inspector…")
-                        .on_hover_text("Edit common properties of the selected \
-                                        dobject(s) — layer, color, linetype, \
-                                        lineweight, and type-specific style")
-                        .clicked()
-                    {
-                        self.run_command("props");
-                        ui.close_menu();
+                    // Fillet — method row (cyan CODE + ▸ hover flyout, §4/§2.1).
+                    let (fb, fa, frect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("fillet", &fillet_key), "Fillet", nc,
+                        RowT::CodeArrow(&fillet_code, PP_ACCENT));
+                    if fb { self.execute("modify.fillet"); ui.close_menu(); }
+                    if fa { self.open_flyout(FlyMenu::Method("fillet".into()), frect); }
+                    for (name, id) in [
+                        ("Chamfer", "modify.chamfer"), ("Offset", "modify.offset"),
+                        ("Join", "modify.join"), ("Break", "modify.break"),
+                        ("Lengthen", "modify.lengthen 1"), ("Reverse", "modify.reverse"),
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
+                    menu_divider(ui, w);
+                    // Multi-instance / properties group.
+                    if paint_menu_row(ui, w, arrow_x, icon_for("modify.array"), "Array…", nc, RowT::Plain).0
+                        { self.array_open = true; ui.close_menu(); }
+                    let (eb, _, erect) = paint_menu_row(ui, w, arrow_x, icon_for("modify.explode"), "Explode", nc, RowT::Plain);
+                    ui.interact(erect, egui::Id::new(("modtip", "explode")), egui::Sense::hover())
+                        .on_hover_text("Break selected block instances back into their component dobjects");
+                    if eb { self.run_command("explode"); ui.close_menu(); }
+                    // Inspector… — `props`, not a registry command; reserved slot.
+                    let (ipb, _, iprect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Inspector…", nc, RowT::Plain);
+                    ui.interact(iprect, egui::Id::new(("modtip", "inspector")), egui::Sense::hover())
+                        .on_hover_text("Edit common properties of the selected dobject(s) — \
+                                        layer, color, linetype, lineweight, and type-specific style");
+                    if ipb { self.run_command("props"); ui.close_menu(); }
+                    for (name, id) in [
                         ("Match Properties", "modify.matchprop"),
                         ("Change Layer to Current", "modify.chlayer"),
-                    ]);
-                    ui.separator();
-                    self.menu_cmd_items(ui, &cmd_ctx, &[("Erase", "modify.erase")]);
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
+                    }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("modify.erase"), "Erase", nc, RowT::Plain).0
+                        { self.execute("modify.erase"); ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Modify");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("View", |ui| {
-                    if ui.button("Zoom Extents (fit all)").clicked() {
-                        self.zoom_extents();
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Window").clicked() {
-                        self.zoom_start("w");
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Previous").clicked() {
-                        self.zoom_previous();
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset View").clicked() {
+                // View — custom rows (MENU_DROPDOWN). None of the zoom commands
+                // have a glyph yet → all reserve the empty 20px slot (§1); labels
+                // kept verbatim ("Zoom Extents (fit all)" flagged for a trim).
+                custom_menu(ui, "View", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Zoom Extents", RowT::Plain),
+                        ("Zoom Window", RowT::Plain),
+                        ("Zoom Previous", RowT::Plain),
+                        ("Reset View", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Extents", nc, RowT::Plain).0
+                        { self.zoom_extents(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Window", nc, RowT::Plain).0
+                        { self.zoom_start("w"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Previous", nc, RowT::Plain).0
+                        { self.zoom_previous(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Reset View", nc, RowT::Plain).0 {
                         self.view_push_history();
                         self.scale = 20.0;
                         self.world_offset = egui::vec2(0.0, 0.0);
                         ui.close_menu();
                     }
                     pp_cap_ui(ui, "menu: View");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Formative", |ui| {
-                    if ui.button("Layers…").clicked() {
-                        self.layer_panel_open = !self.layer_panel_open;
-                        ui.close_menu();
-                    }
-                    if ui.button("Pens…").clicked() {
-                        self.pen_panel_open = !self.pen_panel_open;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    // Dimension — a formative sub-category (not a top-level menu).
-                    ui.menu_button("Dimension", |ui| {
-                        // Smart dim auto-decides Linear / Radius / Diameter
-                        // from what the first click hits (single `dim`
-                        // command — no separate dimlinear/dimradius words).
-                        if ui.button("Dimension  (smart: linear · radius · diameter)")
-                            .on_hover_text(
-                                "Click a defining point for a linear dim, or a \
-                                 circle/arc for radius (press D for diameter)")
-                            .clicked()
-                        {
-                            self.run_command("dim");
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Dimension Style…")
-                            .on_hover_text("Add or edit a dimension style \
-                                            (arrow size, text height, decimals, color)")
-                            .clicked()
-                        {
-                            self.run_command("dimstyle");
-                            ui.close_menu();
-                        }
-                        pp_cap_ui(ui, "menu: Formative ▸ Dimension");
-                    });
-                    // Styles — a formative sub-category. ONE home for every
-                    // style table. Managers first, then current-style switchers.
-                    ui.menu_button("Styles", |ui| {
-                        ui.label(egui::RichText::new("Managers").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
-                        for (label, cmd, tip) in [
-                            ("Text Style…", "style",
-                             "Named text styles (font, default height)"),
-                            ("Dimension Style…", "dimstyle",
-                             "Arrow size, text height/placement, decimals, colors"),
-                            ("Wall Style…", "wallstyle",
-                             "Wall types (Dry Wall / Structural / …): thickness, poché fill, face color"),
-                        ] {
-                            if ui.button(label).on_hover_text(tip).clicked() {
-                                self.run_command(cmd);
-                                ui.close_menu();
-                            }
-                        }
-                        ui.separator();
-                        ui.label(egui::RichText::new("Current").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
-                        // Snapshot names so the submenu closures don't borrow doc.
-                        let dim_names: Vec<(u32, String)> = self.doc.dim_styles.styles
-                            .iter().enumerate()
-                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                        let wall_names: Vec<(u32, String)> = self.doc.wall_styles.styles
-                            .iter().enumerate()
-                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                        let mut set_dim:  Option<u32> = None;
-                        let mut set_wall: Option<u32> = None;
-                        ui.menu_button(
-                            format!("Dim style:  {}", dim_names
-                                .get(self.current_dim_style as usize)
-                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                            |ui| {
-                                for (id, name) in &dim_names {
-                                    if ui.selectable_label(
-                                        *id == self.current_dim_style, name).clicked()
-                                    {
-                                        set_dim = Some(*id);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        ui.menu_button(
-                            format!("Wall style:  {}", wall_names
-                                .get(self.current_wall_style as usize)
-                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                            |ui| {
-                                for (id, name) in &wall_names {
-                                    if ui.selectable_label(
-                                        *id == self.current_wall_style, name).clicked()
-                                    {
-                                        set_wall = Some(*id);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        if let Some(id) = set_dim {
-                            self.current_dim_style = id;
-                            self.history.push(format!(
-                                "  dim style: '{}' set current",
-                                dim_names[id as usize].1));
-                        }
-                        if let Some(id) = set_wall {
-                            self.current_wall_style = id;
-                            // Same WlThk sync the Wall Style Manager's Set
-                            // Current does, so the next wall draws at the
-                            // style's thickness.
-                            if let Some(s) = self.doc.wall_styles.get(id) {
-                                self.env.WlThk = s.thickness;
-                                let _ = self.env.save();
-                            }
-                            self.history.push(format!(
-                                "  wall style: '{}' set current",
-                                wall_names[id as usize].1));
-                        }
-                        ui.separator();
-                        // Future style tables — visible intent, honestly disabled.
-                        ui.add_enabled(false, egui::Button::new("Opening Style…  (planned)"))
-                            .on_disabled_hover_text(
-                                "Door / window / niche styles riding on walls — \
-                                 see Smart_Dobjects.md §2.6");
-                        pp_cap_ui(ui, "menu: Formative ▸ Styles");
-                    });
+                // Formative — custom rows (MENU_DROPDOWN). Layers/Pens toggle their
+                // panels; Dimension + Styles open the generalized flyout (§9) — the
+                // Styles flyout itself nests the current dim/wall-style pickers.
+                custom_menu(ui, "Formative", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Layers…", RowT::Plain), ("Pens…", RowT::Plain),
+                        ("Dimension", RowT::Arrow), ("Styles", RowT::Arrow),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Layers…", nc, RowT::Plain).0
+                        { self.layer_panel_open = !self.layer_panel_open; ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Pens…", nc, RowT::Plain).0
+                        { self.pen_panel_open = !self.pen_panel_open; ui.close_menu(); }
+                    menu_divider(ui, w);
+                    let (_db, da, drect) = paint_menu_row(ui, w, arrow_x,
+                        icon_for("formative.dimension"), "Dimension", nc, RowT::Arrow);
+                    if da { self.open_flyout(FlyMenu::Dimension, drect); }
+                    let (_sb, sa, srect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::None, "Styles", nc, RowT::Arrow);
+                    if sa { self.open_flyout(FlyMenu::Styles, srect); }
                     pp_cap_ui(ui, "menu: Formative");
                 });
-                ui.menu_button("Utilities", |ui| {
-                    if ui.button("Distance (2 clicks)").clicked() {
-                        self.run_command("dist");
-                        ui.close_menu();
-                    }
-                    if ui.button("List selected dobjects").clicked() {
-                        self.run_command("list");
-                        ui.close_menu();
-                    }
+                // Utilities — custom rows (MENU_DROPDOWN). Both inquiry commands
+                // have Cmd glyphs (Dist / List). Labels kept verbatim ("Distance
+                // (2 clicks)" flagged for a trim).
+                custom_menu(ui, "Utilities", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Distance", RowT::Plain),
+                        ("List", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.dist"), "Distance", nc, RowT::Plain).0
+                        { self.run_command("dist"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.list"), "List", nc, RowT::Plain).0
+                        { self.run_command("list"); ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Utilities");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Tools", |ui| {
-                    ui.label(egui::RichText::new("Palettes").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
-                    // NOTE: this toggles the command-LINE dock (`cmd_window_open`),
-                    // not a palette — the old "Command palette" label was wrong.
-                    ui.checkbox(&mut self.cmd_window_open,      "Command line");
-                    if ui.button("Command palette…   (Ctrl+Shift+P)")
-                        .on_hover_text("Search all commands by name or keyword; ↑/↓ to move, Enter to run")
-                        .clicked()
-                    {
-                        self.palette_open = true;
-                        self.palette_focus = true;
-                        self.palette_query.clear();
-                        self.palette_sel = 0;
+                // Tools — custom rows (MENU_DROPDOWN). §8 section headings +
+                // cyan-checkbox rows for the panel-visibility toggles; the Command
+                // palette shows its shortcut (right-aligned, §1); Debug tools opens
+                // the generalized flyout (§9). Checkbox rows omit `close_menu` so you
+                // can flip several without the menu closing.
+                custom_menu(ui, "Tools", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Palettes", RowT::Plain),
+                        ("Command line", RowT::Plain),
+                        ("Command palette…", RowT::Shortcut("Ctrl+Shift+P")),
+                        ("Layers", RowT::Plain), ("Pens", RowT::Plain),
+                        ("Inspector", RowT::Plain), ("DObjects list", RowT::Plain),
+                        ("Command rails", RowT::Plain),
+                        ("Draw rail (left)", RowT::Plain), ("Modify rail (left)", RowT::Plain),
+                        ("Snap window", RowT::Plain), ("Toggle Grips", RowT::Plain),
+                        ("Text Style…", RowT::Plain),
+                        ("🛰 Session Recorder", RowT::Plain),
+                        ("Inquiry", RowT::Plain),
+                        ("Distance", RowT::Plain), ("List", RowT::Plain),
+                        ("Debug tools", RowT::Arrow),
+                    ]);
+                    ui.set_width(w);
+                    // §8 checkbox row: cyan check in the slot; click toggles, menu stays open.
+                    macro_rules! check_row { ($name:expr, $field:expr) => {
+                        if paint_menu_row(ui, w, arrow_x, MenuIcon::Check($field), $name, nc, RowT::Plain).0
+                            { $field = !$field; }
+                    }; }
+                    menu_heading_row(ui, w, "Palettes");
+                    check_row!("Command line", self.cmd_window_open);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command palette…", nc, RowT::Shortcut("Ctrl+Shift+P")).0 {
+                        self.palette_open = true; self.palette_focus = true;
+                        self.palette_query.clear(); self.palette_sel = 0;
                         ui.close_menu();
                     }
-                    ui.checkbox(&mut self.layers_window_open,   "Layers");
-                    ui.checkbox(&mut self.pens_window_open,     "Pens");
-                    ui.checkbox(&mut self.info_window_open,     "Inspector");
-                    ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
-                    ui.separator();
-                    menu_heading(ui, "Command rails");
-                    ui.checkbox(&mut self.draw_rail_open,   "Draw rail (left)");
-                    ui.checkbox(&mut self.modify_rail_open, "Modify rail (left)");
-                    ui.separator();
-                    if ui.button("Snap window").clicked() {
-                        self.snap_window_open = !self.snap_window_open;
-                        ui.close_menu();
+                    check_row!("Layers", self.layers_window_open);
+                    check_row!("Pens", self.pens_window_open);
+                    check_row!("Inspector", self.info_window_open);
+                    check_row!("DObjects list", self.dobjects_window_open);
+                    menu_divider(ui, w);
+                    menu_heading_row(ui, w, "Command rails");
+                    check_row!("Draw rail (left)", self.draw_rail_open);
+                    check_row!("Modify rail (left)", self.modify_rail_open);
+                    menu_divider(ui, w);
+                    check_row!("Snap window", self.snap_window_open);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Toggle Grips", nc, RowT::Plain).0 {
+                        self.env.GrpEnb = !self.env.GrpEnb; let _ = self.env.save(); ui.close_menu();
                     }
-                    if ui.button("Toggle Grips").clicked() {
-                        self.env.GrpEnb = !self.env.GrpEnb;
-                        let _ = self.env.save();
-                        ui.close_menu();
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Text Style…", nc, RowT::Plain).0 {
+                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuClick {
+                            path: "Tools → Text Style…".into() });
+                        self.run_command("style"); ui.close_menu();
                     }
-                    if ui.button("Text Style…").clicked() {
-                        crate::dbg_event!(self,
-                            crate::dbg_recorder::DbgEvent::MenuClick {
-                                path: "Tools → Text Style…".into() });
-                        self.run_command("style");
-                        ui.close_menu();
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Check(self.dbg_window_open), "🛰 Session Recorder", nc, RowT::Plain).0 {
+                        self.dbg_window_open = !self.dbg_window_open;
+                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuClick {
+                            path: format!("Tools → 🛰 Session Recorder ({})",
+                                if self.dbg_window_open { "open" } else { "close" }) });
                     }
-                    ui.separator();
-                    if ui.checkbox(&mut self.dbg_window_open,
-                        "🛰 Session Recorder").clicked() {
-                        crate::dbg_event!(self,
-                            crate::dbg_recorder::DbgEvent::MenuClick {
-                                path: format!(
-                                    "Tools → 🛰 Session Recorder ({})",
-                                    if self.dbg_window_open { "open" } else { "close" }) });
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    menu_heading(ui, "Inquiry");
-                    if ui.button("Distance (2 clicks)").clicked() {
-                        self.run_command("dist");
-                        ui.close_menu();
-                    }
-                    if ui.button("List selected dobjects").clicked() {
-                        self.run_command("list");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    // ---- Debug tools submenu --------------------------
-                    // All diagnostic / development toggles live here in
-                    // one place. Adding new debug instruments? Put the
-                    // toggle here, not on the toolbar.
-                    ui.menu_button("Debug tools", |ui| {
-                        ui.checkbox(&mut self.screen_stats_open, "Screen Stats")
-                            .on_hover_text(
-                                "Renderer's view of the doc: total / in viewport / drawn / skipped");
-                        ui.checkbox(&mut self.debug_open, "Render mode (CPU/GPU + APX)")
-                            .on_hover_text("CPU/GPU toggle, APX (draft display), render stats");
-                        ui.checkbox(&mut self.trim_debug_open, "Trim Debug Log")
-                            .on_hover_text("Log every click + state transition during trim/extend");
-                        ui.checkbox(&mut self.hatch_debug_open, "Hatch Debug Log")
-                            .on_hover_text("Log dialog + pick-point + apply + render for hatch");
-                        ui.checkbox(&mut self.ui_inspect, "UI inspect (element sizes)")
-                            .on_hover_text("Devtools ruler: hover any panel element to read its \
-                                exact w×h + position, to compare the build against the design spec");
-                        ui.checkbox(&mut self.cmd_dump_open, "Command registry dump")
-                            .on_hover_text("Phase-2 verify: list every command the registry was \
-                                derived from (id / dispatch / title / category / icon)");
-                        ui.separator();
-                        // Spatial index — rebuild + status
-                        let idx_label = if self.index_dirty || self.index.is_none() {
-                            "Rebuild spatial index ⟲"
-                        } else {
-                            "Spatial index ✓ (fresh)"
-                        };
-                        if ui.button(idx_label).clicked() {
-                            self.ensure_index();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // Intersection visualizer (diagnostic — shows ∩
-                        // points so the user can verify a query).
-                        menu_heading(ui, "Intersect visualizer");
-                        if ui.button("∩ view (whole viewport)").clicked() {
-                            self.intersect_view_pending = true;
-                            ui.close_menu();
-                        }
-                        let click_lbl = if self.intersect_pending_click {
-                            "∩ click — waiting for click…"
-                        } else {
-                            "∩ click — arm for next click"
-                        };
-                        if ui.button(click_lbl).clicked() {
-                            self.intersect_pending_click = !self.intersect_pending_click;
-                            ui.close_menu();
-                        }
-                        if ui.button("Clear ∩ overlay").clicked() {
-                            self.intersections.clear();
-                            self.last_intersect_label.clear();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // Destructive — moved to Debug tools because it
-                        // wipes the entire document with no confirmation.
-                        if ui.button("Clear all dobjects (DESTRUCTIVE)").clicked() {
-                            self.clear_all();
-                            self.history.push("  cleared".into());
-                            ui.close_menu();
-                        }
-                        pp_cap_ui(ui, "menu: Tools ▸ Debug tools");
-                    });
+                    menu_divider(ui, w);
+                    menu_heading_row(ui, w, "Inquiry");
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.dist"), "Distance", nc, RowT::Plain).0
+                        { self.run_command("dist"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.list"), "List", nc, RowT::Plain).0
+                        { self.run_command("list"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    // Debug tools ▸ — generalized flyout (§9): toggles, index, ∩, clear.
+                    let (_gb, ga, grect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Debug tools", nc, RowT::Arrow);
+                    if ga { self.open_flyout(FlyMenu::Debug, grect); }
                     pp_cap_ui(ui, "menu: Tools");
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Command help").clicked() {
-                        self.run_command("help");
-                        ui.close_menu();
-                    }
-                    if ui.button("About RUST_CAD").clicked() {
-                        self.history.push(
-                            "  RUST_CAD — pure-Rust 2-D CAD math workbench".into());
-                        self.history.push(
-                            "  github.com/HSI-Lighting/RUST-AutoRASM".into());
+                // Help — custom rows (MENU_DROPDOWN). Neither command has a glyph
+                // yet → both reserve the empty 20px slot (§1).
+                custom_menu(ui, "Help", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Command help", RowT::Plain),
+                        ("About RUST_CAD", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command help", nc, RowT::Plain).0
+                        { self.run_command("help"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "About RUST_CAD", nc, RowT::Plain).0 {
+                        self.history.push("  RUST_CAD — pure-Rust 2-D CAD math workbench".into());
+                        self.history.push("  github.com/HSI-Lighting/RUST-AutoRASM".into());
                         ui.close_menu();
                     }
                     pp_cap_ui(ui, "menu: Help");
-                    menu_autoclose(ui, bar_rect);
                 });
             });
                     });
@@ -22965,7 +23111,7 @@ impl eframe::App for CadApp {
         }
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
-        self.render_menu_flyout(ctx);   // method / Insert-Block dropdown flyouts
+        self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
 
         // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
         // the same swappable engine the Inspector uses. Floats by default
