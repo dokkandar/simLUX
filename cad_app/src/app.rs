@@ -1089,6 +1089,10 @@ pub struct CadApp {
     palette_sel:         usize,
     /// One-shot: request focus on the search box the frame after opening.
     palette_focus:       bool,
+    /// Palette window position — `None` until first dragged (then it's user-
+    /// placed and persists for the session). Dragging the Floating header band
+    /// moves it (§3.1).
+    palette_pos:         Option<egui::Pos2>,
     /// Per-command **preferred method** (dispatch token → method key), session
     /// level. Set by a command's ▼ flyout; APPLIED by `execute(id)` so every
     /// surface (menu, rail, palette, shortcut) runs the remembered method. The
@@ -2689,6 +2693,7 @@ impl Default for CadApp {
             palette_query:        String::new(),
             palette_sel:          0,
             palette_focus:        false,
+            palette_pos:          None,
             command_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
@@ -10250,14 +10255,14 @@ impl CadApp {
     ///
     /// It **applies the command-level preferred method** (`command_method`, set
     /// via a ▼ flyout): if this command has a remembered method, run it
-    /// (`rail_flyout_dispatch`); otherwise the base/default form (`dispatch_base`).
+    /// (`dispatch_method`); otherwise the base/default form (`dispatch_base`).
     /// So the remembered method is honored consistently from every surface —
     /// menu, rail, palette, shortcut. (The command line is exempt; it stays
     /// base/explicit until the deferred command-methods track.)
     fn execute(&mut self, id: &str) {
         if let Some(dispatch) = self.command_registry.get(id).map(|c| c.dispatch) {
             if let Some(key) = self.command_method.get(dispatch).cloned() {
-                self.rail_flyout_dispatch(dispatch, &key);
+                self.dispatch_method(dispatch, &key);
             } else {
                 self.dispatch_base(dispatch);
             }
@@ -10306,17 +10311,56 @@ impl CadApp {
         let cmd_ctx = self.build_ctx();
         let q = self.palette_query.to_lowercase();
 
-        // Filtered, visible commands in canonical order (owned — the registry
-        // borrow drops before we execute).
-        struct Hit { id: String, title: String, icon: crate::command::IconId, enabled: bool }
+        // Build the result rows (owned — the registry borrow drops before we
+        // execute). A method-bearing command (arc/circle/fillet) contributes a
+        // BASE entry (method-aware glyph → runs the remembered method) plus an
+        // inline "methods" GROUP of variant rows (each its own construction glyph
+        // → runs AND sets that method). ONE source (`rail_flyout_items`) + method
+        // memory (`command_method`), same as rail + menu. §1 label = `Name (CODE)`.
+        // Per-row fuzzy so typing `2P` filters straight to that method (§3).
+        enum HitGlyph { Base(crate::command::IconId), Method { cmd: String, key: String } }
+        #[derive(Clone)]
+        enum HitRun { Execute(String), Method { cmd: String, key: String } }
+        struct Hit { name: String, code: String, enabled: bool, glyph: HitGlyph,
+                     run: HitRun, variant: bool, current: bool }
         let mut hits: Vec<Hit> = Vec::new();
         for id in &self.command_registry.order {
             if let Some(info) = self.command_registry.commands.get(id) {
                 if !(info.visible)(&cmd_ctx) { continue; }              // 6b: hidden
-                let hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
-                if palette_fuzzy(&q, &hay) {
-                    hits.push(Hit { id: id.clone(), title: info.title.clone(),
-                                    icon: info.icon, enabled: (info.enabled)(&cmd_ctx) });
+                let ena = (info.enabled)(&cmd_ctx);
+                let dispatch = info.dispatch;
+                let methods  = rail_flyout_items(dispatch);
+                if methods.is_empty() {
+                    // Non-method command — a plain row (no code).
+                    let hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
+                    if !palette_fuzzy(&q, &hay) { continue; }
+                    hits.push(Hit { name: info.title.clone(), code: String::new(),
+                        enabled: ena, glyph: HitGlyph::Base(info.icon),
+                        run: HitRun::Execute(id.clone()), variant: false, current: false });
+                } else {
+                    let cur_key   = self.current_method_key(dispatch);
+                    let cur_short = self.current_method_short(dispatch);
+                    // Base entry — method-aware glyph; `(CODE)` names the current
+                    // method (cyan, §3). Matches on command title + keywords.
+                    let base_hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
+                    if palette_fuzzy(&q, &base_hay) {
+                        hits.push(Hit { name: info.title.clone(), code: cur_short.clone(),
+                            enabled: ena,
+                            glyph: HitGlyph::Method { cmd: dispatch.to_string(), key: cur_key.clone() },
+                            run: HitRun::Execute(id.clone()), variant: false, current: false });
+                    }
+                    // Methods group — method-only rows (`3-Point (3P)`, §3). Each
+                    // matches on the command word + its own name/code, so `2P`
+                    // filters to the 2-Point variant. Current row = cyan (§5).
+                    for (m_short, m_full, key) in &methods {
+                        let var_hay = format!("{} {} {}", info.title, m_full, m_short).to_lowercase();
+                        if !palette_fuzzy(&q, &var_hay) { continue; }
+                        hits.push(Hit { name: m_full.clone(), code: m_short.clone(),
+                            enabled: ena,
+                            glyph: HitGlyph::Method { cmd: dispatch.to_string(), key: key.clone() },
+                            run: HitRun::Method { cmd: dispatch.to_string(), key: key.clone() },
+                            variant: true, current: key == &cur_key });
+                    }
                 }
             }
         }
@@ -10332,64 +10376,199 @@ impl CadApp {
         });
         if down && !hits.is_empty() { self.palette_sel = (self.palette_sel + 1).min(hits.len() - 1); }
         if up { self.palette_sel = self.palette_sel.saturating_sub(1); }
-        if esc { self.palette_open = false; }
 
         let sel = self.palette_sel;
         let mut click: Option<usize> = None;
+        let mut close_x = false;
         let mut open = self.palette_open;
+
+        // ---- Layout columns + HUG width (§3.1/§7). The width follows the longest
+        // RESULT line (measured), NOT the search text — clamped so it never gets
+        // too narrow or too wide. No arbitrary fixed width.
+        const PAD: f32 = 12.0;
+        const ICON: f32 = 20.0;
+        const ICON_GAP: f32 = 14.0;   // icon → name (§3.1)
+        const CODE_GAP: f32 = 6.0;    // name → (CODE)
+        const ROW_H: f32 = 26.0;      // row / hover band; icon box = ROW_H − 6
+        const PAL_MIN_W: f32 = 300.0;
+        const PAL_MAX_W: f32 = 560.0;
+        let font_name = crate::theme::typ::body();
+        let font_code = crate::theme::typ::data_code();
+        let mut longest = 0.0_f32;
+        for h in &hits {
+            let name_w = ctx.fonts(|f| f.layout_no_wrap(h.name.clone(),
+                font_name.clone(), egui::Color32::WHITE).size().x);
+            let code_w = if h.code.is_empty() { 0.0 } else {
+                CODE_GAP + ctx.fonts(|f| f.layout_no_wrap(format!("({})", h.code),
+                    font_code.clone(), egui::Color32::WHITE).size().x)
+            };
+            let indent = if h.variant { ICON + ICON_GAP } else { 0.0 };
+            longest = longest.max(indent + name_w + code_w);
+        }
+        let hug_w = (PAD + ICON + ICON_GAP + longest + PAD).clamp(PAL_MIN_W, PAL_MAX_W);
+
+        // Dragging the Floating band moves the window (§3.1): we own the position
+        // (`palette_pos`) and feed it via `current_pos`; the band's drag_delta
+        // nudges it. `None` until first drag → opens at the default spot.
+        let start_pos = self.palette_pos.unwrap_or(egui::pos2(80.0, 70.0));
+        let mut drag_delta = egui::Vec2::ZERO;
+
+        // Body: surface-1, 1px rounded border. NO egui title bar — it paints the
+        // shared HEADER_STANDARD band itself. Top/side margins 0 so the band is
+        // flush; a 6px BOTTOM inset stops the last result row AT the hairline
+        // (no droop past the rounded border, §3.1).
+        let frame = egui::Frame::none()
+            .fill(crate::theme::color::SURFACE_1)
+            .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER))
+            .rounding(egui::Rounding::same(crate::theme::radius::SM))
+            .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 0.0, bottom: 6.0 });
         egui::Window::new("Command palette")
             .open(&mut open)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
-            .default_pos(egui::pos2(80.0, 70.0))
+            .default_width(hug_w)
+            .current_pos(start_pos)
+            .frame(frame)
             .show(ctx, |ui| {
-                let te = ui.add(egui::TextEdit::singleline(&mut self.palette_query)
-                    .hint_text("Search commands — title + keywords")
-                    .desired_width(f32::INFINITY));
-                if self.palette_focus { te.request_focus(); self.palette_focus = false; }
-                if te.changed() { self.palette_sel = 0; }
-                ui.separator();
-                if hits.is_empty() { ui.weak("No matching commands."); }
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true])
+                // ---- shared Floating header band (HEADER_STANDARD) — drag handle ----
+                let hb = crate::dock::header_band(ui, "Command palette", None, true);
+                if hb.close_clicked { close_x = true; }
+                if hb.band.dragged() { drag_delta = hb.band.drag_delta(); }
+
+                // ---- sticky search block: full-round pill + 1px divider ----
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 8.0 })
                     .show(ui, |ui| {
-                        for (i, h) in hits.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                // small icon glyph (via IconId)
-                                let (r, _) = ui.allocate_exact_size(
-                                    egui::vec2(18.0, 18.0), egui::Sense::hover());
-                                let ink = if h.enabled { PP_TEXT }
-                                          else { crate::theme::color::TEXT_DISABLED };
-                                let p = ui.painter_at(r);
-                                let gc = r.center();
-                                let pen = egui::Stroke::new(1.4, ink);
-                                let dot = |q| { p.circle_filled(q, 1.3, ink); };
-                                match h.icon {
-                                    crate::command::IconId::DrawGlyph(s) =>
-                                        draw_draw_glyph(&p, gc, s, pen, dot, ink),
-                                    crate::command::IconId::ModifyGlyph(k) =>
-                                        draw_cmd_glyph(&p, gc, k, pen, dot, ink),
-                                }
-                                let resp = ui.add_enabled(h.enabled,
-                                    egui::SelectableLabel::new(i == sel, h.title.as_str()));
-                                if resp.clicked() { click = Some(i); }
+                        egui::Frame::none()
+                            .fill(crate::theme::color::SURFACE_0)
+                            .rounding(egui::Rounding::same(12.0))   // full-round: r = h/2
+                            .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER))
+                            .inner_margin(egui::Margin::symmetric(12.0, 3.0))
+                            .show(ui, |ui| {
+                                let te = ui.add(egui::TextEdit::singleline(&mut self.palette_query)
+                                    .frame(false)
+                                    .desired_width(f32::INFINITY)
+                                    .font(crate::theme::typ::body())
+                                    .hint_text(egui::RichText::new("Search commands")
+                                        .color(crate::theme::color::TEXT_MUTED)));
+                                if self.palette_focus { te.request_focus(); self.palette_focus = false; }
+                                if te.changed() { self.palette_sel = 0; }
                             });
+                    });
+                // divider pinned beneath the search (list scrolls under it)
+                let dv = ui.available_rect_before_wrap();
+                ui.painter().hline(dv.x_range(), dv.top(),
+                    egui::Stroke::new(1.0, crate::theme::color::BORDER));
+
+                if hits.is_empty() {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| { ui.add_space(12.0);
+                        ui.weak("No matching commands."); });
+                }
+                // ---- result list (full-width rows; hand-painted) ----
+                egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // Layout columns (§3/§3.1/§4) — consts defined at fn scope:
+                        // left pad, aligned icon column, icon→name gap 14; variants
+                        // indent so the method glyph sits under the base command's
+                        // NAME (indent A); row band 26, icon box = 26−6.
+                        for (i, h) in hits.iter().enumerate() {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+                            let p = ui.painter_at(rect);
+                            let is_cursor = i == sel;
+                            // Row bg: hover OR keyboard cursor → surface-2 (like rails).
+                            if resp.hovered() || is_cursor {
+                                p.rect_filled(rect, 0.0, crate::theme::color::SURFACE_2);
+                            }
+                            // Keyboard cursor also gets a 2px cyan left bar (§3.1) —
+                            // independent of the current-method cyan text.
+                            if is_cursor {
+                                p.rect_filled(egui::Rect::from_min_size(
+                                    rect.left_top(), egui::vec2(2.0, rect.height())), 0.0, PP_ACCENT);
+                            }
+                            // Uniform glyph — one thin stroke + muted tone for EVERY
+                            // row, method or not, in the aligned icon column (§4).
+                            let g_ink = if h.enabled { crate::theme::color::TEXT_MUTED }
+                                        else { crate::theme::color::TEXT_DISABLED };
+                            let g_pen = egui::Stroke::new(1.0, g_ink);
+                            // Base name column; variants indent by one icon+gap so
+                            // the method glyph aligns under the base command's name.
+                            let base_name_x = rect.left() + PAD + ICON + ICON_GAP;
+                            let (glyph_cx, name_x) = if h.variant {
+                                (base_name_x + ICON / 2.0, base_name_x + ICON + ICON_GAP)
+                            } else {
+                                (rect.left() + PAD + ICON / 2.0, base_name_x)
+                            };
+                            let gc = egui::pos2(glyph_cx, rect.center().y);
+                            // Uniform icon box = row band − 6 (§4/§7). Each glyph
+                            // fn normalises its own natural box to this, so all
+                            // icons are one physical size regardless of source fn.
+                            let icon_box = ROW_H - 6.0;
+                            match &h.glyph {
+                                HitGlyph::Base(icon) => {
+                                    let dot = |qq| { p.circle_filled(qq, 1.1, g_ink); };
+                                    match *icon {
+                                        crate::command::IconId::DrawGlyph(s) =>
+                                            draw_draw_glyph(&p, gc, s, g_pen, dot, g_ink,
+                                                icon_box / GLYPH_BOX_DRAW),
+                                        crate::command::IconId::ModifyGlyph(k) =>
+                                            draw_cmd_glyph(&p, gc, k, g_pen, dot, g_ink,
+                                                icon_box / GLYPH_BOX_CMD),
+                                    }
+                                }
+                                HitGlyph::Method { cmd, key } =>
+                                    draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink,
+                                        icon_box / GLYPH_BOX_METHOD),
+                            }
+                            // Name + `(CODE)` — §5 colour marker. Current method =
+                            // whole row cyan; base command = name primary + code
+                            // cyan; other method rows = dim tier; disabled = greyed.
+                            let (name_col, code_col) = if !h.enabled {
+                                (crate::theme::color::TEXT_DISABLED, crate::theme::color::TEXT_DISABLED)
+                            } else if h.current {
+                                (PP_ACCENT, PP_ACCENT)
+                            } else if h.variant {
+                                (crate::theme::color::TEXT_MUTED, crate::theme::color::TEXT_MUTED)
+                            } else {
+                                (PP_TEXT, PP_ACCENT)
+                            };
+                            let nr = p.text(egui::pos2(name_x, rect.center().y),
+                                egui::Align2::LEFT_CENTER, &h.name,
+                                crate::theme::typ::body(), name_col);
+                            if !h.code.is_empty() {
+                                // Code left-grouped right after the name (never right-aligned).
+                                p.text(egui::pos2(nr.right() + CODE_GAP, rect.center().y),
+                                    egui::Align2::LEFT_CENTER, format!("({})", h.code),
+                                    crate::theme::typ::data_code(), code_col);
+                            }
+                            if resp.clicked() { click = Some(i); }
+                            pp_capture(ui, &format!("palette{} · {} ({})",
+                                if h.variant { " variant" } else { "" }, h.name, h.code), rect);
                         }
                     });
             });
+        // Commit a header-band drag to the stored window position (§3.1).
+        if drag_delta != egui::Vec2::ZERO {
+            self.palette_pos = Some(start_pos + drag_delta);
+        }
 
         // Resolve the action: a click runs the clicked item; else Enter runs the
-        // highlighted one. Dispatch via execute(id) (never run_command).
-        let run: Option<String> = if let Some(i) = click {
-            hits.get(i).filter(|h| h.enabled).map(|h| { self.palette_sel = i; h.id.clone() })
-        } else if enter {
-            hits.get(sel).filter(|h| h.enabled).map(|h| h.id.clone())
-        } else {
-            None
-        };
-        self.palette_open = open;   // window × close
-        if let Some(id) = run {
-            self.execute(&id);
+        // highlighted one. A BASE entry dispatches via `execute(id)`; a method
+        // VARIANT via `dispatch_method` (runs AND sets `command_method`). Neither
+        // touches the parser / `run_command`.
+        let chosen = click.or(if enter { Some(sel) } else { None });
+        let picked: Option<(usize, HitRun)> = chosen
+            .and_then(|i| hits.get(i).filter(|h| h.enabled).map(|h| (i, h.run.clone())));
+        // Open state: egui window (no × since title_bar off), header ×, or Esc.
+        self.palette_open = open && !close_x && !esc;
+        if let Some((i, run)) = picked {
+            self.palette_sel = i;
+            match run {
+                HitRun::Execute(id)            => self.execute(&id),
+                HitRun::Method { cmd, key }    => self.dispatch_method(&cmd, &key),
+            }
             self.palette_open = false;
             self.palette_query.clear();
         }
@@ -10413,10 +10592,9 @@ impl CadApp {
                 .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
                 .unwrap_or((false, false));
             if !vis { continue; }
-            if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
-                self.execute(id);
-                ui.close_menu();
-            }
+            let resp = ui.add_enabled(ena, egui::Button::new(label));
+            if resp.clicked() { self.execute(id); ui.close_menu(); }
+            pp_capture(ui, &format!("menu · {}", label), resp.rect);   // UI-inspect
         }
     }
 
@@ -10434,23 +10612,94 @@ impl CadApp {
         }
     }
 
-    /// Render an arc/circle/fillet menu item whose label reflects the CURRENT
-    /// method via the canonical short-code — e.g. `"Circle (3P)"`, `"Arc (SCE)"`.
-    /// The default method is shown explicitly (e.g. `"Circle (CR)"`), so the label
-    /// always carries a method and never flickers in/out. (This deliberately
-    /// overrides "labels verbatim" for these three commands only.) Dispatches via
-    /// the `execute(id)` seam like any plain item.
+    /// The canonical KEY of a command's CURRENT method — the remembered
+    /// `command_method`, or the default (first `rail_flyout_items` entry) when
+    /// none is set. Empty for commands without methods. Companion to
+    /// `current_method_short` (short-code) — this returns the dispatch key the
+    /// glyph + `dispatch_method` need. Same ONE source, no per-surface lists.
+    fn current_method_key(&self, cmd: &str) -> String {
+        let methods = rail_flyout_items(cmd);
+        match self.command_method.get(cmd) {
+            Some(k) if methods.iter().any(|(_, _, key)| key == k) => k.clone(),
+            _ => methods.first().map(|(_, _, key)| key.clone()).unwrap_or_default(),
+        }
+    }
+
+    /// Render an arc/circle/fillet menu item as a **split-click row** that mirrors
+    /// the rail's icon/▼ split (NOT a plain egui hover-submenu):
+    ///   * a thin, muted, method-aware glyph (recessive, §5.12);
+    ///   * the label `Circle (3P)` — clicking it runs the **remembered** method
+    ///     via `execute(id)` (one-click draw);
+    ///   * a `▸` opening a **method submenu** (full name + code, current marked ●)
+    ///     — picking runs AND sets it via `dispatch_method` (so rail + menu +
+    ///     palette all update from the shared `command_method`).
+    /// Non-method commands never reach here — they render as plain items.
     fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
                             base: &str, id: &str, cmd: &str) {
         let (vis, ena) = self.command_registry.get(id)
             .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
             .unwrap_or((false, false));
         if !vis { return; }
-        let short = self.current_method_short(cmd);
-        let label = if short.is_empty() { base.to_string() }
-                    else { format!("{} ({})", base, short) };
-        if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
+        let methods = rail_flyout_items(cmd);
+        let short   = self.current_method_short(cmd);
+        let cur_key = self.current_method_key(cmd);
+        // §5.12: CAD glyph is recessive — thin (~0.9px) + muted (lighter than the
+        // primary-text label), so the label leads and the icon supports.
+        let glyph_ink = crate::theme::color::TEXT_MUTED;
+        let btn_font  = egui::TextStyle::Button.resolve(ui.style());
+        let txt_col   = ui.visuals().text_color();
+
+        let mut do_execute = false;
+        let mut pick: Option<String> = None;
+        ui.horizontal(|ui| {
+            // method-aware glyph (mirrors the rail icon — shows the CURRENT method)
+            let (gr, _) = ui.allocate_exact_size(egui::vec2(20.0, 20.0), egui::Sense::hover());
+            draw_method_glyph(&ui.painter_at(gr), gr.center(), cmd, &cur_key,
+                              egui::Stroke::new(0.9, glyph_ink), glyph_ink,
+                              20.0 / GLYPH_BOX_METHOD);   // §7 same icon box as palette
+            // label / body → run the remembered method. §5: the current-method
+            // `(code)` renders in CYAN (accent) — colour is the marker, no ●/□.
+            let mut job = egui::text::LayoutJob::default();
+            job.append(base, 0.0, egui::TextFormat {
+                font_id: btn_font.clone(), color: txt_col, ..Default::default() });
+            if !short.is_empty() {
+                job.append(&format!(" ({})", short), 0.0, egui::TextFormat {
+                    font_id: btn_font.clone(), color: PP_ACCENT, ..Default::default() });
+            }
+            let lresp = ui.add_enabled(ena, egui::Button::new(job).frame(false));
+            if lresp.clicked() { do_execute = true; }
+            pp_capture(ui, &format!("menu method · {} ({})", base, short), lresp.rect);
+            // ▸ → method submenu (each row: current-marker ● + method glyph + name)
+            ui.menu_button("▸", |ui| {
+                for (m_short, m_full, key) in &methods {
+                    let is_cur = &cur_key == key;
+                    let (rr, rp) = ui.allocate_painter(
+                        egui::vec2(188.0, 22.0), egui::Sense::click());
+                    let rect = rr.rect;
+                    let txt  = ui.visuals().text_color();
+                    if rr.hovered() {
+                        rp.rect_filled(rect, 0.0, ui.visuals().widgets.hovered.weak_bg_fill);
+                    }
+                    // §5: current method = CYAN label; NO ●/□ marker.
+                    let row_col = if is_cur { PP_ACCENT } else { txt };
+                    let gc = egui::pos2(rect.left() + 18.0, rect.center().y);
+                    draw_method_glyph(&rp, gc, cmd, key,
+                                      egui::Stroke::new(0.9, glyph_ink), glyph_ink,
+                                      20.0 / GLYPH_BOX_METHOD);
+                    rp.text(egui::pos2(rect.left() + 34.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER, format!("{} ({})", m_full, m_short),
+                        egui::FontId::proportional(12.0), row_col);
+                    pp_capture(ui, &format!("menu method row · {} ({})", m_full, m_short), rect);
+                    if rr.clicked() { pick = Some(key.clone()); }
+                }
+            });
+        });
+
+        if do_execute {
             self.execute(id);
+            ui.close_menu();
+        } else if let Some(key) = pick {
+            self.dispatch_method(cmd, &key);
             ui.close_menu();
         }
     }
@@ -10471,7 +10720,7 @@ impl CadApp {
     /// Start a rail command in a SPECIFIC creation method, chosen from the ▼
     /// flyout. Reuses each command's normal start (via `run_command`) and then
     /// nudges it into the requested method/option so all the usual setup runs.
-    fn rail_flyout_dispatch(&mut self, cmd: &str, key: &str) {
+    fn dispatch_method(&mut self, cmd: &str, key: &str) {
         // Remember the chosen method so the rail icon shows its glyph.
         if matches!(cmd, "arc" | "circle" | "fillet") {
             self.command_method.insert(cmd.to_string(), key.to_string());
@@ -10561,14 +10810,14 @@ impl CadApp {
                     // tags the rail so a Draw icon can't drop onto Modify.
                     let resp = rail_icon_btn(ui, active, &tip_owned, |p, c, pen, ink| {
                         if let Some(k) = &last_m {
-                            draw_method_glyph(p, c, cmd, k, pen, ink);
+                            draw_method_glyph(p, c, cmd, k, pen, ink, 1.0);
                         } else {
                             let dot = |q| { p.circle_filled(q, 1.6, ink); };
                             match icon {
                                 crate::command::IconId::DrawGlyph(s) =>
-                                    draw_draw_glyph(p, c, s, pen, dot, ink),
+                                    draw_draw_glyph(p, c, s, pen, dot, ink, 1.0),
                                 crate::command::IconId::ModifyGlyph(k) =>
-                                    draw_cmd_glyph(p, c, k, pen, dot, ink),
+                                    draw_cmd_glyph(p, c, k, pen, dot, ink, 1.0),
                             }
                         }
                     });
@@ -10647,7 +10896,7 @@ impl CadApp {
                                             }
                                             let gc = egui::pos2(rect.left() + 24.0, rect.center().y);
                                             let pen = egui::Stroke::new(1.4, txt);
-                                            draw_method_glyph(&rp, gc, cmd, key, pen, txt);
+                                            draw_method_glyph(&rp, gc, cmd, key, pen, txt, 1.0);
                                             rp.text(egui::pos2(rect.left() + 40.0, rect.center().y),
                                                 egui::Align2::LEFT_CENTER,
                                                 format!("{} ({})", full, short),
@@ -10658,7 +10907,7 @@ impl CadApp {
                                     });
                             });
                         if let Some(key) = pick {
-                            self.rail_flyout_dispatch(cmd, &key);
+                            self.dispatch_method(cmd, &key);
                             ui.memory_mut(|m| m.close_popup());
                         } else if ui.ctx().input(|i| i.pointer.any_click()) {
                             // Click outside the popup AND the ▼ corner closes it.
@@ -10797,9 +11046,9 @@ impl CadApp {
                             let dot = |q| { painter.circle_filled(q, 1.5, ink); };
                             match *icon {
                                 crate::command::IconId::DrawGlyph(s) =>
-                                    draw_draw_glyph(&painter, c, s, pen, dot, ink),
+                                    draw_draw_glyph(&painter, c, s, pen, dot, ink, 1.0),
                                 crate::command::IconId::ModifyGlyph(k) =>
-                                    draw_cmd_glyph(&painter, c, k, pen, dot, ink),
+                                    draw_cmd_glyph(&painter, c, k, pen, dot, ink, 1.0),
                             }
                             painter.text(egui::pos2(rect.center().x, rect.bottom() - 6.0),
                                 egui::Align2::CENTER_CENTER, short, egui::FontId::proportional(7.5), ink);
@@ -19529,18 +19778,29 @@ const MODIFY_CMDS: &[(GlyphKind, &str, &'static str)] = &[
 
 /// Line-art glyphs for the Draw rail — parallels `draw_cmd_glyph`, same
 /// stroke style, centered at `c` (~±10px).
+/// Natural bounding-box sizes (max extent × 2) the glyph fns were designed at.
+/// A caller passes `scale = target_icon_box / GLYPH_BOX_*` so every glyph fills
+/// the SAME icon box regardless of which fn drew it (§4/§7 — one uniform icon
+/// size). The rail passes 1.0 (its glyphs are unchanged).
+const GLYPH_BOX_DRAW:   f32 = 18.0;
+const GLYPH_BOX_METHOD: f32 = 18.0;
+const GLYPH_BOX_CMD:    f32 = 24.0;
+
 fn draw_draw_glyph(
     p: &egui::Painter, c: egui::Pos2, id: &str,
-    pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32,
+    pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32, scale: f32,
 ) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_DRAW`) to the caller's icon
+    // box so glyphs are one uniform physical size across surfaces (§4/§7). The
+    // rail passes 1.0 (unchanged); palette/menus pass `icon_box / natural`.
     use egui::vec2;
-    let v = |x: f32, y: f32| c + vec2(x, y);
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
     let poly = |pts: Vec<egui::Pos2>| { p.add(egui::Shape::line(pts, pen)); };
     let ring = |cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32| {
         let n = 22; let mut pts = Vec::with_capacity(n + 1);
         for i in 0..=n {
             let t = a0 + (a1 - a0) * (i as f32 / n as f32);
-            pts.push(c + vec2(cx + rx * t.cos(), cy - ry * t.sin()));
+            pts.push(c + vec2((cx + rx * t.cos()) * scale, (cy - ry * t.sin()) * scale));
         }
         p.add(egui::Shape::line(pts, pen));
     };
@@ -19552,7 +19812,7 @@ fn draw_draw_glyph(
                                  v(4.0, 7.0), v(1.0, 1.0), v(6.0, 1.0), v(-5.0, -8.0)]); }
         "line"    => { p.line_segment([v(-7.0, 7.0), v(7.0, -7.0)], pen); dot(v(-7.0, 7.0)); dot(v(7.0, -7.0)); }
         "pline"   => { poly(vec![v(-8.0, 5.0), v(-3.0, -3.0), v(2.0, 3.0), v(8.0, -5.0)]); }
-        "circle"  => { p.circle_stroke(c, 8.0, pen); dot(c); }
+        "circle"  => { p.circle_stroke(c, 8.0 * scale, pen); dot(c); }
         "arc"     => { ring(0.0, 4.0, 9.0, 9.0, 0.06 * tau, 0.44 * tau); }
         "rect"    => { rstroke(v(-8.0, -5.0), v(8.0, 5.0)); }
         "ellipse" => { ring(0.0, 0.0, 9.0, 5.5, 0.0, tau); }
@@ -19586,7 +19846,7 @@ struct RailDnd { is_draw: bool, pos: usize }
 
 /// Method list for a rail command's ▼ flyout, as `(short, full, key)` triples.
 /// `short` is the compact code shown next to the glyph (e.g. "3P", "TTR"),
-/// `full` is the hover tooltip, `key` is interpreted by `rail_flyout_dispatch`.
+/// `full` is the hover tooltip, `key` is interpreted by `dispatch_method`.
 /// Empty = the command has no methods (no ▼ shown).
 /// Command-palette fuzzy match: `true` if every char of `q` (already lowercased)
 /// appears IN ORDER (subsequence) within `hay` (lowercased `title` + `keywords`).
@@ -19629,14 +19889,16 @@ fn rail_flyout_items(cmd: &str) -> Vec<(String, String, String)> {
 /// flyout size. `cmd`+`key` select the variant; falls back to nothing if
 /// unknown (caller then draws the base command glyph).
 fn draw_method_glyph(p: &egui::Painter, c: egui::Pos2, cmd: &str, key: &str,
-                     pen: egui::Stroke, ink: egui::Color32) {
+                     pen: egui::Stroke, ink: egui::Color32, scale: f32) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_METHOD`) to the caller's icon
+    // box (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`.
     use std::f32::consts::{PI, TAU};
-    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
-    let d = |q: egui::Pos2| p.circle_filled(q, 1.5, ink);
+    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx * scale, c.y + dy * scale);
+    let d = |q: egui::Pos2| p.circle_filled(q, 1.5 * scale.max(0.8), ink);
     match cmd {
         "circle" => {
             let r = 7.0;
-            p.circle_stroke(c, r, pen);
+            p.circle_stroke(c, r * scale, pen);
             match key {
                 "3p" => for k in 0..3 {
                     let a = TAU * (k as f32 / 3.0) - PI / 2.0;
@@ -19746,7 +20008,7 @@ fn cmd_button_resp(
     let ink = egui::Color32::from_rgb(225, 235, 245);
     let pen = egui::Stroke::new(1.6, ink);
     let dot = |p: egui::Pos2| { painter.circle_filled(p, 1.8, ink); };
-    draw_cmd_glyph(&painter, c, glyph_kind, pen, dot, ink);
+    draw_cmd_glyph(&painter, c, glyph_kind, pen, dot, ink, 1.0);
     // Label centered below the glyph.
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 9.0),
@@ -19778,9 +20040,13 @@ fn draw_cmd_glyph(
     pen: egui::Stroke,
     dot: impl Fn(egui::Pos2),
     ink: egui::Color32,
+    scale: f32,
 ) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_CMD`) to the caller's icon box
+    // (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`. All the
+    // glyph geometry flows through `v`, so scaling it scales the whole icon.
     use egui::{Pos2 as _, vec2};
-    let v = |x: f32, y: f32| c + vec2(x, y);
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
     match kind {
         GlyphKind::Move => {
             // four-headed arrow

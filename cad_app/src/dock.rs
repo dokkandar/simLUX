@@ -74,11 +74,29 @@ const MUTED: Color32 = crate::theme::color::TEXT_MUTED;
 /// × closes instead of dragging. `cfg.title` may be empty (the icon rails carry
 /// no name) — then only the × and the drag band show. Returns
 /// `(close_clicked, band_response)`; callers derive undock/drag from the band.
-fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
-    // INSPECTOR_DESIGN_MENTOR §0/§2: shared header band height 32 (all docked
-    // panels: Inspector, command bar, rails), chrome fill, bottom hairline, title
-    // at panel-edge (16). (The Inspector type pill now lives below the header, not
-    // here — see inspector_body; command bar/rails may still set a `badge`.)
+/// Result of the shared header foundation: whether the × was clicked, the band
+/// Response (for drag), and the (usually empty) action-slot rect.
+pub(crate) struct HeaderBand {
+    pub close_clicked: bool,
+    pub band: egui::Response,
+    pub action_slot: Rect,
+}
+
+/// The ONE shared header foundation (HEADER_STANDARD_MENTOR §1). A 32px chrome
+/// band with a bottom hairline and three zones left→right: sentence-case Title at
+/// panel-edge (Geist 16/500), an optional right-side **action slot** (icon-buttons
+/// only, before the ×), and an optional close ×. EVERY titled surface draws from
+/// here — docked panels (Panel variant) and the floating palette/dialogs (Floating
+/// variant) — so changing 32 / chrome / the title token in this one place moves
+/// every header in lockstep.
+///
+/// `badge` is a legacy in-band pill kept for the command bar / rails until they
+/// take their own HEADER_STANDARD pass (the spec moves pills BELOW the band; the
+/// Inspector already did — its pill lives in `inspector_body`). The returned
+/// `action_slot` (empty by default) is where a surface paints its icon-buttons
+/// (help `?`, pin, collapse) with NO change to the band itself (§2).
+pub(crate) fn header_band(ui: &mut Ui, title: &str, badge: Option<&str>,
+                          closable: bool) -> HeaderBand {
     let edge = crate::theme::space::PANEL_EDGE;
     let w = ui.available_width();
     // ONE widget senses the whole band (click + drag) — a separate hover widget
@@ -89,13 +107,33 @@ fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
     let p = ui.painter_at(rect);
     p.rect_filled(rect, 0.0, chrome());
     p.line_segment([rect.left_bottom(), rect.right_bottom()], Stroke::new(1.0, border()));
-    if !cfg.title.is_empty() {
+    if !title.is_empty() {
         p.text(egui::pos2(rect.left() + edge, rect.center().y), Align2::LEFT_CENTER,
-            cfg.title, crate::theme::typ::title(), TEXT);
+            title, crate::theme::typ::title(), TEXT);
     }
-    // Place from the right: type pill (12px from the edge), then × to its left.
+    // Place from the right: 12px inset, then × (if closable), then the legacy pill.
     let mut right_x = rect.right() - 12.0;
-    if let Some(b) = cfg.badge {
+    let mut close_clicked = false;
+    if closable {
+        // × close hit-box (far right). A click on it closes; the rest drags.
+        let xr = Rect::from_center_size(
+            egui::pos2(right_x - 10.0, rect.center().y), egui::vec2(20.0, 20.0));
+        let over_x = ui.rect_contains_pointer(xr);
+        if band.hovered() {
+            ui.ctx().set_cursor_icon(
+                if over_x { CursorIcon::PointingHand } else { CursorIcon::Grab });
+        }
+        let xcol = if over_x { TEXT } else { MUTED };
+        let c = xr.center(); let s = 5.0;
+        let st = Stroke::new(1.5, xcol);
+        p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
+        p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
+        close_clicked = band.clicked() && over_x;
+        right_x = xr.left() - 8.0;
+    } else if band.hovered() {
+        ui.ctx().set_cursor_icon(CursorIcon::Grab);
+    }
+    if let Some(b) = badge {
         let accent = crate::theme::color::ACCENT;
         let font = crate::theme::typ::caption();
         let tw = ui.fonts(|f| f.layout_no_wrap(b.to_owned(), font.clone(), accent)).size().x;
@@ -107,40 +145,29 @@ fn header_band(ui: &mut Ui, cfg: &DockConfig) -> (bool, egui::Response) {
         p.text(pill.center(), Align2::CENTER_CENTER, b, font, accent);
         right_x = pill.left() - 8.0;
     }
-    // × close hit-box: at the right (or left of the pill). A click on it closes;
-    // everything else on the band drags.
-    let xr = Rect::from_center_size(
-        egui::pos2(right_x - 10.0, rect.center().y), egui::vec2(20.0, 20.0));
-    let over_x = ui.rect_contains_pointer(xr);
-    if band.hovered() {
-        ui.ctx().set_cursor_icon(
-            if over_x { CursorIcon::PointingHand } else { CursorIcon::Grab });
-    }
-    let xcol = if over_x { TEXT } else { MUTED };
-    let c = xr.center(); let s = 5.0;
-    let st = Stroke::new(1.5, xcol);
-    p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], st);
-    p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], st);
-    (band.clicked() && over_x, band)
+    // Action slot: title-end → right_x. Empty by default; icon-buttons go here.
+    let action_slot = Rect::from_min_max(
+        egui::pos2(rect.left() + edge, rect.top()), egui::pos2(right_x, rect.bottom()));
+    HeaderBand { close_clicked, band, action_slot }
 }
 
 /// Docked-panel header — drag the band out to undock. Returns
 /// `(close_clicked, undock_to)`.
 fn docked_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Option<Pos2>) {
-    let (close, band) = header_band(ui, cfg);
-    let undock = if band.drag_started() {
-        band.interact_pointer_pos()
+    let h = header_band(ui, cfg.title, cfg.badge, true);
+    let undock = if h.band.drag_started() {
+        h.band.interact_pointer_pos()
             .map(|p| egui::pos2((p.x - 130.0).max(0.0), (p.y - 12.0).max(48.0)))
     } else { None };
-    (close, undock)
+    (h.close_clicked, undock)
 }
 
 /// Floating-panel header — the band drags the window. Returns
 /// `(close_clicked, drag_delta, drag_released)`; the host docks only on release.
 fn float_header(ui: &mut Ui, cfg: &DockConfig) -> (bool, Vec2, bool) {
-    let (close, band) = header_band(ui, cfg);
-    let delta = if band.dragged() { band.drag_delta() } else { Vec2::ZERO };
-    (close, delta, band.drag_stopped())
+    let h = header_band(ui, cfg.title, cfg.badge, true);
+    let delta = if h.band.dragged() { h.band.drag_delta() } else { Vec2::ZERO };
+    (h.close_clicked, delta, h.band.drag_stopped())
 }
 
 /// The hand-rolled egui docking engine.
