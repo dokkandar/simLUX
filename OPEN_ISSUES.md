@@ -164,6 +164,56 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 - **Where:** dump block in `cad_app/src/app.rs` (search `cmd_dump_open` /
   "Command registry dump"); data from `cad_app/src/command.rs` `build()`.
 
+### M1. Dropdown-menu conformance (MENU_DROPDOWN_MENTOR) 🟡
+- **Draw menu: DONE but UNCOMMITTED** (working tree, builds green). Custom-painted
+  rows (`paint_menu_row`): 20px icon box / 14 gap / 26 band, cyan `(CODE)`, no □,
+  surface-2 hover, aligned arrows, `Wall (t = thickness)`, dividers, hug width.
+  Method/Insert flyouts decoupled to top level (`menu_flyout` + `render_menu_flyout`),
+  **hover-open** (0.30s close delay), click=commit (`dispatch_method`). Edge-to-edge
+  hover via zeroed horizontal `menu_margin` + `ui.set_width(w)` + highlight at
+  `ui.max_rect().x_range()`. Flyout radius `radius::SM`(4).
+- **Pending:**
+  1. **Strip the TEMP measurement log** in `paint_menu_row` (the `std::fs::write`
+     guarded `name=="Line"`, writes scratchpad `menu_hover_measure.log`) before the
+     final commit. Owner still to visually confirm the hover reaches both borders
+     (Δ=0 by construction — highlight IS the frame's inner rect).
+  2. **COMMIT the Draw pass** (currently only in the working tree, not pushed).
+  3. **Convert Modify** (and File/Edit/View/etc.) dropdowns to the same rows —
+     they still use the old `menu_cmd_items`/plain-button style.
+- **Where:** `paint_menu_row` / `render_menu_flyout` / `MenuIcon`/`Trailing`/
+  `MenuFlyout` in `cad_app/src/app.rs`; Draw menu closure (`menu_button("Draw")`).
+
+### M2. Dialog header conformance (HEADER_STANDARD_MENTOR §4) 🔵
+- The ~25 `egui::Window` dialogs (Hatch, Block, Insert Block, DWG, raster,
+  parametric, + managers) still use egui's default title bar. Adopt the shared
+  **Floating `dock::header_band`** (32 chrome band, close ×). Deferred — separate
+  pass from the palette (which already conforms).
+
+### E6. "End command" gesture — right-click = Esc = smart end 🔵
+- **Requested (2026-07-04):** in the middle of any command, **right-click and Esc
+  should do the SAME thing** — an "end command" that resolves by context:
+  - **Multi-point draw with enough points** (Line ≥2, Polyline ≥2, Spline ≥3,
+    Wall run ≥1 seg) → **commit up to the last PLACED point** (finish, keep the
+    geometry; drop the rubber-band segment to the cursor) → then fresh
+    (`Tool::None`). The exact primitive already exists: `commit_active_draw()`.
+  - **Too few points / non-draw commands / prompt flows / block-insert** →
+    **cancel** to fresh (clear pending, cancel flows, `Tool::None`).
+  - **Active sub-session** (trim/extend/hatch/offset/array/select) → finish the
+    session (as its Enter/Esc do today).
+- **Decisions to confirm before building:**
+  1. This **changes Esc's current pline/spline behaviour** (today Esc *drops only
+     the last vertex*, stays in the tool). New rule = Esc/right-click *finish the
+     run*. → move "remove last vertex" to **Backspace** (recommended), or make
+     ONLY right-click finish while Esc keeps drop-last (breaks "Esc = right-click").
+  2. Which tools commit-partial: proposed **Line / Polyline / Spline / Wall**;
+     Circle/Arc/Ellipse/Rectangle/Point just cancel.
+  3. **Right-click isn't wired to command-end today** (only logged; primary does
+     the clicking) — confirm it doesn't collide with pan / context-menu first.
+- **Where:** Esc handler `cad_app/src/app.rs` (search `Key::Escape` ~L21101 — the
+  pline drop-last block); Enter/finish path (`commit_active_draw` ~L17964, called
+  ~L21550); canvas right-click (`PointerButton::Secondary` ~L23293).
+- **Status:** DEFERRED by owner — pending the three decisions above.
+
 ### 5. Groups not persisted to `.rsm`
 - Groups are in-session only; saving/reloading drops them.
 

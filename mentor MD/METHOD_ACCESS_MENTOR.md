@@ -60,16 +60,38 @@ For arc/circle/fillet the Draw/Modify menu item becomes:
 [glyph] Circle (3P)   ▸
 ```
 
+- **Point / hover the ▸ arrow** → the **method flyout opens** (no click). It lists all
+  methods (full name + code), the current one in **cyan** (see §5; no ●/□). The flyout
+  stays open while the pointer is over the arrow **or** the flyout, and closes shortly
+  after the pointer leaves both (a small diagonal-travel tolerance so you can move onto
+  the flyout).
 - **Click the label / body** → `execute(id)` → runs the **remembered** method
   (one-click draw).
-- **Click the ▸ arrow** → opens a **method submenu** — all methods (full name +
-  code), the current one shown in **cyan** (accent) — see §5 marker rule; no ●/□.
-- **Pick a method** → `dispatch_method(cmd, method)` → runs it AND sets
+- **Click a flyout item** → `dispatch_method(cmd, method)` → runs it AND sets
   `command_method` (so rail + menu + palette all update).
 - The label shows the current method `(3P)` and a thin method-aware glyph.
 
-Reuse the rail's icon/▼ **split** pattern — NOT a plain egui hover-submenu, which
-has no separate label-click action.
+**Click never *opens* the flyout — hover opens, click commits.** Keep the hand-rolled
+`Area` flyout (it's what allows a separate label-click-to-run); only its **trigger is
+hover, not click**. This is NOT a plain egui hover-submenu — that can't host the
+separate label-click-run.
+
+### 2.1 Flyout visual — ONE design (rail + menu)
+
+The method flyout looks **identical** whether opened from the **rail ▼** or the **menu
+▸**. The **menu (dropdown) flyout is the reference**; the **rail flyout is updated to
+match it** (rail update is a follow-up task — see backlog).
+
+- **Corner radius:** `radius::SM = 4` (user preference — sharper corner). Same on both
+  flyouts. *(MD(8) was tried and reverted 2026-07-04.)*
+- **Rows:** same as the menu/palette — method-aware glyph in the **icon box (band − 6 =
+  20)**, **icon→name gap 14**, label `Full Name (CODE)` UPPERCASE (§1), **current method
+  in cyan** (§5; no ●/□), full-width `surface-2` **hover**.
+- **Width:** hug the longest method line (§7).
+- **Fill / border:** popover `surface-3` + 1px `border`, per theme.
+
+Net: rail ▼ flyout and menu ▸ flyout are the same widget's look — same radius, icons,
+gap, label format, and cyan current-method marker.
 
 ---
 

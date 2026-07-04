@@ -1093,6 +1093,17 @@ pub struct CadApp {
     /// placed and persists for the session). Dragging the Floating header band
     /// moves it (§3.1).
     palette_pos:         Option<egui::Pos2>,
+    /// Open menu FLYOUT (method submenu or Insert-Block submenu), rendered at the
+    /// top level so it survives the parent dropdown closing (MENU_DROPDOWN §2.1).
+    /// Opens on HOVER of the ▸ arrow (§2) and stays open while the pointer is over
+    /// the arrow or the flyout; closes after a short delay once it leaves both.
+    menu_flyout:         Option<MenuFlyout>,
+    /// Set true each frame the pointer is over an arrow (by the menu) or the
+    /// flyout (by `render_menu_flyout`); drives the hover stay-open + close delay.
+    menu_flyout_hot:     bool,
+    /// `ctx.input().time` when the pointer left both the arrow and the flyout —
+    /// the flyout closes `MENU_FLYOUT_CLOSE_DELAY` seconds later (travel tolerance).
+    menu_flyout_leave_t: Option<f64>,
     /// Per-command **preferred method** (dispatch token → method key), session
     /// level. Set by a command's ▼ flyout; APPLIED by `execute(id)` so every
     /// surface (menu, rail, palette, shortcut) runs the remembered method. The
@@ -2694,6 +2705,9 @@ impl Default for CadApp {
             palette_sel:          0,
             palette_focus:        false,
             palette_pos:          None,
+            menu_flyout:          None,
+            menu_flyout_hot:      false,
+            menu_flyout_leave_t:  None,
             command_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
@@ -19786,6 +19800,208 @@ const GLYPH_BOX_DRAW:   f32 = 18.0;
 const GLYPH_BOX_METHOD: f32 = 18.0;
 const GLYPH_BOX_CMD:    f32 = 24.0;
 
+// ---- Category-dropdown row metrics (MENU_DROPDOWN_MENTOR) — matched to the
+// palette so a menu row is dimensionally identical (band 26 / icon box 20 /
+// icon-gap 14). Every value a named const; no magic numbers at the call sites.
+const MENU_ROW_H:   f32 = 26.0;   // row / hover band
+const MENU_PAD:     f32 = 10.0;   // menu edge padding (left + right)
+const MENU_ICON:    f32 = 20.0;   // icon column width (box = ROW_H − 6 = 20)
+const MENU_ICON_GAP: f32 = 14.0;  // icon → name
+const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE)/hint, and longest-line → arrow
+const MENU_ARROW_W: f32 = 10.0;   // arrow column width
+/// Grace period before a hover-opened flyout closes after the pointer leaves both
+/// the arrow and the flyout — lets the user travel diagonally onto it (§2).
+const MENU_FLYOUT_CLOSE_DELAY: f64 = 0.30;
+
+/// A dropdown FLYOUT that outlives its parent menu (rendered at the top level of
+/// `update` so it survives egui auto-closing the dropdown on the ▸ click). Anchor
+/// = the row rect the flyout hangs off. See `CadApp::render_menu_flyout`.
+#[derive(Clone)]
+enum MenuFlyout {
+    /// Method submenu for `cmd` (arc/circle/…) — pick → `dispatch_method`.
+    Method { cmd: String, anchor: egui::Rect },
+    /// Insert-Block submenu (the doc's block names) — pick → `insert <name>`.
+    Insert { anchor: egui::Rect },
+}
+
+/// Icon spec for a custom-painted menu row. `Method` carries `(cmd, key)` so it
+/// shows the current method's construction glyph (method-aware); the others are
+/// the base draw/modify glyphs. `None` reserves the empty 20px slot.
+enum MenuIcon<'a> { Draw(&'static str), Cmd(GlyphKind), Method(&'a str, &'a str), None }
+
+/// Trailing after the name: a cyan-or-tinted `(CODE)` in Mono (method marker,
+/// §4/§5) or a muted body-font hint (Wall). Measures into the longest line.
+enum Trailing<'a> { None, Code(&'a str, egui::Color32), Hint(&'a str) }
+
+/// Paint ONE conformant dropdown row (MENU_DROPDOWN_MENTOR §1): full-width
+/// surface-2 hover band (26), aligned 20px icon box (uniform scale), Geist-13
+/// name in `name_col`, a `Trailing`, and an optional ▸ painted on the shared
+/// `arrow_x` column (§2). Returns `(body_clicked, arrow_clicked, rect)` — body
+/// runs the command, ▸ opens a submenu.
+fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
+                  name: &str, name_col: egui::Color32, trailing: Trailing,
+                  arrow: bool) -> (bool, bool, egui::Rect) {
+    // Interaction is a REAL frameless Button so egui's menu recognises it as an
+    // item (keeps the menu open through the click, fires `clicked()` on release);
+    // a bare allocated rect makes egui close the menu on press → clicks are lost.
+    // All visuals are custom-painted over its rect.
+    // §3 root fix: the highlight spans the FRAME's own inner x-range
+    // (`max_rect`), NOT the row's w-wide rect — so it reaches both borders even if
+    // the frame is a hair wider than `w`. With `ui.set_width(w)` upstream the two
+    // are equal, so the highlight physically touches both inner borders.
+    let hl_x = ui.max_rect().x_range();
+    let resp = ui.add_sized(egui::vec2(width, MENU_ROW_H),
+        egui::Button::new("").frame(false));
+    let rect = resp.rect;
+    let band = egui::Rect::from_x_y_ranges(hl_x, rect.y_range());
+    let p = ui.painter_at(band);
+    if resp.hovered() { p.rect_filled(band, 0.0, crate::theme::color::SURFACE_2); }
+
+    // Icon — uniform thin muted glyph, box = ROW_H − 6, aligned column.
+    let g_ink = crate::theme::color::TEXT_MUTED;
+    let g_pen = egui::Stroke::new(1.0, g_ink);
+    let ibox  = MENU_ROW_H - 6.0;
+    let gc = egui::pos2(rect.left() + MENU_PAD + MENU_ICON / 2.0, rect.center().y);
+    let dot = |q: egui::Pos2| { p.circle_filled(q, 1.1, g_ink); };
+    match icon {
+        MenuIcon::Draw(s) => draw_draw_glyph(&p, gc, s, g_pen, dot, g_ink, ibox / GLYPH_BOX_DRAW),
+        MenuIcon::Cmd(k)  => draw_cmd_glyph(&p, gc, k, g_pen, dot, g_ink, ibox / GLYPH_BOX_CMD),
+        MenuIcon::Method(cmd, key) =>
+            draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink, ibox / GLYPH_BOX_METHOD),
+        MenuIcon::None => {}
+    }
+
+    // Name, then the trailing immediately after (left-grouped, never right-aligned).
+    let name_x = rect.left() + MENU_PAD + MENU_ICON + MENU_ICON_GAP;
+    let nr = p.text(egui::pos2(name_x, rect.center().y), egui::Align2::LEFT_CENTER,
+        name, crate::theme::typ::body(), name_col);
+    match trailing {
+        Trailing::Code(c, col) =>
+            { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
+                egui::Align2::LEFT_CENTER, format!("({})", c),
+                crate::theme::typ::data_code(), col); }
+        Trailing::Hint(h) =>
+            { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
+                egui::Align2::LEFT_CENTER, h,
+                crate::theme::typ::body(), crate::theme::color::TEXT_MUTED); }
+        Trailing::None => {}
+    }
+
+    // ▸ on the aligned column (painted triangle — the ▸ char is tofu in our fonts).
+    if arrow {
+        let ax = rect.left() + arrow_x;
+        let cy = rect.center().y;
+        p.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(ax, cy - 3.5), egui::pos2(ax + 5.0, cy), egui::pos2(ax, cy + 3.5)],
+            crate::theme::color::TEXT_MUTED, egui::Stroke::NONE));
+    }
+
+    // §2 update: the ▸ opens the flyout on HOVER, not click. The whole row's
+    // CLICK runs the command (label = remembered method). Report `(body_clicked,
+    // arrow_hovered, rect)` — arrow_hovered = pointer over the arrow column.
+    let arrow_hovered = arrow && ui.ctx().pointer_hover_pos()
+        .is_some_and(|p| rect.contains(p) && p.x >= rect.left() + arrow_x - MENU_CODE_GAP);
+    (resp.clicked(), arrow_hovered, rect)
+}
+
+/// Hand-rolled method submenu popup (MENU_DROPDOWN §2.1) — the rail's `Area`
+/// pattern reused inside a menubar dropdown: lists a command's methods (icon +
+/// `Name (CODE)`), current row cyan, click → `key`. Returns the picked key.
+/// Positioned to the RIGHT of `anchor`. `open` gates rendering; the caller owns
+/// the open flag via egui memory so it survives across frames.
+impl CadApp {
+    /// Render the open menu FLYOUT (method submenu or Insert-Block) at the TOP
+    /// LEVEL — independent of the parent dropdown, so it survives egui auto-closing
+    /// the dropdown on the ▸ click and captures its own clicks (no leak to the
+    /// canvas). Rows are the same custom-painted rows as the parent menu. Pick →
+    /// dispatch (method → `dispatch_method`, block → `insert`); outside-click
+    /// closes. §2.1.
+    fn render_menu_flyout(&mut self, ctx: &egui::Context) {
+        let fly = match &self.menu_flyout { Some(f) => f.clone(), None => return };
+        let anchor = match &fly {
+            MenuFlyout::Method { anchor, .. } => *anchor,
+            MenuFlyout::Insert { anchor }     => *anchor,
+        };
+        let mut method_pick: Option<(String, String)> = None;
+        let mut insert_pick: Option<String> = None;
+        let mut close = false;
+        let area = egui::Area::new(egui::Id::new("menu_flyout"))
+            .order(egui::Order::Foreground)
+            .fixed_pos(egui::pos2(anchor.right() + 2.0, anchor.top()))
+            .constrain(true)
+            .show(ctx, |ui| {
+                egui::Frame::popup(ui.style())
+                    .rounding(egui::Rounding::same(crate::theme::radius::SM))
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                        let fn_ = crate::theme::typ::body();
+                        let fc_ = crate::theme::typ::data_code();
+                        match &fly {
+                            MenuFlyout::Method { cmd, .. } => {
+                                let cur_key = self.current_method_key(cmd);
+                                let methods = rail_flyout_items(cmd);
+                                let mut longest = 0.0_f32;
+                                for (s, full, _) in &methods {
+                                    longest = longest.max(
+                                        ui.fonts(|f| f.layout_no_wrap(full.clone(), fn_.clone(), egui::Color32::WHITE).size().x)
+                                        + MENU_CODE_GAP
+                                        + ui.fonts(|f| f.layout_no_wrap(format!("({})", s), fc_.clone(), egui::Color32::WHITE).size().x));
+                                }
+                                let w = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_PAD;
+                                for (short, full, key) in &methods {
+                                    // §5: current method row = cyan; others normal.
+                                    let cur = key == &cur_key;
+                                    let ncol = if cur { PP_ACCENT } else { PP_TEXT };
+                                    let ccol = if cur { PP_ACCENT } else { crate::theme::color::TEXT_MUTED };
+                                    if paint_menu_row(ui, w, w + 1.0, MenuIcon::Method(cmd, key),
+                                        full, ncol, Trailing::Code(short, ccol), false).0
+                                    { method_pick = Some((cmd.clone(), key.clone())); }
+                                }
+                                pp_cap_ui(ui, &format!("menu flyout · {}", cmd));
+                            }
+                            MenuFlyout::Insert { .. } => {
+                                let names: Vec<String> = self.doc.blocks.blocks.iter()
+                                    .map(|b| b.name.clone()).collect();
+                                if names.is_empty() { ui.weak("(no blocks defined)"); }
+                                let longest = names.iter().map(|n|
+                                    ui.fonts(|f| f.layout_no_wrap(n.clone(), fn_.clone(), egui::Color32::WHITE).size().x))
+                                    .fold(80.0_f32, f32::max);
+                                let w = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_PAD;
+                                for n in &names {
+                                    if paint_menu_row(ui, w, w + 1.0, MenuIcon::Cmd(GlyphKind::Block),
+                                        n, PP_TEXT, Trailing::None, false).0
+                                    { insert_pick = Some(n.clone()); }
+                                }
+                                pp_cap_ui(ui, "menu flyout · Insert Block");
+                            }
+                        }
+                    });
+            });
+        // Hover stay-open (§2): keep open while the pointer is over the arrow
+        // (flag set by the menu) OR the flyout itself; once it leaves both, close
+        // after MENU_FLYOUT_CLOSE_DELAY (travel tolerance for the diagonal move).
+        let over_flyout = ctx.pointer_hover_pos()
+            .is_some_and(|p| area.response.rect.contains(p));
+        if self.menu_flyout_hot || over_flyout {
+            self.menu_flyout_leave_t = None;
+        } else {
+            let now = ctx.input(|i| i.time);
+            match self.menu_flyout_leave_t {
+                Some(t) if now - t >= MENU_FLYOUT_CLOSE_DELAY => close = true,
+                _ => {
+                    if self.menu_flyout_leave_t.is_none() { self.menu_flyout_leave_t = Some(now); }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                }
+            }
+        }
+        self.menu_flyout_hot = false;   // re-armed each frame by the menu / flyout
+        // Clicking a flyout item commits (method → dispatch_method, block → insert).
+        if let Some((cmd, key)) = method_pick { self.dispatch_method(&cmd, &key); close = true; }
+        if let Some(n) = insert_pick { self.run_command(&format!("insert {}", n)); close = true; }
+        if close { self.menu_flyout = None; self.menu_flyout_leave_t = None; }
+    }
+}
+
 fn draw_draw_glyph(
     p: &egui::Painter, c: egui::Pos2, id: &str,
     pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32, scale: f32,
@@ -21699,69 +21915,99 @@ impl eframe::App for CadApp {
                     pp_cap_ui(ui, "menu: Edit");
                     menu_autoclose(ui, bar_rect);
                 });
+                // Zero the popup's HORIZONTAL inner margin so a full-width row
+                // reaches the frame border (edge-to-edge hover, §3); each row's own
+                // MENU_PAD keeps the content off the edge. Vertical margin kept.
+                let saved_mm = ui.style().spacing.menu_margin;
+                ui.style_mut().spacing.menu_margin.left  = 0.0;
+                ui.style_mut().spacing.menu_margin.right = 0.0;
                 ui.menu_button("Draw", |ui| {
-                    // Plain command items — curated id-list (COMMAND_SYSTEM §4),
-                    // labels verbatim, dispatch via execute(id). Order/membership
-                    // preserved exactly; `block`/`insert` (Modify-category) still
-                    // live below via the hand-authored Block…/Insert Block ▸.
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Line",      "draw.line"),
-                        ("Rectangle", "draw.rectangle"),
-                    ]);
-                    // Circle / Arc — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Circle", "draw.circle", "circle");
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Arc", "draw.arc", "arc");
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Ellipse",     "draw.ellipse"),
-                        ("Ellipse Arc", "draw.ellipsearc"),
-                        ("Polyline",    "draw.pline"),
-                        ("Spline",      "draw.spline"),
-                        ("Point",       "draw.point"),
-                    ]);
-                    // Hatch… — dialog special, hand-authored (unchanged).
-                    if ui.button("Hatch…").clicked() {
-                        self.run_command("hatch");
-                        ui.close_menu();
+                    // Custom-painted rows (MENU_DROPDOWN_MENTOR): every command
+                    // iconized in one aligned column, 26 band / 20 icon box / 14
+                    // gap (palette-identical), cyan (CODE) marker, surface-2 hover,
+                    // ▸ on one aligned column, hug width. Rows are flush (spacing 0).
+                    ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                    let circle_key  = self.current_method_key("circle");
+                    let circle_code = self.current_method_short("circle");
+                    let arc_key     = self.current_method_key("arc");
+                    let arc_code    = self.current_method_short("arc");
+
+                    // Pass 1 — measure the longest FULL line (incl. any (CODE)/hint)
+                    // → arrow column = longest + 6, and the hug width (§2).
+                    let fn_ = crate::theme::typ::body();
+                    let fc_ = crate::theme::typ::data_code();
+                    let nw = |ui: &egui::Ui, s: &str| ui.fonts(|f|
+                        f.layout_no_wrap(s.to_string(), fn_.clone(), egui::Color32::WHITE).size().x);
+                    let cw = |ui: &egui::Ui, s: &str| ui.fonts(|f|
+                        f.layout_no_wrap(s.to_string(), fc_.clone(), egui::Color32::WHITE).size().x);
+                    let mut longest = 0.0_f32;
+                    for (name, code, hint) in [
+                        ("Line", None, None), ("Rectangle", None, None),
+                        ("Circle", Some(circle_code.as_str()), None),
+                        ("Arc",    Some(arc_code.as_str()), None),
+                        ("Ellipse", None, None), ("Ellipse Arc", None, None),
+                        ("Polyline", None, None), ("Spline", None, None),
+                        ("Point", None, None), ("Hatch…", None, None),
+                        ("Wall", None, Some("(t = thickness)")),
+                        ("Block…", None, None), ("Insert Block", None, None),
+                    ] {
+                        let tw = if let Some(c) = code { MENU_CODE_GAP + cw(ui, &format!("({})", c)) }
+                                 else if let Some(h) = hint { MENU_CODE_GAP + nw(ui, h) }
+                                 else { 0.0 };
+                        longest = longest.max(nw(ui, name) + tw);
                     }
-                    if ui.button("Wall  (chained run — t = thickness)")
-                        .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
-                        .clicked()
-                    {
-                        self.run_command("wall");
-                        ui.close_menu();
+                    let arrow_x = MENU_PAD + MENU_ICON + MENU_ICON_GAP + longest + MENU_CODE_GAP;
+                    let w = arrow_x + MENU_ARROW_W + MENU_PAD;
+                    let nc = PP_TEXT;   // command-name colour
+
+                    // Pass 2 — render + dispatch. Rows fill the full menu
+                    // content width (edge-to-edge hover + click, §3): a w-wide
+                    // spacer sets the menu floor, then rows use available width.
+                    ui.set_width(w);   // §3: pin frame inner width to the hug width
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("line"), "Line", nc, Trailing::None, false).0
+                        { self.execute("draw.line"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("rect"), "Rectangle", nc, Trailing::None, false).0
+                        { self.execute("draw.rectangle"); ui.close_menu(); }
+                    // Circle — body runs remembered; ▸ opens the method flyout
+                    // (top-level, survives the dropdown closing — §2.1).
+                    let (cb, ca, crect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("circle", &circle_key), "Circle", nc,
+                        Trailing::Code(&circle_code, PP_ACCENT), true);
+                    if cb { self.execute("draw.circle"); ui.close_menu(); }
+                    if ca { self.menu_flyout = Some(MenuFlyout::Method { cmd: "circle".into(), anchor: crect }); self.menu_flyout_hot = true; }
+                    // Arc
+                    let (ab, aa, arect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("arc", &arc_key), "Arc", nc,
+                        Trailing::Code(&arc_code, PP_ACCENT), true);
+                    if ab { self.execute("draw.arc"); ui.close_menu(); }
+                    if aa { self.menu_flyout = Some(MenuFlyout::Method { cmd: "arc".into(), anchor: arect }); self.menu_flyout_hot = true; }
+                    for (icon, name, id) in [
+                        ("ellipse", "Ellipse",     "draw.ellipse"),
+                        ("ellarc",  "Ellipse Arc", "draw.ellipsearc"),
+                        ("pline",   "Polyline",    "draw.pline"),
+                        ("spline",  "Spline",      "draw.spline"),
+                        ("point",   "Point",       "draw.point"),
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw(icon), name, nc, Trailing::None, false).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    ui.separator();
-                    // Blocks — the dialog collects the name; insert lists
-                    // the defined blocks as a submenu.
-                    if ui.button("Block…")
-                        .on_hover_text("Create a block from the selection \
-                                        (opens the Block dialog)")
-                        .clicked()
-                    {
-                        self.run_command("block");
-                        ui.close_menu();
-                    }
-                    let block_names: Vec<String> = self.doc.blocks.blocks.iter()
-                        .map(|b| b.name.clone()).collect();
-                    let mut insert_pick: Option<String> = None;
-                    ui.menu_button("Insert Block", |ui| {
-                        if block_names.is_empty() {
-                            ui.label("(no blocks defined)");
-                        }
-                        for n in &block_names {
-                            if ui.button(n).clicked() {
-                                insert_pick = Some(n.clone());
-                                ui.close_menu();
-                            }
-                        }
-                        pp_cap_ui(ui, "menu: Draw ▸ Insert Block");
-                    });
-                    if let Some(n) = insert_pick {
-                        self.run_command(&format!("insert {}", n));
-                        ui.close_menu();
-                    }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("hatch"), "Hatch…", nc, Trailing::None, false).0
+                        { self.run_command("hatch"); ui.close_menu(); }
+                    // Wall (t = thickness) — muted parenthetical hint.
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Draw("wall"), "Wall", nc, Trailing::Hint("(t = thickness)"), false).0
+                        { self.run_command("wall"); ui.close_menu(); }
+                    // group divider hairline (kept)
+                    let (dr, _) = ui.allocate_exact_size(egui::vec2(w, 5.0), egui::Sense::hover());
+                    ui.painter().hline(dr.x_range(), dr.center().y, egui::Stroke::new(1.0, crate::theme::color::BORDER));
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Cmd(GlyphKind::Block), "Block…", nc, Trailing::None, false).0
+                        { self.run_command("block"); ui.close_menu(); }
+                    // Insert Block ▸ — opens the block-name flyout (top-level, §2.1).
+                    let (ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::Cmd(GlyphKind::Insert), "Insert Block", nc, Trailing::None, true);
+                    if ia { self.menu_flyout = Some(MenuFlyout::Insert { anchor: irect }); self.menu_flyout_hot = true; }
+                    let _ = ib;
                     pp_cap_ui(ui, "menu: Draw");
                 });
+                ui.style_mut().spacing.menu_margin = saved_mm;   // restore for other menus
                 ui.menu_button("Modify", |ui| {
                     // Transform group — plain items via execute(id).
                     self.menu_cmd_items(ui, &cmd_ctx, &[
@@ -22719,6 +22965,7 @@ impl eframe::App for CadApp {
         }
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
+        self.render_menu_flyout(ctx);   // method / Insert-Block dropdown flyouts
 
         // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
         // the same swappable engine the Inspector uses. Floats by default

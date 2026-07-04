@@ -11,6 +11,17 @@ Shares: the label notation and current-method marker from `METHOD_ACCESS_MENTOR.
 
 A menubar dropdown is a **flyout**, not a titled surface → it gets **no header band**.
 
+**Applies to ALL category menus** (Edit, Draw, Modify, View, Formative, Utilities,
+Tools, Help). **Draw is the reference** — every other category adopts the same row
+layout, icon column, hover, spacing, arrow-column rule, hug width, dividers, and SM(4)
+flyout radius.
+
+**Method-specific bits only where a command has methods.** The cyan `(CODE)` marker
+(§4), the `▸` method flyout, and the split label-click/hover-open behavior apply **only**
+to method-bearing commands (Draw: Circle/Arc; Modify: Fillet; etc.). Non-method
+commands are plain rows: icon + name, hover, no code, no arrow (unless they open a real
+submenu, which still follows the arrow-column rule).
+
 ---
 
 ## 1. Row layout
@@ -19,7 +30,7 @@ Every command is one row, left → right:
 
 ```
 [icon]  Name (CODE)                         ▸
-└20┘ 12 └──── label zone ────┘  6  └arrow┘
+└20┘ 14 └──── label zone ────┘  6  └arrow┘
 ```
 
 - **Icon column (all commands):** every command shows an icon — **20px box**, one
@@ -29,7 +40,7 @@ Every command is one row, left → right:
   construction glyph). Icon box follows the **shared icon-box rule** (`box = band − 6`,
   glyph scales to fill) — `METHOD_ACCESS_MENTOR.md` §4/§7 — so an icon is the same
   physical size here as in the palette.
-- **icon → name gap: 12.**
+- **icon → name gap: 14** (matches the palette's shipped gap).
 - **Name:** body (Geist 13/400), `text-primary`.
 - **(CODE):** only on method commands — the current method, `data-code` (Mono 11),
   **cyan** (see §4), one **name↔code gap (6)** before it. Format `Name (CODE)` UPPERCASE
@@ -37,9 +48,9 @@ Every command is one row, left → right:
 - **Arrow ▸:** only where the row opens a submenu (method submenu OR real submenu like
   Insert Block). One **unified size + tone** for all arrows (`text-muted`).
 
-Metrics are **matched to the command palette**: same 13 text, same 20 icon, same 12
-icon-gap, same **7px vertical row padding** → the row height / hover box is identical
-to a palette row.
+Metrics are **matched to the command palette**: same 13 text, same 20 icon box, same 14
+icon-gap, same **26 hover-band height** → the row / hover box is identical to a palette
+row.
 
 ---
 
@@ -53,12 +64,67 @@ to a palette row.
   edge padding` — no far-edge void, no arbitrary width.
 - This is the alignment reference for the whole menu; every arrow follows it.
 
+### 2.1 Painting vs submenu mechanism (non-negotiable)
+
+**Every row is custom-painted — including the rows that open a submenu** (method
+submenus like Circle ▸ / Arc ▸, and real submenus like Insert Block ▸). Their icon box,
+26 band, cyan `(CODE)`, hover, and **the ▸ on the aligned column** are painted the same
+as any other row. No row is exempt from the visual rules because it opens a submenu.
+
+The **submenu open/close mechanism is an implementation detail, never a visual
+compromise:**
+- **Prefer** the rail's existing hand-rolled `Area` popup (proven in this codebase) —
+  toggled by the ▸ click, like the rail flyouts.
+- **Only if** a hand-rolled popup is genuinely unstable inside the menubar-menu context
+  (parent closing early) after real tuning, fall back to egui's `menu_button` **as an
+  invisible interaction hitbox underneath the custom-painted row** — the row is still
+  custom-painted and the arrow is still on the column.
+- **Never** ship a natively-styled submenu row with a "hair off" arrow or a mismatched
+  height/hover. Arrow alignment is a headline rule and the submenu rows are the *only*
+  rows it governs — a visible gap there defeats the whole rule.
+
 ---
 
 ## 3. Hover
 
-Full-width row fill one elevation step above the menu fill (`surface-2`-equivalent),
-text unchanged, **instant** (no animation) — identical to the palette/rails hover.
+**Edge-to-edge full-width** row fill one elevation step above the menu fill
+(`surface-2`-equivalent), text unchanged, **instant** (no animation) — identical to the
+palette/rails hover. The highlight spans the **entire menu content width** (from the
+menu's left inner edge to its right inner edge), **not** just the icon+label zone. The
+row's *click* target is the same full-width rect.
+
+**Order matters — hover must not drive width.** The menu width is set **first** by the
+hug rule (§2 / §7) from the longest row. The hover then paints across **that** fixed
+width. Do **not** derive the hover from `available_width` (or any loose/expanding
+measure) — that inflates the menu and still misaligns the edges. Compute the intrinsic
+content width, size the menu to it, then paint each row's hover to the menu's own width.
+
+**Why "full-width" hover can still leave a gap (the real root):** two widths must be
+made equal, or a sliver always remains:
+1. The **menu `Frame` inner width** — egui picks this itself; after you zero the margin
+   it is **not** guaranteed to equal the hug width `w` (it can be wider), so a highlight
+   drawn at `w` stops short of the frame's true right border.
+2. The **highlight width** — if painted at the row's own `w` rect, it can't reach a
+   frame that's wider than `w`.
+
+Fix (both, together):
+- **Zero the frame's horizontal inner margin**, and move that padding inside each row.
+- **Pin the menu content width to exactly `w`** (`ui.set_width(w)`) so the frame inner
+  width **equals** the hug width.
+- **Paint the highlight across the menu's actual content x-range** (`ui.max_rect()
+  .x_range()`, the frame inner edges) — **not** the row's own allocated rect.
+
+When frame width and highlight both derive from the same `w` and the margin is 0, the
+highlight physically reaches both borders. If a gap persists, **measure**: log the frame
+content rect `x` vs the highlight rect `x` for one row — the delta names the culprit.
+
+> **⚠️ PARKED (2026-07-04) — a sliver still remains after content-rect fixes.** The gap
+> is **not** the content inset (zeroed + width-pinned). It lives one layer OUT: the egui
+> menu is `Area` + `Frame` (its own `inner_margin` / `stroke` / `rounding`) wrapping the
+> content ui. Measuring highlight vs `max_rect()` is circular (same rect → always 0).
+> **Resume by measuring the RIGHT pair:** content `ui.max_rect().x` vs the **outer
+> menu/Area frame rect `.x`**. That delta names the outer inset (margin vs stroke vs
+> rounding) — fix *that*, don't touch the content rect again.
 
 ---
 
