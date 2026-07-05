@@ -5,7 +5,7 @@ import * as THREE from "three";
 import { useStore } from "../store/projectStore";
 import type { CalculationPlane, Line2, LuxGrid, Mesh as SceneMesh, Project } from "../types";
 import { toThree } from "../three/coords";
-import { WallDraw, WallFootprints } from "./WallLayer";
+import { WallFootprints } from "./WallLayer";
 
 const MATERIAL_COLOR: Record<number, string> = { 0: "#5a5f66", 1: "#8a9098", 2: "#c9ced6" };
 
@@ -123,20 +123,10 @@ function Heatmap({ grid, plane }: { grid: LuxGrid; plane: CalculationPlane }) {
 
 function DxfLines({ lines }: { lines: Line2[] }) {
   const geometry = useMemo(() => {
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const l of lines) {
-      minX = Math.min(minX, l.start.x, l.end.x);
-      maxX = Math.max(maxX, l.start.x, l.end.x);
-      minY = Math.min(minY, l.start.y, l.end.y);
-      maxY = Math.max(maxY, l.start.y, l.end.y);
-    }
-    const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
+    // Real (uncentred) coordinates — the 2D plan and 3D view share one frame.
     const positions = new Float32Array(lines.length * 6);
     lines.forEach((l, i) => {
-      positions.set(
-        [l.start.x - cx, 0.01, -(l.start.y - cy), l.end.x - cx, 0.01, -(l.end.y - cy)],
-        i * 6,
-      );
+      positions.set([...toThree(l.start.x, l.start.y, 0.01), ...toThree(l.end.x, l.end.y, 0.01)], i * 6);
     });
     const g = new THREE.BufferGeometry();
     g.setAttribute("position", new THREE.BufferAttribute(positions, 3));
@@ -181,15 +171,9 @@ function useBounds(project: Project | null, dxfLines: Line2[]): Bounds | null {
       t(o.x, o.y, o.z); t(o.x + w, o.y, o.z); t(o.x + w, o.y + d, o.z); t(o.x, o.y + d, o.z);
     }
     if (dxfLines.length) {
-      let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
       for (const l of dxfLines) {
-        mnx = Math.min(mnx, l.start.x, l.end.x); mxx = Math.max(mxx, l.start.x, l.end.x);
-        mny = Math.min(mny, l.start.y, l.end.y); mxy = Math.max(mxy, l.start.y, l.end.y);
-      }
-      const cx = (mnx + mxx) / 2, cy = (mny + mxy) / 2;
-      for (const l of dxfLines) {
-        add(l.start.x - cx, 0, -(l.start.y - cy));
-        add(l.end.x - cx, 0, -(l.end.y - cy));
+        t(l.start.x, l.start.y, 0);
+        t(l.end.x, l.end.y, 0);
       }
     }
     if (!any) return null;
@@ -254,7 +238,6 @@ export default function Viewport() {
       {project && <Luminaires project={project} />}
       {project && <WallFootprints walls={project.walls} />}
       <DxfLines lines={dxfLines} />
-      <WallDraw />
 
       <FitView bounds={bounds} />
       <OrbitControls makeDefault />

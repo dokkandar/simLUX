@@ -12,20 +12,20 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
    (background only)   DXF ───────────────┴→ read_dxf → Line2  ── dimmed floor-plan underlay
                         (reference only — NOT lit, NOT 3D geometry)
 
-2. DRAW WALLS (2D)     trace over the underlay with the Wall tool →
-                        WallSeg { start, end, thickness }
-   modifiers            move · offset · (trim · extend · fillet — planned) · cope(=miter)
+2. DRAFT (2D)          Construction tab — Line / Polyline / Rectangle / Wall tools
+                        on a top-down grid, with snapping. → WallSeg { start, end, thickness }
+   modifiers            move · offset · (trim · extend · fillet — planned)
 
-3. STITCH              cad_wall::solve_faces → mitred faces at shared nodes → room footprint
+3. GIVE HEIGHT         extrude each drafted line/wall → a single vertical SURFACE
+                        (a closed loop also gets a floor + ceiling) → 3D meshes
 
-4. GIVE HEIGHT         extrude stitched walls + floor + ceiling to room height → 3D meshes
-
-5. LIGHT               IES luminaires at ceiling → lux engine → heatmap
+4. LIGHT               IES luminaires at ceiling → lux engine → heatmap
 ```
 
-Reused from `dokkandar/Auto_RASM`: `cad_io` (DXF read), `cad_wall` (junction
-miter), `cad_kernel` (Wall + geometry + modifiers). DWG import is a convert step
-(`tools/dwgconv`, C#/ACadSharp) — deferred until DWG is needed.
+Rule: **one line → one surface** (no solid boxes). Reused from
+`dokkandar/Auto_RASM`: `cad_io` (DXF read), `cad_kernel` (geometry types). The
+tools are reimplemented in the web frontend (Auto_RASM's UI is native egui).
+DWG import is a convert step (`tools/dwgconv`, C#/ACadSharp) — deferred.
 
 ---
 
@@ -59,21 +59,20 @@ grid rendered as a heatmap. Indirect (wall reflection) was pulled in early._
 - [ ] **Interactive placement**: drag a luminaire / size the plane in-canvas
       (currently via `add_luminaire` / `add_demo_room` commands).
 
-## Phase 3.2 — Wall drawing & 3D scene 🚧
+## Phase 3.2 — 2D drafting & 3D scene 🚧
 
-- [x] DXF demoted to a **dimmed reference underlay** (not lit, not 3D).
-- [x] **Draw walls** interactively over the underlay (click-to-draw polyline,
-      endpoint snapping to wall nodes + DXF endpoints; Esc to finish).
-- [x] **Stitch** walls at junctions via `cad_wall::solve_faces` (mitre).
-- [x] **Extrude** stitched walls + floor + ceiling to room height → `Mesh`es
-      (ear-clip triangulation for the floor/ceiling — handles L-shapes).
-- [x] Modifiers: **move**, **offset** (commands). Ray tracer already lights the
-      resulting meshes (BVH, rayon).
+- [x] **Construction tab**: a top-down 2D CAD view (SVG) — pan (drag), zoom
+      (wheel, about cursor), adaptive grid, snapping to nodes + grid.
+- [x] Drafting tools: **Select / Line / Polyline / Rectangle / Wall**.
+- [x] DXF is a **dimmed reference underlay** (shared coordinate frame with 3D).
+- [x] **Extrude**: each drafted line/wall → one vertical surface; a closed loop
+      also gets floor + ceiling (ear-clip triangulation, handles L-shapes).
+- [x] Modifiers: **move**, **offset** (commands). Ray tracer lights the result.
+- [x] Tabbed layout (Construction / 3D & Light) + tool palette.
 - [ ] Modifiers: **trim / extend / fillet** (reuse `Geom::trim_at/extend_to`,
-      `fillet_geoms`) — need two-entity pick UX.
-- [ ] Curved walls (`bulge`) + wall styles/thickness table.
-- [ ] Footprint from an open/branching wall set (currently a closed draw-order
-      loop); inner-face floor instead of centreline footprint.
+      `fillet_geoms`) — need two-entity pick UX in the 2D view.
+- [ ] Select tool: pick + move/delete drawn segments in-canvas.
+- [ ] Dimensions, rulers, ortho/polar tracking; curved walls (`bulge`).
 
 ## Phase 3.3 — Radiosity & indirect light ⬜
 

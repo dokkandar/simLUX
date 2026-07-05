@@ -23,7 +23,7 @@ Built with **Tauri v2 + React (react-three-fiber)** on the front, and a
 | Engine     | Rust — `glam` (math), `rayon` (parallelism), custom BVH ray tracer |
 | Photometry | Custom IES LM-63 parser + bilinear candela interpolation   |
 | CAD import | DXF via `cad_io` (from `dokkandar/Auto_RASM`) — underlay only |
-| Walls      | Drawn in-app; stitched via `cad_wall`; extruded to a room  |
+| Drafting   | In-app 2D CAD view (Line/Polyline/Rect/Wall); lines extrude to surfaces |
 
 ## Layout
 
@@ -31,8 +31,10 @@ Built with **Tauri v2 + React (react-three-fiber)** on the front, and a
 SIMLUX/
 ├─ src/                     React frontend
 │  ├─ api/commands.ts       typed wrappers over Tauri invoke()
-│  ├─ components/           Toolbar, Sidebar, Viewport (r3f), StatusBar
-│  ├─ store/projectStore.ts zustand app state
+│  ├─ components/           Plan2D (2D CAD view), ToolPalette, Viewport (r3f),
+│  │                        Toolbar (tabs), Sidebar, StatusBar
+│  ├─ three/coords.ts       engine Z-up ↔ three.js Y-up mapping
+│  ├─ store/projectStore.ts zustand app state (tab, tool, project, …)
 │  └─ types.ts              mirror of the Rust serde model
 ├─ src-tauri/
 │  └─ src/
@@ -44,7 +46,7 @@ SIMLUX/
 │        ├─ ies/            IES LM-63 photometry
 │        ├─ dxf/            DXF plan import
 │        ├─ geometry/       2D/3D primitives, meshes, box_room, calc plane
-│        ├─ wall/           stitch (cad_wall) + extrude walls → room meshes
+│        ├─ wall/           extrude lines/walls → surface meshes (+floor/ceiling)
 │        ├─ rt/             ray tracer: Tri/AABB/BVH + cosine sampling
 │        ├─ calc/           direct + Monte-Carlo indirect lux (rayon)
 │        └─ math.rs         vector + photometry helpers
@@ -87,11 +89,11 @@ npm run tauri build    # produces a native installer under src-tauri/target/rele
 | `add_demo_room(width, depth, height, …)` | `Project`     | box room + calc grid + a downlight   |
 | `calculate_lux()`                        | `LuxGrid`     | compute the illuminance grid         |
 
-### Try it — draw a room
+### Try it — draft a room
 
-`Import IES` (`samples/T1.ies`) → optionally `Load DXF` (`samples/corner sofa.dxf`)
-as a **reference underlay** → `Draw Wall` and click a closed loop of points (snaps
-to nodes; Esc finishes) → `Build Room` → `Calculate Lux`. The heatmap shows
-direct + reflected illuminance on the work plane.
-
-Quick path without drawing: `Import IES` → `Demo Room` → `Calculate Lux`.
+In the **Construction** tab, pick the **Rect** (or **Wall**) tool and draw a
+room on the grid (snaps to nodes/grid; wheel to zoom, drag to pan; Esc finishes a
+chain). Optionally `Load DXF` (`samples/corner sofa.dxf`) first as a reference
+underlay to trace. Then `Import IES` (`samples/T1.ies`) → `Build Room` (extrudes
+each line to a surface + floor/ceiling, switches to **3D & Light**) →
+`Calculate`. The heatmap shows direct + reflected illuminance.

@@ -1,6 +1,9 @@
 import { create } from "zustand";
 import type { EngineInfo, Line2, LuxGrid, Project } from "../types";
 
+export type Tool = "select" | "line" | "polyline" | "rect" | "wall";
+export type Tab = "construction" | "view3d";
+
 interface AppStore {
   engine: EngineInfo | null;
   project: Project | null;
@@ -8,9 +11,8 @@ interface AppStore {
   luxGrid: LuxGrid | null;
   status: string;
   busy: boolean;
-  // Wall-drawing interaction state.
-  drawMode: boolean;
-  pendingStart: [number, number] | null;
+  tab: Tab;
+  tool: Tool;
   wallThickness: number;
   setEngine: (e: EngineInfo) => void;
   setProject: (p: Project) => void;
@@ -18,8 +20,8 @@ interface AppStore {
   setLuxGrid: (g: LuxGrid | null) => void;
   setStatus: (s: string) => void;
   setBusy: (b: boolean) => void;
-  setDrawMode: (b: boolean) => void;
-  setPendingStart: (p: [number, number] | null) => void;
+  setTab: (t: Tab) => void;
+  setTool: (t: Tool) => void;
   setWallThickness: (t: number) => void;
 }
 
@@ -30,8 +32,8 @@ export const useStore = create<AppStore>((set) => ({
   luxGrid: null,
   status: "Ready.",
   busy: false,
-  drawMode: false,
-  pendingStart: null,
+  tab: "construction",
+  tool: "wall",
   wallThickness: 0.1,
   setEngine: (engine) => set({ engine }),
   setProject: (project) => set({ project }),
@@ -39,7 +41,7 @@ export const useStore = create<AppStore>((set) => ({
   setLuxGrid: (luxGrid) => set({ luxGrid }),
   setStatus: (status) => set({ status }),
   setBusy: (busy) => set({ busy }),
-  setDrawMode: (drawMode) => set({ drawMode }),
-  setPendingStart: (pendingStart) => set({ pendingStart }),
+  setTab: (tab) => set({ tab }),
+  setTool: (tool) => set({ tool }),
   setWallThickness: (wallThickness) => set({ wallThickness }),
 }));

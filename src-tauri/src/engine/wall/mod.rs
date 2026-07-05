@@ -1,13 +1,9 @@
-//! Wall system — the "3D geometry engine".
+//! Wall / line extrusion — the "3D geometry engine".
 //!
-//! Turns user-drawn 2D walls into the room meshes the lux engine lights. Walls
-//! are stitched at their shared nodes with `cad_wall::solve_faces` (the same
-//! mitre solver used in Auto_RASM), then extruded — sides, tops, and a
-//! triangulated floor/ceiling — to the room height. DXF stays a reference
-//! underlay; the lit geometry comes from here.
-use cad_kernel::{wall_sides, Vec2, Wall as KWall};
-use cad_wall::{solve_faces, WallFaces};
-
+//! Rule: a single drafted line (or wall) extrudes to a single vertical
+//! **surface** — not a solid box. When the drafted segments form a closed loop
+//! in draw order, a floor and ceiling are added too. These surfaces are what the
+//! lux engine lights; DXF stays a reference underlay.
 use crate::engine::geometry::{Mesh, Point2, Triangle, Vertex, WallSeg};
 use crate::model::MaterialId;
 
@@ -15,65 +11,24 @@ const FLOOR: MaterialId = 0;
 const WALL: MaterialId = 1;
 const CEILING: MaterialId = 2;
 
-fn kwall(w: &WallSeg) -> KWall {
-    KWall {
-        start: Vec2::new(w.start.x as f64, w.start.y as f64),
-        end: Vec2::new(w.end.x as f64, w.end.y as f64),
-        thickness: w.thickness as f64,
-        style: 0,
-        bulge: 0.0,
-    }
-}
-
-fn vtx(p: Vec2, z: f32) -> Vertex {
-    Vertex::new(p.x as f32, p.y as f32, z)
-}
-
-/// Vertical quad from ground edge `a → b` up to `height`.
-fn wall_quad(a: Vec2, b: Vec2, height: f32) -> Mesh {
+/// One vertical surface from the segment `a → b`, extruded to `height`.
+fn surface(a: Point2, b: Point2, height: f32) -> Mesh {
     Mesh {
-        vertices: vec![vtx(a, 0.0), vtx(b, 0.0), vtx(b, height), vtx(a, height)],
+        vertices: vec![
+            Vertex::new(a.x, a.y, 0.0),
+            Vertex::new(b.x, b.y, 0.0),
+            Vertex::new(b.x, b.y, height),
+            Vertex::new(a.x, a.y, height),
+        ],
         triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
         material: WALL,
     }
 }
 
-/// Horizontal quad (a wall top) at height `z`.
-fn top_quad(a: Vec2, b: Vec2, c: Vec2, d: Vec2, z: f32) -> Mesh {
-    Mesh {
-        vertices: vec![vtx(a, z), vtx(b, z), vtx(c, z), vtx(d, z)],
-        triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
-        material: WALL,
-    }
-}
-
-/// Mitred faces for one wall — falls back to a plain centreline offset if the
-/// junction solver bows out (degenerate input).
-fn faces_of(w: &KWall, all: &[KWall]) -> WallFaces {
-    if let Some(f) = solve_faces(w, all) {
-        return f;
-    }
-    if let Some((l, r)) = wall_sides(w.start, w.end, w.thickness) {
-        return WallFaces { left: (l.a, l.b), right: (r.a, r.b) };
-    }
-    WallFaces { left: (w.start, w.end), right: (w.start, w.end) }
-}
-
-/// Extrude stitched walls plus floor + ceiling into meshes.
+/// Extrude each segment to a surface, plus a floor + ceiling if the segments
+/// close a loop.
 pub fn extrude(walls: &[WallSeg], height: f32) -> Vec<Mesh> {
-    let mut meshes = Vec::new();
-    let kwalls: Vec<KWall> = walls.iter().map(kwall).collect();
-
-    for kw in &kwalls {
-        let f = faces_of(kw, &kwalls);
-        let (l0, l1) = f.left;
-        let (r0, r1) = f.right;
-        meshes.push(wall_quad(l0, l1, height)); // left face
-        meshes.push(wall_quad(r0, r1, height)); // right face
-        meshes.push(wall_quad(l0, r0, height)); // start cap
-        meshes.push(wall_quad(l1, r1, height)); // end cap
-        meshes.push(top_quad(l0, l1, r1, r0, height)); // top
-    }
+    let mut meshes: Vec<Mesh> = walls.iter().map(|w| surface(w.start, w.end, height)).collect();
 
     if let Some(poly) = footprint_loop(walls) {
         let tris = triangulate(&poly);
@@ -85,8 +40,8 @@ pub fn extrude(walls: &[WallSeg], height: f32) -> Vec<Mesh> {
     meshes
 }
 
-/// The room footprint when the walls form a closed loop in draw order
-/// (each wall's end meets the next wall's start). `None` otherwise.
+/// The room footprint when the segments form a closed loop in draw order
+/// (each segment's end meets the next segment's start). `None` otherwise.
 pub fn footprint_loop(walls: &[WallSeg]) -> Option<Vec<Point2>> {
     if walls.len() < 3 {
         return None;
@@ -187,7 +142,7 @@ mod tests {
     use super::*;
 
     fn seg(ax: f32, ay: f32, bx: f32, by: f32) -> WallSeg {
-        WallSeg { start: Point2 { x: ax, y: ay }, end: Point2 { x: bx, y: by }, thickness: 0.2 }
+        WallSeg { start: Point2 { x: ax, y: ay }, end: Point2 { x: bx, y: by }, thickness: 0.1 }
     }
 
     #[test]
@@ -203,7 +158,6 @@ mod tests {
 
     #[test]
     fn triangulate_l_shape() {
-        // Concave (L) polygon → 4 triangles.
         let l = vec![
             Point2 { x: 0.0, y: 0.0 },
             Point2 { x: 2.0, y: 0.0 },
@@ -216,7 +170,7 @@ mod tests {
     }
 
     #[test]
-    fn square_room_extrudes_with_floor_and_ceiling() {
+    fn square_room_extrudes_surfaces_plus_floor_ceiling() {
         let w = 4.0;
         let walls = vec![
             seg(0.0, 0.0, w, 0.0),
@@ -226,9 +180,18 @@ mod tests {
         ];
         assert!(footprint_loop(&walls).is_some());
         let m = extrude(&walls, 3.0);
-        // 5 quads per wall + floor + ceiling.
-        assert!(m.len() >= 4 * 5 + 2, "got {} meshes", m.len());
-        assert!(m.iter().any(|mm| mm.material == FLOOR && !mm.triangles.is_empty()));
-        assert!(m.iter().any(|mm| mm.material == CEILING && !mm.triangles.is_empty()));
+        // 4 wall surfaces + floor + ceiling.
+        assert_eq!(m.len(), 6);
+        assert!(m.iter().all(|mm| mm.vertices.len() >= 3));
+        assert!(m.iter().any(|mm| mm.material == FLOOR));
+        assert!(m.iter().any(|mm| mm.material == CEILING));
+        assert_eq!(m.iter().filter(|mm| mm.material == WALL).count(), 4);
+    }
+
+    #[test]
+    fn open_line_extrudes_to_one_surface() {
+        let m = extrude(&[seg(0.0, 0.0, 5.0, 0.0)], 3.0);
+        assert_eq!(m.len(), 1); // single surface, no floor
+        assert_eq!(m[0].material, WALL);
     }
 }
