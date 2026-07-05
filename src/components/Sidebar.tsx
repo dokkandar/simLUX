@@ -11,8 +11,13 @@ function Row({ k, v }: { k: string; v: string }) {
 
 export default function Sidebar() {
   const engine = useStore((s) => s.engine);
+  const project = useStore((s) => s.project);
   const dxfCount = useStore((s) => s.dxfLines.length);
   const luxGrid = useStore((s) => s.luxGrid);
+
+  const profileCount = project ? Object.keys(project.profiles).length : 0;
+  const lumCount = project?.luminaires.length ?? 0;
+  const plane = project?.calc_plane ?? null;
 
   return (
     <aside className="sidebar">
@@ -22,20 +27,26 @@ export default function Sidebar() {
         <Row k="Version" v={engine?.version ?? "—"} />
       </div>
 
-      <h2>Geometry</h2>
+      <h2>Scene</h2>
       <div className="panel">
+        <Row k="IES profiles" v={String(profileCount)} />
+        <Row k="Luminaires" v={String(lumCount)} />
+        <Row k="Room faces" v={String(project?.meshes.length ?? 0)} />
         <Row k="DXF segments" v={String(dxfCount)} />
-        <Row k="Rooms" v="0" />
+        {plane && <Row k="Calc grid" v={`${plane.cols} × ${plane.rows} @ ${plane.origin.z} m`} />}
       </div>
 
-      <h2>Results</h2>
+      <h2>Results (lux)</h2>
       <div className="panel">
         {luxGrid ? (
           <>
-            <Row k="Avg lux" v={luxGrid.avg.toFixed(1)} />
-            <Row k="Min lux" v={luxGrid.min.toFixed(1)} />
-            <Row k="Max lux" v={luxGrid.max.toFixed(1)} />
-            <Row k="Grid" v={`${luxGrid.cols} × ${luxGrid.rows}`} />
+            <Row k="Average" v={luxGrid.avg.toFixed(0)} />
+            <Row k="Minimum" v={luxGrid.min.toFixed(0)} />
+            <Row k="Maximum" v={luxGrid.max.toFixed(0)} />
+            <Row
+              k="Uniformity"
+              v={luxGrid.avg > 0 ? (luxGrid.min / luxGrid.avg).toFixed(2) : "—"}
+            />
           </>
         ) : (
           <p className="muted">No calculation yet.</p>

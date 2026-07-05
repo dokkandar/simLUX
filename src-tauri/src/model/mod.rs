@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::calc::RayTracingSettings;
-use crate::engine::geometry::{CalculationPlane, Line2, Room, Vertex};
+use crate::engine::geometry::{CalculationPlane, Line2, Mesh, Room, Vertex};
 use crate::engine::ies::IesProfile;
 
 /// Index into the project's material table.
@@ -45,6 +45,8 @@ pub struct Project {
     pub profiles: HashMap<String, IesProfile>,
     /// Raw imported DXF geometry (plan underlay).
     pub dxf_lines: Vec<Line2>,
+    /// Triangulated scene geometry the ray tracer bounces light off.
+    pub meshes: Vec<Mesh>,
     pub calc_plane: Option<CalculationPlane>,
     pub settings: RayTracingSettings,
 }
@@ -62,6 +64,7 @@ impl Default for Project {
             ],
             profiles: HashMap::new(),
             dxf_lines: Vec::new(),
+            meshes: Vec::new(),
             calc_plane: None,
             settings: RayTracingSettings::default(),
         }

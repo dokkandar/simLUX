@@ -17,21 +17,27 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
   `calculate_lux`) with `AppState` (`Mutex<Project>`) and serialisable errors.
 - 3D viewport shell: grid, orbit controls, DXF line rendering, heatmap-ready.
 
-## Phase 3.1 — Direct-only calculation 🚧
+## Phase 3.1 — Direct + first-bounce indirect ✅ (mostly)
 
-_Goal: load a DXF, define one calc plane, place one IES luminaire, get a
-direct-only lux grid rendered as a heatmap._
+_Goal: import an IES + DXF, define a calc plane, place a luminaire, get a lux
+grid rendered as a heatmap. Indirect (wall reflection) was pulled in early._
 
-- [ ] **IES parser** (`engine/ies`): tokenize LM-63-2002, handle TILT, read
-      angle arrays + candela block; store lumens, multiplier, dimensions.
-- [ ] **Candela interpolation**: bilinear over `candela[h][v]` in
-      `IesProfile::intensity`.
-- [ ] **DXF loader** (`engine/dxf`): read `LWPOLYLINE` / `LINE` → `Vec<Line2>`
-      (add the `dxf` crate).
-- [ ] **Direct engine** (`engine/calc::calculate_direct`): per grid point,
-      `E = Σ I(θ,ψ)·cos(ε) / d²`, with a single shadow ray per luminaire.
-- [ ] **Frontend**: draw/size a calculation plane, place a light (XY + Z),
-      render the returned `LuxGrid` as a heatmap on the plane.
+- [x] **IES parser** (`engine/ies`): LM-63 (TILT=NONE), angle arrays + candela
+      block; stores lumens, multiplier, watts, dimensions. Tested vs `T1.ies`.
+- [x] **Candela interpolation**: bilinear over `candela[h][v]` in
+      `IesProfile::intensity` (0 outside measured vertical range).
+- [x] **DXF loader** (`engine/dxf`): reuses `cad_io::dxf::read_dxf` from
+      `dokkandar/Auto_RASM`; flattens Line/Arc/Circle/Polyline/Spline → `Line2`.
+- [x] **Ray tracer** (`engine/rt`): Möller–Trumbore + median-split BVH +
+      cosine-weighted sampling + deterministic RNG. Tested vs brute force.
+- [x] **Lux engine** (`engine/calc`): direct `E = Σ I(θ,ψ)·cos(ε)/d²` with
+      shadow rays, plus Monte-Carlo one-bounce indirect. rayon-parallel.
+- [x] **Frontend**: room meshes, luminaire markers, and a `LuxGrid` heatmap on
+      the calc plane; fit-to-scene camera. `Demo Room` builds a test box.
+- [ ] **DXF → calc plane / real rooms**: today the demo room is a `box_room`;
+      wiring a plane + walls from imported DXF is Phase 3.2.
+- [ ] **Interactive placement**: drag a luminaire / size the plane in-canvas
+      (currently via `add_luminaire` / `add_demo_room` commands).
 
 ## Phase 3.2 — Wall drawing & 3D scene ⬜
 

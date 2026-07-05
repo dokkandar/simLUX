@@ -12,4 +12,14 @@ export const importIes = (path: string) =>
 
 export const loadDxf = (path: string) => invoke<Line2[]>("load_dxf", { path });
 
+export const addLuminaire = (x: number, y: number, z: number, profile: string) =>
+  invoke<Project>("add_luminaire", { x, y, z, profile });
+
+export const addDemoRoom = (
+  width: number,
+  depth: number,
+  height: number,
+  planeHeight: number,
+) => invoke<Project>("add_demo_room", { width, depth, height, planeHeight });
+
 export const calculateLux = () => invoke<LuxGrid>("calculate_lux");

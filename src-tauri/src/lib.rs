@@ -27,6 +27,8 @@ pub fn run() {
             commands::get_project,
             commands::import_ies,
             commands::load_dxf,
+            commands::add_luminaire,
+            commands::add_demo_room,
             commands::calculate_lux,
         ])
         .run(tauri::generate_context!())

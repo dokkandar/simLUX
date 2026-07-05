@@ -98,3 +98,27 @@ impl CalculationPlane {
         )
     }
 }
+
+/// Build a closed rectangular room (floor + 4 walls + ceiling) as triangulated
+/// meshes, in the engine's Z-up world. Footprint `[0,width] × [0,depth]`, height
+/// `height`. Material ids follow the project defaults: floor 0, walls 1, ceiling 2.
+///
+/// A stand-in until the Phase 3.2 wall tracer meshes real rooms — but it gives
+/// the ray tracer genuine surfaces to bounce light off today.
+pub fn box_room(width: f32, depth: f32, height: f32) -> Vec<Mesh> {
+    let (w, d, h) = (width, depth, height);
+    let quad = |p0: Vertex, p1: Vertex, p2: Vertex, p3: Vertex, material: MaterialId| Mesh {
+        vertices: vec![p0, p1, p2, p3],
+        triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
+        material,
+    };
+    let v = Vertex::new;
+    vec![
+        quad(v(0.0, 0.0, 0.0), v(w, 0.0, 0.0), v(w, d, 0.0), v(0.0, d, 0.0), 0), // floor
+        quad(v(0.0, 0.0, h), v(0.0, d, h), v(w, d, h), v(w, 0.0, h), 2), // ceiling
+        quad(v(0.0, 0.0, 0.0), v(0.0, d, 0.0), v(0.0, d, h), v(0.0, 0.0, h), 1), // x = 0
+        quad(v(w, 0.0, 0.0), v(w, 0.0, h), v(w, d, h), v(w, d, 0.0), 1), // x = w
+        quad(v(0.0, 0.0, 0.0), v(0.0, 0.0, h), v(w, 0.0, h), v(w, 0.0, 0.0), 1), // y = 0
+        quad(v(0.0, d, 0.0), v(w, d, 0.0), v(w, d, h), v(0.0, d, h), 1), // y = d
+    ]
+}

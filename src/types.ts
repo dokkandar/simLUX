@@ -82,6 +82,18 @@ export interface Room {
   walls: Wall[];
 }
 
+export interface Triangle {
+  a: number;
+  b: number;
+  c: number;
+}
+
+export interface Mesh {
+  vertices: Vertex[];
+  triangles: Triangle[];
+  material: number;
+}
+
 export interface Project {
   name: string;
   rooms: Room[];
@@ -89,6 +101,7 @@ export interface Project {
   materials: Material[];
   profiles: Record<string, IesProfile>;
   dxf_lines: Line2[];
+  meshes: Mesh[];
   calc_plane: CalculationPlane | null;
   settings: RayTracingSettings;
 }
