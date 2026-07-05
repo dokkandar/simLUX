@@ -344,6 +344,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "cad_io"
+version = "0.1.0"
+source = "git+https://github.com/dokkandar/Auto_RASM?rev=dd9e74ef5b06b38f015e1fec09db9f252464657b#dd9e74ef5b06b38f015e1fec09db9f252464657b"
+dependencies = [
+ "cad_kernel",
+]
+
+[[package]]
+name = "cad_kernel"
+version = "0.1.0"
+source = "git+https://github.com/dokkandar/Auto_RASM?rev=dd9e74ef5b06b38f015e1fec09db9f252464657b#dd9e74ef5b06b38f015e1fec09db9f252464657b"
+dependencies = [
+ "cad_nurbs",
+]
+
+[[package]]
+name = "cad_nurbs"
+version = "0.1.0"
+source = "git+https://github.com/dokkandar/Auto_RASM?rev=dd9e74ef5b06b38f015e1fec09db9f252464657b#dd9e74ef5b06b38f015e1fec09db9f252464657b"
+
+[[package]]
 name = "cairo-rs"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3106,6 +3127,8 @@ checksum = "703d5c7ef118737c72f1af64ad2f6f8c5e1921f818cdcb97b8fe6fc69bf66214"
 name = "simlux"
 version = "0.1.0"
 dependencies = [
+ "cad_io",
+ "cad_kernel",
  "glam",
  "rayon",
  "serde",
