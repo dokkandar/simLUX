@@ -1,6 +1,6 @@
 import { open } from "@tauri-apps/plugin-dialog";
 import { useStore } from "../store/projectStore";
-import { buildRoom, calculateLux, clearWalls, importIes, loadDxf } from "../api/commands";
+import { buildRoom, calculateLux, execCommand, importIes, loadDxf } from "../api/commands";
 
 export default function Toolbar() {
   const busy = useStore((s) => s.busy);
@@ -12,6 +12,7 @@ export default function Toolbar() {
   const setLuxGrid = useStore((s) => s.setLuxGrid);
   const setStatus = useStore((s) => s.setStatus);
   const setBusy = useStore((s) => s.setBusy);
+  const applyCmd = useStore((s) => s.applyCmd);
 
   async function run<T>(label: string, fn: () => Promise<T>, ok: (r: T) => void) {
     try {
@@ -55,10 +56,10 @@ export default function Toolbar() {
   }
 
   async function onClear() {
-    await run("Clear", () => clearWalls(), (p) => {
-      setProject(p);
+    await run("Clear", () => execCommand("clear"), (r) => {
+      applyCmd(r);
       setLuxGrid(null);
-      setStatus("Walls & room cleared.");
+      setStatus("Drawing cleared.");
     });
   }
 

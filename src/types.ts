@@ -119,3 +119,22 @@ export interface EngineInfo {
   version: string;
   phase: string;
 }
+
+// A drafted entity from the command engine (cad_kernel::Document snapshot).
+export type GeomDto =
+  | { kind: "line"; a: [number, number]; b: [number, number] }
+  | { kind: "wall"; a: [number, number]; b: [number, number]; thickness: number }
+  | { kind: "polyline"; pts: [number, number][]; closed: boolean }
+  | { kind: "circle"; c: [number, number]; r: number }
+  | { kind: "arc"; c: [number, number]; r: number; start_deg: number; sweep_deg: number }
+  | { kind: "point"; p: [number, number] };
+
+export interface CmdResult {
+  ok: boolean;
+  message: string;
+  prompt: string;
+  active: boolean;
+  active_tool: string | null;
+  active_pts: [number, number][];
+  geometry: GeomDto[];
+}

@@ -1,8 +1,11 @@
 import { create } from "zustand";
-import type { EngineInfo, Line2, LuxGrid, Project } from "../types";
+import type { CmdResult, EngineInfo, GeomDto, Line2, LuxGrid, Project } from "../types";
 
-export type Tool = "select" | "line" | "polyline" | "rect" | "wall";
 export type Tab = "construction" | "view3d";
+export interface LogLine {
+  text: string;
+  kind: "in" | "out" | "err";
+}
 
 interface AppStore {
   engine: EngineInfo | null;
@@ -12,7 +15,12 @@ interface AppStore {
   status: string;
   busy: boolean;
   tab: Tab;
-  tool: Tool;
+  // Command-line drafting state (mirrors the backend session).
+  geometry: GeomDto[];
+  prompt: string;
+  activeTool: string | null;
+  activePts: [number, number][];
+  cmdLog: LogLine[];
   wallThickness: number;
   setEngine: (e: EngineInfo) => void;
   setProject: (p: Project) => void;
@@ -21,8 +29,9 @@ interface AppStore {
   setStatus: (s: string) => void;
   setBusy: (b: boolean) => void;
   setTab: (t: Tab) => void;
-  setTool: (t: Tool) => void;
   setWallThickness: (t: number) => void;
+  pushInput: (text: string) => void;
+  applyCmd: (r: CmdResult) => void;
 }
 
 export const useStore = create<AppStore>((set) => ({
@@ -33,7 +42,11 @@ export const useStore = create<AppStore>((set) => ({
   status: "Ready.",
   busy: false,
   tab: "construction",
-  tool: "wall",
+  geometry: [],
+  prompt: "Command:",
+  activeTool: null,
+  activePts: [],
+  cmdLog: [],
   wallThickness: 0.1,
   setEngine: (engine) => set({ engine }),
   setProject: (project) => set({ project }),
@@ -42,6 +55,18 @@ export const useStore = create<AppStore>((set) => ({
   setStatus: (status) => set({ status }),
   setBusy: (busy) => set({ busy }),
   setTab: (tab) => set({ tab }),
-  setTool: (tool) => set({ tool }),
   setWallThickness: (wallThickness) => set({ wallThickness }),
+  pushInput: (text) =>
+    set((s) => ({ cmdLog: [...s.cmdLog, { text, kind: "in" as const }].slice(-40) })),
+  applyCmd: (r) =>
+    set((s) => ({
+      geometry: r.geometry,
+      prompt: r.prompt || "Command:",
+      activeTool: r.active_tool,
+      activePts: r.active_pts,
+      status: r.message || r.prompt || s.status,
+      cmdLog: r.message
+        ? [...s.cmdLog, { text: r.message, kind: (r.ok ? "out" : "err") as LogLine["kind"] }].slice(-40)
+        : s.cmdLog,
+    })),
 }));

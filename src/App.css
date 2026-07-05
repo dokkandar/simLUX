@@ -281,6 +281,72 @@ button:disabled {
   border-radius: 4px;
 }
 
+/* ---- Construction stage (2D plan + command line) ---- */
+.stage.construction {
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-wrap {
+  position: relative;
+  flex: 1;
+  min-height: 0;
+}
+
+/* ---- Command line ---- */
+.cmdline {
+  flex: 0 0 auto;
+  background: var(--panel);
+  border-top: 1px solid var(--border);
+  font-family: "Cascadia Code", Consolas, ui-monospace, monospace;
+  font-size: 12px;
+}
+
+.cmdlog {
+  max-height: 96px;
+  overflow-y: auto;
+  padding: 6px 10px 2px;
+}
+
+.cmdlog-line {
+  white-space: pre-wrap;
+  line-height: 1.5;
+}
+
+.cmdlog-line.in {
+  color: var(--text);
+}
+
+.cmdlog-line.out {
+  color: var(--muted);
+}
+
+.cmdlog-line.err {
+  color: #f0857d;
+}
+
+.cmdrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.cmdprompt {
+  color: var(--accent-2);
+  white-space: nowrap;
+}
+
+.cmdrow input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+}
+
 /* ---- 2D drafting view ---- */
 .plan2d {
   position: absolute;

@@ -1,19 +1,31 @@
 import { useStore } from "../store/projectStore";
-import type { Tool } from "../store/projectStore";
+import { cancelCommand, execCommand } from "../api/commands";
 
-const TOOLS: Array<{ id: Tool; label: string; hint: string }> = [
-  { id: "select", label: "Select", hint: "Pan / select (drag to pan; wheel to zoom)" },
-  { id: "wall", label: "Wall", hint: "Chain walls with thickness (Esc/Enter to finish)" },
-  { id: "line", label: "Line", hint: "Single line segment (extrudes to a surface)" },
-  { id: "polyline", label: "Polyline", hint: "Chain of lines (Esc/Enter to finish)" },
-  { id: "rect", label: "Rect", hint: "Rectangular room from two corners" },
+const TOOLS: Array<{ id: string; label: string; cmd: string | null; hint: string }> = [
+  { id: "select", label: "Select", cmd: null, hint: "Cancel active command (Esc)" },
+  { id: "line", label: "Line", cmd: "line", hint: "Line chain — each segment a surface" },
+  { id: "polyline", label: "Pline", cmd: "pline", hint: "Polyline (Close to make a room)" },
+  { id: "rectangle", label: "Rect", cmd: "rectangle", hint: "Rectangle from two corners" },
+  { id: "circle", label: "Circle", cmd: "circle", hint: "Circle: centre + radius point" },
+  { id: "arc", label: "Arc", cmd: "arc", hint: "Arc through three points" },
+  { id: "wall", label: "Wall", cmd: "wall", hint: "Wall chain (has thickness)" },
+  { id: "point", label: "Point", cmd: "point", hint: "Place a point" },
 ];
 
 export default function ToolPalette() {
-  const tool = useStore((s) => s.tool);
-  const setTool = useStore((s) => s.setTool);
+  const activeTool = useStore((s) => s.activeTool);
+  const applyCmd = useStore((s) => s.applyCmd);
   const thickness = useStore((s) => s.wallThickness);
   const setThickness = useStore((s) => s.setWallThickness);
+
+  async function pick(id: string, cmd: string | null) {
+    if (!cmd) {
+      applyCmd(await cancelCommand());
+      return;
+    }
+    const line = id === "wall" ? `wall ${thickness}` : cmd;
+    applyCmd(await execCommand(line));
+  }
 
   return (
     <aside className="palette">
@@ -21,8 +33,8 @@ export default function ToolPalette() {
         <button
           key={t.id}
           title={t.hint}
-          className={tool === t.id ? "tool active" : "tool"}
-          onClick={() => setTool(t.id)}
+          className={activeTool === t.id ? "tool active" : "tool"}
+          onClick={() => pick(t.id, t.cmd)}
         >
           {t.label}
         </button>

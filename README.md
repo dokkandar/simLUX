@@ -7,9 +7,10 @@ ray-traced / progressive-radiosity engine.
 Built with **Tauri v2 + React (react-three-fiber)** on the front, and a
 **Rust** computation engine on the back.
 
-> Status: **Phase 3.2** — draw walls over a DXF underlay, stitch + extrude them
-> to a room, place IES luminaires, and compute a ray-traced direct + indirect
-> lux heatmap. See [ROADMAP.md](./ROADMAP.md) for the phased plan and
+> Status: **Phase 3.2** — a command-line 2D drafting environment (reusing
+> Auto_RASM's `parse` + `Document`): draw with commands/coordinates or clicks,
+> extrude to surfaces, place IES luminaires, and compute a ray-traced lux
+> heatmap. See [ROADMAP.md](./ROADMAP.md) for the phased plan and
 > [docs/Guide-for-simLUX.txt](./docs/Guide-for-simLUX.txt) for the full design
 > research.
 
@@ -23,7 +24,7 @@ Built with **Tauri v2 + React (react-three-fiber)** on the front, and a
 | Engine     | Rust — `glam` (math), `rayon` (parallelism), custom BVH ray tracer |
 | Photometry | Custom IES LM-63 parser + bilinear candela interpolation   |
 | CAD import | DXF via `cad_io` (from `dokkandar/Auto_RASM`) — underlay only |
-| Drafting   | In-app 2D CAD view (Line/Polyline/Rect/Wall); lines extrude to surfaces |
+| Drafting   | Command-line 2D CAD (reuses `cad_kernel::parse` + `Document`); lines extrude to surfaces |
 
 ## Layout
 
@@ -31,8 +32,8 @@ Built with **Tauri v2 + React (react-three-fiber)** on the front, and a
 SIMLUX/
 ├─ src/                     React frontend
 │  ├─ api/commands.ts       typed wrappers over Tauri invoke()
-│  ├─ components/           Plan2D (2D CAD view), ToolPalette, Viewport (r3f),
-│  │                        Toolbar (tabs), Sidebar, StatusBar
+│  ├─ components/           Plan2D (2D CAD view), CommandLine, ToolPalette,
+│  │                        Viewport (r3f), Toolbar (tabs), Sidebar, StatusBar
 │  ├─ three/coords.ts       engine Z-up ↔ three.js Y-up mapping
 │  ├─ store/projectStore.ts zustand app state (tab, tool, project, …)
 │  └─ types.ts              mirror of the Rust serde model
@@ -46,7 +47,8 @@ SIMLUX/
 │        ├─ ies/            IES LM-63 photometry
 │        ├─ dxf/            DXF plan import
 │        ├─ geometry/       2D/3D primitives, meshes, box_room, calc plane
-│        ├─ wall/           extrude lines/walls → surface meshes (+floor/ceiling)
+│        ├─ draft/          command engine (cad_kernel parse + Document) + extrude
+│        ├─ wall/           ear-clip triangulation (floor/ceiling caps)
 │        ├─ rt/             ray tracer: Tri/AABB/BVH + cosine sampling
 │        ├─ calc/           direct + Monte-Carlo indirect lux (rayon)
 │        └─ math.rs         vector + photometry helpers
@@ -81,19 +83,19 @@ npm run tauri build    # produces a native installer under src-tauri/target/rele
 | `get_project()`                          | `Project`     | snapshot of app state                |
 | `import_ies(path)`                       | `IesProfile`  | parse + store an IES file            |
 | `load_dxf(path)`                         | `Line2[]`     | load DXF plan geometry               |
+| `exec_command(input)`                    | `CmdResult`   | run a command / coordinate / keyword |
+| `pick_point(x, y)`                       | `CmdResult`   | feed a clicked point to the command  |
+| `cancel_command()` / `get_geometry()`    | `CmdResult`   | cancel / snapshot the drawing        |
 | `add_luminaire(x, y, z, profile)`        | `Project`     | place a luminaire in the scene       |
-| `add_wall(sx, sy, ex, ey, thickness)`    | `Project`     | append a drawn wall segment          |
-| `move_wall` / `offset_wall`              | `Project`     | wall modifiers                       |
-| `build_room(height, plane_height)`       | `Project`     | stitch + extrude walls → room + grid |
-| `clear_walls()`                          | `Project`     | remove walls + room                  |
+| `build_room(height, plane_height)`       | `Project`     | extrude the drawing → room + grid    |
 | `add_demo_room(width, depth, height, …)` | `Project`     | box room + calc grid + a downlight   |
 | `calculate_lux()`                        | `LuxGrid`     | compute the illuminance grid         |
 
 ### Try it — draft a room
 
-In the **Construction** tab, pick the **Rect** (or **Wall**) tool and draw a
-room on the grid (snaps to nodes/grid; wheel to zoom, drag to pan; Esc finishes a
-chain). Optionally `Load DXF` (`samples/corner sofa.dxf`) first as a reference
-underlay to trace. Then `Import IES` (`samples/T1.ies`) → `Build Room` (extrudes
-each line to a surface + floor/ceiling, switches to **3D & Light**) →
-`Calculate`. The heatmap shows direct + reflected illuminance.
+In the **Construction** tab, use the command line (or the tool buttons):
+type `rect` ⏎ then click two corners — or type it fully: `rect` ⏎ `0,0` ⏎ `4,3` ⏎.
+Coordinates can be absolute (`3,0`), relative (`@2,0`), or polar (`@5<90`); use
+`close` / `undo` while chaining a `pline`/`wall`. Optionally `Load DXF`
+(`samples/corner sofa.dxf`) first to trace. Then `Import IES` (`samples/T1.ies`)
+→ `Build Room` (extrudes to surfaces, switches to **3D & Light**) → `Calculate`.

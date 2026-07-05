@@ -13,6 +13,7 @@ export default function Sidebar() {
   const engine = useStore((s) => s.engine);
   const project = useStore((s) => s.project);
   const dxfCount = useStore((s) => s.dxfLines.length);
+  const entityCount = useStore((s) => s.geometry.length);
   const luxGrid = useStore((s) => s.luxGrid);
 
   const profileCount = project ? Object.keys(project.profiles).length : 0;
@@ -30,7 +31,7 @@ export default function Sidebar() {
       <h2>Scene</h2>
       <div className="panel">
         <Row k="IES profiles" v={String(profileCount)} />
-        <Row k="Walls drawn" v={String(project?.walls.length ?? 0)} />
+        <Row k="Entities" v={String(entityCount)} />
         <Row k="Luminaires" v={String(lumCount)} />
         <Row k="Room faces" v={String(project?.meshes.length ?? 0)} />
         <Row k="DXF underlay" v={`${dxfCount} seg`} />

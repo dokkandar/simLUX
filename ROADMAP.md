@@ -12,9 +12,10 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
    (background only)   DXF ───────────────┴→ read_dxf → Line2  ── dimmed floor-plan underlay
                         (reference only — NOT lit, NOT 3D geometry)
 
-2. DRAFT (2D)          Construction tab — Line / Polyline / Rectangle / Wall tools
-                        on a top-down grid, with snapping. → WallSeg { start, end, thickness }
-   modifiers            move · offset · (trim · extend · fillet — planned)
+2. DRAFT (2D)          Construction tab — a **command line** (reusing cad_kernel::parse)
+                        + tools: line/polyline/rectangle/circle/arc/point/wall. Typed
+                        coordinates (3,0 · @2,0 · @5<90) or clicks. → cad_kernel::Document
+   modify               move · offset · trim · extend · fillet — planned
 
 3. GIVE HEIGHT         extrude each drafted line/wall → a single vertical SURFACE
                         (a closed loop also gets a floor + ceiling) → 3D meshes
@@ -23,8 +24,9 @@ Legend: ✅ done · 🚧 in progress · ⬜ planned
 ```
 
 Rule: **one line → one surface** (no solid boxes). Reused from
-`dokkandar/Auto_RASM`: `cad_io` (DXF read), `cad_kernel` (geometry types). The
-tools are reimplemented in the web frontend (Auto_RASM's UI is native egui).
+`dokkandar/Auto_RASM`: `cad_io` (DXF read), `cad_kernel` (`parse` + `Command` +
+`Document` + geometry). The command *orchestration* is reimplemented (Auto_RASM's
+dispatch is native egui; `COMMAND_LINE.md` there is a design spec, unimplemented).
 DWG import is a convert step (`tools/dwgconv`, C#/ACadSharp) — deferred.
 
 ---
@@ -59,20 +61,25 @@ grid rendered as a heatmap. Indirect (wall reflection) was pulled in early._
 - [ ] **Interactive placement**: drag a luminaire / size the plane in-canvas
       (currently via `add_luminaire` / `add_demo_room` commands).
 
-## Phase 3.2 — 2D drafting & 3D scene 🚧
+## Phase 3.2 — Command-line 2D drafting & 3D scene 🚧
 
-- [x] **Construction tab**: a top-down 2D CAD view (SVG) — pan (drag), zoom
-      (wheel, about cursor), adaptive grid, snapping to nodes + grid.
-- [x] Drafting tools: **Select / Line / Polyline / Rectangle / Wall**.
-- [x] DXF is a **dimmed reference underlay** (shared coordinate frame with 3D).
-- [x] **Extrude**: each drafted line/wall → one vertical surface; a closed loop
-      also gets floor + ceiling (ear-clip triangulation, handles L-shapes).
-- [x] Modifiers: **move**, **offset** (commands). Ray tracer lights the result.
-- [x] Tabbed layout (Construction / 3D & Light) + tool palette.
-- [ ] Modifiers: **trim / extend / fillet** (reuse `Geom::trim_at/extend_to`,
-      `fillet_geoms`) — need two-entity pick UX in the 2D view.
-- [ ] Select tool: pick + move/delete drawn segments in-canvas.
-- [ ] Dimensions, rulers, ortho/polar tracking; curved walls (`bulge`).
+- [x] **Command environment**: `engine::draft` adopts `cad_kernel::Document` and
+      reuses `cad_kernel::parse`; a stateful session (exec / pick / cancel) with
+      prompts. Command-line bar with transcript.
+- [x] **Draw commands**: line · polyline · rectangle · circle · arc · point ·
+      wall — via typed command + coords (`3,0`, `@2,0`, `@5<90`) **or** clicks;
+      `close` / `undo` keywords.
+- [x] **Construction view** (SVG): pan, zoom-about-cursor, adaptive grid,
+      snapping to entity nodes + grid; renders the Document; tool palette issues
+      commands.
+- [x] DXF = dimmed reference underlay (shared coordinate frame with 3D).
+- [x] **Extrude** the Document: each line/wall → one surface; closed paths +
+      circles get floor + ceiling; arcs/circles tessellated.
+- [ ] **Modify commands**: move · copy · erase · offset · trim · extend · fillet
+      · rotate · scale · mirror (kernel has them; need pick UX). Currently they
+      parse and report "not yet".
+- [ ] Select/grip editing; snap overrides (END/MID/CEN/INT/PER); dimensions,
+      rulers, ortho/polar tracking; ellipse/spline; curved walls (`bulge`).
 
 ## Phase 3.3 — Radiosity & indirect light ⬜
 

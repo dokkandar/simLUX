@@ -5,7 +5,6 @@ import * as THREE from "three";
 import { useStore } from "../store/projectStore";
 import type { CalculationPlane, Line2, LuxGrid, Mesh as SceneMesh, Project } from "../types";
 import { toThree } from "../three/coords";
-import { WallFootprints } from "./WallLayer";
 
 const MATERIAL_COLOR: Record<number, string> = { 0: "#5a5f66", 1: "#8a9098", 2: "#c9ced6" };
 
@@ -236,7 +235,6 @@ export default function Viewport() {
       {project?.meshes.map((m, i) => <RoomMesh key={i} mesh={m} />)}
       {luxGrid && project?.calc_plane && <Heatmap grid={luxGrid} plane={project.calc_plane} />}
       {project && <Luminaires project={project} />}
-      {project && <WallFootprints walls={project.walls} />}
       <DxfLines lines={dxfLines} />
 
       <FitView bounds={bounds} />
