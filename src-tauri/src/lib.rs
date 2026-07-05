@@ -29,6 +29,11 @@ pub fn run() {
             commands::load_dxf,
             commands::add_luminaire,
             commands::add_demo_room,
+            commands::add_wall,
+            commands::move_wall,
+            commands::offset_wall,
+            commands::clear_walls,
+            commands::build_room,
             commands::calculate_lux,
         ])
         .run(tauri::generate_context!())

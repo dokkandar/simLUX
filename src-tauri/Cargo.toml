@@ -31,12 +31,12 @@ rayon = "1"
 # Ergonomic error enums across the command boundary.
 thiserror = "2"
 
-# DXF import — reuse the tested ASCII-DXF reader from Auto_RASM
-# (cad_io::dxf::read_dxf -> cad_kernel::Document). Pinned for reproducibility.
+# DXF import + wall system — reuse tested code from Auto_RASM. `cad_io` reads DXF,
+# `cad_wall` mitres wall junctions, `cad_kernel` carries the shared geometry types.
+# Pinned to one rev so all three resolve to the same cad_kernel instance.
 cad_io     = { git = "https://github.com/dokkandar/Auto_RASM", package = "cad_io",     rev = "dd9e74ef5b06b38f015e1fec09db9f252464657b" }
 cad_kernel = { git = "https://github.com/dokkandar/Auto_RASM", package = "cad_kernel", rev = "dd9e74ef5b06b38f015e1fec09db9f252464657b" }
+cad_wall   = { git = "https://github.com/dokkandar/Auto_RASM", package = "cad_wall",   rev = "dd9e74ef5b06b38f015e1fec09db9f252464657b" }
 
 # --- Planned per-phase dependencies (uncomment as each roadmap phase lands) ---
-# Phase 3.2  geo     = "0.29"    # 2D boolean ops, point-in-polygon
-# Phase 3.2  earcutr = "0.4"     # robust polygon triangulation -> meshes
-# Phase 3.3  parry3d = "0.17"    # BVH + ray/triangle intersection for shadows & bounces
+# Phase 3.3  parry3d = "0.17"    # optional: swap the hand-rolled BVH for parry

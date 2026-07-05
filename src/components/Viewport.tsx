@@ -4,9 +4,8 @@ import { Grid, OrbitControls, GizmoHelper, GizmoViewport } from "@react-three/dr
 import * as THREE from "three";
 import { useStore } from "../store/projectStore";
 import type { CalculationPlane, Line2, LuxGrid, Mesh as SceneMesh, Project } from "../types";
-
-// Engine world is Z-up; three.js is Y-up. (ex, ey, ez) -> (ex, ez, -ey).
-const toThree = (x: number, y: number, z: number): [number, number, number] => [x, z, -y];
+import { toThree } from "../three/coords";
+import { WallDraw, WallFootprints } from "./WallLayer";
 
 const MATERIAL_COLOR: Record<number, string> = { 0: "#5a5f66", 1: "#8a9098", 2: "#c9ced6" };
 
@@ -147,7 +146,8 @@ function DxfLines({ lines }: { lines: Line2[] }) {
   if (lines.length === 0) return null;
   return (
     <lineSegments geometry={geometry}>
-      <lineBasicMaterial color="#4ea1ff" />
+      {/* Dimmed — the DXF is a reference underlay, not lit geometry. */}
+      <lineBasicMaterial color="#3c586f" transparent opacity={0.85} />
     </lineSegments>
   );
 }
@@ -252,7 +252,9 @@ export default function Viewport() {
       {project?.meshes.map((m, i) => <RoomMesh key={i} mesh={m} />)}
       {luxGrid && project?.calc_plane && <Heatmap grid={luxGrid} plane={project.calc_plane} />}
       {project && <Luminaires project={project} />}
+      {project && <WallFootprints walls={project.walls} />}
       <DxfLines lines={dxfLines} />
+      <WallDraw />
 
       <FitView bounds={bounds} />
       <OrbitControls makeDefault />

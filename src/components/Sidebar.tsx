@@ -30,9 +30,10 @@ export default function Sidebar() {
       <h2>Scene</h2>
       <div className="panel">
         <Row k="IES profiles" v={String(profileCount)} />
+        <Row k="Walls drawn" v={String(project?.walls.length ?? 0)} />
         <Row k="Luminaires" v={String(lumCount)} />
         <Row k="Room faces" v={String(project?.meshes.length ?? 0)} />
-        <Row k="DXF segments" v={String(dxfCount)} />
+        <Row k="DXF underlay" v={`${dxfCount} seg`} />
         {plane && <Row k="Calc grid" v={`${plane.cols} × ${plane.rows} @ ${plane.origin.z} m`} />}
       </div>
 

@@ -22,4 +22,23 @@ export const addDemoRoom = (
   planeHeight: number,
 ) => invoke<Project>("add_demo_room", { width, depth, height, planeHeight });
 
+export const addWall = (
+  startX: number,
+  startY: number,
+  endX: number,
+  endY: number,
+  thickness: number,
+) => invoke<Project>("add_wall", { startX, startY, endX, endY, thickness });
+
+export const moveWall = (index: number, dx: number, dy: number) =>
+  invoke<Project>("move_wall", { index, dx, dy });
+
+export const offsetWall = (index: number, dist: number) =>
+  invoke<Project>("offset_wall", { index, dist });
+
+export const clearWalls = () => invoke<Project>("clear_walls");
+
+export const buildRoom = (height: number, planeHeight: number) =>
+  invoke<Project>("build_room", { height, planeHeight });
+
 export const calculateLux = () => invoke<LuxGrid>("calculate_lux");

@@ -18,6 +18,15 @@ pub struct Line2 {
     pub end: Point2,
 }
 
+/// A user-drawn wall: a 2D centreline segment with a thickness (metres). Height
+/// is a room-level property applied at extrusion time, not stored per wall.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct WallSeg {
+    pub start: Point2,
+    pub end: Point2,
+    pub thickness: f32,
+}
+
 /// A 3D vertex (metres).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Vertex {

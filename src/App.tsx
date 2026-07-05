@@ -10,6 +10,8 @@ import "./App.css";
 export default function App() {
   const setEngine = useStore((s) => s.setEngine);
   const setStatus = useStore((s) => s.setStatus);
+  const setDrawMode = useStore((s) => s.setDrawMode);
+  const setPendingStart = useStore((s) => s.setPendingStart);
 
   useEffect(() => {
     engineInfo()
@@ -19,6 +21,18 @@ export default function App() {
       })
       .catch((e) => setStatus(`Engine unavailable: ${String(e)}`));
   }, [setEngine, setStatus]);
+
+  // Esc finishes / exits wall-draw mode.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        setDrawMode(false);
+        setPendingStart(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [setDrawMode, setPendingStart]);
 
   return (
     <div className="app">

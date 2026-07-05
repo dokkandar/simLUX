@@ -365,6 +365,14 @@ version = "0.1.0"
 source = "git+https://github.com/dokkandar/Auto_RASM?rev=dd9e74ef5b06b38f015e1fec09db9f252464657b#dd9e74ef5b06b38f015e1fec09db9f252464657b"
 
 [[package]]
+name = "cad_wall"
+version = "0.1.0"
+source = "git+https://github.com/dokkandar/Auto_RASM?rev=dd9e74ef5b06b38f015e1fec09db9f252464657b#dd9e74ef5b06b38f015e1fec09db9f252464657b"
+dependencies = [
+ "cad_kernel",
+]
+
+[[package]]
 name = "cairo-rs"
 version = "0.18.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3129,6 +3137,7 @@ version = "0.1.0"
 dependencies = [
  "cad_io",
  "cad_kernel",
+ "cad_wall",
  "glam",
  "rayon",
  "serde",

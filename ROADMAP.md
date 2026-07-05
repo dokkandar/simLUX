@@ -1,11 +1,31 @@
 # SIMLUX Roadmap
 
 Phased plan distilled from [docs/Guide-for-simLUX.txt](./docs/Guide-for-simLUX.txt).
-Each phase is shippable on its own. The current tree is the **scaffold**: every
-module and command exists and compiles, engine functions return
-`EngineError::NotImplemented` pointing back here.
+Each phase is shippable on its own.
 
 Legend: ✅ done · 🚧 in progress · ⬜ planned
+
+## Workflow (the concept)
+
+```
+1. INSERT REFERENCE   DWG ─(dwgconv)→ DXF ┐
+   (background only)   DXF ───────────────┴→ read_dxf → Line2  ── dimmed floor-plan underlay
+                        (reference only — NOT lit, NOT 3D geometry)
+
+2. DRAW WALLS (2D)     trace over the underlay with the Wall tool →
+                        WallSeg { start, end, thickness }
+   modifiers            move · offset · (trim · extend · fillet — planned) · cope(=miter)
+
+3. STITCH              cad_wall::solve_faces → mitred faces at shared nodes → room footprint
+
+4. GIVE HEIGHT         extrude stitched walls + floor + ceiling to room height → 3D meshes
+
+5. LIGHT               IES luminaires at ceiling → lux engine → heatmap
+```
+
+Reused from `dokkandar/Auto_RASM`: `cad_io` (DXF read), `cad_wall` (junction
+miter), `cad_kernel` (Wall + geometry + modifiers). DWG import is a convert step
+(`tools/dwgconv`, C#/ACadSharp) — deferred until DWG is needed.
 
 ---
 
@@ -39,12 +59,21 @@ grid rendered as a heatmap. Indirect (wall reflection) was pulled in early._
 - [ ] **Interactive placement**: drag a luminaire / size the plane in-canvas
       (currently via `add_luminaire` / `add_demo_room` commands).
 
-## Phase 3.2 — Wall drawing & 3D scene ⬜
+## Phase 3.2 — Wall drawing & 3D scene 🚧
 
-- [ ] Trace DXF lines into `Wall`s (thickness + height) grouped into `Room`s.
-- [ ] Extrude + triangulate walls/floor/ceiling into `Mesh`es (`earcutr`).
-- [ ] Shadow test upgraded to `ray vs. triangle` over all meshes, parallelised
-      with `rayon`; add a BVH (`parry3d`) as scenes grow.
+- [x] DXF demoted to a **dimmed reference underlay** (not lit, not 3D).
+- [x] **Draw walls** interactively over the underlay (click-to-draw polyline,
+      endpoint snapping to wall nodes + DXF endpoints; Esc to finish).
+- [x] **Stitch** walls at junctions via `cad_wall::solve_faces` (mitre).
+- [x] **Extrude** stitched walls + floor + ceiling to room height → `Mesh`es
+      (ear-clip triangulation for the floor/ceiling — handles L-shapes).
+- [x] Modifiers: **move**, **offset** (commands). Ray tracer already lights the
+      resulting meshes (BVH, rayon).
+- [ ] Modifiers: **trim / extend / fillet** (reuse `Geom::trim_at/extend_to`,
+      `fillet_geoms`) — need two-entity pick UX.
+- [ ] Curved walls (`bulge`) + wall styles/thickness table.
+- [ ] Footprint from an open/branching wall set (currently a closed draw-order
+      loop); inner-face floor instead of centreline footprint.
 
 ## Phase 3.3 — Radiosity & indirect light ⬜
 

@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 use crate::engine::calc::RayTracingSettings;
-use crate::engine::geometry::{CalculationPlane, Line2, Mesh, Room, Vertex};
+use crate::engine::geometry::{CalculationPlane, Line2, Mesh, Room, Vertex, WallSeg};
 use crate::engine::ies::IesProfile;
 
 /// Index into the project's material table.
@@ -43,9 +43,13 @@ pub struct Project {
     pub luminaires: Vec<LuminaireInstance>,
     pub materials: Vec<Material>,
     pub profiles: HashMap<String, IesProfile>,
-    /// Raw imported DXF geometry (plan underlay).
+    /// Raw imported DXF geometry — a reference floor-plan underlay only.
     pub dxf_lines: Vec<Line2>,
-    /// Triangulated scene geometry the ray tracer bounces light off.
+    /// User-drawn 2D walls (traced over the underlay).
+    pub walls: Vec<WallSeg>,
+    /// Room height (metres) applied when walls are extruded.
+    pub room_height: f32,
+    /// Triangulated scene geometry the ray tracer bounces light off (from `walls`).
     pub meshes: Vec<Mesh>,
     pub calc_plane: Option<CalculationPlane>,
     pub settings: RayTracingSettings,
@@ -64,6 +68,8 @@ impl Default for Project {
             ],
             profiles: HashMap::new(),
             dxf_lines: Vec::new(),
+            walls: Vec::new(),
+            room_height: 3.0,
             meshes: Vec::new(),
             calc_plane: None,
             settings: RayTracingSettings::default(),

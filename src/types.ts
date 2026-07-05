@@ -94,6 +94,12 @@ export interface Mesh {
   material: number;
 }
 
+export interface WallSeg {
+  start: Point2;
+  end: Point2;
+  thickness: number;
+}
+
 export interface Project {
   name: string;
   rooms: Room[];
@@ -101,6 +107,8 @@ export interface Project {
   materials: Material[];
   profiles: Record<string, IesProfile>;
   dxf_lines: Line2[];
+  walls: WallSeg[];
+  room_height: number;
   meshes: Mesh[];
   calc_plane: CalculationPlane | null;
   settings: RayTracingSettings;
