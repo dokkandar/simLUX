@@ -1,0 +1,11 @@
+# Dev convenience aliases (cargo-watch must be installed: `cargo install cargo-watch`).
+#
+# `cargo dev`  → watch all workspace sources; on every save, automatically
+#                rebuild and relaunch the GUI app. No manual close/reopen.
+#                -c clears the screen between runs; -x is the command to re-run.
+#                cargo-watch kills the previous run BEFORE rebuilding, which also
+#                avoids the "exe is locked" error from a running instance.
+#
+# Stop the loop with Ctrl+C.
+[alias]
+dev = ["watch", "-c", "-x", "run -p cad_app"]

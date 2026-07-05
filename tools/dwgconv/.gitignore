@@ -1,0 +1,4 @@
+# .NET build artifacts — never commit these
+bin/
+obj/
+dist/

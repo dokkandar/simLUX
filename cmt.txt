@@ -1,0 +1,420 @@
+================================================================================
+RUST-AutoRASM — Change Log & Feature Handoff  (cmt.txt)
+================================================================================
+Purpose: a self-contained record of all work done on branch
+`windows-ui-session-2026-06-20` so another coding agent (or another machine) can
+understand and reproduce the same features. Lists every commit with a summary,
+the user-facing keys/commands, and the open/pending work.
+
+Repo:   https://github.com/HSI-Lighting/RUST-AutoRASM
+Branch: windows-ui-session-2026-06-20   (NOT merged to main)
+Stack:  Rust cargo workspace. Crates: cad_kernel (pure geom/model),
+        cad_io (DXF/RSM), cad_app (egui/eframe GUI, bin `rust_cad`), cad_cli,
+        cad_nurbs, cad_wall, cad_snap.
+Build:  cargo build -p cad_app [--release]  ·  tests: cargo test -p cad_kernel
+        Windows note: a running rust_cad.exe LOCKS the release exe — kill it
+        before `cargo build --release`. Linux/Arch also supported.
+
+NOTE on `git push` from PowerShell: git writes progress to stderr, which shows
+as a red "NativeCommandError" even on success — check the final ref-update line.
+
+================================================================================
+PART 1 — COMMITS (newest first), each with what changed & why
+================================================================================
+
+---- (2026-06-25) FILLET line↔polyline: stop mangling the polyline ----
+Filleting a line to a polyline produced garbage (the polyline's whole shape
+distorted), while exploding the polyline first and filleting a bare segment
+worked. Cause: the line↔polyline path ALWAYS moved the polyline's FREE end
+vertex to the tangent point, even when the corner was on the INTERIOR side —
+yanking the wrong vertex across the drawing. Fix: pick the clicked segment's
+endpoint FARTHER from the pick (the corner side) as the one to trim to the
+tangent point; move it ONLY if it is a free end of an open polyline
+(poly_moved_vertex / poly_move_ok). If the corner-side vertex is interior
+(shared), refuse with a clear message ("explode the polyline first, or pick so
+the end nearest the other object is its loose tip") instead of producing
+garbage. Same guard added to chamfer_geoms. Ctx::PolyEnd → Ctx::Poly{pl,seg}
+(the end-segment-only restriction is gone; geometry decides). 2 tests
+(fillet_line_to_polyline_end_segment_moves_free_tip, ..._interior_side_is_
+refused_not_garbage). cad_kernel: 183 tests pass.
+
+---- (2026-06-25) EXTEND line→tangent circle + Ttr tangent-pick snap noise ----
+Two issues from a session dump (draw a Ttr circle tangent to an arc + a line,
+then EXTEND both to it — the arc extended, the line said "no intersection"):
+  * KERNEL: intersect_line_circle used an ABSOLUTE discriminant epsilon
+    (disc < -EPS). For a TANGENT line the discriminant is ~0 but its magnitude
+    scales with |d|⁴ — and extend lengthens the line to 1e6 — so float error
+    dwarfed EPS and the tangent point was rejected (the line never reached its
+    circle). Rewrote it in perpendicular-distance form (stable regardless of
+    line length): foot-of-perpendicular param, compare pd vs r with a geometric
+    tolerance, tangent → single point. (Arc extend already worked: it routes
+    through circle_circle, which was already tangent-tolerant.) Regression test
+    line_circle_tangent_large_coords_and_long_line. cad_kernel: 181 tests pass.
+  * APP: while the Ttr flow asks for a tangent OBJECT, object snap fired (CEN
+    aperture + radius line) and — worse — snapped the click to the arc's CENTRE,
+    so nearest_entity_under missed the curve and the arc was only pickable at its
+    ends. Added flow_picks_object() (true for CircleStep::TtrObj1/TtrObj2) and
+    folded it into the snap-suppression `entity_pick_phase` gate, so a Ttr
+    tangent pick uses the raw click — selectable anywhere on the object, no snap.
+
+---- (2026-06-25) DIMENSION: click-pick on the dim line (was def-points only) ----
+A dimension could only be selected by window-pick, never by clicking on/near the
+line. Cause: Geom::Dimension::distance_to_point measured distance to the def/grip
+points ONLY, so a click on the dimension line or extension lines missed. Fix:
+new Dim::outline_segments() returns the VISIBLE segments (ext line 1 + ext line 2
++ dim line for linear; the diameter/leader line for radius/diameter — linear ends
+are the projections of p1/p2 onto the dim line through dimline_pos). distance_to_
+point now takes the min over those segments AND the grip points. cad_kernel: 180
+tests pass (new dimension_picks_on_the_dim_line_not_only_def_points).
+
+---- (2026-06-25) FILLET / CHAMFER: no object-snap noise while picking objects ----
+Selecting an arc/curve during fillet showed the CEN osnap (aperture at the arc
+centre + the radius preview line to it) — pure noise, since fillet/chamfer pick
+ENTITIES, not points. Two causes / fixes:
+  * The draw tool was left ACTIVE when fillet started (sticky continuous tools),
+    so `self.tool != Tool::None` kept `snap_phase_active` true. Command::Fillet
+    and Command::Chamfer now clear `self.tool = Tool::None` + pending (like
+    STRETCH already does), so the leftover tool no longer drives snap.
+  * Defence-in-depth: the snap-candidate gate now also requires the entity-pick
+    phase be off (`fillet_state == Off && chamfer_state == Off`), so object snap
+    is suppressed during fillet/chamfer regardless of tool state.
+
+---- (2026-06-25) FILLET P: re-apply with a new radius UPDATES the rounding ----
+Re-running `fillet P` on an already-filleted polyline used to round the already-
+rounded corners (stacking). Now polyline_all() first calls defillet_polyline()
+which collapses existing fillet arcs back to sharp corners, then fillets the
+sharpened outline — so changing the radius mid-command and re-picking the same
+polyline UPDATES every corner to the new radius. A fillet arc is detected by its
+signature: a line→arc→line run where the arc is TANGENT to both straight
+neighbours; the recovered corner is the intersection of the two straight sides.
+Genuine (non-tangent) arcs and arc-neighboured arcs are left untouched. Only the
+Fillet op de-fillets (chamfer P does not). 2 tests (refillet_updates_radius_
+does_not_stack, defillet_recovers_original_square_corners). cad_kernel: 179 pass.
+
+---- (2026-06-25) FILLET / CHAMFER: radius-too-big guard + re-prompt (don't exit) ----
+Two follow-ups from a session dump (P-fillet with a too-big radius drew a self-
+intersecting blob and silently exited):
+  * KERNEL: polyline_all now does an OVERLAP CHECK — two fillets on the SAME
+    segment (one at each end) must not eat past each other. After solving every
+    corner it verifies each segment's trimmed span keeps its direction (start
+    param ≤ end param via along_param()); if not → Err "radius too large —
+    rounded corners would overlap". count==0 message is now "radius too large
+    for any corner". 2 new tests (fillet_all_radius_too_large_overlaps_errs,
+    fillet_corner_radius_too_large_errs). cad_kernel: 177 tests pass.
+  * APP: on any "too large" fillet error the command STAYS active and re-prompts
+    for a smaller radius (fillet_radius_too_big() arms fillet_waiting_radius +
+    sets the prompt). Mirror for chamfer (chamfer_dist_too_big() on "too large"/
+    "exceeds" → re-arms the two-step distance entry). The canvas pick branches
+    skip their multiple/exit logic while a re-prompt is armed, so the prompt
+    isn't overwritten and the command never drops out. Esc still cancels.
+
+---- (2026-06-25) FILLET / CHAMFER: polylines, arcs, and the P (whole-polyline) option ----
+FILLET and CHAMFER were LINE+LINE only (Walls rode on their centerline). Now they
+generalize to line/arc pieces and polylines:
+  * two segments of the SAME polyline  → round/bevel that corner IN PLACE (insert
+    a fillet-arc vertex via bulge; chamfer inserts a straight bevel vertex).
+  * a polyline's END segment ↔ a separate Line/Arc/Polyline-end → trims the end
+    segment (moves the free vertex to the tangent point) + adds the fillet arc.
+  * the AutoCAD `P` option → pick ONE polyline, round/bevel EVERY corner at once.
+  * bare Line ↔ Arc, Arc ↔ Arc now work too (was unsupported).
+
+KERNEL — new module cad_kernel/src/fillet.rs (re-exported from lib.rs). Unified
+"offset-locus" solver: the centre of a radius-r circle tangent to a line lies on
+a parallel offset line; tangent to a circle/arc, on a concentric circle R±r.
+Intersect the two pieces' loci → candidate centres; pick the one INSIDE the corner
+(on the keep-side bisector) nearest the corner; tangent points are the feet/radial
+projections. Public fns:
+  fillet_geoms / chamfer_geoms (g1,p1,g2,p2,...) -> FilletOut/ChamferOut  [separate objs]
+  fillet_polyline_corner / chamfer_polyline_corner (pl, seg_a, seg_b, ...) -> Polyline
+  fillet_polyline_all / chamfer_polyline_all (pl, ...) -> (Polyline, count)  [P option]
+  nearest_polyline_segment(pl, p) -> Option<usize>   [which segment was clicked]
+Polyline arc (bulge) segments are handled; bulges recomputed when endpoints move.
+Splines / ellipse-arcs NOT yet (no simple offset locus — tessellate first, or add
+a numerical solver). 5 unit tests (perp lines, square all-corners, open-L corner,
+chamfer square). cad_kernel: 175 tests pass.
+
+APP — apply_fillet/apply_chamfer became DISPATCHERS:
+  same polyline (2 segments) → apply_*_corner;  Line/Wall pair → apply_*_lines
+  (old centerline/curved-wall path, unchanged);  else → apply_*_general (kernel).
+P option: `p` sub-command toggles fillet_poly_all/chamfer_poly_all; the next pick
+is a polyline → apply_*_poly_all. Prompts show ", POLY" + a `p=poly` hint; flag
+resets at command start and on Esc. New per-corner apply_*_corner / apply_*_general
+/ apply_*_poly_all methods (snapshot_doc + undo-pop on Err, like the originals).
+
+---- (2026-06-25) keys: Ctrl+Z = Undo ----
+Ctrl+Z now undoes the drawing. Consumed via input_mut.consume_key so the
+command-line TextEdit doesn't also undo its own typed text — Ctrl+Z is always
+the drawing undo (AutoCAD-style). Calls run_command("undo"). Added after the
+F7/F8/F9 handlers in update().
+
+---- (2026-06-25) pline width: DXF/RSM persistence + chamfer continuous + taper fix ----
+1. PERSISTENCE (Stage 4): polyline tapered width now survives save/reload.
+   - RSM bumped to v4: after the polyline vertices, write u32 count + (start,end)
+     f64 per segment; read gated on ver>=4 (older files → empty widths).
+   - DXF LWPOLYLINE: write per-vertex 40/41 (start/end width of the segment at
+     that vertex) when non-zero; read parses 40/41 per vertex AND the constant-
+     width 43, maps to per-segment widths (n-1 open / n closed), empty when all
+     zero. Round-trip tests added (cad_io: 19 pass).
+2. CHAMFER continuous by default (mirror of fillet): loop until Esc; `D` changes
+   distances mid-command; `M` single-shot. (chamfer_multiple = true at start.)
+3. TAPER QUIRK fixed: polyline_width_centerline (and the live-preview push_seg)
+   emitted one width per vertex, so the first segment after a width change
+   tapered old->new. Now a COINCIDENT point carrying the new start width is
+   emitted only when the width STEPS at a shared vertex; fill_width_strip already
+   skips the zero-length span. Uniform segments after a width change stay uniform
+   (a clean step at the change).
+
+---- (2026-06-24) draw: Enter/Space at first-point = continue from last point ----
+For draw tools that ask for a start point (line, arc, circle, ellipse, polyline,
+rectangle, spline, point), pressing Enter or Space INSTEAD of picking now uses
+the last point drawn in the previous command (AutoCAD "last point"). New field
+CadApp.last_point: Option<Vec2>, set on every draw-tool click (where click_world
+is computed), in flow_input_point (circle/arc + typed coords), and the Line DDE
+path. New helpers draw_tool_wants_first_point + feed_first_point_from_last;
+called in the empty-Enter cascade (only when nothing is pending yet, so it never
+steals Enter from finish/close). cmd_flow tools route via flow_input_point;
+pending tools via pending.push + try_finalise.
+
+---- (2026-06-24) trim: click a polyline segment with no boundary → remove it ----
+When trimming a polyline, clicking a target segment that does NOT intersect any
+selected cutter now REMOVES that whole segment (was: kept). Connected-runs path
+splits the polyline at the removed segment (before-run + after-run); explode
+path drops the clicked segment, keeps the rest. Segment that crosses a cutter
+still trims normally. (cad_kernel/src/trim.rs)
+App-side (cad_app apply_trim_pick): a POLYLINE target with NO other cutters
+(e.g. the polyline itself was the only thing selected) no longer errors "no
+other cutters available" — it proceeds with an empty cutter list so the clicked
+segment is removed. Non-polyline targets still require a real cutter.
+Kernel trim_at top guard ("target has no intersection with the cutting edges")
+is now SKIPPED for Polyline targets (the per-segment logic handles miss = remove).
+ALL OPEN polylines now go through the connected-runs path (was width-only), so
+trimming/removing a segment keeps the rest as a single polyline instead of
+exploding to bare Lines (non-width runs carry EMPTY widths). Updated the
+trim_polyline test to expect 2 polylines. Closed polylines still explode (v1).
+
+---- ac62164 (2026-06-24) fillet: continuous by default ----
+FILLET now loops: pick pair after pair until Esc. `R` changes radius mid-command
+(persisted to env.FltRad as next default); `M` toggles single-shot; `T` toggles
+trim. Change was flipping fillet_multiple default to ON at command start
+(cad_app/src/app.rs, Command::Fillet arm).
+
+---- 7522275 (2026-06-24) pline width: clean solid fill (no internal seams) ----
+The faint line from a vertex into a wide-pline fill was the triangle-FAN split
+(egui AAs every triangle edge). `fill_hull` now emits ONE convex polygon per
+fill → AA only on the outer boundary, clean solid look.
+
+---- 33634cc (2026-06-24) extend works on polylines + trim keeps connected runs ----
+EXTEND polyline: handled at top of `Geom::extend_to` (trim.rs) BEFORE the
+whole-target intersection test — extends the END SEGMENT nearest the pick toward
+the boundary, moves that free endpoint, recomputes arc bulge. Width preserved.
+TRIM polyline corners: for an OPEN width-carrying polyline, new
+`trim_polyline_connected` keeps CONNECTED multi-segment runs (a "before" run and
+an "after" run split at the cut), each retaining per-segment widths so corners
+stay mitred. Non-width/closed polylines keep the v1 explode-to-Line/Arc.
+
+---- 7197537 (2026-06-23) docs: session notes ----
+PROJECT_NOTES.md updated.
+
+---- 76f2704 (2026-06-23) pline width: smooth mitered edges + safe bevel ----
+Per-vertex miter decision in `fill_width_strip`: within 8x-half-width limit
+adjacent segment quads REUSE the shared miter apex (seamless smooth edge);
+beyond it each segment uses its own normal + convex-hull bevel fill (no spike).
+
+---- f46d852 (2026-06-23) pline width: robust fill (rects + convex-hull joints) ----
+(Superseded by 76f2704.) Independent rectangles + convex-hull joint fills to
+avoid spikes on sharp/reflex/self-intersecting polylines.
+
+---- 822fd15 (2026-06-23) pline width: solid mitered fill via shared offset pts ----
+(Iteration.) Mitered left/right offset points so segment fills share edges.
+
+---- 467cde6 (2026-06-23) pline width: sharp miter corners + preserve width thru trim ----
+Sharp miter triangles (bevel past limit). Trim wraps each surviving Line/Arc
+back into a 1-segment polyline retaining width (wrap_with_width helper; arc
+reconstructs bulge). Non-width polylines keep explode behaviour.
+
+---- cbf71d6 (2026-06-23) pline width: fix corners collapsing to zero ----
+(Iteration.) Averaged-tangent normal collapsed at sharp corners; switched to
+per-span quads + round-join discs (round corners — later replaced by miter).
+
+---- 0cb318b (2026-06-23) pline width: don't finish polyline on width default ----
+Empty-Enter to accept the default ending width was finishing the polyline (the
+empty-Enter handler ran before the width handler, which only runs for non-empty
+input). Added a guard: empty Enter during a pline width/arc sub-flow routes to
+that sub-flow (accept default / cancel) instead of committing. New helper
+pline_width_accept_default.
+
+---- 679453d (2026-06-23) pline width: live preview, mitred corners, sticky ----
+(1) Live width preview while drawing (committed segments + rubber-band).
+(2) Continuous mitred strip render. (3) Forward-only width that PERSISTS as the
+sticky default across segments and subsequent polylines (AutoCAD PLINEWID).
+
+---- b85ca56 (2026-06-23) chore: gitignore .git_commit_msg.txt ----
+
+---- b6cd8b5 (2026-06-23) pline: tapered width (model + render + tool) ----
+THE CORE WIDTH FEATURE.
+Model (cad_kernel/geom.rs): Polyline gains `widths: Vec<(f64,f64)>` = per-segment
+(start,end) width in world units; empty = thin (old behaviour). Transforms
+preserve/scale widths; reversed() reverses + swaps each pair; bbox() expands by
+max half-width. ~24 Polyline literals updated across crates.
+Render (cad_app): draw_polyline_widths / polyline_width_centerline /
+fill_width_strip — fill as solid filled geometry (NOT a stroke). Widths are
+world units so they scale with zoom.
+Tool (cad_app): PLINE `w`/`h` (width/halfwidth) entry — start then end width
+(Enter on ending = same; halfwidth doubles); end carries as next segment's
+start. Stored in pending_widths, drained into Polyline.widths on commit.
+
+---- e0a2275 (2026-06-23) pline: Arc Direction (`d`) sub-command ----
+PLINE Arc mode `d`: set the start tangent of the next arc (click a point OR type
+an angle°), then click the endpoint. New PlineArcSub::AwaitingDirection +
+pline_dir_override; consumed after one segment.
+
+---- b191cb8 (2026-06-23) pline: Close (`c`) sub-command ----
+While drawing, `c`/`close` was leaking to the global Copy command. Now `c`
+commits the run as a CLOSED polyline (needs >= 2 vertices) and stays active.
+
+---- db6af5b (2026-06-23) parser: bare `arc`/`pline` start the interactive tool ----
+parse_arc / parse_polyline with no args now return SetTool(Arc/Polyline) instead
+of a usage error, matching line/circle. (cad_kernel/parser.rs.)
+
+---- 5ba29e2 (2026-06-23) pedit: AutoCAD-style "select object" entry ----
+`pe` with nothing selected opens a one-object selection session (green prompt)
+and runs pedit on the pick (QueuedOp::PeditStart), instead of erroring.
+
+---- 54fba67 (2026-06-23) pedit: accept ellipse-arc/spline as PEDIT target ----
+pedit_start tessellates an EllipseArc/Spline target into a faceted polyline
+(shared tessellated_polyline helper, same as pedit_join).
+
+---- 831998f (2026-06-23) pedit: join elliptical arcs + Enter repeats PEDIT ----
+PEDIT Join tessellates EllipseArc picks (was silently dropped). `pe` intercept
+sets last_command="pedit" so empty-Enter repeats it.
+
+---- 0a0e460 (2026-06-23) refactor: split kernel + pedit into own files ----
+Pure code movement (no behaviour change): geom.rs 4402→2987 lines; new
+cad_kernel/src/join.rs (join_geoms, chain/collinear/concentric helpers,
+bulge_arc/bulge_from_arc/polyline_segments, JOIN_EPS/CHAIN_EPS), trim.rs
+(trim_at, join_trim_survivors, circular_union, same_ellipse), modify.rs
+(offset, fillet_lines, chamfer_lines). cad_app/src/app/pedit.rs child module
+holds all pedit_* methods. Crate-root re-exports unchanged. 170 tests pass.
+
+---- aaa4419 (2026-06-22) PEDIT/JOIN: fix arc-join geometry bugs + picking ----
+Kernel: CHAIN_EPS=1e-3 fuzzy chain tolerance; FIX Arc::reversed()/
+EllipseArc::reversed() (were relocating the arc — kept +sweep with new start);
+chain_to_polyline reads far endpoint directly; collinear-line merge is gap-aware
+(doesn't bridge trim gaps); bulge_from_arc sign correct for MAJOR arcs (>pi)
+via traversal direction; Polyline::bbox()/distance_to_point() expand bulges into
+true arcs so the curved part is selectable. App: pedit-join diagnostics; fixed
+window-selection hint text. 170 tests pass.
+
+---- d23fc25 (2026-06-22) Explode: handle polylines and rectangles ----
+EXPLODE decomposes Polyline/rectangle into Line + Arc (bulge) segments.
+
+---- 6380566 (2026-06-22) Groups + right-click context menu ----
+Group/ungroup/add-to-group (members by handle; selecting a member selects the
+group). Ctrl+G / `group` / `ungroup`. Edit menu + right-click flyout submenus
+(Group, Clipboard) + Properties. In-session only (not yet persisted to .rsm).
+
+---- f62fad0 (2026-06-22) Copy/Paste: Ctrl+C/V via clipboard events ----
+Ctrl+C/V detected via eframe Event::Copy/Paste (NOT key presses — eframe never
+emits those for clipboard combos); events consumed so the command line doesn't
+also react. Paste asks DESTINATION only (auto base = clipboard lower-left) with
+ghost preview. Edit menu shows the shortcuts.
+
+---- 73f06e1 (2026-06-22) Notes: Groups planned ----
+
+---- fd4fe8c (2026-06-20) Selection model, connected lines, file dialog, Save ----
+Selection: plain click/drag = REPLACE, Shift = ADD, Alt = REMOVE; select-session
+shortcuts p/L/D; Del erases (focus-independent); Esc clears + refocuses.
+LINE draws connected segments (Esc ends). File dialog: drive dropdown, editable
+path, DXF/Native filter, wireframe preview, hidden/system filter, resizable
+panel layout; File > Save. Copy/Paste base->destination ghost placement. Active
+prompt recolored green (#184C04). Layer-rename commits on focus loss.
+
+---- c704a01 (2026-06-19) Windows build support, ZOOM, dev loop ----
+Made eframe wayland/x11 features Linux-only (builds on Windows MSVC + Arch).
+AutoCAD-style ZOOM (z/zoom): All/Center/Extents/Previous/Scale(nX)/Window(live
+preview)/Object/real-time drag. `cargo dev` alias + dev.ps1 (cargo-watch).
+
+================================================================================
+PART 2 — USER-FACING KEYS, COMMANDS & BEHAVIORS (current state)
+================================================================================
+
+GLOBAL KEYBOARD KEYS
+  Esc        Cancel active tool/command/sub-flow; clear selection; refocus cmd line
+  Delete     Erase selected object(s)
+  Enter      Finish current drawing (line/polyline/spline); on an EMPTY command
+             line, REPEAT the last command; inside a sub-flow, accept default/advance
+  Space      Submit the typed command (same as Enter at the prompt)
+  Tab        Cycle snap candidates under the cursor
+  Ctrl+C / Ctrl+V   Copy / Paste (clipboard events)
+  Ctrl+G     Group the current selection
+  Ctrl+Z     Undo (drawing undo; consumed so it never undoes cmd-line text)
+  F7         Toggle grid (env.GrdEnb)
+  F8         Toggle CARD — cardinal/ortho drafting lock (cursor H or V only)
+  F9         Toggle grid snap (env.GrdSnp)
+
+CONTINUOUS DRAWING (one command, keep going)
+  LINE       each click adds a connected vertex; Esc ends.
+  POLYLINE (pl)  connected vertices; Enter finishes (open); `c` Enter (or click
+                 back on first vertex) closes; Esc cancels.
+  SPLINE     connected control points; Enter finishes.
+  FILLET     continuous by default — pick pairs until Esc; `r` changes radius
+             mid-command (persists as default); `m` single-shot; `t` trim toggle.
+
+SUB-COMMAND KEYS (typed while a command is active)
+  PLINE (while drawing):
+    A arc mode · L line mode · C close · U undo last vertex · S second-point
+    (3-pt) arc · D arc start direction · W/H width / halfwidth
+  PEDIT (pe):
+    C/O close/open · J join · W width · U undo · X exit
+  ZOOM (z):
+    A all · C center · E extents · P previous · S scale · W window · O object
+    (+ real-time drag)
+  FILLET / CHAMFER (while picking):
+    R radius (fillet) / D distances (chamfer) · T trim toggle · M multiple toggle
+    P polyline mode (pick ONE polyline → round/bevel ALL its corners)
+    Works on: Line, Arc, Wall, and Polylines (two segments of one polyline =
+    round that corner; an end segment vs a separate object; or P for all corners).
+  Selection session (while a command asks you to select):
+    p previous selection · l last created object · d remove from selection
+
+COMMAND ALIASES (type then Enter/Space)
+  l/line · ci/circle · a/arc · pl/pline/polyline · tr/trim · pe/pedit · z/zoom ·
+  group/ungroup · plus tool words (rectangle, spline, …)
+
+================================================================================
+PART 3 — KEY ARCHITECTURE NOTES (for re-implementers)
+================================================================================
+- PLINE WIDTH is a SOLID FILL, not a thick stroke. Data: Polyline.widths
+  Vec<(f64,f64)> per segment (start,end), world units, empty = thin. Render:
+  cad_app fill_width_strip builds filled convex polygons per segment with
+  per-vertex miter (shared apex within limit) or convex-hull bevel (sharp).
+- ARC bulge convention: bulge = tan(sweep/4); positive = CCW. bulge_from_arc
+  signs by TRAVERSAL direction (CCW-angle vs swept magnitude), NOT chord side
+  (chord side is only valid for minor arcs). Arc.sweep_angle stored POSITIVE.
+- Arc::reversed() CANNOT encode CW under positive-sweep, so it returns identical
+  geometry; chaining reads the far endpoint directly, never via reversed().
+- JOIN passes: collinear-line (gap-aware) → concentric-arc → touching-chain →
+  polyline. CHAIN_EPS=1e-3 fuzzy endpoint match; JOIN_EPS=1e-6 precision.
+- eframe delivers Ctrl+C/X/V as Event::Copy/Cut/Paste, NOT key presses.
+
+================================================================================
+PART 4 — OPEN / PENDING WORK
+================================================================================
+1. FILLET/CHAMFER on SPLINE and ELLIPSE-ARC — NOT done (no simple offset locus).
+   Plan: either tessellate to a dense polyline first (result becomes a polyline)
+   or add a numerical tangent-circle root-finder in fillet.rs alongside the
+   offset-locus solver.
+2. FILLET/CHAMFER of two NON-ADJACENT segments of one polyline — currently errs
+   ("segments must be adjacent"). AutoCAD removes the intervening segments; not
+   implemented.
+3. Groups: in-session only — not persisted to .rsm yet.
+4. Old open bug: circular-arc "curves wrong after pe+j" — diagnostic in
+   pedit_join_selected prints `src arc:` / `pl v[i]`; needs a session dump.
+5. RECONCILE: origin/main is ~14 commits ahead (other machine) with OVERLAPPING
+   file-dialog/zoom/block work. Do NOT blind-merge this branch into main —
+   review upstream vs this branch first.
+
+DONE since last edit: pline width DXF/RSM persistence (Stage 4); width-change
+taper quirk; chamfer continuous-by-default; generalized fillet/chamfer (polylines
++ arcs + P option).
+================================================================================

@@ -1,0 +1,431 @@
+//! SIMLUX lighting integration for the CAD app.
+//!
+//! [`LightState`] holds the lighting scene (IES profiles, surface materials,
+//! luminaires, room height, ray settings) and the last computed lux grid, and
+//! draws the **Light** panel. It drives the pure-Rust `cad_light` engine on the
+//! shared `cad_kernel::Document`; the app paints the resulting grid as a 2D
+//! false-colour overlay on the plan (see `CadApp::paint_lux_overlay`).
+
+use std::collections::HashMap;
+
+use cad_light::{
+    bbox, calculate as calc_lux, default_materials, extrude, parse_ies, CalcPlane, IesProfile,
+    LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
+};
+use cad_kernel::Document;
+
+/// Key for the always-available synthetic luminaire (works before any IES import).
+pub const BUILTIN: &str = "Built-in downlight (1000 cd)";
+
+/// A cosine (Lambertian) downlight: I(γ) = 1000·cos γ cd, axially symmetric.
+fn builtin_downlight() -> IesProfile {
+    let vertical_angles: Vec<f64> = (0..=18).map(|i| i as f64 * 5.0).collect();
+    let candela: Vec<f64> = vertical_angles
+        .iter()
+        .map(|g| 1000.0 * g.to_radians().cos().max(0.0))
+        .collect();
+    IesProfile {
+        name: BUILTIN.to_string(),
+        photometry: PhotometryType::C,
+        lumens: -1.0,
+        multiplier: 1.0,
+        vertical_angles,
+        horizontal_angles: vec![0.0],
+        candela: vec![candela],
+        watts: 0.0,
+        width: 0.0,
+        length: 0.0,
+        height: 0.0,
+    }
+}
+
+/// Side effects the panel asks the app to run (they need `&Document`).
+#[derive(Default)]
+pub struct LightAction {
+    pub calculate: bool,
+}
+
+/// All lighting UI + engine state, owned by `CadApp`.
+pub struct LightState {
+    /// Toggles the Light window (Tools ▸ SIMLUX Light).
+    pub window_open: bool,
+    /// Loaded IES profiles, keyed by name; always contains [`BUILTIN`].
+    pub profiles: HashMap<String, IesProfile>,
+    /// Profile used for auto-placed / new luminaires.
+    pub active_profile: String,
+    /// Surface materials [floor, wall, ceiling] — reflectances are editable.
+    pub materials: Vec<Material>,
+    /// Room (extrusion) height, metres.
+    pub room_height: f32,
+    /// Work-plane height above the floor, metres (typ. 0.8 m desk height).
+    pub plane_height: f32,
+    /// Target grid cell size, metres (clamped to 8..64 cells per axis).
+    pub cell_size: f32,
+    /// Ray-tracer controls.
+    pub settings: RaySettings,
+    /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
+    pub luminaires: Vec<Luminaire>,
+    pub auto_center_light: bool,
+    /// When set, canvas clicks drop a luminaire (P4 placement mode).
+    pub place_mode: bool,
+    /// Monotonic id source for placed luminaires.
+    pub next_id: u32,
+    /// Mounting height for newly placed fixtures (defaults to room height).
+    pub mount_height: f32,
+    /// Last computed grid + its plane + extruded scene.
+    pub grid: Option<LuxGrid>,
+    pub plane: Option<CalcPlane>,
+    pub meshes: Vec<Mesh>,
+    /// Paint the false-colour overlay on the 2D plan.
+    pub show_overlay: bool,
+    /// Fixed scale ceiling for the colour map (None ⇒ auto = grid max).
+    pub scale_max: Option<f64>,
+    /// IES file path typed into the panel.
+    pub ies_path: String,
+    /// Status / result line.
+    pub last_msg: String,
+
+    // ---- 3D viewport (P2) -------------------------------------------------
+    /// Show the docked 3D viewport panel.
+    pub view3d_open: bool,
+    /// Orbit camera: yaw + pitch (radians), distance (m), target (world, Z-up).
+    pub cam_yaw: f32,
+    pub cam_pitch: f32,
+    pub cam_dist: f32,
+    pub cam_target: [f32; 3],
+    /// Paint the lux heatmap on the 3D floor (P3) rather than the floor material.
+    pub floor_heatmap: bool,
+}
+
+impl Default for LightState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LightState {
+    pub fn new() -> Self {
+        let mut profiles = HashMap::new();
+        profiles.insert(BUILTIN.to_string(), builtin_downlight());
+        Self {
+            window_open: false,
+            profiles,
+            active_profile: BUILTIN.to_string(),
+            materials: default_materials(),
+            room_height: 3.0,
+            plane_height: 0.8,
+            cell_size: 0.25,
+            settings: RaySettings::default(),
+            luminaires: Vec::new(),
+            auto_center_light: true,
+            place_mode: false,
+            next_id: 1,
+            mount_height: 3.0,
+            grid: None,
+            plane: None,
+            meshes: Vec::new(),
+            show_overlay: true,
+            scale_max: None,
+            ies_path: String::new(),
+            last_msg: "Draw a room, set the height, then Calculate.".to_string(),
+            view3d_open: false,
+            cam_yaw: 0.7,
+            cam_pitch: 0.6,
+            cam_dist: 10.0,
+            cam_target: [0.0, 0.0, 1.5],
+            floor_heatmap: true,
+        }
+    }
+
+    /// Colour-map ceiling: user override, else the current grid's max.
+    pub fn scale_ceiling(&self) -> f64 {
+        self.scale_max
+            .or_else(|| self.grid.as_ref().map(|g| g.max))
+            .unwrap_or(1.0)
+            .max(1e-3)
+    }
+
+    fn import_ies(&mut self) {
+        let path = self.ies_path.trim().trim_matches('"').to_string();
+        if path.is_empty() {
+            self.last_msg = "Enter a .ies file path first.".to_string();
+            return;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match parse_ies(&text) {
+                Ok(mut prof) => {
+                    if prof.name.trim().is_empty() {
+                        prof.name = std::path::Path::new(&path)
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "IES".to_string());
+                    }
+                    let key = prof.name.clone();
+                    self.active_profile = key.clone();
+                    self.profiles.insert(key.clone(), prof);
+                    self.last_msg = format!("Loaded IES '{key}'.");
+                }
+                Err(e) => self.last_msg = format!("IES parse error: {e}"),
+            },
+            Err(e) => self.last_msg = format!("Read error: {e}"),
+        }
+    }
+
+    /// Drop a luminaire at plan position (x, y) on the mounting plane.
+    pub fn add_luminaire_at(&mut self, x: f32, y: f32) {
+        let id = self.next_id;
+        self.next_id += 1;
+        self.luminaires.push(Luminaire {
+            id,
+            profile: self.active_profile.clone(),
+            position: Vertex::new(x, y, self.mount_height),
+            rotation_deg: 0.0,
+            dimming: 1.0,
+        });
+        self.last_msg = format!("Placed fixture #{id} at ({x:.2}, {y:.2}) — press Calculate.");
+    }
+
+    /// Run the lux engine on `doc` and store the grid + plane + scene.
+    pub fn calculate(&mut self, doc: &Document) {
+        let Some((min_x, min_y, max_x, max_y)) = bbox(doc) else {
+            self.grid = None;
+            self.plane = None;
+            self.last_msg = "No geometry — draw walls / a closed room first.".to_string();
+            return;
+        };
+        let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
+        let cols = ((w / self.cell_size).round() as u32).clamp(8, 64);
+        let rows = ((d / self.cell_size).round() as u32).clamp(8, 64);
+        let plane = CalcPlane {
+            origin: Vertex::new(min_x, min_y, self.plane_height),
+            width: w,
+            depth: d,
+            cols,
+            rows,
+        };
+        let meshes = extrude(doc, self.room_height);
+        let lums = if self.luminaires.is_empty() && self.auto_center_light {
+            vec![Luminaire {
+                id: 1,
+                profile: self.active_profile.clone(),
+                position: Vertex::new(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), self.room_height),
+                rotation_deg: 0.0,
+                dimming: 1.0,
+            }]
+        } else {
+            self.luminaires.clone()
+        };
+        let grid = calc_lux(&meshes, &lums, &self.profiles, &self.materials, &plane, &self.settings);
+        self.last_msg = format!(
+            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx",
+            cols, rows, grid.avg, grid.min, grid.max
+        );
+        self.grid = Some(grid);
+        self.plane = Some(plane);
+        self.meshes = meshes;
+        self.show_overlay = true;
+
+        // Fit the orbit camera to the room.
+        self.cam_target = [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * self.room_height];
+        let diag = (w * w + d * d + self.room_height * self.room_height).sqrt();
+        self.cam_dist = (diag * 1.3).max(3.0);
+    }
+
+    /// Draw the panel body. Returns actions the app must run (they need `&Document`).
+    pub fn panel_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
+        let mut action = LightAction::default();
+        ui.set_min_width(260.0);
+
+        // ---- Luminaire / IES --------------------------------------------
+        ui.label(egui::RichText::new("Luminaire").strong());
+        let mut keys: Vec<String> = self.profiles.keys().cloned().collect();
+        keys.sort();
+        egui::ComboBox::from_label("Photometry")
+            .selected_text(self.active_profile.clone())
+            .show_ui(ui, |ui| {
+                for k in &keys {
+                    ui.selectable_value(&mut self.active_profile, k.clone(), k.as_str());
+                }
+            });
+        ui.horizontal(|ui| {
+            ui.label("IES:");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.ies_path)
+                    .desired_width(150.0)
+                    .hint_text(r"C:\path\to\file.ies"),
+            );
+            if ui.button("Load").clicked() {
+                self.import_ies();
+            }
+        });
+        ui.checkbox(&mut self.auto_center_light, "Auto-place one at room centre if none placed");
+
+        ui.separator();
+
+        // ---- Fixtures (P4 placement) ------------------------------------
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Fixtures").strong());
+            ui.label(egui::RichText::new(format!("({})", self.luminaires.len())).weak());
+        });
+        let place_label = if self.place_mode { "◉ Placing… click the plan" } else { "＋ Place on plan" };
+        if ui.selectable_label(self.place_mode, place_label)
+            .on_hover_text("Toggle, then click points on the 2D plan to drop fixtures. Esc / untoggle to stop.")
+            .clicked()
+        {
+            self.place_mode = !self.place_mode;
+        }
+        ui.add(egui::Slider::new(&mut self.mount_height, 0.0..=8.0).text("Mount height (m)"));
+        if !self.luminaires.is_empty() {
+            let mut remove: Option<usize> = None;
+            egui::ScrollArea::vertical().max_height(120.0).show(ui, |ui| {
+                for (i, l) in self.luminaires.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.label(format!("#{}  ({:.1}, {:.1}, {:.1})", l.id, l.position.x, l.position.y, l.position.z));
+                        if ui.small_button("✕").clicked() {
+                            remove = Some(i);
+                        }
+                        ui.add(egui::Slider::new(&mut l.dimming, 0.0..=1.0).text("dim"));
+                    });
+                }
+            });
+            if let Some(i) = remove {
+                self.luminaires.remove(i);
+            }
+            if ui.button("Clear all fixtures").clicked() {
+                self.luminaires.clear();
+            }
+        }
+
+        ui.separator();
+
+        // ---- Room -------------------------------------------------------
+        ui.label(egui::RichText::new("Room").strong());
+        ui.add(egui::Slider::new(&mut self.room_height, 2.0..=8.0).text("Height (m)"));
+        ui.add(egui::Slider::new(&mut self.plane_height, 0.0..=2.0).text("Work plane (m)"));
+        ui.add(egui::Slider::new(&mut self.cell_size, 0.1..=1.0).text("Grid cell (m)"));
+
+        ui.separator();
+
+        // ---- Materials --------------------------------------------------
+        ui.label(egui::RichText::new("Reflectances").strong());
+        for m in &mut self.materials {
+            let name = m.name.clone();
+            ui.add(egui::Slider::new(&mut m.reflectance, 0.0..=1.0).text(name));
+        }
+
+        ui.separator();
+
+        // ---- Quality ----------------------------------------------------
+        ui.collapsing("Quality", |ui| {
+            ui.add(egui::Slider::new(&mut self.settings.max_bounces, 0..=3).text("Indirect bounces"));
+            let mut rays = self.settings.rays_per_point as i32;
+            if ui.add(egui::Slider::new(&mut rays, 8..=256).text("Rays / point")).changed() {
+                self.settings.rays_per_point = rays.max(1) as u32;
+            }
+            ui.checkbox(&mut self.settings.shadows, "Cast shadows");
+        });
+
+        ui.separator();
+
+        // ---- Calculate --------------------------------------------------
+        if ui
+            .add(egui::Button::new(egui::RichText::new("  Calculate  ").strong()))
+            .clicked()
+        {
+            action.calculate = true;
+        }
+        ui.checkbox(&mut self.show_overlay, "Show lux overlay on 2D plan");
+        ui.horizontal(|ui| {
+            ui.checkbox(&mut self.view3d_open, "3D view");
+            ui.checkbox(&mut self.floor_heatmap, "Heatmap floor");
+        });
+
+        // ---- Colour scale -----------------------------------------------
+        ui.horizontal(|ui| {
+            let mut auto = self.scale_max.is_none();
+            if ui.checkbox(&mut auto, "Auto scale").changed() {
+                self.scale_max = if auto {
+                    None
+                } else {
+                    Some(self.grid.as_ref().map(|g| g.max).unwrap_or(500.0).max(1.0))
+                };
+            }
+            if let Some(m) = &mut self.scale_max {
+                ui.add(
+                    egui::DragValue::new(m)
+                        .speed(10.0)
+                        .suffix(" lx")
+                        .range(1.0..=100_000.0),
+                );
+            }
+        });
+
+        // ---- Results ----------------------------------------------------
+        if let Some(g) = &self.grid {
+            ui.separator();
+            let uo = if g.avg > 0.0 { g.min / g.avg } else { 0.0 };
+            ui.label(format!("Average   {:.0} lx", g.avg));
+            ui.label(format!("Min / Max   {:.0} / {:.0} lx", g.min, g.max));
+            ui.label(format!("Uniformity Uo (min/avg)   {:.2}", uo));
+            legend_bar(ui, self.scale_ceiling());
+        }
+
+        ui.add_space(4.0);
+        ui.label(egui::RichText::new(&self.last_msg).small().italics());
+        action
+    }
+}
+
+/// Five-stop false-colour ramp (low→high). `t` is clamped to 0..1.
+pub fn lux_color(t: f32) -> egui::Color32 {
+    const STOPS: [(f32, [u8; 3]); 5] = [
+        (0.00, [20, 24, 82]),    // deep blue
+        (0.25, [34, 116, 204]),  // blue
+        (0.50, [40, 190, 120]),  // green
+        (0.75, [240, 214, 72]),  // yellow
+        (1.00, [226, 72, 46]),   // red
+    ];
+    let t = t.clamp(0.0, 1.0);
+    let (mut lo, mut hi) = (STOPS[0], STOPS[STOPS.len() - 1]);
+    for w in STOPS.windows(2) {
+        if t >= w[0].0 && t <= w[1].0 {
+            lo = w[0];
+            hi = w[1];
+            break;
+        }
+    }
+    let span = (hi.0 - lo.0).max(1e-6);
+    let f = (t - lo.0) / span;
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * f).round() as u8;
+    egui::Color32::from_rgb(lerp(lo.1[0], hi.1[0]), lerp(lo.1[1], hi.1[1]), lerp(lo.1[2], hi.1[2]))
+}
+
+/// The same false-colour ramp as [`lux_color`], as float RGB (0..1) for the
+/// 3D floor heatmap. `fn(f32) -> (f32, f32, f32)` so it can be passed as a
+/// plain function pointer into the 3D vertex builder.
+pub fn lux_rgb(t: f32) -> (f32, f32, f32) {
+    let c = lux_color(t);
+    (c.r() as f32 / 255.0, c.g() as f32 / 255.0, c.b() as f32 / 255.0)
+}
+
+/// A horizontal gradient legend from 0 to `max` lux.
+pub fn legend_bar(ui: &mut egui::Ui, max: f64) {
+    let (resp, painter) = ui.allocate_painter(egui::vec2(240.0, 16.0), egui::Sense::hover());
+    let rect = resp.rect;
+    let n = 64;
+    for i in 0..n {
+        let t = i as f32 / (n - 1) as f32;
+        let x0 = rect.left() + rect.width() * (i as f32 / n as f32);
+        let x1 = rect.left() + rect.width() * ((i + 1) as f32 / n as f32);
+        painter.rect_filled(
+            egui::Rect::from_min_max(egui::pos2(x0, rect.top()), egui::pos2(x1, rect.bottom())),
+            0.0,
+            lux_color(t),
+        );
+    }
+    ui.horizontal(|ui| {
+        ui.label("0");
+        ui.add_space(180.0);
+        ui.label(format!("{max:.0} lx"));
+    });
+}

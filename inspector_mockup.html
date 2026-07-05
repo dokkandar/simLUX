@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Inspector — design mockup (measurable)</title>
+<style>
+  /* ============================================================
+     TOKENS — every value from INSPECTOR_DESIGN.md §1.
+     Change here and the whole panel updates. Inspect elements in
+     devtools; computed sizes match the spec's measurement table (§7).
+     ============================================================ */
+  :root{
+    /* spacing (compact 4px scale) */
+    --box: 24px;            /* control / field / icon height */
+    --row-gap: 8px;         /* between rows (pitch = box + row-gap = 32) */
+    --label-input: 8px;     /* label col -> field */
+    --input-pad: 8px;       /* inside field, edge -> text */
+    --section-content: 12px;
+    --group-gap: 12px;
+    --column-gap: 12px;     /* Start <-> End */
+    --panel-edge: 16px;
+    --panel-header-content: 24px;
+    --label-col: 84px;      /* unified value start */
+
+    /* radius */
+    --r-xs: 2px; --r-sm: 4px; --r-md: 8px; --r-lg: 12px; --r-full: 9999px;
+
+    /* color */
+    --surface-0:#141C25; --surface-1:#1A2430; --surface-2:#222B34;
+    --surface-3:#2A3744; --chrome:#223040; --border:#34414B;
+    --accent:#00E5FF; --on-accent:#063B45;
+    --text-primary:#DAE3EF; --text-secondary:#AEB9C4; --text-muted:#93A1AC;
+    --text-disabled:#5C6975; --danger:#E5484D;
+
+    /* type */
+    --ui: "Geist","Inter",system-ui,"Segoe UI",sans-serif;
+    --mono:"JetBrains Mono",ui-monospace,"Cascadia Mono",Consolas,monospace;
+  }
+
+  *{ box-sizing:border-box; }
+  html,body{ margin:0; height:100%; background:var(--surface-0);
+    font-family:var(--ui); color:var(--text-primary);
+    -webkit-font-smoothing:antialiased; }
+  .stage{ min-height:100%; display:flex; gap:40px; align-items:flex-start;
+    padding:40px; }
+  .note{ max-width:340px; color:var(--text-secondary); font-size:13px;
+    line-height:1.6; }
+  .note h2{ font-size:14px; color:var(--text-primary); margin:0 0 8px; }
+  .note code{ font-family:var(--mono); font-size:12px; color:var(--accent); }
+
+  /* ---- panel card ---- */
+  .card{ width:264px; background:var(--surface-1);
+    border:1px solid var(--border); border-radius:var(--r-lg);
+    overflow:hidden; }
+
+  /* ---- header band (h=40, chrome, bottom hairline) ---- */
+  .head{ height:40px; background:var(--chrome);
+    border-bottom:1px solid var(--border); display:flex; align-items:center;
+    padding:0 var(--panel-edge); gap:8px; }
+  .head .title{ font-size:16px; font-weight:500; color:var(--text-primary); }
+  .head .spacer{ flex:1; }
+  .pill{ height:18px; display:inline-flex; align-items:center; padding:0 8px;
+    border-radius:var(--r-full); background:rgba(0,229,255,.10);
+    color:var(--accent); font-size:11px; font-weight:500; line-height:1; }
+
+  /* ---- content column (padded panel-edge; first row panel-header-content below) ---- */
+  .body{ padding:var(--panel-header-content) var(--panel-edge) var(--panel-edge); }
+
+  /* ---- section ---- */
+  .section + .section{ margin-top:var(--group-gap); }
+  .sec-head{ height:18px; display:flex; align-items:center; gap:8px;
+    cursor:default; }
+  .sec-head .chev{ color:var(--text-muted); font-size:10px; width:10px; }
+  .sec-head .cap{ font-size:11px; font-weight:500; letter-spacing:.04em;
+    color:var(--text-muted); text-transform:uppercase; }
+  .sec-body{ margin-top:var(--section-content); }
+  .sec-body .row + .row{ margin-top:var(--row-gap); }
+  .sec-body .row + .colhdr{ margin-top:var(--row-gap); }
+
+  /* ---- row: label col + value ---- */
+  .row{ display:flex; align-items:center; height:var(--box); gap:var(--label-input); }
+  .row > .label{ width:var(--label-col); flex:0 0 var(--label-col);
+    font-size:13px; color:var(--text-muted); }
+  .row > .value{ flex:1; min-width:0; }
+
+  /* ---- field box (h=box, surface-0, border, radius sm, pad input-pad) ---- */
+  .field{ height:var(--box); background:var(--surface-0);
+    border:1px solid var(--border); border-radius:var(--r-sm);
+    display:flex; align-items:center; gap:9px; padding:0 var(--input-pad);
+    font-size:13px; color:var(--text-primary); }
+  .field.dd{ cursor:pointer; }
+  .field .chev{ margin-left:auto; color:var(--text-muted); font-size:12px; }
+  .field:hover{ border-color:var(--accent); }
+  .field .num{ font-family:var(--mono); font-size:12px; }
+  .field .unit{ margin-left:auto; color:var(--text-muted); font-family:var(--mono);
+    font-size:12px; }
+
+  /* swatch */
+  .sw{ width:13px; height:13px; border-radius:var(--r-xs); flex:0 0 13px; }
+
+  /* linetype dashed preview */
+  .lt{ width:34px; flex:0 0 34px; border-top:1.5px dashed var(--text-primary); }
+  /* lineweight thickness bar (0.25mm -> 1px) */
+  .lw{ width:34px; flex:0 0 34px; height:1px; background:var(--text-primary); }
+
+  /* checkbox */
+  .cbx{ width:16px; height:16px; border-radius:var(--r-sm);
+    border:1px solid var(--border); background:var(--surface-0);
+    display:inline-flex; align-items:center; justify-content:center; }
+  .cbx.on{ background:var(--accent); border-color:var(--accent); }
+  .cbx.on svg{ stroke:var(--on-accent); }
+
+  /* coordinate column headers */
+  .colhdr{ display:flex; align-items:center; gap:var(--label-input); height:13px; }
+  .colhdr .label{ width:var(--label-col); flex:0 0 var(--label-col); }
+  .colhdr .cols{ flex:1; display:flex; gap:var(--column-gap); }
+  .colhdr .cols span{ flex:1; font-size:11px; font-weight:500;
+    color:var(--text-muted); }
+  /* two coordinate fields */
+  .row .pair{ flex:1; display:flex; gap:var(--column-gap); }
+  .row .pair .field{ flex:1; }
+
+  /* derived read-only row (no box) */
+  .row.ro .value{ font-family:var(--mono); font-size:12px; color:var(--text-muted);
+    padding-left:0; }
+
+  /* subtle ruler so nested boxes are visible even without devtools */
+  .card.rulers .field,.card.rulers .sw,.card.rulers .cbx,
+  .card.rulers .sec-head,.card.rulers .pill{ outline:1px solid rgba(0,229,255,.18); }
+</style>
+</head>
+<body>
+  <div class="stage">
+    <!-- ============ THE INSPECTOR (Line selected) ============ -->
+    <div class="card" id="panel">
+      <div class="head">
+        <span class="title">Inspector</span>
+        <span class="spacer"></span>
+        <span class="pill">Line</span>
+      </div>
+
+      <div class="body">
+        <!-- GENERAL -->
+        <div class="section">
+          <div class="sec-head"><span class="chev">▼</span><span class="cap">General</span></div>
+          <div class="sec-body">
+            <div class="row"><div class="label">Layer</div>
+              <div class="value"><div class="field dd">
+                <span class="sw" style="background:#00E5FF"></span><span>O-WALLS</span>
+                <span class="chev">▾</span></div></div></div>
+
+            <div class="row"><div class="label">Color</div>
+              <div class="value"><div class="field dd">
+                <span class="sw" style="background:#E44BC8"></span><span>By Layer</span>
+                <span class="chev">▾</span></div></div></div>
+
+            <div class="row"><div class="label">Linetype</div>
+              <div class="value"><div class="field dd">
+                <span class="lt"></span><span>Continuous</span>
+                <span class="chev">▾</span></div></div></div>
+
+            <div class="row"><div class="label">Lt scale</div>
+              <div class="value"><div class="field"><span class="num">1.00</span></div></div></div>
+
+            <div class="row"><div class="label">Lineweight</div>
+              <div class="value"><div class="field dd">
+                <span class="lw"></span><span class="num">0.25 mm</span>
+                <span class="chev">▾</span></div></div></div>
+
+            <div class="row"><div class="label">Visible</div>
+              <div class="value"><span class="cbx on"><svg width="10" height="10" viewBox="0 0 10 10" fill="none" stroke-width="1.6"><path d="M1 5.2 3.7 8 9 2"/></svg></span></div></div>
+          </div>
+        </div>
+
+        <!-- GEOMETRY -->
+        <div class="section">
+          <div class="sec-head"><span class="chev">▼</span><span class="cap">Geometry</span></div>
+          <div class="sec-body">
+            <div class="colhdr"><div class="label"></div>
+              <div class="cols"><span>Start</span><span>End</span></div></div>
+
+            <div class="row"><div class="label">X</div>
+              <div class="pair">
+                <div class="field"><span class="num">1250.00</span></div>
+                <div class="field"><span class="num">1310.00</span></div></div></div>
+
+            <div class="row"><div class="label">Y</div>
+              <div class="pair">
+                <div class="field"><span class="num">840.50</span></div>
+                <div class="field"><span class="num">905.00</span></div></div></div>
+
+            <div class="row ro"><div class="label">Length</div>
+              <div class="value">88.60</div></div>
+            <div class="row ro"><div class="label">Angle</div>
+              <div class="value">47.30°</div></div>
+          </div>
+        </div>
+
+        <!-- HATCH (collapsed) -->
+        <div class="section">
+          <div class="sec-head"><span class="chev">▸</span><span class="cap">Hatch</span></div>
+        </div>
+        <!-- MISC (collapsed) -->
+        <div class="section">
+          <div class="sec-head"><span class="chev">▸</span><span class="cap">Misc</span></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="note">
+      <h2>How to use</h2>
+      <p>This panel is built to <code>INSPECTOR_DESIGN.md</code>. Open devtools
+      (F12) and hover any element — computed <code>width</code>/<code>height</code>
+      should match the measurement table (§7): field box <code>140×24</code>,
+      label column <code>84</code>, coordinate field <code>64×24</code>, swatch
+      <code>13×13</code>, row pitch <code>32</code>, radius <code>4</code>.</p>
+      <p>Toggle the button to outline the boxes.</p>
+      <p><button id="rul" style="font:inherit;padding:6px 10px;border-radius:8px;
+        border:1px solid var(--border);background:var(--surface-2);
+        color:var(--text-primary);cursor:pointer">Toggle rulers</button></p>
+      <p style="color:var(--text-muted);font-size:12px">Fonts: Geist/JetBrains
+      Mono if installed, else the system fallback — glyph widths differ slightly
+      but box sizes are exact.</p>
+    </div>
+  </div>
+
+  <script>
+    document.getElementById('rul').onclick = () =>
+      document.getElementById('panel').classList.toggle('rulers');
+  </script>
+</body>
+</html>

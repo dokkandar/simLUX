@@ -1,0 +1,588 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RUST_CAD Daily Activity — 2026-06-04</title>
+<style>
+  :root {
+    --bg:#13171d; --panel:#1c222b; --line:#2d3540;
+    --text:#dde3ec; --muted:#90a0b4; --accent:#7fc8ff; --warn:#ffb86b;
+    --ok:#86d782; --bad:#ff8b8b; --feat:#c4a8ff;
+    --mono:'Source Code Pro','Fira Mono','Consolas',monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);font:14.5px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{padding:32px 48px;max-width:1180px;margin:0 auto}
+  h1{font-size:28px;margin:0 0 6px;color:#fff;letter-spacing:.5px}
+  h2{font-size:20px;margin:34px 0 12px;color:var(--accent);border-bottom:1px solid var(--line);padding-bottom:6px}
+  h3{font-size:16px;margin:24px 0 8px;color:#fff}
+  .sub{color:var(--muted);margin-bottom:24px}
+  .stat-row{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 28px}
+  .stat{background:var(--panel);border:1px solid var(--line);padding:10px 16px;border-radius:6px;min-width:130px}
+  .stat .n{font-size:22px;color:#fff;font-weight:600}
+  .stat .l{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.8px}
+
+  table{width:100%;border-collapse:collapse;background:var(--panel);
+        border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:8px 0 14px}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#222a35;color:var(--accent);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.6px}
+  tr:last-child td{border-bottom:none}
+  code{font-family:var(--mono);background:#0c1015;padding:1px 5px;border-radius:3px;color:#eee;font-size:12.5px}
+  pre{font-family:var(--mono);background:#0c1015;padding:10px 14px;border-radius:5px;
+      border:1px solid var(--line);overflow-x:auto;font-size:12.5px;line-height:1.45}
+  pre code{background:none;padding:0}
+
+  .card{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);
+        border-radius:5px;padding:16px 22px;margin:14px 0}
+  .card.feat{border-left-color:var(--feat)}
+  .card.arch{border-left-color:var(--bad)}
+  .card.polish{border-left-color:var(--accent)}
+  .card.infra{border-left-color:var(--warn)}
+  .card-header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:6px}
+  .card-id{font-family:var(--mono);color:var(--muted);font-size:12.5px;letter-spacing:.5px}
+  .card-title{font-size:16px;color:#fff;font-weight:600;flex:1}
+  .card-commit{font-family:var(--mono);color:var(--accent);font-size:12px;
+              background:#0c1015;padding:2px 8px;border-radius:3px;border:1px solid var(--line)}
+  .ok{color:var(--ok)}
+  .bad{color:var(--bad)}
+  .warn{color:var(--warn)}
+  .muted{color:var(--muted);font-size:12.5px}
+
+  ul,ol{margin:6px 0 6px 22px}
+  li{margin:3px 0}
+
+  .toc{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px 22px;margin:16px 0 28px}
+  .toc h3{margin:0 0 8px;color:var(--accent);font-size:14px;text-transform:uppercase;letter-spacing:.6px}
+  .toc ol{margin-left:22px}
+  .toc a{color:var(--text);text-decoration:none;border-bottom:1px dotted transparent}
+  .toc a:hover{color:#fff;border-bottom-color:var(--accent)}
+
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin:6px 0 16px}
+  .legend .item{display:flex;align-items:center;gap:6px}
+  .swatch{display:inline-block;width:14px;height:14px;border-radius:2px;border:1px solid var(--line)}
+  .sw-feat{background:var(--feat)}
+  .sw-arch{background:var(--bad)}
+  .sw-polish{background:var(--accent)}
+  .sw-infra{background:var(--warn)}
+
+  .tomorrow{background:#1a2230;border:1px solid #2a3a55;border-radius:6px;padding:18px 24px;margin:14px 0}
+  .tomorrow h3{color:#a8c8ff;margin-top:10px}
+  .priority{display:inline-block;padding:1px 7px;border-radius:3px;font-size:11px;font-weight:600;
+            text-transform:uppercase;letter-spacing:.5px;margin-right:8px}
+  .p-hi{background:#3a1f1f;color:#ff9090;border:1px solid #5a2929}
+  .p-md{background:#3a2f1a;color:#ffc680;border:1px solid #5a4a29}
+  .p-lo{background:#1f2a3a;color:#90b8ff;border:1px solid #2a4570}
+
+  .footer{margin-top:48px;color:var(--muted);font-size:12px;
+          border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+
+<h1>RUST_CAD — Daily Activity Report</h1>
+<div class="sub">
+  Date: <strong>2026-06-04</strong> &middot;
+  Repo: <code>github.com/HSI-Lighting/RUST-AutoRASM</code> &middot;
+  Branch: <code>main</code> &middot;
+  Commit range: <code>669151e</code> &rarr; <code>4df87e1</code>
+</div>
+
+<div class="stat-row">
+  <div class="stat"><div class="n">20</div><div class="l">commits pushed</div></div>
+  <div class="stat"><div class="n">163</div><div class="l">tests passing</div></div>
+  <div class="stat"><div class="n">+1400</div><div class="l">lines added</div></div>
+  <div class="stat"><div class="n">1</div><div class="l">new module</div></div>
+  <div class="stat"><div class="n">9</div><div class="l">new trace tests</div></div>
+</div>
+
+<div class="legend">
+  <div class="item"><span class="swatch sw-feat"></span> Feature</div>
+  <div class="item"><span class="swatch sw-arch"></span> Architectural fix</div>
+  <div class="item"><span class="swatch sw-polish"></span> UX / Polish</div>
+  <div class="item"><span class="swatch sw-infra"></span> Infrastructure</div>
+</div>
+
+<div class="toc">
+  <h3>Contents</h3>
+  <ol>
+    <li><a href="#focus">Today's focus</a></li>
+    <li><a href="#timeline">Commit timeline</a></li>
+    <li><a href="#hatch">Hatch pick-point — BPOLY pipeline</a></li>
+    <li><a href="#polish">UX polish &amp; workflow</a></li>
+    <li><a href="#infra">Infrastructure</a></li>
+    <li><a href="#diagnostics">Diagnostics &amp; debug</a></li>
+    <li><a href="#tests">Tests &amp; build state</a></li>
+    <li><a href="#deferred">What's still gappy</a></li>
+    <li><a href="#tomorrow">Tomorrow's work</a></li>
+  </ol>
+</div>
+
+<h2 id="focus">1. Today's focus</h2>
+<p>
+  Completing the <strong>Hatch section</strong> end-to-end. Started the day finishing the
+  GPU/CPU render-divergence fixes from the prior session; spent the rest of the day taking
+  pick-point from "smallest containing closed dobject" to a full AutoCAD BPOLY-style pipeline:
+  ray cast, segment tessellation with intersection splitting, planar-subdivision face traversal,
+  outer/island classification, materialisation of traced loops as boundary polylines.
+  Layered diagnostics through the entire flow so the next bug report comes with the algorithm's
+  internal state already on the page.
+</p>
+<p>
+  Theme by commit count: <strong>13</strong> hatch / boundary-detection commits,
+  <strong>2</strong> UX polish, <strong>1</strong> UI (toolbar icon),
+  <strong>1</strong> cancellation infrastructure, <strong>1</strong> docking,
+  <strong>1</strong> debug, <strong>1</strong> documentation (Bug_Report html).
+</p>
+
+<h2 id="timeline">2. Commit timeline</h2>
+<table>
+  <thead>
+    <tr><th>Time</th><th>Commit</th><th>Slice</th><th>Class</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>early</td><td><code>669151e</code></td><td>Hatch dialog &rarr; Dobject/s + Pick Point buttons (drop OK/Cancel)</td><td>UX</td></tr>
+    <tr><td>early</td><td><code>135d635</code></td><td>Hatch Debug Log window — live log + state badge + dump-state button</td><td>Infra</td></tr>
+    <tr><td>early</td><td><code>fcf6783</code></td><td>Auto-open Hatch Debug window on every <code>hatch</code> command</td><td>UX</td></tr>
+    <tr><td>early</td><td><code>58c1281</code></td><td>Hatch fixes from debug-log analysis: GPU render + auto-dump diagnostics</td><td>Arch</td></tr>
+    <tr><td>early</td><td><code>77a0759</code></td><td>GPU render mode: respect per-dobject color (<code>resolve_color</code>)</td><td>Arch</td></tr>
+    <tr><td>early</td><td><code>9f1571c</code></td><td>Hatch render-architecture fix: 3 layered bugs causing GPU&ne;CPU divergence</td><td>Arch</td></tr>
+    <tr><td>mid</td><td><code>fe2c4bf</code></td><td>Bug_Report_2026-06-04.html — full session bug log + architectural lessons</td><td>Doc</td></tr>
+    <tr><td>mid</td><td><code>4908f67</code></td><td>Hatch pick-point completion: bulge-aware PIP + BPOLY trace + materialise</td><td>Feat</td></tr>
+    <tr><td>mid</td><td><code>1126df0</code></td><td>Per-coord verbose dump in hatch debug; <strong>PLINE auto-close</strong> on click-back-to-start</td><td>UX</td></tr>
+    <tr><td>mid</td><td><code>ad1097c</code></td><td>Cheap-path island auto-detection + Hatch button in Draw toolbar</td><td>Feat</td></tr>
+    <tr><td>mid</td><td><code>ed5e442</code></td><td>Polylines with endpoint gap &lt; &epsilon; treated as effectively closed</td><td>Arch</td></tr>
+    <tr><td>late</td><td><code>7ab92af</code></td><td>v2c: pairwise intersection splitting + LARGEST-CCW face-traversal rule (bug fix)</td><td>Arch</td></tr>
+    <tr><td>late</td><td><code>3a1bf1b</code></td><td>Route to trace path when single outer is crossed by another dobject</td><td>Feat</td></tr>
+    <tr><td>late</td><td><code>c95baa2</code></td><td>Custom-painted hatch icon next to circle in toolbar</td><td>UX</td></tr>
+    <tr><td>late</td><td><code>a08aff2</code></td><td>Pick-point stays armed across clicks until Enter / Esc</td><td>Feat</td></tr>
+    <tr><td>late</td><td><code>573b960</code></td><td>Cheap-path fallback when trace fails on shared-vertex junctions</td><td>Arch</td></tr>
+    <tr><td>late</td><td><code>beb5e0c</code></td><td>Edge-snap docking for floating windows (50px threshold)</td><td>UX</td></tr>
+    <tr><td>late</td><td><code>be41c04</code></td><td>Per-hit trace diagnostics (attempt0..N: OK/DEAD-END + contains-seed)</td><td>Infra</td></tr>
+    <tr><td>late</td><td><code>d8d2431</code></td><td>Cancellation primitive (<code>op_cancel</code> + cancellable trace variants)</td><td>Infra</td></tr>
+    <tr><td>late</td><td><code>4df87e1</code></td><td>Hit deduplication + zoom + world-per-pixel in debug log</td><td>Infra</td></tr>
+  </tbody>
+</table>
+
+<h2 id="hatch">3. Hatch pick-point — BPOLY pipeline</h2>
+
+<div class="card feat">
+  <div class="card-header">
+    <span class="card-id">F-01</span>
+    <span class="card-title">New module <code>cad_app::hatch_trace</code> &mdash; the BPOLY pipeline</span>
+    <span class="card-commit">4908f67</span>
+  </div>
+  <p>
+    Six-phase pipeline, every step exposed for diagnostic logging:
+  </p>
+  <ol>
+    <li><code>tessellate_doc</code> &mdash; every visible non-hatch dobject &rarr; short segments tagged with source idx</li>
+    <li><code>cluster_endpoints</code> &mdash; endpoints within JOIN_EPS share a graph node</li>
+    <li><code>build_adjacency</code> &mdash; per-cluster list of <code>(segment, other_cluster, leaving_angle)</code></li>
+    <li><code>ray_cast_horiz</code> &mdash; +X horizontal ray from seed; sorted hits east of seed</li>
+    <li><code>trace_loop</code> &mdash; walk by LARGEST-CCW-turn (left-face boundary) from each starting hit; cap MAX_TRACE_STEPS</li>
+    <li>Classify: outer = SMALLEST traced loop containing seed; islands = strictly inside outer, not containing seed</li>
+  </ol>
+  <p class="muted">
+    Wrapped end-to-end as <code>trace_boundary_at(doc, seed) -&gt; Option&lt;TracedBoundary&gt;</code>.
+    On success, the app's <code>apply_pick_point_hatch</code> materialises every loop as a new
+    closed Polyline dobject on the active layer, then pushes a Hatch referencing them by handle.
+  </p>
+</div>
+
+<div class="card arch">
+  <div class="card-header">
+    <span class="card-id">F-02</span>
+    <span class="card-title">v2c: pairwise intersection splitting + CCW-rule correction</span>
+    <span class="card-commit">7ab92af</span>
+  </div>
+  <p>
+    Two crossing primitives must form a face at their crossing. <code>split_at_intersections</code>
+    runs after tessellation: for every pair from <em>different</em> source dobjects, compute the
+    2D line-line intersection; if strictly interior to both, split both segments. Endpoint-cluster
+    pass naturally treats every crossing as a graph node.
+  </p>
+  <p>
+    Writing the first lens-test caught a real bug: the original "smallest CCW turn" rule actually
+    traces the <em>right</em>-side face. Seed sits on the LEFT of the +X ray's first hit (south&rarr;north
+    walk puts the west &mdash; and the seed &mdash; on the left), so we want the LARGEST valid CCW
+    turn = sharpest left turn = bounds the LEFT face = the face containing the seed.
+  </p>
+  <p>
+    Tests:
+    <code>lens_between_two_overlapping_circles</code>,
+    <code>common_region_of_three_overlapping_circles</code>,
+    plus 3 mechanical split tests
+    (<code>noop_when_no_crossings</code>,
+    <code>basic_cross</code>,
+    <code>skips_same_source</code>).
+  </p>
+</div>
+
+<div class="card feat">
+  <div class="card-header">
+    <span class="card-id">F-03</span>
+    <span class="card-title">Smart routing &mdash; cheap path / trace path / fallback</span>
+    <span class="card-commit">3a1bf1b, 573b960</span>
+  </div>
+  <table>
+    <thead><tr><th>Click situation</th><th>Path taken</th></tr></thead>
+    <tbody>
+      <tr><td>0 closed candidates contain seed</td><td>trace path</td></tr>
+      <tr><td>1 candidate, no boundary crossings on outer</td><td>cheap path (outer + auto-islands)</td></tr>
+      <tr><td>1 candidate, outer IS crossed by another dobject</td><td>trace path (planar subdivision sub-face)</td></tr>
+      <tr><td>2+ candidates contain seed</td><td>trace path (partial overlap)</td></tr>
+      <tr><td>Trace returns None</td><td>fallback &rarr; cheap path with auto-islands</td></tr>
+    </tbody>
+  </table>
+</div>
+
+<div class="card arch">
+  <div class="card-header">
+    <span class="card-id">F-04</span>
+    <span class="card-title">Effectively-closed polyline rule</span>
+    <span class="card-commit">ed5e442</span>
+  </div>
+  <p>
+    Polylines whose first/last vertices coincide within 1e-3 world units are treated as closed for
+    all hatch purposes, regardless of the <code>closed</code> flag. Surfaces the "drew a closed
+    shape but forgot <code>c</code> Enter" case as <code>[closed-by-gap]</code> in the debug dump.
+    Single predicate <code>polyline_is_effectively_closed</code> + shared tessellation helper
+    <code>closed_dobject_polygon</code> keep render, containment, and island-scan consistent.
+  </p>
+</div>
+
+<div class="card feat">
+  <div class="card-header">
+    <span class="card-id">F-05</span>
+    <span class="card-title">Auto-island detection on the cheap path</span>
+    <span class="card-commit">ad1097c</span>
+  </div>
+  <p>
+    After cheap path picks an outer, scan every other visible closed dobject:
+    bbox fully inside outer's bbox <strong>&amp;</strong>
+    doesn't contain the seed <strong>&amp;</strong>
+    5 evenly-spaced boundary samples all inside outer &rarr; auto-island.
+    Selection becomes <code>[outer, island1, island2, ...]</code> which <code>apply_hatch</code>
+    already renders with even-odd alternation.
+  </p>
+</div>
+
+<h2 id="polish">4. UX polish &amp; workflow</h2>
+
+<div class="card polish">
+  <div class="card-header">
+    <span class="card-id">U-01</span>
+    <span class="card-title">Persistent pick-point session (Enter = end)</span>
+    <span class="card-commit">a08aff2</span>
+  </div>
+  <p>
+    Match the picker-basket pattern: click Pick Point &rarr; click region A (hatched) &rarr; click region B
+    (hatched) &rarr; Enter (session ends). Esc cancels. Pattern args snapshotted into
+    <code>hatch_pick_point_session</code> so the second click uses the same ANSI31 / scale / angle
+    instead of falling back to SOLID after <code>apply_hatch</code> consumes
+    <code>pending_hatch_pattern</code>.
+  </p>
+</div>
+
+<div class="card polish">
+  <div class="card-header">
+    <span class="card-id">U-02</span>
+    <span class="card-title">PLINE auto-close on click-back-to-start</span>
+    <span class="card-commit">1126df0</span>
+  </div>
+  <p>
+    During PLINE drafting, a click within pickbox tolerance of vertex[0] (with 3+ vertices already
+    pending) commits the polyline as <code>closed=true</code> and exits drawing mode. No more
+    <code>c</code> Enter required when the visual gesture is "return to start". Tolerance =
+    <code>PkBxSz / scale</code>.
+  </p>
+</div>
+
+<div class="card polish">
+  <div class="card-header">
+    <span class="card-id">U-03</span>
+    <span class="card-title">Custom hatch icon in Draw toolbar</span>
+    <span class="card-commit">c95baa2</span>
+  </div>
+  <p>
+    Replaces the unicode-glyph "&#9007; hatch" button with a custom-painted icon: boundary square
+    with 45&deg; hatching clipped to the square, L-shaped corner registration ticks, offset pickbox
+    + arrow signifying the pick-point flow. Positioned between <strong>circle</strong> and
+    <strong>ellipse</strong> in the toolbar per user request. 56&times;52px footprint matches every
+    other tool button.
+  </p>
+</div>
+
+<div class="card polish">
+  <div class="card-header">
+    <span class="card-id">U-04</span>
+    <span class="card-title">Edge-snap docking for floating windows (50px)</span>
+    <span class="card-commit">beb5e0c</span>
+  </div>
+  <p>
+    Drag any of Layers / Command / Hatch Debug Log / Trim Debug Log / Info / Properties / Pens /
+    DObjects within 50px of any screen edge &rarr; snaps flush. Drag away &gt; 50px &rarr; releases.
+    <code>CadApp::docked_window_pos: HashMap&lt;&amp;'static str, Pos2&gt;</code> stores snapped
+    positions; <code>apply_dock_pos</code> attaches <code>current_pos</code> before show;
+    <code>process_dock_after_show</code> updates the map after.
+  </p>
+</div>
+
+<div class="card polish">
+  <div class="card-header">
+    <span class="card-id">U-05</span>
+    <span class="card-title">Hatch dialog redesign: Dobject/s + Pick Point</span>
+    <span class="card-commit">669151e</span>
+  </div>
+  <p>
+    Dropped the OK/Cancel buttons. Two action buttons now drive the flow:
+    <strong>Dobject/s</strong> uses the current selection (or prompts for one) as
+    boundary loops; <strong>Pick Point</strong> arms the next canvas click for BPOLY-style
+    seed-based hatching.
+  </p>
+</div>
+
+<h2 id="infra">5. Infrastructure</h2>
+
+<div class="card infra">
+  <div class="card-header">
+    <span class="card-id">I-01</span>
+    <span class="card-title">Cooperative cancellation primitive</span>
+    <span class="card-commit">d8d2431</span>
+  </div>
+  <p>
+    Global <code>op_cancel: Arc&lt;AtomicBool&gt;</code> on CadApp; Esc handler sets it; cancellable
+    variants of every heavy hatch phase
+    (<code>tessellate_doc_cancellable</code>,
+    <code>split_at_intersections_cancellable</code>,
+    <code>cluster_endpoints_cancellable</code>)
+    poll every <code>CANCEL_CHECK_STRIDE = 256</code> iterations. One atomic load per ~256 inner ops,
+    negligible overhead.
+  </p>
+  <p class="muted">
+    <strong>Limitation surfaced in code comments:</strong> egui's input snapshot is frozen for the
+    duration of <code>update</code>, so mid-op Esc presses aren't seen until the call returns.
+    Mid-op cancellation requires worker-thread backgrounding &mdash; the cancel flag is the bridge.
+    That's tomorrow's work (see &sect;9).
+  </p>
+</div>
+
+<div class="card infra">
+  <div class="card-header">
+    <span class="card-id">I-02</span>
+    <span class="card-title">Hatch Debug Log window</span>
+    <span class="card-commit">135d635, fcf6783, 58c1281</span>
+  </div>
+  <p>
+    Floating Window with copy-log / clear / dump-state buttons. Auto-opens on every <code>hatch</code>
+    command so the user doesn't have to remember to toggle it. Active phase state badge in the
+    header. <code>self.hatch_dbg(msg)</code> is a no-op when window is closed &mdash; zero cost when
+    not needed.
+  </p>
+</div>
+
+<h2 id="diagnostics">6. Diagnostics &amp; debug</h2>
+
+<table>
+  <thead><tr><th>Layer</th><th>What's logged</th><th>Commit</th></tr></thead>
+  <tbody>
+    <tr>
+      <td>Doc snapshot</td>
+      <td>Every dobject's bbox + closure tag (<code>[closed]</code> / <code>[closed-by-gap]</code> /
+          <code>[open]</code>) + full vertex list for polylines + endpoint gap with
+          "visually closed but <code>closed=false</code>" flag</td>
+      <td>1126df0, ed5e442</td>
+    </tr>
+    <tr>
+      <td>Cheap-path verdict</td>
+      <td>Per-dobject CANDIDATE / skip reason (open polyline, doesn't contain seed, partial overlap, &hellip;)</td>
+      <td>ed5e442</td>
+    </tr>
+    <tr>
+      <td>Island scan verdict</td>
+      <td>Per other-dobject ACCEPTED / skip reason (bbox not inside, contains seed, partial overlap)</td>
+      <td>ed5e442</td>
+    </tr>
+    <tr>
+      <td>Trace pipeline</td>
+      <td><code>tessellated N segs &rarr; split into M segs (+K), C clusters, H hits east of seed</code></td>
+      <td>4908f67, 7ab92af</td>
+    </tr>
+    <tr>
+      <td>Per-hit attempts</td>
+      <td><code>attempt0: trace_loop OK &mdash; V verts, contains seed: true/false</code> or
+          <code>DEAD-END</code></td>
+      <td>be41c04</td>
+    </tr>
+    <tr>
+      <td>Routing decision</td>
+      <td><code>--- single outer #N has crossings with other dobjects &rarr; deferring to trace path ---</code></td>
+      <td>3a1bf1b</td>
+    </tr>
+    <tr>
+      <td>Hit dedup</td>
+      <td><code>(deduped K duplicate-position hits &rarr; U unique attempts)</code></td>
+      <td>4df87e1</td>
+    </tr>
+    <tr>
+      <td>View context</td>
+      <td><code>zoom=5.32 px/world  world_per_px=0.1879</code> &mdash; lets you compare seed drift
+          across zoom levels for zoom-dependent bug reports</td>
+      <td>4df87e1</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2 id="tests">7. Tests &amp; build state</h2>
+<table>
+  <thead><tr><th>Crate</th><th>Tests</th><th>Notes</th></tr></thead>
+  <tbody>
+    <tr><td><code>cad_kernel</code></td><td>124 passing</td><td>unchanged from prior session</td></tr>
+    <tr><td><code>cad_app</code></td><td>14 passing</td><td><strong>+9 hatch_trace tests</strong> (lens / 3-circle / square-from-4-lines / island promotion / no-boundary / 3 split mechanics)</td></tr>
+    <tr><td><code>aci_picker</code></td><td>5 passing</td><td>unchanged</td></tr>
+    <tr><td><code>cad_nurbs</code></td><td>7 passing</td><td>unchanged</td></tr>
+    <tr><td><code>cad_snap doc-tests</code></td><td>2 passing</td><td>unchanged</td></tr>
+    <tr><td><code>cad_io</code> / others</td><td>11 passing</td><td>unchanged</td></tr>
+    <tr><td><strong>Total</strong></td><td><strong>163 passing, 0 failing</strong></td><td></td></tr>
+  </tbody>
+</table>
+<p class="muted">
+  Release binary: <code>~/workspace/RUST_CAD/target/release/rust_cad</code>
+  &middot; ~8.2 MB.
+</p>
+
+<h2 id="deferred">8. What's still gappy</h2>
+
+<ul>
+  <li>
+    <strong>Mid-op Esc cancellation</strong> &mdash; cancel flag is in place but trace runs
+    synchronously, so Esc only fires between phases (which can each take seconds at 1M dobjects).
+    Needs worker-thread backgrounding.
+  </li>
+  <li>
+    <strong>O(N&sup2;) split scan</strong> &mdash; will time out long before 1M dobjects. Needs
+    spatial-index broad-phase using the existing <code>UniformGrid</code>.
+  </li>
+  <li>
+    <strong>Trace robustness at shared-vertex junctions</strong> &mdash; LARGEST-CCW-turn rule is
+    ambiguous when multiple dobjects share a corner; trace can divert into the wrong sub-loop and
+    dead-end. Today's mitigation: cheap-path fallback when trace returns None. Proper fix: a
+    full DCEL planar subdivision data structure with explicit face links.
+  </li>
+  <li>
+    <strong>Zoom-dependent seed precision</strong> &mdash; at low zoom one screen pixel covers
+    larger world area, so clicks near a region boundary land at slightly different world coords
+    across zooms. The trace itself is zoom-invariant; only the seed input varies. Mitigation
+    option: pickbox-inward snap.
+  </li>
+  <li>
+    <strong>Boundary materialisation creates new polyline dobjects</strong> &mdash; user sees
+    "ghost" polylines appear after each pick-point hatch. Useful for grip-edit but can surprise.
+    Could mark them with a "synthetic boundary" style flag.
+  </li>
+  <li>
+    <strong>Pattern catalog gaps</strong> &mdash; no dashed-line families (ANSI33 should dash);
+    no row stagger (BRICK has no delta-x); no <code>.pat</code> file reader.
+  </li>
+  <li>
+    <strong>Region entity + Boolean ops</strong> &mdash; not started. Same intersection-splitting
+    primitive as v2c, but needs new Region geom variant + UNION/SUBTRACT/INTERSECT command set.
+  </li>
+</ul>
+
+<h2 id="tomorrow">9. Tomorrow's work</h2>
+
+<div class="tomorrow">
+
+  <h3><span class="priority p-hi">High</span> Mid-op Esc cancellation via worker thread</h3>
+  <p>
+    The cancellation primitive is in place; the remaining work is to actually move the
+    <code>trace_boundary_at_cancellable</code> call onto a worker thread so the UI keeps spinning
+    and Esc presses are seen mid-op.
+  </p>
+  <ul>
+    <li>Add <code>HatchWorker { cancel: Arc&lt;AtomicBool&gt;, rx: mpsc::Receiver&lt;Option&lt;TracedBoundary&gt;&gt; }</code> field on CadApp</li>
+    <li>On Pick Point click: clone the Document, spawn worker thread, store handle</li>
+    <li>In <code>update</code>: try_recv the channel; if ready, materialise hatch + drop worker</li>
+    <li>Esc handler: set cancel flag (already does); drop worker (thread exits at next cancel check)</li>
+    <li>Status indicator: "hatching... press Esc to cancel" while worker is alive</li>
+  </ul>
+  <p class="muted">~150 lines, won't touch the trace algorithm itself. Clean separation.</p>
+
+  <h3><span class="priority p-hi">High</span> Hit deduplication audit — verify against the zoom-dependent log</h3>
+  <p>
+    Today's hit-dedup commit (<code>4df87e1</code>) only ran briefly before session end. Tomorrow
+    re-run yesterday's failed pick-point cases with the new log lines:
+    <code>zoom=... world_per_px=...</code> and
+    <code>(deduped K hits)</code>. Look for: do the FAIL and SUCCESS seeds differ significantly?
+    Does dedup change the per-hit attempt list?
+  </p>
+
+  <h3><span class="priority p-md">Medium</span> Spatial-index broad-phase for <code>split_at_intersections</code></h3>
+  <p>
+    Replace the O(N&sup2;) pairwise scan with a UniformGrid lookup:
+  </p>
+  <pre><code>for each seg, get its cell range
+for each cell, only test pairs whose bbox overlap
+</code></pre>
+  <p>
+    At 30M segments (1M dobjects &times; ~30 segs each), this is the only realistic way the trace
+    survives. Existing <code>cad_kernel::spatial::UniformGrid</code> is reusable &mdash; just need
+    a segment-level wrapper.
+  </p>
+  <p class="muted">
+    Likely outcome: 100&times; faster for typical drawings, 10000&times; faster for huge ones.
+    Cancellation infrastructure already in place.
+  </p>
+
+  <h3><span class="priority p-md">Medium</span> Pickbox-inward snap for "click just outside" cases</h3>
+  <p>
+    When the cheap-path verdict says "0 self-closed dobjects contain the click" AND a closed
+    dobject's boundary is within pickbox tolerance of the seed, jitter the seed inward and retry.
+    Smoother UX at low zoom &mdash; user's intent is recovered even when their pixel-precision
+    click landed just outside.
+  </p>
+
+  <h3><span class="priority p-md">Medium</span> Sketch DCEL planar subdivision plan</h3>
+  <p>
+    Write up an architectural plan (Markdown, not code) for the proper face-traversal data
+    structure:
+  </p>
+  <ul>
+    <li>Vertices (cluster_pos)</li>
+    <li>Half-edges (each segment becomes two half-edges, with twin / next / face links)</li>
+    <li>Faces (explicit list, each with outer half-edge + island half-edges)</li>
+    <li>Build pass: trace each face's boundary by following <code>next</code> half-edges</li>
+    <li>Lookup: given a seed, find the face containing it via ray-cast + parity</li>
+  </ul>
+  <p>
+    Replaces the current "trace from each ray hit, classify by smallest containing" with one
+    deterministic build + one O(log N) lookup.
+  </p>
+
+  <h3><span class="priority p-lo">Low</span> Hatch refinements</h3>
+  <ul>
+    <li>Dashed-line families in pattern catalog (ANSI33, etc.)</li>
+    <li>Row stagger (BRICK delta-x/y)</li>
+    <li>"Synthetic boundary" style flag so materialised polylines render distinctly from user-drawn ones</li>
+  </ul>
+
+  <h3><span class="priority p-lo">Low</span> Next-feature candidates after hatch settles</h3>
+  <ul>
+    <li><strong>PLINE Phase 2 sub-options</strong> &mdash; Width / Halfwidth / Length / Angle / Center / Direction / Radius. Currently the prompt mentions them but they print "not yet wired".</li>
+    <li><strong>UI.4 Properties palette</strong> &mdash; per-dobject row of layer / color / linetype / lineweight editable in a docked panel. The Info window is the prototype; needs the bulk-edit UX.</li>
+    <li><strong>DXF I/O</strong> &mdash; <code>Dobject_DXF.md</code> catalogs ~310 group codes; <code>cad_io::dxf</code> module doesn't exist yet.</li>
+    <li><strong>NURBS follow-ups</strong> &mdash; fit-points-through mode, weight editing UI, closed splines.</li>
+  </ul>
+
+</div>
+
+<div class="footer">
+  Generated 2026-06-04. Run binary:
+  <code>~/workspace/RUST_CAD/target/release/rust_cad</code>.
+  Companion: <a href="Bug_Report_2026-06-04.html" style="color:var(--accent)">Bug_Report_2026-06-04.html</a>
+  covers per-bug details (11 bugs + 3 architectural lessons surfaced earlier in the session).
+</div>
+
+</body>
+</html>

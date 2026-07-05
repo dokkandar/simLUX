@@ -1,0 +1,1191 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RUST_CAD — Internal Storage Audit</title>
+<style>
+:root {
+  --bg:           #12161c;
+  --bg-elev:     #1a1f27;
+  --bg-elev-2:   #232a34;
+  --line:        #2c3441;
+  --text:        #d9dde4;
+  --text-dim:    #8d97a4;
+  --text-very-dim:#5c6573;
+  --accent:      #6db4ff;
+  --accent-2:    #8ddfff;
+  --warn:        #ffaf6b;
+  --good:        #74d97e;
+  --bad:         #ff7a7a;
+  --byte-tag:    #b692ff;
+  --byte-pay:    #6db4ff;
+  --byte-pad:    #5c6573;
+  --code-bg:     #0d1116;
+  --code-key:    #ff9d6b;
+  --code-str:    #a3d97a;
+  --code-com:    #5c6573;
+  --code-num:    #d4a3ff;
+  --code-typ:    #6dd9ff;
+  font-family: ui-sans-serif, "Inter", "Segoe UI", system-ui, sans-serif;
+}
+
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.55;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+/* ---- layout ---- */
+.layout {
+  display: grid;
+  grid-template-columns: 260px 1fr;
+  min-height: 100vh;
+}
+
+aside {
+  background: var(--bg-elev);
+  border-right: 1px solid var(--line);
+  padding: 32px 22px 60px 28px;
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  overflow-y: auto;
+}
+aside .brand {
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  margin-bottom: 4px;
+}
+aside .title {
+  font-weight: 600;
+  font-size: 17px;
+  margin-bottom: 18px;
+  color: var(--text);
+}
+aside ol {
+  list-style: none;
+  padding: 0; margin: 0;
+  counter-reset: toc;
+}
+aside ol li {
+  counter-increment: toc;
+  padding: 5px 0;
+  font-size: 13.5px;
+}
+aside ol li::before {
+  content: counter(toc) ".";
+  color: var(--text-very-dim);
+  margin-right: 8px;
+  font-variant-numeric: tabular-nums;
+}
+aside ol li a {
+  color: var(--text-dim);
+}
+aside ol li a:hover {
+  color: var(--text);
+  text-decoration: none;
+}
+aside .meta {
+  margin-top: 32px;
+  border-top: 1px solid var(--line);
+  padding-top: 16px;
+  font-size: 12px;
+  color: var(--text-very-dim);
+  line-height: 1.7;
+}
+
+main {
+  padding: 56px 64px 96px 64px;
+  max-width: 1100px;
+}
+
+@media (max-width: 900px) {
+  .layout { grid-template-columns: 1fr; }
+  aside { position: static; height: auto; }
+  main { padding: 32px 24px; }
+}
+
+/* ---- typography ---- */
+h1 {
+  font-size: 32px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  margin: 0 0 10px;
+  line-height: 1.15;
+}
+h2 {
+  font-size: 24px;
+  font-weight: 600;
+  margin-top: 56px;
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--line);
+  scroll-margin-top: 24px;
+}
+h2 .sec {
+  color: var(--text-very-dim);
+  font-weight: 400;
+  margin-right: 12px;
+  font-variant-numeric: tabular-nums;
+}
+h3 {
+  font-size: 18px;
+  margin-top: 32px;
+  color: var(--accent-2);
+  font-weight: 600;
+}
+
+p { margin: 14px 0; }
+strong { color: var(--text); font-weight: 600; }
+em.kw { color: var(--code-key); font-style: normal; font-weight: 500; }
+
+/* ---- cover ---- */
+.cover {
+  background: linear-gradient(135deg, #1a2233 0%, #14202c 100%);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  padding: 36px 40px;
+  margin-bottom: 40px;
+}
+.cover .super {
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  color: var(--accent);
+  text-transform: uppercase;
+  margin-bottom: 12px;
+}
+.cover .sub {
+  color: var(--text-dim);
+  font-size: 16px;
+  margin-top: 12px;
+}
+.cover .badges {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  margin-top: 20px;
+}
+.cover .badges span {
+  font-size: 11px;
+  padding: 4px 9px;
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+/* ---- callouts ---- */
+.callout {
+  border-left: 3px solid var(--accent);
+  background: rgba(109, 180, 255, 0.06);
+  padding: 14px 18px;
+  border-radius: 0 6px 6px 0;
+  margin: 18px 0;
+}
+.callout.warn { border-left-color: var(--warn); background: rgba(255, 175, 107, 0.06); }
+.callout.good { border-left-color: var(--good); background: rgba(116, 217, 126, 0.06); }
+.callout.warn .label { color: var(--warn); }
+.callout.good .label { color: var(--good); }
+.callout .label {
+  display: inline-block;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+  margin-bottom: 4px;
+  font-weight: 600;
+}
+
+/* ---- code ---- */
+pre, code { font-family: "JetBrains Mono", "SF Mono", ui-monospace, Consolas, monospace; }
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 18px;
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.55;
+}
+code { font-size: 13px; color: var(--accent-2); background: var(--bg-elev-2); padding: 1px 5px; border-radius: 3px; }
+pre code { background: transparent; padding: 0; color: inherit; }
+.kw { color: var(--code-key); }
+.s  { color: var(--code-str); }
+.c  { color: var(--code-com); font-style: italic; }
+.n  { color: var(--code-num); }
+.t  { color: var(--code-typ); }
+
+/* ---- tables ---- */
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 18px 0;
+  font-size: 13.5px;
+}
+th, td {
+  text-align: left;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  vertical-align: top;
+}
+th {
+  color: var(--text);
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  background: var(--bg-elev);
+}
+tbody tr:hover { background: rgba(109, 180, 255, 0.03); }
+td.num, th.num {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+  font-family: ui-monospace, monospace;
+}
+
+/* ---- byte-layout diagram ---- */
+.byte-row {
+  display: flex;
+  align-items: stretch;
+  gap: 2px;
+  margin: 16px 0;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  flex-wrap: wrap;
+}
+.byte {
+  background: var(--bg-elev-2);
+  border: 1px solid var(--line);
+  padding: 10px 12px;
+  border-radius: 4px;
+  min-width: 60px;
+  text-align: center;
+}
+.byte .name { color: var(--text); font-weight: 500; }
+.byte .size { color: var(--text-very-dim); font-size: 11px; display: block; margin-top: 3px; }
+.byte.tag  { border-color: var(--byte-tag); background: rgba(182, 146, 255, 0.08); }
+.byte.pay  { border-color: var(--byte-pay); background: rgba(109, 180, 255, 0.08); }
+.byte.pad  { border-color: var(--byte-pad); background: rgba(92, 101, 115, 0.08); color: var(--text-very-dim); }
+
+/* ---- inheritance flow SVG ---- */
+.svg-wrap {
+  background: var(--code-bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 22px;
+  margin: 22px 0;
+  display: flex;
+  justify-content: center;
+}
+.svg-wrap svg { max-width: 100%; height: auto; }
+.svg-wrap text { font-family: ui-monospace, monospace; font-size: 12px; fill: var(--text); }
+.svg-wrap text.dim { fill: var(--text-dim); font-size: 11px; }
+.svg-wrap text.label { fill: var(--accent); font-size: 11px; }
+.svg-wrap rect.node { fill: var(--bg-elev); stroke: var(--line); }
+.svg-wrap rect.node.warn { stroke: var(--warn); }
+.svg-wrap rect.node.good { stroke: var(--good); }
+.svg-wrap path.arrow { fill: none; stroke: var(--text-dim); stroke-width: 1.5; marker-end: url(#arrow); }
+
+/* ---- footer ---- */
+footer {
+  margin-top: 80px;
+  padding-top: 24px;
+  border-top: 1px solid var(--line);
+  color: var(--text-very-dim);
+  font-size: 12px;
+  display: flex;
+  justify-content: space-between;
+}
+
+/* ---- print stylesheet ---- */
+@media print {
+  body { background: #fff; color: #1a1a1a; font-size: 11pt; }
+  .layout { display: block; }
+  aside { display: none; }
+  main { max-width: 100%; padding: 12mm; }
+  .cover { background: #f5f7fa; color: #1a1a1a; }
+  .cover .super, .cover .sub { color: #555; }
+  .cover .badges span { background: #e9eef5; color: #444; border-color: #c8d2e0; }
+  pre, code { background: #f0f2f6 !important; color: #1a1a1a !important; border-color: #d6dbe3 !important; }
+  pre .kw { color: #b0440f; }
+  pre .s  { color: #2c7a2c; }
+  pre .c  { color: #708090; }
+  pre .n  { color: #5e338e; }
+  pre .t  { color: #1463a3; }
+  th { background: #eef1f7; color: #1a1a1a; }
+  td, th { border-color: #d6dbe3; }
+  h2 { border-bottom-color: #d6dbe3; }
+  .callout { background: #f0f5fb !important; }
+  .callout.warn { background: #fff5eb !important; }
+  .callout.good { background: #f0faf3 !important; }
+  .byte { background: #eef2f8; color: #1a1a1a; border-color: #c8d2e0; }
+  .byte.tag { background: #efe5ff; border-color: #a883e0; }
+  .byte.pay { background: #e5f0ff; border-color: #6494d6; }
+  .byte.pad { background: #eceef2; border-color: #999; }
+  .svg-wrap { background: #fafbfd; border-color: #d6dbe3; }
+  .svg-wrap text { fill: #1a1a1a; }
+  .svg-wrap text.dim { fill: #555; }
+  .svg-wrap rect.node { fill: #fff; stroke: #999; }
+  .svg-wrap path.arrow { stroke: #555; }
+  h2, h3 { page-break-after: avoid; }
+  table, pre, .callout { page-break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+<div class="layout">
+
+<aside>
+  <div class="brand">RUST_CAD</div>
+  <div class="title">Internal Storage Audit</div>
+  <ol>
+    <li><a href="#tl-dr">TL;DR — design summary</a></li>
+    <li><a href="#document">Document container</a></li>
+    <li><a href="#dobject">DObject layout</a></li>
+    <li><a href="#geom">Geom variants</a></li>
+    <li><a href="#style">Style fields</a></li>
+    <li><a href="#color">Color model</a></li>
+    <li><a href="#inheritance">Color inheritance chain</a></li>
+    <li><a href="#tables">Layer / Linetype / Pen tables</a></li>
+    <li><a href="#rsm">RSM binary format</a></li>
+    <li><a href="#dxf">DXF reader mapping</a></li>
+    <li><a href="#render">Default render path</a></li>
+    <li><a href="#extend">Adding a new property</a></li>
+    <li><a href="#future">Deferred refactors</a></li>
+  </ol>
+  <div class="meta">
+    Generated&nbsp;2026-06-02<br>
+    Branch&nbsp;main &nbsp;·&nbsp; Commit&nbsp;173ff3a<br>
+    Format&nbsp;HTML&nbsp;·&nbsp; Print-safe
+  </div>
+</aside>
+
+<main>
+
+<section class="cover">
+  <div class="super">RUST_CAD · Engineering audit</div>
+  <h1>Internal Storage Audit</h1>
+  <div class="sub">
+    A byte-level walkthrough of how RUST_CAD holds a drawing in memory,
+    how it serialises to the RSM binary format, and how the DXF reader
+    fills the same structures from group-coded text. Written for design
+    engineers reviewing the data model before extending it.
+  </div>
+  <div class="badges">
+    <span>Pure Rust workspace</span>
+    <span>5 crates (kernel · io · snap · app · cli)</span>
+    <span>138 tests</span>
+    <span>9 M dobject memory budget audited</span>
+  </div>
+</section>
+
+<!-- ============================================ -->
+<section id="tl-dr">
+<h2><span class="sec">§ 1</span>TL;DR — design summary</h2>
+
+<p>
+Three rules govern every piece of state in the data model:
+</p>
+
+<div class="callout good">
+  <div class="label">Rule 1 — One source of truth per kind</div>
+  Every Dobject points to <em class="kw">tables</em> on the Document
+  (layers, linetypes, pens, truecolors). The Dobject never duplicates
+  what a table can store once and share.
+</div>
+
+<div class="callout good">
+  <div class="label">Rule 2 — Indirect what's heavy, inline what's light</div>
+  ACI is one byte and goes inline on every Dobject. 24-bit truecolor
+  is a u16 index into a shared, deduplicated table — so a million
+  dobjects all in <code>#FF8040</code> cost one row in the table, not
+  a million u32s.
+</div>
+
+<div class="callout good">
+  <div class="label">Rule 3 — On-disk format is decoupled from in-memory</div>
+  RSM still inlines truecolor RGB on disk (lossless DXF round-trip).
+  The reader interns each RGB into the loading Document's table; the
+  writer dereferences refs back to inline RGB. Storage refactors don't
+  break files.
+</div>
+
+<h3>What this audit is for</h3>
+<p>
+Use this document when:
+</p>
+<ul>
+  <li>Adding a per-Dobject property — §12 has the seven-step checklist.</li>
+  <li>Estimating memory at a target dobject count — §3 and §6 have the
+      cost tables.</li>
+  <li>Implementing a new DXF record type — §10 has the existing reader's
+      group-code mapping pattern.</li>
+  <li>Modifying RSM — §9 documents the byte-by-byte layout.</li>
+  <li>Reviewing the color inheritance chain — §7 has the resolution
+      diagram.</li>
+</ul>
+</section>
+
+<!-- ============================================ -->
+<section id="document">
+<h2><span class="sec">§ 2</span>Document container</h2>
+
+<p>
+File: <code>cad_kernel/src/document.rs</code>. The top-level container
+that holds the entire drawing.
+</p>
+
+<pre><code><span class="kw">pub struct</span> <span class="t">Document</span> {
+    <span class="kw">pub</span> dobjects:   <span class="t">Vec</span>&lt;<span class="t">DObject</span>&gt;,       <span class="c">// the drafting dobjects</span>
+    <span class="kw">pub</span> layers:     <span class="t">LayerTable</span>,         <span class="c">// named layers</span>
+    <span class="kw">pub</span> linetypes:  <span class="t">LinetypeTable</span>,      <span class="c">// dash patterns</span>
+    <span class="kw">pub</span> pens:       <span class="t">PenTable</span>,           <span class="c">// pre-set styles</span>
+    <span class="kw">pub</span> truecolors: <span class="t">TrueColorTable</span>,     <span class="c">// shared 24-bit colors</span>
+}</code></pre>
+
+<h3>Architecture at a glance</h3>
+<div class="svg-wrap">
+<svg viewBox="0 0 760 320" width="760" height="320" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8d97a4"/>
+    </marker>
+  </defs>
+  <!-- Document -->
+  <rect class="node" x="280" y="14" width="200" height="50" rx="6"/>
+  <text x="380" y="38" text-anchor="middle" font-weight="600">Document</text>
+  <text x="380" y="54" text-anchor="middle" class="dim">cad_kernel::document</text>
+  <!-- Dobjects vec -->
+  <rect class="node" x="20" y="120" width="170" height="50" rx="6"/>
+  <text x="105" y="142" text-anchor="middle">Vec&lt;DObject&gt;</text>
+  <text x="105" y="158" text-anchor="middle" class="dim">geom · style · handle</text>
+  <!-- LayerTable -->
+  <rect class="node" x="210" y="120" width="120" height="50" rx="6"/>
+  <text x="270" y="142" text-anchor="middle">LayerTable</text>
+  <text x="270" y="158" text-anchor="middle" class="dim">named</text>
+  <!-- LinetypeTable -->
+  <rect class="node" x="345" y="120" width="120" height="50" rx="6"/>
+  <text x="405" y="142" text-anchor="middle">LinetypeTable</text>
+  <text x="405" y="158" text-anchor="middle" class="dim">dash patterns</text>
+  <!-- PenTable -->
+  <rect class="node" x="480" y="120" width="120" height="50" rx="6"/>
+  <text x="540" y="142" text-anchor="middle">PenTable</text>
+  <text x="540" y="158" text-anchor="middle" class="dim">presets</text>
+  <!-- TrueColorTable -->
+  <rect class="node" x="615" y="120" width="125" height="50" rx="6"/>
+  <text x="678" y="142" text-anchor="middle">TrueColorTable</text>
+  <text x="678" y="158" text-anchor="middle" class="dim">deduped RGB</text>
+
+  <!-- arrows down -->
+  <path class="arrow" d="M 380 64 L 105 120"/>
+  <path class="arrow" d="M 380 64 L 270 120"/>
+  <path class="arrow" d="M 380 64 L 405 120"/>
+  <path class="arrow" d="M 380 64 L 540 120"/>
+  <path class="arrow" d="M 380 64 L 678 120"/>
+
+  <!-- DObject -> tables -->
+  <rect class="node" x="20" y="220" width="170" height="80" rx="6"/>
+  <text x="105" y="242" text-anchor="middle" font-weight="600">DObject</text>
+  <text x="105" y="262" text-anchor="middle" class="dim">style.layer → LayerTable</text>
+  <text x="105" y="277" text-anchor="middle" class="dim">style.color → TrueColors</text>
+  <text x="105" y="292" text-anchor="middle" class="dim">style.linetype → Linetype</text>
+  <path class="arrow" d="M 105 170 L 105 220"/>
+  <path class="arrow" d="M 190 260 L 210 170"/>
+  <path class="arrow" d="M 190 280 L 345 170"/>
+  <path class="arrow" d="M 190 290 L 615 170"/>
+</svg>
+</div>
+
+<h3>Default state</h3>
+<table>
+<thead><tr><th>Field</th><th>On <code>Document::default()</code></th></tr></thead>
+<tbody>
+<tr><td><code>dobjects</code></td><td>empty</td></tr>
+<tr><td><code>layers</code></td><td>one layer: <strong>"LAYER B"</strong> (Base), color ACI 7 (white), visible, plottable.</td></tr>
+<tr><td><code>linetypes</code></td><td>CONTINUOUS (id 0) + DASHED (id 1) + DASH-DOT-CENTER (id 2).</td></tr>
+<tr><td><code>pens</code></td><td>7 preset entries (ByLayer + six named styles).</td></tr>
+<tr><td><code>truecolors</code></td><td>empty — populated only when the user explicitly picks a TrueColor (not an ACI palette index).</td></tr>
+</tbody></table>
+</section>
+
+<!-- ============================================ -->
+<section id="dobject">
+<h2><span class="sec">§ 3</span>DObject layout</h2>
+
+<p>
+File: <code>cad_kernel/src/dobject.rs</code>. The drafting dobject that
+the user creates, edits, and selects.
+</p>
+
+<pre><code><span class="kw">pub struct</span> <span class="t">DObject</span> {
+    <span class="kw">pub</span> geom:   <span class="t">Geom</span>,      <span class="c">// ~48 bytes — enum tag + largest variant</span>
+    <span class="kw">pub</span> style:  <span class="t">Style</span>,     <span class="c">// ~28 bytes — visual properties</span>
+    <span class="kw">pub</span> handle: <span class="t">Handle</span>,    <span class="c">//   8 bytes — process-wide u64</span>
+}</code></pre>
+
+<div class="byte-row">
+  <div class="byte pay"><span class="name">geom</span><span class="size">48 B</span></div>
+  <div class="byte pay"><span class="name">style</span><span class="size">28 B</span></div>
+  <div class="byte pay"><span class="name">handle</span><span class="size">8 B</span></div>
+  <div class="byte pad"><span class="name">pad</span><span class="size">4 B</span></div>
+</div>
+<p style="margin-top:-6px; color: var(--text-dim); font-size: 13px;">
+  Total per Dobject: <strong>~88 bytes</strong> (including alignment padding).
+</p>
+
+<h3>Memory cost at scale</h3>
+<table>
+<thead><tr><th>Dobjects</th><th class="num">geom</th><th class="num">style</th><th class="num">handle</th><th class="num">Total</th></tr></thead>
+<tbody>
+<tr><td>100 k</td><td class="num">4.8 MB</td><td class="num">2.8 MB</td><td class="num">0.8 MB</td><td class="num"><strong>8.4 MB</strong></td></tr>
+<tr><td>1 M</td>  <td class="num">48 MB</td> <td class="num">28 MB</td> <td class="num">8 MB</td>  <td class="num"><strong>84 MB</strong></td></tr>
+<tr><td>9 M</td>  <td class="num">432 MB</td><td class="num">252 MB</td><td class="num">72 MB</td> <td class="num"><strong>756 MB</strong></td></tr>
+</tbody></table>
+
+<p>
+Geometry coordinates dominate. Style is constant-per-dobject. To
+scale beyond 9 M dobjects on commodity hardware see §13 — the
+deferred refactors collapse Style to a 4-byte ref into a shared
+table.
+</p>
+
+<h3>Handle allocation</h3>
+<p>
+<code>Handle</code> is a process-wide monotonic <code>u64</code> from
+<code>next_handle()</code>. Two Dobjects never share a handle within
+one process lifetime.
+</p>
+<div class="callout warn">
+  <div class="label">Future</div>
+  Per-Document handle namespace so DXF imports can preserve their hex
+  handles losslessly on round-trip. Tracked under §13.
+</div>
+</section>
+
+<!-- ============================================ -->
+<section id="geom">
+<h2><span class="sec">§ 4</span>Geom variants</h2>
+
+<p>
+File: <code>cad_kernel/src/geom.rs</code>. One enum, seven variants,
+all 2-D. The largest non-heap variant dictates the enum's stack size.
+</p>
+
+<table>
+<thead><tr><th>Variant</th><th class="num">Stack size</th><th>Fields</th></tr></thead>
+<tbody>
+<tr><td><code>Line</code></td>          <td class="num">32 B</td><td>2 × <code>Vec2</code> endpoints</td></tr>
+<tr><td><code>Circle</code></td>        <td class="num">24 B</td><td><code>Vec2</code> center + <code>f64</code> radius</td></tr>
+<tr><td><code>Arc</code></td>           <td class="num">40 B</td><td>center + radius + start_angle + sweep_angle</td></tr>
+<tr><td><code>Ellipse</code></td>       <td class="num">40 B</td><td>center + major <code>Vec2</code> + ratio <code>f64</code></td></tr>
+<tr><td><code>EllipseArc</code></td>    <td class="num">56 B</td><td>Ellipse + start_param + sweep_param</td></tr>
+<tr><td><code>Point</code></td>         <td class="num">24 B</td><td>location + style <code>u8</code> + size <code>f32</code></td></tr>
+<tr><td><code>Polyline</code></td>      <td class="num">32 B inline</td><td><code>Vec&lt;PolyVertex&gt;</code> on heap + <code>closed</code> flag</td></tr>
+</tbody></table>
+
+<p>
+<code>Vec2</code> is two <code>f64</code> (16 bytes, 8-aligned). The
+enum totals <strong>~48 bytes</strong> after tag + alignment.
+</p>
+
+<h3>Polyline heap cost</h3>
+<p>
+<code>PolyVertex</code> = <code>Vec2 pos</code> + <code>f64 bulge</code>
+= 24 bytes per vertex.
+</p>
+<table>
+<thead><tr><th>Vertices</th><th class="num">Heap bytes</th><th>Typical case</th></tr></thead>
+<tbody>
+<tr><td>4 (closed square)</td><td class="num">~96 B</td><td>Boundary box, room outline.</td></tr>
+<tr><td>100</td>              <td class="num">~2.4 KB</td><td>Wall trace, equipment outline.</td></tr>
+<tr><td>10 000</td>           <td class="num">~240 KB</td><td>Topographic contour line.</td></tr>
+</tbody></table>
+</section>
+
+<!-- ============================================ -->
+<section id="style">
+<h2><span class="sec">§ 5</span>Style fields</h2>
+
+<p>
+File: <code>cad_kernel/src/style.rs</code>. The "common properties" every
+Dobject carries — what AutoCAD calls the entity's display attributes (we call ours <em class="kw">dobjects</em>).
+</p>
+
+<pre><code><span class="kw">pub struct</span> <span class="t">Style</span> {
+    <span class="kw">pub</span> layer:          <span class="t">LayerId</span>,        <span class="c">// u32 → 4 B</span>
+    <span class="kw">pub</span> color:          <span class="t">Color</span>,          <span class="c">// 4 B  (after 2026-06-02 indirection refactor)</span>
+    <span class="kw">pub</span> linetype:       <span class="t">u32</span>,            <span class="c">// 4 B  — LinetypeId</span>
+    <span class="kw">pub</span> linetype_scale: <span class="t">f32</span>,            <span class="c">// 4 B</span>
+    <span class="kw">pub</span> lineweight:     <span class="t">Lineweight</span>,     <span class="c">// 8 B  — enum + f32 payload</span>
+    <span class="kw">pub</span> visible:        <span class="kw">bool</span>,           <span class="c">// 1 B</span>
+}</code></pre>
+
+<div class="byte-row">
+  <div class="byte pay"><span class="name">layer</span><span class="size">4 B</span></div>
+  <div class="byte pay"><span class="name">color</span><span class="size">4 B</span></div>
+  <div class="byte pay"><span class="name">linetype</span><span class="size">4 B</span></div>
+  <div class="byte pay"><span class="name">lt_scale</span><span class="size">4 B</span></div>
+  <div class="byte pay"><span class="name">lineweight</span><span class="size">8 B</span></div>
+  <div class="byte pay"><span class="name">visible</span><span class="size">1 B</span></div>
+  <div class="byte pad"><span class="name">pad</span><span class="size">3 B</span></div>
+</div>
+<p style="margin-top:-6px; color: var(--text-dim); font-size: 13px;">
+  Aligned: <strong>~28 bytes</strong>.
+</p>
+
+<h3>Defaults</h3>
+<p>From <code>Style::default()</code>:</p>
+<table>
+<thead><tr><th>Field</th><th>Default</th><th>Meaning</th></tr></thead>
+<tbody>
+<tr><td><code>layer</code></td>          <td><code>LAYER_BASE</code> (id 0, name "LAYER B")</td><td>Built-in Base layer.</td></tr>
+<tr><td><code>color</code></td>          <td><code>Color::ByLayer</code></td><td>Inherits from layer.</td></tr>
+<tr><td><code>linetype</code></td>       <td><code>CONTINUOUS</code> (id 0)</td><td>Solid line.</td></tr>
+<tr><td><code>linetype_scale</code></td> <td><code>1.0</code></td><td>Pattern at native size.</td></tr>
+<tr><td><code>lineweight</code></td>     <td><code>Lineweight::ByLayer</code></td><td>Inherits from layer.</td></tr>
+<tr><td><code>visible</code></td>        <td><code>true</code></td><td>Rendered.</td></tr>
+</tbody></table>
+</section>
+
+<!-- ============================================ -->
+<section id="color">
+<h2><span class="sec">§ 6</span>Color model</h2>
+
+<p>
+File: <code>cad_kernel/src/color.rs</code>. Refactored 2026-06-02 to
+separate the per-Dobject color slot from the shared 24-bit RGB pool.
+</p>
+
+<pre><code><span class="kw">pub enum</span> <span class="t">Color</span> {
+    ByLayer,                  <span class="c">// 0-byte payload — inherits from style.layer</span>
+    ByBlock,                  <span class="c">// 0-byte payload — inherits from block (not yet wired)</span>
+    Aci(<span class="t">u8</span>),                  <span class="c">// 1-byte ACI palette index (1..=255)</span>
+    TrueColorRef(<span class="t">u16</span>),        <span class="c">// 2-byte index into Document::truecolors</span>
+}
+
+<span class="kw">pub struct</span> <span class="t">TrueColorTable</span> {
+    rgbs:   <span class="t">Vec</span>&lt;<span class="t">u32</span>&gt;,                       <span class="c">// index → 0x00RRGGBB</span>
+    by_rgb: <span class="t">HashMap</span>&lt;<span class="t">u32</span>, <span class="t">u16</span>&gt;,              <span class="c">// dedup on intern()</span>
+}</code></pre>
+
+<div class="byte-row">
+  <div class="byte tag"><span class="name">tag</span><span class="size">1 B</span></div>
+  <div class="byte pay"><span class="name">payload</span><span class="size">≤ 2 B</span></div>
+  <div class="byte pad"><span class="name">pad</span><span class="size">1 B</span></div>
+</div>
+<p style="margin-top:-6px; color: var(--text-dim); font-size: 13px;">
+  Color enum size: <strong>4 bytes</strong> (was 8 before the
+  refactor, because <code>TrueColor(u32)</code> forced u32 alignment).
+</p>
+
+<h3>Why indirection</h3>
+<div class="callout">
+  <div class="label">Memory math</div>
+  Before refactor: per-Dobject color slot = 8 B → 9 M × 8 = <strong>72 MB</strong>.<br>
+  After refactor:  per-Dobject color slot = 4 B → 9 M × 4 = <strong>36 MB</strong>, plus
+  ~32 B per <em>unique</em> RGB in the dedup table. Typical CAD usage
+  has dozens of unique truecolors; the table overhead is a few KB.
+</div>
+
+<h3>Dedup behaviour</h3>
+<p>
+A million Dobjects all in <code>#FF8040</code> cost:
+</p>
+<ul>
+  <li>~4 MB across their per-Dobject color slots (the u16 ref + tag).</li>
+  <li><strong>4 bytes once</strong> in <code>truecolors.rgbs</code> for the RGB.</li>
+  <li>~32 bytes once in <code>truecolors.by_rgb</code> for the HashMap entry.</li>
+</ul>
+
+<h3>API for new code</h3>
+<pre><code><span class="c">// Set a per-Dobject TrueColor:</span>
+<span class="kw">let</span> idx = doc.truecolors.intern(<span class="n">0xFF8040</span>);
+dobject.style.color = <span class="t">Color</span>::TrueColorRef(idx);
+
+<span class="c">// Resolve to concrete RGB at render time:</span>
+<span class="kw">let</span> (r, g, b) = resolve_color(
+    dobject.style.color,
+    dobject.style.layer,
+    &amp;doc.layers,
+    &amp;doc.truecolors,
+);</code></pre>
+</section>
+
+<!-- ============================================ -->
+<section id="inheritance">
+<h2><span class="sec">§ 7</span>Color inheritance chain</h2>
+
+<p>
+"By Dobject", "By Block", "By Group", and "By Layer" are not separate
+storage — they are four resolutions of the same <code>Color</code>
+field, dispatched at render time.
+</p>
+
+<h3>Resolution flow</h3>
+<div class="svg-wrap">
+<svg viewBox="0 0 720 380" width="720" height="380" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#8d97a4"/>
+    </marker>
+  </defs>
+  <!-- Start -->
+  <rect class="node" x="280" y="10" width="160" height="44" rx="6"/>
+  <text x="360" y="32" text-anchor="middle" font-weight="600">style.color</text>
+  <text x="360" y="48" text-anchor="middle" class="dim">on the Dobject</text>
+
+  <!-- Variant boxes -->
+  <rect class="node good" x="20" y="110" width="150" height="50" rx="6"/>
+  <text x="95" y="132" text-anchor="middle">TrueColorRef(idx)</text>
+  <text x="95" y="148" text-anchor="middle" class="dim">→ truecolors.get</text>
+
+  <rect class="node good" x="200" y="110" width="150" height="50" rx="6"/>
+  <text x="275" y="132" text-anchor="middle">Aci(idx)</text>
+  <text x="275" y="148" text-anchor="middle" class="dim">→ aci_palette</text>
+
+  <rect class="node" x="380" y="110" width="150" height="50" rx="6"/>
+  <text x="455" y="132" text-anchor="middle">ByLayer</text>
+  <text x="455" y="148" text-anchor="middle" class="dim">→ recurse on layer</text>
+
+  <rect class="node warn" x="560" y="110" width="150" height="50" rx="6"/>
+  <text x="635" y="132" text-anchor="middle">ByBlock</text>
+  <text x="635" y="148" text-anchor="middle" class="dim">→ falls to ByLayer</text>
+
+  <!-- arrows from top to variants -->
+  <path class="arrow" d="M 320 54 L 95 110"/>
+  <path class="arrow" d="M 340 54 L 275 110"/>
+  <path class="arrow" d="M 380 54 L 455 110"/>
+  <path class="arrow" d="M 400 54 L 635 110"/>
+
+  <!-- Layer resolution box -->
+  <rect class="node" x="220" y="210" width="300" height="80" rx="6"/>
+  <text x="370" y="232" text-anchor="middle" font-weight="600">layers[style.layer].color</text>
+  <text x="370" y="252" text-anchor="middle" class="dim">Same enum, looked up on the layer.</text>
+  <text x="370" y="268" text-anchor="middle" class="dim">If ByLayer/ByBlock again → fallback to white</text>
+  <text x="370" y="282" text-anchor="middle" class="dim">(safety break, no infinite recursion).</text>
+
+  <path class="arrow" d="M 455 160 L 370 210"/>
+  <path class="arrow" d="M 635 160 L 470 210"/>
+
+  <!-- Result -->
+  <rect class="node good" x="270" y="320" width="180" height="44" rx="6"/>
+  <text x="360" y="346" text-anchor="middle" font-weight="600">(r, g, b) — RGB triple</text>
+
+  <path class="arrow" d="M 95 160 L 305 320"/>
+  <path class="arrow" d="M 275 160 L 340 320"/>
+  <path class="arrow" d="M 370 290 L 370 320"/>
+</svg>
+</div>
+
+<h3>What each source means</h3>
+<table>
+<thead><tr><th>Source</th><th>How it's stored</th><th>When resolved</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>By Dobject</strong></td>
+  <td><code>style.color = Color::Aci(n)</code> or <code>Color::TrueColorRef(idx)</code> on the dobject itself. Overrides everything.</td>
+  <td>Render time.</td>
+</tr>
+<tr>
+  <td><strong>By Block</strong></td>
+  <td><code>style.color = Color::ByBlock</code>. Resolves to the block's color when the Dobject is inside a block reference. <strong>Block support not yet implemented</strong> — today ByBlock falls back to ByLayer.</td>
+  <td>Render time, via block→layer chain (when blocks land).</td>
+</tr>
+<tr>
+  <td><strong>By Group</strong></td>
+  <td><em>Not a separate color source</em> in the data model. Groups (when added) inherit from the dobjects they contain; group selection is a UX concept, not a color source.</td>
+  <td>—</td>
+</tr>
+<tr>
+  <td><strong>By Layer</strong></td>
+  <td><code>style.color = Color::ByLayer</code>. Resolves via <code>layers[style.layer].color</code>. The layer holds the concrete <code>Color::Aci(n)</code> or <code>Color::TrueColorRef(idx)</code>. <strong>This is the default for new Dobjects.</strong></td>
+  <td>Render time.</td>
+</tr>
+</tbody></table>
+
+<h3>Default chain for a freshly drawn dobject</h3>
+<pre><code><span class="t">Style</span>::default()
+    .color  = <span class="t">Color</span>::ByLayer
+    .layer  = <span class="t">LayerTable</span>::LAYER_BASE       <span class="c">// id 0, name "LAYER B"</span>
+
+<span class="t">LayerTable</span>::LAYER_BASE.color = <span class="t">Color</span>::Aci(<span class="n">7</span>)
+<span class="t">aci_palette</span>(<span class="n">7</span>)                       = (<span class="n">255</span>, <span class="n">255</span>, <span class="n">255</span>)   <span class="c">// white</span></code></pre>
+<p>
+Hence the project convention: "Dobject by default is drawn on LAYER B
+(Base) with color 0 (white)."
+</p>
+</section>
+
+<!-- ============================================ -->
+<section id="tables">
+<h2><span class="sec">§ 8</span>Layer / Linetype / Pen tables</h2>
+
+<h3>LayerTable</h3>
+<pre><code><span class="kw">pub struct</span> <span class="t">Layer</span> {
+    <span class="kw">pub</span> name:       <span class="t">String</span>,
+    <span class="kw">pub</span> color:      <span class="t">Color</span>,
+    <span class="kw">pub</span> linetype:   <span class="t">u32</span>,         <span class="c">// LinetypeId</span>
+    <span class="kw">pub</span> lineweight: <span class="t">Lineweight</span>,
+    <span class="kw">pub</span> visible:    <span class="kw">bool</span>,
+    <span class="kw">pub</span> locked:     <span class="kw">bool</span>,
+    <span class="kw">pub</span> frozen:     <span class="kw">bool</span>,
+    <span class="kw">pub</span> plottable:  <span class="kw">bool</span>,
+}
+
+<span class="kw">pub struct</span> <span class="t">LayerTable</span> {
+    <span class="kw">pub</span> layers: <span class="t">Vec</span>&lt;<span class="t">Layer</span>&gt;,           <span class="c">// index = LayerId (u32)</span>
+    <span class="kw">pub</span> active: <span class="t">LayerId</span>,
+}
+
+<span class="kw">impl</span> <span class="t">LayerTable</span> {
+    <span class="kw">pub const</span> LAYER_BASE: <span class="t">LayerId</span> = <span class="n">0</span>;   <span class="c">// reserved — can't be deleted or renamed</span>
+}</code></pre>
+
+<p>
+<code>with_defaults()</code> populates one Layer at id 0 named
+<strong>"LAYER B"</strong> (Base). It is reserved — DXF / RSM
+round-trips would break without it.
+</p>
+
+<div class="callout">
+  <div class="label">Visibility / selectability gates</div>
+  <ul>
+    <li><code>Document::is_visible(idx)</code> = Dobject's own <code>visible</code> AND its layer renders (not hidden, not frozen).</li>
+    <li><code>Document::is_selectable(idx)</code> additionally requires the layer is not locked.</li>
+  </ul>
+</div>
+
+<h3>Linetype + Lineweight + Pen</h3>
+<table>
+<thead><tr><th>Type</th><th>Shape</th><th>Notes</th></tr></thead>
+<tbody>
+<tr>
+  <td><code>Linetype</code></td>
+  <td><code>name + description + pattern: Vec&lt;f32&gt;</code></td>
+  <td>Positive value = dash, negative = gap. CONTINUOUS (id 0) has empty pattern.</td>
+</tr>
+<tr>
+  <td><code>Lineweight</code></td>
+  <td><code>ByLayer | ByBlock | Default | Custom(f32 mm)</code></td>
+  <td>Same inheritance shape as Color. DXF group 370 (in 0.01 mm units).</td>
+</tr>
+<tr>
+  <td><code>Pen</code></td>
+  <td><code>name + color + linetype + lineweight</code></td>
+  <td>Pen panel clicks apply the row's style to every selected Dobject. 7 default presets ship.</td>
+</tr>
+</tbody></table>
+</section>
+
+<!-- ============================================ -->
+<section id="rsm">
+<h2><span class="sec">§ 9</span>RSM binary format</h2>
+
+<p>
+File: <code>cad_io/src/rsm.rs</code>. Little-endian throughout.
+Current version constant: <code>VERSION = 1</code>.
+</p>
+
+<h3>Top-level layout</h3>
+<table>
+<thead><tr><th class="num">Offset</th><th class="num">Size</th><th>Field</th></tr></thead>
+<tbody>
+<tr><td class="num">0</td>  <td class="num">4</td><td>MAGIC <code>"RSM\0"</code></td></tr>
+<tr><td class="num">4</td>  <td class="num">2</td><td><code>VERSION</code> (u16)</td></tr>
+<tr><td class="num">6</td>  <td class="num">2</td><td>padding (u16 reserved)</td></tr>
+<tr><td class="num">8</td>  <td class="num">…</td><td>LINETYPE TABLE</td></tr>
+<tr><td class="num">…</td>  <td class="num">…</td><td>LAYER TABLE</td></tr>
+<tr><td class="num">…</td>  <td class="num">…</td><td>PEN TABLE</td></tr>
+<tr><td class="num">…</td>  <td class="num">…</td><td>DOBJECT BLOCK</td></tr>
+</tbody></table>
+
+<h3>LINETYPE TABLE</h3>
+<pre><code><span class="t">u32</span>                            n (linetype count)
+repeated n times:
+    str                            name           (u32 length + bytes)
+    str                            description
+    <span class="t">u32</span>                            pattern length
+    <span class="t">f32</span> × pattern_length         pattern entries</code></pre>
+
+<h3>LAYER TABLE</h3>
+<pre><code><span class="t">u32</span>                            active LayerId
+<span class="t">u32</span>                            n (layer count)
+repeated n times:
+    str                            name
+    color                          (see §9.5)
+    <span class="t">u32</span>                            linetype id
+    lineweight                     (see §9.6)
+    <span class="t">u8</span>                             flags
+                                     bit 0 = visible
+                                     bit 1 = locked
+                                     bit 2 = frozen
+                                     bit 3 = plottable</code></pre>
+
+<h3>PEN TABLE</h3>
+<pre><code><span class="t">u32</span>                            n (pen count)
+repeated n times:
+    str                            name
+    color                          (see §9.5)
+    <span class="t">u32</span>                            linetype id
+    lineweight                     (see §9.6)</code></pre>
+
+<h3>DOBJECT BLOCK</h3>
+<pre><code><span class="t">u32</span>                            n (dobject count)
+repeated n times:
+    <span class="t">u64</span>                            handle
+    <span class="t">u32</span>                            style.layer
+    color                          style.color  (see §9.5)
+    <span class="t">u32</span>                            style.linetype
+    <span class="t">f32</span>                            style.linetype_scale
+    lineweight                     style.lineweight  (see §9.6)
+    <span class="t">u8</span>                             visible (0|1)
+    geom                           (see §9.7)</code></pre>
+
+<h3>§ 9.5 — Color encoding</h3>
+<div class="callout">
+  <div class="label">Indirection-agnostic on disk</div>
+  On-disk format still inlines TrueColor as <code>u32</code>. The
+  writer dereferences <code>Color::TrueColorRef(idx)</code> via
+  <code>truecolors.get(idx)</code>. The reader interns each
+  <code>u32</code> back into the loading Document's table. Round-trip
+  is lossless and the on-disk size is unchanged.
+</div>
+<pre><code><span class="t">u8</span> tag
+   <span class="n">0</span> = ByLayer
+   <span class="n">1</span> = ByBlock
+   <span class="n">2</span> = Aci(<span class="t">u8</span>) — followed by <span class="t">u8</span> index
+   <span class="n">3</span> = TrueColor — followed by <span class="t">u32</span> <span class="n">0x00RRGGBB</span></code></pre>
+
+<h3>§ 9.6 — Lineweight encoding</h3>
+<pre><code><span class="t">u8</span> tag
+   <span class="n">0</span> = ByLayer
+   <span class="n">1</span> = ByBlock
+   <span class="n">2</span> = Default
+   <span class="n">3</span> = Custom — followed by <span class="t">f32</span> millimetres</code></pre>
+
+<h3>§ 9.7 — Geometry encoding</h3>
+<pre><code><span class="t">u8</span> tag
+   <span class="n">0</span> = Line       — 2 × Vec2 (4 × f64 = 32 B)
+   <span class="n">1</span> = Circle     — Vec2 + f64 radius (24 B)
+   <span class="n">2</span> = Arc        — Vec2 + radius + start + sweep (40 B)
+   <span class="n">3</span> = Ellipse    — Vec2 + Vec2 major + f64 ratio (40 B)
+   <span class="n">4</span> = EllipseArc — Ellipse + f64 start_param + f64 sweep_param (56 B)
+   <span class="n">5</span> = Point      — Vec2 location + u8 style + f32 size
+   <span class="n">6</span> = Polyline   — u8 closed + u32 vertex count + (Vec2 + f64 bulge) × n</code></pre>
+
+<h3>What's NOT in RSM yet</h3>
+<ul>
+  <li>Block table (placeholder in <code>document.rs</code>).</li>
+  <li>Group table.</li>
+  <li>Text styles, dim styles, UCS list, named views.</li>
+  <li>Per-Dobject xdata (DXF application-defined data).</li>
+</ul>
+</section>
+
+<!-- ============================================ -->
+<section id="dxf">
+<h2><span class="sec">§ 10</span>DXF reader mapping</h2>
+
+<p>
+File: <code>cad_io/src/dxf.rs</code>. DXF is a tagged text format
+(one group code + value per line). The reader does <strong>two
+passes</strong>:
+</p>
+
+<ol>
+  <li><strong>Tokenise:</strong> each pair (code, value) becomes
+      <code>Vec&lt;(i32, String)&gt;</code>.</li>
+  <li><strong>Walk:</strong> dispatch on group code <code>0</code>
+      (the DXF spec's entity-type marker) and accumulate per-dobject
+      fields until the next <code>0</code>.</li>
+</ol>
+
+<h3>LAYER table mapping</h3>
+<table>
+<thead><tr><th class="num">DXF code</th><th>Field on <code>Layer</code></th></tr></thead>
+<tbody>
+<tr><td class="num">2</td>  <td><code>name</code></td></tr>
+<tr><td class="num">62</td> <td><code>color = Color::Aci(abs(value))</code>; visible=false if negative</td></tr>
+<tr><td class="num">6</td>  <td>linetype name (looked up in LinetypeTable)</td></tr>
+<tr><td class="num">70</td> <td>flags (bit 0 = frozen)</td></tr>
+<tr><td class="num">420</td><td><strong>TrueColor — NOT yet read on LAYER</strong> (follow-up).</td></tr>
+<tr><td class="num">430</td><td>Color book name — <strong>NOT supported</strong>.</td></tr>
+</tbody></table>
+
+<h3>Dobject common-style mapping</h3>
+<p>
+Every dobject reader (LINE, CIRCLE, ARC, ELLIPSE, LWPOLYLINE, POINT)
+shares this Style accumulator pass.
+</p>
+<table>
+<thead><tr><th class="num">DXF code</th><th>Field on <code>Style</code></th></tr></thead>
+<tbody>
+<tr><td class="num">8</td>  <td>layer name → resolved to LayerId; falls back to <code>LAYER_BASE</code></td></tr>
+<tr><td class="num">62</td> <td><code>color = Color::Aci(value)</code></td></tr>
+<tr><td class="num">420</td><td><code>color = Color::TrueColorRef(doc.truecolors.intern(0x00RRGGBB))</code></td></tr>
+<tr><td class="num">6</td>  <td>linetype name</td></tr>
+<tr><td class="num">370</td><td>lineweight in 0.01 mm units (−1 = ByLayer, −2 = ByBlock, −3 = Default)</td></tr>
+<tr><td class="num">60</td> <td><code>visible</code> (0 = visible, 1 = invisible)</td></tr>
+</tbody></table>
+
+<h3>Per-dobject geometry</h3>
+<table>
+<thead><tr><th>DXF record</th><th>DXF codes</th><th>Geom variant</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>LINE</strong></td>
+  <td>10/20/30 = start; 11/21/31 = end (Z ignored: we're 2-D)</td>
+  <td><code>Geom::Line</code></td>
+</tr>
+<tr>
+  <td><strong>CIRCLE</strong></td>
+  <td>10/20 = center; 40 = radius</td>
+  <td><code>Geom::Circle</code></td>
+</tr>
+<tr>
+  <td><strong>ARC</strong></td>
+  <td>10/20 = center; 40 = radius; 50 = start angle (deg); 51 = end angle (deg)</td>
+  <td><code>Geom::Arc</code> with <code>sweep = (end − start) mod 2π</code></td>
+</tr>
+<tr>
+  <td><strong>ELLIPSE</strong></td>
+  <td>10/20 = center; 11/21 = major-axis endpoint (relative); 40 = ratio; 41 = start param; 42 = end param</td>
+  <td><code>Geom::Ellipse</code> if 41=0 ∧ 42≈2π, else <code>Geom::EllipseArc</code></td>
+</tr>
+<tr>
+  <td><strong>LWPOLYLINE</strong></td>
+  <td>70 = flags (bit 0 = closed); 90 = vertex count; 10/20 = per-vertex X/Y; 42 = per-vertex bulge</td>
+  <td><code>Geom::Polyline</code></td>
+</tr>
+<tr>
+  <td><strong>POINT</strong></td>
+  <td>10/20 = location</td>
+  <td><code>Geom::Point</code> with default style/size</td>
+</tr>
+</tbody></table>
+
+<h3>What's NOT read yet</h3>
+<table>
+<thead><tr><th>DXF record / feature</th><th>Status</th></tr></thead>
+<tbody>
+<tr><td>BLOCK / ENDBLK / INSERT</td><td>Skipped — no block support yet.</td></tr>
+<tr><td>SPLINE / NURBS</td><td>Skipped — no spline kernel.</td></tr>
+<tr><td>TEXT / MTEXT</td><td>Skipped.</td></tr>
+<tr><td>DIMENSION</td><td>Skipped.</td></tr>
+<tr><td>HATCH</td><td>Skipped.</td></tr>
+<tr><td>Xdata (1001+ codes)</td><td>Skipped.</td></tr>
+</tbody></table>
+</section>
+
+<!-- ============================================ -->
+<section id="render">
+<h2><span class="sec">§ 11</span>Default render path</h2>
+
+<p>
+A freshly drawn Line via the Line tool follows this chain end to end.
+</p>
+
+<ol>
+  <li><code>add_dobject(Geom::Line(...))</code> →</li>
+  <li><code>Document::push(DObject::new(geom))</code> →</li>
+  <li><code>DObject::new</code> calls <code>Style::default()</code>:
+    <ul>
+      <li><code>layer = LAYER_BASE</code>,
+          <code>color = ByLayer</code>,
+          <code>linetype = CONTINUOUS</code>,
+          <code>lineweight = ByLayer</code>,
+          <code>visible = true</code>,
+          <code>linetype_scale = 1.0</code></li>
+    </ul>
+  </li>
+  <li><code>Document::push</code> rewrites <code>style.layer</code> to
+      <code>layers.active</code> if the active layer differs from
+      <code>LAYER_BASE</code>.</li>
+  <li>At render time:
+      <code>resolve_color(ByLayer, layer, &amp;layers, &amp;truecolors)</code>
+      → walks to <code>layers[active_layer].color</code> → that's
+      <code>Color::Aci(7)</code> for LAYER B →
+      <code>aci_palette(7)</code> → <strong>(255, 255, 255) = white</strong>.
+  </li>
+</ol>
+
+<div class="callout good">
+  <div class="label">Project convention</div>
+  Dobject by default → drawn on <strong>LAYER B (Base)</strong> →
+  resolves to <strong>color 0 (white)</strong> via ByLayer → ACI 7.
+</div>
+</section>
+
+<!-- ============================================ -->
+<section id="extend">
+<h2><span class="sec">§ 12</span>Adding a new per-Dobject property</h2>
+
+<p>
+Seven steps. Follow them in order; missing any step leaves the
+property silently lost on RSM/DXF round-trip or invisible in the UI.
+</p>
+
+<ol>
+  <li><strong>Struct field</strong> — add to <code>Style</code> in <code>cad_kernel/src/style.rs</code>.</li>
+  <li><strong>Default value</strong> — add to <code>Style::default()</code>.</li>
+  <li><strong>RSM I/O</strong> — extend <code>write_dobjects</code> and <code>read_dobjects</code> in <code>cad_io/src/rsm.rs</code>. Bump <code>VERSION</code> if the on-disk shape changes.</li>
+  <li><strong>DXF I/O</strong> — extend the style-accumulator in <code>cad_io/src/dxf.rs</code> with the matching group code (e.g. <strong>440</strong> for transparency).</li>
+  <li><strong>Renderer</strong> — the canvas render loop in <code>cad_app/src/app.rs</code> builds <code>(r,g,b)</code> + stroke per Dobject. New properties either modify the resolved style (transparency → alpha) or add a new render channel.</li>
+  <li><strong>Property panel</strong> — keep <code>Dobject_Properties.md</code> in sync.</li>
+  <li><strong>Tests</strong> — kernel test for the resolution chain + RSM round-trip test in <code>cad_io</code>.</li>
+</ol>
+</section>
+
+<!-- ============================================ -->
+<section id="future">
+<h2><span class="sec">§ 13</span>Deferred storage refactors</h2>
+
+<p>
+In rough size-payoff order. None scheduled — trigger only when actual
+test data shows the ceiling (10 M+ dobjects, or DXF handle
+preservation needed).
+</p>
+
+<table>
+<thead><tr><th>Refactor</th><th class="num">Saving at 9 M dobjects</th><th>Trigger</th></tr></thead>
+<tbody>
+<tr>
+  <td><strong>StyleId indirection</strong> — collapse Style to a <code>u32</code> ref into a shared <code>StyleTable</code>. Two Dobjects with identical style share one row.</td>
+  <td class="num">252 MB → 36 MB</td>
+  <td>Memory ceiling on real datasets.</td>
+</tr>
+<tr>
+  <td><strong>SoA Geom storage</strong> — <code>Vec&lt;Line&gt;</code>, <code>Vec&lt;Circle&gt;</code> etc. instead of <code>Vec&lt;Geom&gt;</code>. Removes enum discriminant.</td>
+  <td class="num">~10 %</td>
+  <td>Hot-loop perf profile shows tag dispatch as a bottleneck.</td>
+</tr>
+<tr>
+  <td><strong>Per-Document handle namespace</strong></td>
+  <td class="num">—</td>
+  <td>DXF round-trip needs handle preservation.</td>
+</tr>
+<tr>
+  <td><strong>Block / Group tables</strong> — first-class containers, not just selection abstractions.</td>
+  <td class="num">N/A (added cost ~64 B / block + refs)</td>
+  <td>Block import / authoring slice opens.</td>
+</tr>
+</tbody></table>
+</section>
+
+<footer>
+  <span>RUST_CAD Internal Storage Audit · 2026-06-02</span>
+  <span>github.com/HSI-Lighting/RUST-AutoRASM</span>
+</footer>
+
+</main>
+</div>
+</body>
+</html>

@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RUST_CAD Bug Report — 2026-06-04</title>
+<style>
+  :root {
+    --bg:#13171d; --panel:#1c222b; --line:#2d3540;
+    --text:#dde3ec; --muted:#90a0b4; --accent:#7fc8ff; --warn:#ffb86b;
+    --ok:#86d782; --bad:#ff8b8b;
+    --mono:'Source Code Pro','Fira Mono','Consolas',monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--bg);color:var(--text);font:14.5px/1.55 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+  body{padding:32px 48px;max-width:1180px;margin:0 auto}
+  h1{font-size:28px;margin:0 0 6px;color:#fff;letter-spacing:.5px}
+  h2{font-size:20px;margin:34px 0 12px;color:var(--accent);border-bottom:1px solid var(--line);padding-bottom:6px}
+  h3{font-size:16px;margin:24px 0 8px;color:#fff}
+  .sub{color:var(--muted);margin-bottom:24px}
+  .stat-row{display:flex;gap:14px;flex-wrap:wrap;margin:8px 0 28px}
+  .stat{background:var(--panel);border:1px solid var(--line);padding:10px 16px;border-radius:6px;min-width:130px}
+  .stat .n{font-size:22px;color:#fff;font-weight:600}
+  .stat .l{color:var(--muted);font-size:11.5px;text-transform:uppercase;letter-spacing:.8px}
+
+  table{width:100%;border-collapse:collapse;background:var(--panel);
+        border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:8px 0 14px}
+  th,td{padding:9px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top}
+  th{background:#222a35;color:var(--accent);font-weight:600;font-size:12.5px;text-transform:uppercase;letter-spacing:.6px}
+  tr:last-child td{border-bottom:none}
+  code{font-family:var(--mono);background:#0c1015;padding:1px 5px;border-radius:3px;color:#eee;font-size:12.5px}
+  pre{font-family:var(--mono);background:#0c1015;padding:10px 14px;border-radius:5px;
+      border:1px solid var(--line);overflow-x:auto;font-size:12.5px;line-height:1.45}
+  pre code{background:none;padding:0}
+
+  .bug{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--warn);
+        border-radius:5px;padding:18px 22px 14px;margin:18px 0}
+  .bug.arch{border-left-color:var(--bad)}
+  .bug.feel{border-left-color:var(--accent)}
+  .bug-header{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;margin-bottom:4px}
+  .bug-id{font-family:var(--mono);color:var(--muted);font-size:12.5px;letter-spacing:.5px}
+  .bug-title{font-size:16.5px;color:#fff;font-weight:600;flex:1}
+  .bug-commit{font-family:var(--mono);color:var(--accent);font-size:12.5px;
+              background:#0c1015;padding:2px 8px;border-radius:3px;border:1px solid var(--line)}
+  .bug-section{margin-top:10px}
+  .bug-section h4{margin:8px 0 4px;font-size:12px;text-transform:uppercase;
+                  letter-spacing:.7px;color:var(--muted);font-weight:600}
+  .bug-section p{margin:4px 0}
+  .ok{color:var(--ok)}
+  .bad{color:var(--bad)}
+  .warn{color:var(--warn)}
+  .muted{color:var(--muted);font-size:12.5px}
+
+  ul,ol{margin:6px 0 6px 22px}
+  li{margin:3px 0}
+
+  .toc{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:14px 22px;margin:16px 0 28px}
+  .toc h3{margin:0 0 8px;color:var(--accent);font-size:14px;text-transform:uppercase;letter-spacing:.6px}
+  .toc ol{margin-left:22px}
+  .toc a{color:var(--text);text-decoration:none;border-bottom:1px dotted transparent}
+  .toc a:hover{color:#fff;border-bottom-color:var(--accent)}
+
+  .legend{display:flex;gap:18px;flex-wrap:wrap;font-size:12.5px;color:var(--muted);margin:6px 0 16px}
+  .legend .item{display:flex;align-items:center;gap:6px}
+  .swatch{display:inline-block;width:14px;height:14px;border-radius:2px;border:1px solid var(--line)}
+  .sw-feel{background:var(--accent)}
+  .sw-arch{background:var(--bad)}
+  .sw-norm{background:var(--warn)}
+
+  .footer{margin-top:48px;color:var(--muted);font-size:12px;
+          border-top:1px solid var(--line);padding-top:14px}
+</style>
+</head>
+<body>
+
+<h1>RUST_CAD — Bug Report</h1>
+<div class="sub">
+  Session date: <strong>2026-06-04</strong> &middot;
+  Repo: <code>github.com/HSI-Lighting/RUST-AutoRASM</code> &middot;
+  Branch: <code>main</code> &middot;
+  Today's commit range: <code>d14f41b</code> &rarr; <code>9f1571c</code>
+</div>
+
+<div class="stat-row">
+  <div class="stat"><div class="n">11</div><div class="l">bugs fixed</div></div>
+  <div class="stat"><div class="n">11</div><div class="l">commits pushed</div></div>
+  <div class="stat"><div class="n">3</div><div class="l">architectural</div></div>
+  <div class="stat"><div class="n">163</div><div class="l">tests passing</div></div>
+</div>
+
+<div class="legend">
+  <div class="item"><span class="swatch sw-arch"></span> architectural bug (deeper / risk of recurrence)</div>
+  <div class="item"><span class="swatch sw-norm"></span> standard bug (localised)</div>
+  <div class="item"><span class="swatch sw-feel"></span> UX / feel bug (correct output but wrong affordance)</div>
+</div>
+
+<div class="toc">
+  <h3>Contents</h3>
+  <ol>
+    <li><a href="#b1">B-01 &mdash; PLINE: committed arc segments render as chords, not arcs</a></li>
+    <li><a href="#b2">B-02 &mdash; Hatch ignores nested boundaries; doesn't follow when source dobject moves</a></li>
+    <li><a href="#b3">B-03 &mdash; Polyline draws "dots only" between clicks (no live segment preview)</a></li>
+    <li><a href="#b4">B-04 &mdash; Hatch rejects Circle / Ellipse as boundaries</a></li>
+    <li><a href="#b5">B-05 &mdash; Hatch attributes UX: OK/Cancel doesn't match workflow</a></li>
+    <li><a href="#b6">B-06 &mdash; No real-time visibility into the hatch state machine</a></li>
+    <li><a href="#b7">B-07 &mdash; Hatch debug window has to be opened manually each session</a></li>
+    <li><a href="#b8">B-08 &mdash; GPU mode silently dropped every Hatch dobject</a></li>
+    <li><a href="#b9">B-09 &mdash; GPU mode painted every dobject in one of three hardcoded colors</a></li>
+    <li><a href="#b10">B-10 &mdash; CPU and GPU hatch render diverged after the GPU color fix</a></li>
+    <li><a href="#b11">B-11 &mdash; Hatch pattern looks empty at default scale</a></li>
+  </ol>
+  <h3 style="margin-top:18px">Architectural lessons</h3>
+  <ol>
+    <li><a href="#lesson1">L-1 &nbsp; By-reference entities need first-class kernel support</a></li>
+    <li><a href="#lesson2">L-2 &nbsp; State-based render dispatch is fragile against new Geom types</a></li>
+    <li><a href="#lesson3">L-3 &nbsp; GPU vs CPU render paths drift unless they share dispatch</a></li>
+  </ol>
+</div>
+
+<!-- ============================================================ -->
+<h2>Bug detail</h2>
+
+<div class="bug" id="b1">
+  <div class="bug-header">
+    <div class="bug-id">B-01</div>
+    <div class="bug-title">PLINE arc segments rendered as straight chords once committed</div>
+    <div class="bug-commit">d14f41b</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User drew a polyline with arc segments (PLINE Arc sub-mode), saw the arcs in the live rubber-band preview, then hit Enter &mdash; arcs collapsed to straight chord segments the instant the polyline committed.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>Both <code>draw_dobject_thick</code> (regular + selected highlight) and <code>draw_dobject_dashed</code> (selection outline) had a Polyline arm that flattened bulges to chords. Comment in code even acknowledged it: <em>"Polyline = piecewise lines. Bulges deferred &mdash; straight only for now"</em>. The kernel data model carried <code>bulge</code> per vertex correctly &mdash; the renderer just ignored it.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>New shared helper <code>polyline_tessellated_screen_pts(&Polyline, app, rect) &rarr; Vec&lt;Pos2&gt;</code> walks the vertex chain and expands each arc segment by computing <code>(centre, radius, sweep)</code> from the bulge then sampling at on-screen density. Both render paths now route through it &mdash; committed polylines render the same arcs the preview shows.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Files</h4>
+    <p><code>cad_app/src/app.rs</code> (+90 lines)</p>
+  </div>
+</div>
+
+<div class="bug arch" id="b2">
+  <div class="bug-header">
+    <div class="bug-id">B-02</div>
+    <div class="bug-title">Hatch ignored nested boundaries and didn't update when source moved</div>
+    <div class="bug-commit">fc762c5</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User selected an outer polyline + 3 inner circles. Old hatch only fired on closed polylines; circles were skipped. Even if hatched, moving the boundary later left a stale fill at the old position &mdash; the hatch carried a vertex snapshot, not a reference.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>v1 <code>Hatch</code> owned <code>boundary: Vec&lt;Vec2&gt;</code> &mdash; a copy taken at the moment of <code>apply_hatch</code>. No live link to the source dobjects.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix &mdash; redesign</h4>
+    <p>Following the LibreCAD model the user pointed at, <code>Hatch</code> now holds <code>boundary_handles: Vec&lt;Handle&gt;</code> &mdash; <strong>references</strong>, not copies. Renderer resolves handles each frame via the new <code>Document::find_by_handle(h)</code> &mdash; live link, move/edit propagates automatically.</p>
+    <ul>
+      <li>Geom-level transforms (rotated/scaled/mirrored/translated) become no-ops on Hatch &mdash; boundaries transform on their own.</li>
+      <li>Multi-loop support via even-odd at render &mdash; outer + inner closed polylines become outer fill + holes.</li>
+    </ul>
+  </div>
+  <div class="bug-section">
+    <h4>Files</h4>
+    <p><code>cad_kernel/src/geom.rs</code>, <code>cad_kernel/src/document.rs</code>, <code>cad_io/src/rsm.rs</code>, <code>cad_app/src/app.rs</code> (+249 / &minus;135 lines)</p>
+  </div>
+</div>
+
+<div class="bug feel" id="b3">
+  <div class="bug-header">
+    <div class="bug-id">B-03</div>
+    <div class="bug-title">PLINE drawing showed nothing between clicks ("dots only")</div>
+    <div class="bug-commit">e85b42e</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User clicked points to draw a polyline; nothing appeared between clicks until Enter committed the whole thing. Reported as "pline is full of dots".</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>The draw-tool preview <code>match (self.tool, self.pending.as_slice())</code> had branches for Line / Circle / Ellipse / EllipseArc but <strong>no Polyline branch</strong>. The only thing on screen between clicks was the drafting cursor sitting on each captured vertex.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>Added a Polyline preview branch: filled dot per captured vertex, solid hint-color segments between consecutive captured vertices, dashed rubber-band from the last vertex to the cursor. Ortho + grid-snap already worked because polyline's <code>ortho_anchor</code> returns the last pending point.</p>
+  </div>
+</div>
+
+<div class="bug" id="b4">
+  <div class="bug-header">
+    <div class="bug-id">B-04</div>
+    <div class="bug-title">Hatch rejected Circle / Ellipse as boundaries</div>
+    <div class="bug-commit">6e058e1</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User's screenshot: outer polyline + 3 inner circles, all selected, ran <code>hatch</code> &rarr; <em>"no closed polyline in selection"</em>. The circles were geometrically closed; the filter rejected them anyway.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>v2 hatch filter was <code>match { Polyline(p) if p.closed && p.vertices.len() &gt;= 3 =&gt; accept, _ =&gt; skip }</code>. Circles and Ellipses fell into the skip arm despite being closed by construction.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <ul>
+      <li><code>apply_hatch</code> filter widened to accept <code>Circle</code> and <code>Ellipse</code> alongside closed Polylines.</li>
+      <li><code>resolve_hatch_loops</code> tessellates each non-polyline boundary to a 64-vertex closed loop via new helpers <code>tessellate_circle_loop</code> / <code>tessellate_ellipse_loop</code>.</li>
+    </ul>
+    <p class="muted">Open chains (line + arc loops) and Splines still skipped &mdash; they need boundary-traversal to chain into a loop (queued as Hatch v2b).</p>
+  </div>
+</div>
+
+<div class="bug feel" id="b5">
+  <div class="bug-header">
+    <div class="bug-id">B-05</div>
+    <div class="bug-title">Hatch attributes dialog used OK/Cancel; didn't match the AutoCAD workflow</div>
+    <div class="bug-commit">669151e</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User: <em>"instead of OK / Cancel should be Dobject/s, Pick point"</em>. The dialog's OK button left the user mid-air &mdash; how does the boundary get selected after OK? AutoCAD-style workflow puts the boundary-acquisition mode <strong>on the dialog</strong>.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>Design mistake on my part &mdash; OK/Cancel maps to "commit/discard a pending value", which doesn't fit the hatch flow where the user still needs to acquire the boundary AFTER pattern selection.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <ul>
+      <li><strong>&#x2610; Dobject/s</strong> &rarr; begin ForSelect session for boundary dobjects; Enter commits with the dialog's pattern.</li>
+      <li><strong>&#x25c9; Pick Point</strong> &rarr; arm canvas; next pointer-mode click runs <code>find_smallest_containing_closed</code> on every closed dobject in the doc (PIP test + bbox-area tiebreak), hatches the winner.</li>
+      <li><strong>X (window close)</strong> &rarr; dismiss, no commit.</li>
+    </ul>
+    <p class="muted">New helper <code>point_in_polygon(p, iter)</code> &mdash; standard half-open Y-test PIP.</p>
+  </div>
+</div>
+
+<div class="bug feel" id="b6">
+  <div class="bug-header">
+    <div class="bug-id">B-06</div>
+    <div class="bug-title">No real-time visibility into the hatch state machine</div>
+    <div class="bug-commit">135d635</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User: <em>"something is wrong, we need to real-time debug &mdash; add a debug menu, record all the display dobjects and screen events"</em>. Without a per-event log, hatch failures came back as "nothing happened".</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>New Hatch Debug Log window mirroring the existing Trim Debug pattern. Toolbar toggle (<code>hatch dbg &#9656;</code>). Records every state transition: command parse / dialog open / dialog button / pick-point click / accept-skip per dobject / apply_hatch params / hatch pushed / X close. Live status badge (idle / dialog open / pick-point armed / awaiting boundary). Pending-pattern always-visible readout so you can SEE what the next <code>apply_hatch</code> will commit. Buttons: &#128203; Copy Log, &#128465; Clear, &#128248; Dump Hatch State (snapshot every Hatch dobject + resolved-loop diagnostics).</p>
+    <p class="muted"><code>hatch_dbg(msg)</code> is a no-op when the window is closed &mdash; wide instrumentation doesn't cost memory in normal use.</p>
+  </div>
+</div>
+
+<div class="bug feel" id="b7">
+  <div class="bug-header">
+    <div class="bug-id">B-07</div>
+    <div class="bug-title">Hatch debug window required a manual toolbar toggle each session</div>
+    <div class="bug-commit">fcf6783</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User: <em>"debug window should trigger automatically by hatch command"</em>. Friction &mdash; you'd hit a bug, then have to remember to enable the window before reproducing.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>New helper <code>hatch_dbg_session_start()</code> flips <code>hatch_debug_open = true</code> and stamps a session marker. Called at the top of <code>Command::Hatch</code>. Doesn't clear the prior log &mdash; accumulating context across runs is useful when comparing what worked vs what didn't.</p>
+  </div>
+</div>
+
+<div class="bug arch" id="b8">
+  <div class="bug-header">
+    <div class="bug-id">B-08</div>
+    <div class="bug-title">GPU render mode silently dropped every Hatch dobject</div>
+    <div class="bug-commit">58c1281</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>Found by debug-log analysis after B-07: user's log showed 3 hatches successfully committed (<code>apply_hatch</code> all OK), but they didn't see them. CPU branch was short-circuiting hatches to <code>render_hatch_fill</code>; GPU branch's <code>_ =&gt;</code> arm sent them to the free <code>draw_dobject</code>, which is stubbed for Hatch.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>GPU's non-circle arm now checks <code>if let Geom::Hatch(h)</code> and dispatches to <code>render_hatch_fill</code> (the only path with Document access for handle resolution) before falling through to <code>draw_dobject</code>.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Plus diagnostics</h4>
+    <ul>
+      <li><code>apply_hatch</code> now auto-calls <code>dump_hatch_state</code> at its tail (no need to press the button).</li>
+      <li><code>dump_hatch_state</code> enriched with per-loop bbox + per-family line-count estimate. ⚠ ZERO LINES warning when spacing &gt; boundary diagonal &mdash; catches "pattern looks empty" caused by too-coarse default scale.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="bug arch" id="b9">
+  <div class="bug-header">
+    <div class="bug-id">B-09</div>
+    <div class="bug-title">GPU mode painted every dobject in one of three hardcoded colors</div>
+    <div class="bug-commit">77a0759</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User: <em>"in GPU the dobjects are not getting colour as single colour, in CPU all has got the colour, is it architecture problem?"</em></p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause</h4>
+    <p>GPU branch hardcoded:</p>
+    <pre><code>let sel_col  = 0xA0A5AFFFu32;  // gray  &mdash; selected
+let snap_col = 0x78F0FFFFu32;  // cyan  &mdash; snap source
+let def_col  = 0xAAC8E6FFu32;  // light blue &mdash; everything else</code></pre>
+    <p>Per-dobject <code>style.color</code> (ByLayer / ByBlock / ACI / TrueColor) was completely ignored. CPU resolved correctly via <code>resolve_color(e.style.color, e.style.layer, &amp;doc.layers, &amp;doc.truecolors)</code>; GPU just never called it.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <p>GPU's color resolution now matches CPU. Selection (yellow) and snap-source (cyan) overrides applied first; everything else routes through <code>resolve_color</code> then packs to the shader's expected byte order <code>(R&lt;&lt;24)|(G&lt;&lt;16)|(B&lt;&lt;8)|A</code>, matching the vertex-shader unpack at <code>gpu.rs:66</code>. Applies to both Circle (instance buffer u32) and non-circle (egui Color32).</p>
+    <p class="muted">No shader / kernel change &mdash; shader was always ready to take arbitrary RGBA per instance; CPU side just wasn't feeding real colors.</p>
+  </div>
+</div>
+
+<div class="bug arch" id="b10">
+  <div class="bug-header">
+    <div class="bug-id">B-10</div>
+    <div class="bug-title">CPU and GPU hatch render diverged: GPU showed hatches, CPU didn't</div>
+    <div class="bug-commit">9f1571c</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>User's screenshots: GPU rendered the hatch correctly inside a circle; CPU rendered only the circle outline. Two render paths producing different results on the same doc &mdash; clear architectural mismatch.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Root cause &mdash; three layered bugs, all from <code>Hatch::bbox() = (0,0)</code></h4>
+    <ol>
+      <li><strong>Spatial index</strong> &mdash; <code>UniformGrid::build</code> bucketed Hatch in only the origin cell. <code>query_bbox(viewport)</code> returned it only when the camera included the origin. Pan away &rarr; never in <code>candidate_iter</code>.</li>
+      <li><strong>Viewport cull</strong> at the top of the CPU per-loop checked Hatch's bbox against <code>(v_min, v_max)</code>. With bbox <code>(0,0)</code> the cull dropped Hatch unless origin was in view.</li>
+      <li><strong>State-based branches</strong> inside the CPU loop (selection-dashed, trim-pulse) routed Hatch into <code>draw_dobject_dashed</code> / <code>draw_dobject_thick</code> &mdash; both stub Hatch as no-op. Hatch in selection basket &rarr; drawn as nothing.</li>
+    </ol>
+    <p>GPU branch happened to dodge (2) and (3) because its loop has no state-based dispatch &mdash; every non-Circle reached the renderer. That's why GPU appeared to "just work" while CPU didn't, even though the underlying bbox bug was in both.</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix</h4>
+    <ul>
+      <li><strong>Kernel</strong> &mdash; new <code>Geom::is_view_independent_bbox() -&gt; bool</code>. Returns true for Hatch (and future Region/BlockRef/Xref). Default false.</li>
+      <li><strong>Spatial index</strong> &mdash; <code>UniformGrid</code> tracks <code>view_independent: Vec&lt;u32&gt;</code> separately. Build skips them when computing the world bbox + cell-size and when bucketing into cells. <code>query_bbox</code> and <code>query_near</code> always append the full list &mdash; camera position doesn't matter.</li>
+      <li><strong>App</strong> &mdash; top-of-CPU-loop Hatch short-circuit before viewport cull, micro-cull, and any state-based branch. Dispatches straight to <code>render_hatch_fill</code> with the correctly-resolved color.</li>
+    </ul>
+  </div>
+</div>
+
+<div class="bug feel" id="b11">
+  <div class="bug-header">
+    <div class="bug-id">B-11</div>
+    <div class="bug-title">Hatch pattern looks empty at default scale on small shapes</div>
+    <div class="bug-commit">58c1281</div>
+  </div>
+  <div class="bug-section">
+    <h4>How it surfaced</h4>
+    <p>Inferred from B-08 debug analysis. ANSI31's catalog spacing is 3.175 world units (the AutoCAD default = 1/8 inch). On a polygon ~2 units wide, 0 or 1 pattern lines cross the boundary &mdash; reads as "no hatch".</p>
+  </div>
+  <div class="bug-section">
+    <h4>Fix &mdash; diagnostic, not behavior</h4>
+    <p><code>dump_hatch_state</code> now emits a per-family line-count estimate and flags zero-line families:</p>
+    <pre><code>hatch #7 pattern=[ANSI31 scale=1.000 angle=0.00]
+  boundary_handles=[#5] resolved_loops=[5v bbox=2.10x3.40]
+  estimated families: [45(1 lines @ spacing 3.175)]
+  &#9888; ZERO LINES &mdash; raise scale or pick a finer pattern</code></pre>
+    <p>User-actionable: <code>hatch ANSI31 10</code> scales 10&times; and pattern becomes visible. Long-term, a "Fit Pattern to Boundary" auto-scale checkbox in the dialog would remove the friction; queued for the hatch UX polish slice.</p>
+  </div>
+</div>
+
+<!-- ============================================================ -->
+<h2>Architectural lessons</h2>
+
+<div class="bug arch" id="lesson1">
+  <div class="bug-header">
+    <div class="bug-id">L-1</div>
+    <div class="bug-title">By-reference entities need first-class kernel support</div>
+  </div>
+  <p>Hatch is the first dobject whose bbox / distance / contains depends on data the kernel can't see (boundary dobjects in the Document). Returning a placeholder <code>(0,0)</code> exposed three independent failure modes (B-10).</p>
+  <p>Same trap waits for every future <strong>by-reference</strong> entity:</p>
+  <ul>
+    <li><strong>Region</strong> (Hatch v2c) &mdash; boundary refs</li>
+    <li><strong>BlockRef</strong> &mdash; block definition ref</li>
+    <li><strong>Xref</strong> &mdash; external drawing ref</li>
+    <li><strong>Group</strong> &mdash; member refs</li>
+    <li><strong>Dimension</strong> &mdash; sometimes refs the dimensioned dobject</li>
+  </ul>
+  <p>Today's mitigation: the <code>is_view_independent_bbox()</code> trait-method pattern + spatial-index global list. Works for any number of new entity types &mdash; each one just answers true and the spatial path handles it correctly.</p>
+  <p><strong>Permanent fix</strong> queued under <em>Handle-first Document API refactor</em>: kernel methods that need Document access should take it explicitly. <code>fn bbox(&amp;self, doc: &amp;Document) -&gt; (Vec2, Vec2)</code> instead of a free <code>fn bbox(&amp;self)</code>. Touches every call site, but eliminates the placeholder-bbox class of bugs.</p>
+</div>
+
+<div class="bug arch" id="lesson2">
+  <div class="bug-header">
+    <div class="bug-id">L-2</div>
+    <div class="bug-title">State-based render dispatch is fragile against new Geom types</div>
+  </div>
+  <p>The CPU render loop has multiple state-based early-exit branches: layer-visible, viewport-cull, micro-cull, snap-source-cyan, selection-dashed, trim-cutter-pulse, extend-boundary-pulse, then finally <code>draw_dobject</code>. Each branch calls a render function with its own per-Geom match arms. Add a new Geom variant and you have to remember to handle it in EVERY branch's render function.</p>
+  <p>Today's Hatch slipped because:</p>
+  <ul>
+    <li>Stubbed in <code>draw_dobject_thick</code> when introduced</li>
+    <li>Stubbed in <code>draw_dobject_dashed</code> when introduced</li>
+    <li>Worked in the "normal" branch only, because I added the short-circuit there</li>
+  </ul>
+  <p>4&times; the work per entity type, and easy to forget &mdash; which is exactly how this happened.</p>
+  <p><strong>Permanent fix</strong> queued: a per-Geom render trait method (e.g. <code>trait Renderable { fn render_into(&amp;self, ctx: &amp;RenderCtx); }</code>) so dispatch lives WITH the geometry, not in match-arm pyramids in the render loop. The state (selected / cutter / snap source / etc.) becomes <code>RenderCtx</code> fields. Each new entity then only has ONE place to think about.</p>
+</div>
+
+<div class="bug arch" id="lesson3">
+  <div class="bug-header">
+    <div class="bug-id">L-3</div>
+    <div class="bug-title">GPU and CPU render paths drift unless they share dispatch</div>
+  </div>
+  <p>B-09 (GPU ignored per-dobject color) and B-10 (GPU/CPU diverged on Hatch) are the same shape of mistake: GPU branch was written as a simpler version of CPU, with a different short-circuit structure. Each fix to one had to be remembered in the other; bugs accumulated when memory failed.</p>
+  <p>Today's mitigation: B-09 and B-10 both audit-and-mirror &mdash; GPU now uses the same <code>resolve_color</code> + the same Hatch dispatch as CPU.</p>
+  <p><strong>Permanent fix</strong> (same as L-2): a shared <code>render_into(ctx)</code> per Geom, with the backend selection (egui Painter vs glow instance buffer) inside <code>ctx</code>. Then there is exactly one code path; the only "split" is whether each render call falls into the painter or the instance buffer at the lowest level &mdash; not whether the dispatch even happens.</p>
+</div>
+
+<div class="footer">
+  Generated 2026-06-04 &middot; All 11 fixes pushed to <code>origin/main</code> &middot;
+  Working tree clean &middot; full test suite (163 tests) passing.
+</div>
+
+</body>
+</html>
