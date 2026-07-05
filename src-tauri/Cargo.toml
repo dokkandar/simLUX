@@ -1,0 +1,38 @@
+[package]
+name = "simlux"
+version = "0.1.0"
+description = "SIMLUX — a physically-based lighting (lux) simulator for professional lighting design"
+authors = ["HSI Lighting <dev@hsilighting.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "simlux_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Math: glam for f32 vectors/matrices (serde feature lets us hand geometry to the UI).
+glam = { version = "0.29", features = ["serde"] }
+# Work-stealing parallelism for the per-grid-point lux calculation (Phase 3.2+).
+rayon = "1"
+# Ergonomic error enums across the command boundary.
+thiserror = "2"
+
+# --- Planned per-phase dependencies (uncomment as each roadmap phase lands) ---
+# Phase 3.1  dxf     = "0.5"     # DXF LWPOLYLINE / LINE parsing
+# Phase 3.2  geo     = "0.29"    # 2D boolean ops, point-in-polygon
+# Phase 3.2  earcutr = "0.4"     # robust polygon triangulation -> meshes
+# Phase 3.3  parry3d = "0.17"    # BVH + ray/triangle intersection for shadows & bounces
