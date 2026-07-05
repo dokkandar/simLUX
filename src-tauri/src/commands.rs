@@ -64,10 +64,11 @@ pub fn exec_command(state: State<AppState>, input: String) -> CmdResult {
     state.draft.lock().unwrap().exec(&input)
 }
 
-/// Feed a clicked world point to the active command.
+/// Feed a clicked world point to the active command (or select an entity when
+/// idle). `tol` is the world-space pick radius (pixels ÷ zoom).
 #[tauri::command]
-pub fn pick_point(state: State<AppState>, x: f32, y: f32) -> CmdResult {
-    state.draft.lock().unwrap().click(x, y)
+pub fn pick_point(state: State<AppState>, x: f32, y: f32, tol: f32) -> CmdResult {
+    state.draft.lock().unwrap().click(x, y, tol)
 }
 
 /// Cancel the active command (Esc).

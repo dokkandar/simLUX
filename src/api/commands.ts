@@ -13,7 +13,8 @@ export const loadDxf = (path: string) => invoke<Line2[]>("load_dxf", { path });
 
 // --- command-line drafting ---
 export const execCommand = (input: string) => invoke<CmdResult>("exec_command", { input });
-export const pickPoint = (x: number, y: number) => invoke<CmdResult>("pick_point", { x, y });
+export const pickPoint = (x: number, y: number, tol: number) =>
+  invoke<CmdResult>("pick_point", { x, y, tol });
 export const cancelCommand = () => invoke<CmdResult>("cancel_command");
 export const getGeometry = () => invoke<CmdResult>("get_geometry");
 

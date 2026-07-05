@@ -75,11 +75,14 @@ grid rendered as a heatmap. Indirect (wall reflection) was pulled in early._
 - [x] DXF = dimmed reference underlay (shared coordinate frame with 3D).
 - [x] **Extrude** the Document: each line/wall → one surface; closed paths +
       circles get floor + ceiling; arcs/circles tessellated.
-- [ ] **Modify commands**: move · copy · erase · offset · trim · extend · fillet
-      · rotate · scale · mirror (kernel has them; need pick UX). Currently they
-      parse and report "not yet".
-- [ ] Select/grip editing; snap overrides (END/MID/CEN/INT/PER); dimensions,
-      rulers, ortho/polar tracking; ellipse/spline; curved walls (`bulge`).
+- [x] **Selection**: click to select/deselect (hit-test via `distance_to_point`);
+      selected entities highlighted.
+- [x] **Modify commands**: move · copy · erase · rotate · scale · mirror ·
+      offset · trim · extend — reusing `Geom::offset/trim_at/extend_to` and
+      `DObject::translated/rotated/scaled/mirrored`.
+- [x] **OSNAP**: END / MID / CEN / INT with markers (same kinds as Auto_RASM).
+- [ ] fillet / chamfer; PER / TAN / NEA snaps + snap toggles; grip editing;
+      dimensions, rulers, ortho/polar tracking; ellipse/spline; curved walls.
 
 ## Phase 3.3 — Radiosity & indirect light ⬜
 

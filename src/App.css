@@ -247,12 +247,21 @@ button:disabled {
   border-right: 1px solid var(--border);
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 5px;
   padding: 8px 6px;
+  overflow-y: auto;
+}
+
+.palette-label {
+  font-size: 9px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--muted);
+  margin-top: 4px;
 }
 
 .palette .tool {
-  padding: 9px 4px;
+  padding: 8px 4px;
   font-size: 12px;
 }
 

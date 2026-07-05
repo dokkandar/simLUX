@@ -84,7 +84,7 @@ npm run tauri build    # produces a native installer under src-tauri/target/rele
 | `import_ies(path)`                       | `IesProfile`  | parse + store an IES file            |
 | `load_dxf(path)`                         | `Line2[]`     | load DXF plan geometry               |
 | `exec_command(input)`                    | `CmdResult`   | run a command / coordinate / keyword |
-| `pick_point(x, y)`                       | `CmdResult`   | feed a clicked point to the command  |
+| `pick_point(x, y, tol)`                  | `CmdResult`   | click → point, entity pick, or select |
 | `cancel_command()` / `get_geometry()`    | `CmdResult`   | cancel / snapshot the drawing        |
 | `add_luminaire(x, y, z, profile)`        | `Project`     | place a luminaire in the scene       |
 | `build_room(height, plane_height)`       | `Project`     | extrude the drawing → room + grid    |
@@ -94,8 +94,11 @@ npm run tauri build    # produces a native installer under src-tauri/target/rele
 ### Try it — draft a room
 
 In the **Construction** tab, use the command line (or the tool buttons):
-type `rect` ⏎ then click two corners — or type it fully: `rect` ⏎ `0,0` ⏎ `4,3` ⏎.
-Coordinates can be absolute (`3,0`), relative (`@2,0`), or polar (`@5<90`); use
-`close` / `undo` while chaining a `pline`/`wall`. Optionally `Load DXF`
-(`samples/corner sofa.dxf`) first to trace. Then `Import IES` (`samples/T1.ies`)
-→ `Build Room` (extrudes to surfaces, switches to **3D & Light**) → `Calculate`.
+type `rect` ⏎ then click two corners — or fully: `rect` ⏎ `0,0` ⏎ `4,3` ⏎.
+Coordinates: absolute (`3,0`), relative (`@2,0`), polar (`@5<90`); `close`/`undo`
+while chaining a `pline`/`wall`. The cursor snaps to **END / MID / CEN / INT**.
+
+**Edit** with the modify tools/commands: click objects to select, then `move` /
+`copy` / `rotate` / `erase`; or `trim` (click the part to remove), `extend`,
+`offset`. Then `Import IES` (`samples/T1.ies`) → `Build Room` (extrudes to
+surfaces, switches to **3D & Light**) → `Calculate`.

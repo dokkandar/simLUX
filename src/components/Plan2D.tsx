@@ -9,6 +9,7 @@ interface View {
   ty: number;
 }
 type Pt = [number, number];
+type Snap = { p: Pt; kind: "end" | "mid" | "cen" | "int" | null };
 
 function arcPoints(c: Pt, r: number, startDeg: number, sweepDeg: number, n = 40): Pt[] {
   const out: Pt[] = [];
@@ -19,9 +20,22 @@ function arcPoints(c: Pt, r: number, startDeg: number, sweepDeg: number, n = 40)
   return out;
 }
 
+function segInt(a: [Pt, Pt], b: [Pt, Pt]): Pt | null {
+  const [p1, p2] = a, [p3, p4] = b;
+  const d1x = p2[0] - p1[0], d1y = p2[1] - p1[1];
+  const d2x = p4[0] - p3[0], d2y = p4[1] - p3[1];
+  const den = d1x * d2y - d1y * d2x;
+  if (Math.abs(den) < 1e-9) return null;
+  const t = ((p3[0] - p1[0]) * d2y - (p3[1] - p1[1]) * d2x) / den;
+  const u = ((p3[0] - p1[0]) * d1y - (p3[1] - p1[1]) * d1x) / den;
+  if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+  return [p1[0] + t * d1x, p1[1] + t * d1y];
+}
+
 /** Top-down 2D CAD drafting view (SVG). World is metres, Y-up. */
 export default function Plan2D() {
   const geometry = useStore((s) => s.geometry);
+  const selected = useStore((s) => s.selected);
   const dxfLines = useStore((s) => s.dxfLines);
   const activeTool = useStore((s) => s.activeTool);
   const activePts = useStore((s) => s.activePts);
@@ -30,7 +44,7 @@ export default function Plan2D() {
   const svgRef = useRef<SVGSVGElement | null>(null);
   const [size, setSize] = useState({ w: 800, h: 600 });
   const [view, setView] = useState<View>({ scale: 40, tx: 400, ty: 300 });
-  const [hover, setHover] = useState<Pt | null>(null);
+  const [hover, setHover] = useState<Snap | null>(null);
   const pan = useRef<{ x: number; y: number; tx: number; ty: number } | null>(null);
   const down = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const fitted = useRef(false);
@@ -51,52 +65,67 @@ export default function Plan2D() {
     return 200;
   }, [view.scale]);
 
-  const snapNodes = useMemo(() => {
-    const out: Pt[] = [];
+  // OSNAP candidates (same kinds as Auto_RASM): END, MID, CEN, INT.
+  const osnap = useMemo(() => {
+    const ends: Pt[] = [], mids: Pt[] = [], cens: Pt[] = [], segs: [Pt, Pt][] = [];
+    const addSeg = (a: Pt, b: Pt) => {
+      segs.push([a, b]);
+      ends.push(a, b);
+      mids.push([(a[0] + b[0]) / 2, (a[1] + b[1]) / 2]);
+    };
     for (const g of geometry) {
-      if (g.kind === "line" || g.kind === "wall") out.push(g.a, g.b);
-      else if (g.kind === "polyline") out.push(...g.pts);
-      else if (g.kind === "circle") out.push(g.c);
+      if (g.kind === "line" || g.kind === "wall") addSeg(g.a, g.b);
+      else if (g.kind === "polyline") {
+        for (let i = 0; i < g.pts.length - 1; i++) addSeg(g.pts[i], g.pts[i + 1]);
+        if (g.closed && g.pts.length > 2) addSeg(g.pts[g.pts.length - 1], g.pts[0]);
+      } else if (g.kind === "circle") cens.push(g.c);
       else if (g.kind === "arc") {
-        out.push(g.c);
-        const a0 = (g.start_deg * Math.PI) / 180;
-        const a1 = ((g.start_deg + g.sweep_deg) * Math.PI) / 180;
-        out.push([g.c[0] + g.r * Math.cos(a0), g.c[1] + g.r * Math.sin(a0)]);
-        out.push([g.c[0] + g.r * Math.cos(a1), g.c[1] + g.r * Math.sin(a1)]);
-      } else if (g.kind === "point") out.push(g.p);
+        cens.push(g.c);
+        const a0 = (g.start_deg * Math.PI) / 180, a1 = ((g.start_deg + g.sweep_deg) * Math.PI) / 180;
+        ends.push([g.c[0] + g.r * Math.cos(a0), g.c[1] + g.r * Math.sin(a0)]);
+        ends.push([g.c[0] + g.r * Math.cos(a1), g.c[1] + g.r * Math.sin(a1)]);
+      } else if (g.kind === "point") ends.push(g.p);
     }
-    for (const l of dxfLines) out.push([l.start.x, l.start.y], [l.end.x, l.end.y]);
-    return out;
+    for (const l of dxfLines) addSeg([l.start.x, l.start.y], [l.end.x, l.end.y]);
+    const ints: Pt[] = [];
+    for (let i = 0; i < segs.length; i++)
+      for (let j = i + 1; j < segs.length; j++) {
+        const p = segInt(segs[i], segs[j]);
+        if (p) ints.push(p);
+      }
+    return { ends, mids, cens, ints };
   }, [geometry, dxfLines]);
 
   const snap = useCallback(
-    (wx: number, wy: number): Pt => {
-      let best: Pt | null = null;
-      let bd = 12 / view.scale;
-      for (const [nx, ny] of snapNodes) {
-        const d = Math.hypot(nx - wx, ny - wy);
-        if (d < bd) { bd = d; best = [nx, ny]; }
+    (wx: number, wy: number): Snap => {
+      const r = 12 / view.scale;
+      const groups: Array<[Snap["kind"], Pt[]]> = [
+        ["end", osnap.ends], ["mid", osnap.mids], ["cen", osnap.cens], ["int", osnap.ints],
+      ];
+      for (const [kind, arr] of groups) {
+        let best: Pt | null = null;
+        let bd = r;
+        for (const p of arr) {
+          const d = Math.hypot(p[0] - wx, p[1] - wy);
+          if (d < bd) { bd = d; best = p; }
+        }
+        if (best) return { p: best, kind };
       }
-      if (best) return best;
-      return [Math.round(wx / gridSpacing) * gridSpacing, Math.round(wy / gridSpacing) * gridSpacing];
+      return { p: [Math.round(wx / gridSpacing) * gridSpacing, Math.round(wy / gridSpacing) * gridSpacing], kind: null };
     },
-    [snapNodes, gridSpacing, view.scale],
+    [osnap, gridSpacing, view.scale],
   );
 
   const fit = useCallback(() => {
-    let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity, any = false;
-    const add = (x: number, y: number) => {
-      any = true;
-      mnx = Math.min(mnx, x); mny = Math.min(mny, y);
-      mxx = Math.max(mxx, x); mxy = Math.max(mxy, y);
-    };
-    for (const [x, y] of snapNodes) add(x, y);
-    if (!any) { setView({ scale: 40, tx: size.w / 2, ty: size.h / 2 }); return; }
+    const pts = [...osnap.ends, ...osnap.cens];
+    if (!pts.length) { setView({ scale: 40, tx: size.w / 2, ty: size.h / 2 }); return; }
+    let mnx = Infinity, mny = Infinity, mxx = -Infinity, mxy = -Infinity;
+    for (const [x, y] of pts) { mnx = Math.min(mnx, x); mny = Math.min(mny, y); mxx = Math.max(mxx, x); mxy = Math.max(mxy, y); }
     const bw = Math.max(mxx - mnx, 0.001), bh = Math.max(mxy - mny, 0.001);
     const scale = Math.max(2, Math.min(size.w / bw, size.h / bh) * 0.85);
     const cx = (mnx + mxx) / 2, cy = (mny + mxy) / 2;
     setView({ scale, tx: size.w / 2 - cx * scale, ty: size.h / 2 + cy * scale });
-  }, [snapNodes, size]);
+  }, [osnap, size]);
 
   useEffect(() => {
     const el = svgRef.current;
@@ -108,11 +137,11 @@ export default function Plan2D() {
   }, []);
 
   useEffect(() => {
-    if (!fitted.current && snapNodes.length > 0 && size.w > 0) {
+    if (!fitted.current && osnap.ends.length > 0 && size.w > 0) {
       fit();
       fitted.current = true;
     }
-  }, [snapNodes.length, size.w, fit]);
+  }, [osnap.ends.length, size.w, fit]);
 
   useEffect(() => {
     const el = svgRef.current;
@@ -163,8 +192,8 @@ export default function Plan2D() {
     down.current = null;
     if (d?.moved) return;
     const [wx, wy] = eventWorld(e);
-    const [sx, sy] = snap(wx, wy);
-    applyCmd(await pickPoint(sx, sy));
+    const { p } = snap(wx, wy);
+    applyCmd(await pickPoint(p[0], p[1], 12 / view.scale));
   };
 
   useEffect(() => {
@@ -194,27 +223,41 @@ export default function Plan2D() {
   }, [gridSpacing, toScreen, toWorld, size]);
 
   const poly = (pts: Pt[]) => pts.map((p) => toScreen(p[0], p[1]).join(",")).join(" ");
+  const selSet = useMemo(() => new Set(selected), [selected]);
 
   function renderGeom(g: GeomDto, i: number) {
+    const sel = selSet.has(i);
+    const stroke = sel ? "#57e08a" : "#9aa4b2";
+    const w = sel ? 2.5 : 1.5;
     if (g.kind === "line" || g.kind === "wall") {
       const [x1, y1] = toScreen(g.a[0], g.a[1]);
       const [x2, y2] = toScreen(g.b[0], g.b[1]);
-      const sw = g.kind === "wall" ? Math.max(2, g.thickness * view.scale) : 1.5;
-      return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke="#9aa4b2" strokeWidth={sw} strokeLinecap="round" />;
+      const sw = g.kind === "wall" ? Math.max(2, g.thickness * view.scale) : w;
+      return <line key={i} x1={x1} y1={y1} x2={x2} y2={y2} stroke={stroke} strokeWidth={sw} strokeLinecap="round" />;
     }
     if (g.kind === "polyline") {
       const pts = g.closed ? [...g.pts, g.pts[0]] : g.pts;
-      return <polyline key={i} points={poly(pts)} fill="none" stroke="#9aa4b2" strokeWidth={1.5} />;
+      return <polyline key={i} points={poly(pts)} fill="none" stroke={stroke} strokeWidth={w} />;
     }
     if (g.kind === "circle") {
       const [cx, cy] = toScreen(g.c[0], g.c[1]);
-      return <circle key={i} cx={cx} cy={cy} r={g.r * view.scale} fill="none" stroke="#9aa4b2" strokeWidth={1.5} />;
+      return <circle key={i} cx={cx} cy={cy} r={g.r * view.scale} fill="none" stroke={stroke} strokeWidth={w} />;
     }
     if (g.kind === "arc") {
-      return <polyline key={i} points={poly(arcPoints(g.c, g.r, g.start_deg, g.sweep_deg))} fill="none" stroke="#9aa4b2" strokeWidth={1.5} />;
+      return <polyline key={i} points={poly(arcPoints(g.c, g.r, g.start_deg, g.sweep_deg))} fill="none" stroke={stroke} strokeWidth={w} />;
     }
     const [px, py] = toScreen(g.p[0], g.p[1]);
-    return <circle key={i} cx={px} cy={py} r={2.5} fill="#9aa4b2" />;
+    return <circle key={i} cx={px} cy={py} r={2.5} fill={stroke} />;
+  }
+
+  function snapMarker(s: Snap) {
+    const [x, y] = toScreen(s.p[0], s.p[1]);
+    const c = "#ffd24a";
+    if (s.kind === "end") return <rect x={x - 5} y={y - 5} width={10} height={10} fill="none" stroke={c} strokeWidth={1.5} />;
+    if (s.kind === "mid") return <polygon points={`${x},${y - 6} ${x - 6},${y + 5} ${x + 6},${y + 5}`} fill="none" stroke={c} strokeWidth={1.5} />;
+    if (s.kind === "cen") return <circle cx={x} cy={y} r={6} fill="none" stroke={c} strokeWidth={1.5} />;
+    if (s.kind === "int") return <g stroke={c} strokeWidth={1.5}><line x1={x - 5} y1={y - 5} x2={x + 5} y2={y + 5} /><line x1={x - 5} y1={y + 5} x2={x + 5} y2={y - 5} /></g>;
+    return <circle cx={x} cy={y} r={3} fill={c} />;
   }
 
   return (
@@ -243,30 +286,28 @@ export default function Plan2D() {
 
         {geometry.map((g, i) => renderGeom(g, i))}
 
-        {/* active command preview */}
         {activePts.length >= 1 && hover && activeTool === "rectangle" && (() => {
           const [ax, ay] = toScreen(activePts[0][0], activePts[0][1]);
-          const [bx, by] = toScreen(hover[0], hover[1]);
+          const [bx, by] = toScreen(hover.p[0], hover.p[1]);
           return <rect x={Math.min(ax, bx)} y={Math.min(ay, by)} width={Math.abs(bx - ax)} height={Math.abs(by - ay)} fill="none" stroke="#ffd24a" strokeWidth={1.5} strokeDasharray="5 4" />;
         })()}
         {activePts.length >= 1 && hover && activeTool === "circle" && (() => {
           const [cx, cy] = toScreen(activePts[0][0], activePts[0][1]);
-          const r = Math.hypot(hover[0] - activePts[0][0], hover[1] - activePts[0][1]) * view.scale;
+          const r = Math.hypot(hover.p[0] - activePts[0][0], hover.p[1] - activePts[0][1]) * view.scale;
           return <circle cx={cx} cy={cy} r={r} fill="none" stroke="#ffd24a" strokeWidth={1.5} strokeDasharray="5 4" />;
         })()}
         {activePts.length >= 1 && hover && activeTool !== "rectangle" && activeTool !== "circle" && (
-          <polyline points={poly([...activePts, hover])} fill="none" stroke="#ffd24a" strokeWidth={1.5} strokeDasharray="5 4" />
+          <polyline points={poly([...activePts, hover.p])} fill="none" stroke="#ffd24a" strokeWidth={1.5} strokeDasharray="5 4" />
         )}
 
-        {hover && activeTool && (
-          <circle cx={toScreen(hover[0], hover[1])[0]} cy={toScreen(hover[0], hover[1])[1]} r={4} fill="#ffd24a" />
-        )}
+        {hover && snapMarker(hover)}
       </svg>
 
       <div className="plan2d-hud">
         <span className="tag">{activeTool ?? "ready"}</span>
-        {hover && <span>{hover[0].toFixed(2)}, {hover[1].toFixed(2)} m</span>}
+        {hover && <span>{hover.p[0].toFixed(2)}, {hover.p[1].toFixed(2)} m{hover.kind ? ` · ${hover.kind.toUpperCase()}` : ""}</span>}
         <span className="spacer" />
+        {selected.length > 0 && <span>{selected.length} selected</span>}
         <span>grid {gridSpacing} m</span>
         <button onClick={fit}>Fit</button>
       </div>

@@ -1,15 +1,34 @@
 import { useStore } from "../store/projectStore";
 import { cancelCommand, execCommand } from "../api/commands";
 
-const TOOLS: Array<{ id: string; label: string; cmd: string | null; hint: string }> = [
-  { id: "select", label: "Select", cmd: null, hint: "Cancel active command (Esc)" },
+interface Tool {
+  id: string;
+  label: string;
+  cmd: string | null;
+  hint: string;
+}
+
+const DRAW: Tool[] = [
+  { id: "select", label: "Select", cmd: null, hint: "Select/deselect (click objects); Esc cancels" },
   { id: "line", label: "Line", cmd: "line", hint: "Line chain — each segment a surface" },
   { id: "polyline", label: "Pline", cmd: "pline", hint: "Polyline (Close to make a room)" },
   { id: "rectangle", label: "Rect", cmd: "rectangle", hint: "Rectangle from two corners" },
-  { id: "circle", label: "Circle", cmd: "circle", hint: "Circle: centre + radius point" },
+  { id: "circle", label: "Circle", cmd: "circle", hint: "Circle: centre + radius" },
   { id: "arc", label: "Arc", cmd: "arc", hint: "Arc through three points" },
   { id: "wall", label: "Wall", cmd: "wall", hint: "Wall chain (has thickness)" },
   { id: "point", label: "Point", cmd: "point", hint: "Place a point" },
+];
+
+const MODIFY: Tool[] = [
+  { id: "move", label: "Move", cmd: "move", hint: "Move selection (base → destination)" },
+  { id: "copy", label: "Copy", cmd: "copy", hint: "Copy selection (base → destination)" },
+  { id: "rotate", label: "Rotate", cmd: "rotate", hint: "Rotate selection (base + angle/point)" },
+  { id: "scale", label: "Scale", cmd: "scale", hint: "Scale selection (base + factor/point)" },
+  { id: "mirror", label: "Mirror", cmd: "mirror", hint: "Mirror selection across a line" },
+  { id: "offset", label: "Offset", cmd: "offset", hint: "Offset an object — pick it, then a side" },
+  { id: "trim", label: "Trim", cmd: "trim", hint: "Trim to cutting edges — click the part to remove" },
+  { id: "extend", label: "Extend", cmd: "extend", hint: "Extend to boundaries — click near the end" },
+  { id: "erase", label: "Erase", cmd: "erase", hint: "Erase the selection" },
 ];
 
 export default function ToolPalette() {
@@ -23,22 +42,26 @@ export default function ToolPalette() {
       applyCmd(await cancelCommand());
       return;
     }
-    const line = id === "wall" ? `wall ${thickness}` : cmd;
-    applyCmd(await execCommand(line));
+    applyCmd(await execCommand(id === "wall" ? `wall ${thickness}` : cmd));
   }
+
+  const btn = (t: Tool) => (
+    <button
+      key={t.id}
+      title={t.hint}
+      className={activeTool === t.id ? "tool active" : "tool"}
+      onClick={() => pick(t.id, t.cmd)}
+    >
+      {t.label}
+    </button>
+  );
 
   return (
     <aside className="palette">
-      {TOOLS.map((t) => (
-        <button
-          key={t.id}
-          title={t.hint}
-          className={activeTool === t.id ? "tool active" : "tool"}
-          onClick={() => pick(t.id, t.cmd)}
-        >
-          {t.label}
-        </button>
-      ))}
+      <div className="palette-label">Draw</div>
+      {DRAW.map(btn)}
+      <div className="palette-label">Modify</div>
+      {MODIFY.map(btn)}
       <div className="palette-field">
         <label>Wall t</label>
         <input

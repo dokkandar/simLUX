@@ -136,5 +136,6 @@ export interface CmdResult {
   active: boolean;
   active_tool: string | null;
   active_pts: [number, number][];
+  selected: number[];
   geometry: GeomDto[];
 }

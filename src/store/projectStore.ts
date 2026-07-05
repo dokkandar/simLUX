@@ -17,6 +17,7 @@ interface AppStore {
   tab: Tab;
   // Command-line drafting state (mirrors the backend session).
   geometry: GeomDto[];
+  selected: number[];
   prompt: string;
   activeTool: string | null;
   activePts: [number, number][];
@@ -43,6 +44,7 @@ export const useStore = create<AppStore>((set) => ({
   busy: false,
   tab: "construction",
   geometry: [],
+  selected: [],
   prompt: "Command:",
   activeTool: null,
   activePts: [],
@@ -61,6 +63,7 @@ export const useStore = create<AppStore>((set) => ({
   applyCmd: (r) =>
     set((s) => ({
       geometry: r.geometry,
+      selected: r.selected,
       prompt: r.prompt || "Command:",
       activeTool: r.active_tool,
       activePts: r.active_pts,
