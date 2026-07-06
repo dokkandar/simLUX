@@ -187,6 +187,45 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
   Kept verbatim (flagged): `Zoom Extents (fit all)`→done; Dimension flyout's
   `Dimension  (smart: linear · radius · diameter)` — owner may trim. Edit shortcuts
   `Ctrl+C/V/G` + Tools `Ctrl+Shift+P` now render right-aligned muted Mono (§1).
+- **Edit category pass (2026-07-13):** `Erase selection`→`Erase` (label only, cmd
+  unchanged). **New app-layer shortcuts** wired alongside Ctrl+C/V/G in the `update`
+  input block: **Select All = Shift+A**, **Deselect All = Ctrl/Cmd+D** — both shown
+  right-aligned in the menu, both verified on-screen (Shift+A→6 sel, Ctrl+D→0 sel),
+  **no binding conflicts** (no prior A/D global bind). Shift+A drops its `"A"` text
+  event so it selects instead of typing (gated by cmd-empty like Ctrl+C/V/G).
+- **Shortcut font → Geist (GLOBAL, 2026-07-13):** the shared `RowT::Shortcut` path
+  now renders in `typ::hint` (Geist 11, muted) not Mono — one change point in
+  `paint_menu_row` + matching `hw` measurer in `menu_hug_geometry`. Mono stays only
+  for `(CODE)` + numbers. Verified in Edit (Ctrl+C/V/G, Shift+A, Ctrl+D) AND Tools
+  (Ctrl+Shift+P). **Undo/Redo cmd-glyphs recentered** on x=0 (`draw_cmd_glyph`) so
+  they align in the icon column — those glyphs are Edit-menu-only, safe to change.
+- **Arrow-column gap 6→32 (GLOBAL, §2, 2026-07-13):** new `MENU_ARROW_GAP=32` const;
+  `menu_hug_geometry` decoupled so the submenu-▸ column = `base + 32` while shortcuts
+  keep the 6 gap and right-align to the 12 right pad (independent). One change point →
+  every menu. Verified on Draw (Circle/Arc/Insert-Block arrows ~32px past `Wall
+  (t = thickness)`, menu hugs to the column). Shortcuts unaffected.
+- **Tools category pass (2026-07-13):**
+  - **§8 real checkbox in `MenuIcon::Check`** — now ALWAYS draws the Inspector-style
+    16×16 r4 box: OFF = surface-0 fill + 1px `border` (muted, never a blank slot);
+    ON = cyan fill + on-accent check. Applies to every toggle row (Command line,
+    Layers, Pens, Inspector, DObjects, rails, Snap, Session Recorder).
+  - **Session Recorder** — dropped the `🛰` (tofu □); now a plain toggle row.
+  - **Text Style…** removed from Tools (lives in Formative → Styles).
+  - **§10 menu-launch positioning + bring-to-front (2026-07-13):**
+    - **Position:** `apply_dock_pos` applies a `menu_launch_anchor` (id→pos) as
+      `default_pos` (first-open only; egui remembers user moves after). Tools records
+      the anchor adjacent-right/top-aligned to the clicked row (`r.right()+8, r.top()`).
+    - **Bring-to-front (`raise_windows` queue):** on every menu-open, the panel id is
+      queued; consumed once when it renders. `raise_after_show` `move_to_top`s the
+      egui::Window panels (Layers / Pens / DObjects / **Session Recorder**);
+      `raise_dock_after_show` raises the `dock::HOST` float area `(id,"float")` for
+      **Inspector / Command line** when floating (docked = pinned edge, no-op).
+    - **Session Recorder** now anchors adjacent-right + raises (was left/behind); given
+      `apply_dock_pos("Session Recorder")`.
+    - Remembered geometry still wins for position; raise fires regardless of position.
+    - **Snap window** toggle has NO renderer (dead toggle — nothing to position); left
+      as a plain checkbox. Inspector/Command-line anchor entries are inert (those use
+      the dock host, not `apply_dock_pos`) — raise is what applies to them.
 - **Missing icons (reserved 20px slot — later icon-assign pass):** Edit → Paste,
   Group, Add to Group, Ungroup, Select All, Deselect All, Settings…; Modify →
   Inspector…; View → all 4 zoom; Help → both; File → Import/parametric/Exit;

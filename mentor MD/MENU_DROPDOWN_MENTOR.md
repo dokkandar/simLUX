@@ -47,10 +47,13 @@ Every command is one row, left → right:
   (`METHOD_ACCESS` §1).
 - **Arrow ▸:** only where the row opens a submenu (method submenu OR real submenu like
   Insert Block). One **unified size + tone** for all arrows (`text-muted`).
-- **Shortcut hint (optional):** where a command has a keyboard shortcut (Edit:
-  `Ctrl+C` / `Ctrl+V` / `Ctrl+G`), show it **right-aligned, `text-muted`, Mono** in the
-  trailing zone. A row has **either** a shortcut **or** a submenu arrow, never both. The
-  trailing element (shortcut or arrow) is what the width + alignment rule measures.
+- **Shortcut hint (optional):** where a command has a keyboard shortcut, show it
+  **right-aligned** in the trailing zone — **Geist 11 (`hint` token), `text-muted`**
+  (sans, *not* mono — mono read too code-editor; sans matches the command names).
+  Mono stays for `(CODE)` and numbers only. A row has **either** a shortcut **or** a
+  submenu arrow, never both. The trailing element (shortcut or arrow) is what the width
+  + alignment rule measures. Current Edit shortcuts: `Copy Ctrl+C`, `Paste Ctrl+V`,
+  `Group Ctrl+G`, **`Select All Shift+A`**, **`Deselect All Ctrl+D`**.
 
 **Metrics (exact — the SINGLE source; the one shared row painter uses these, no menu
 overrides anything):**
@@ -62,8 +65,10 @@ overrides anything):**
 | Left pad — menu inner edge → icon | **12** |
 | Icon → name gap | **14** |
 | Name → (CODE) gap | **6** |
-| Longest line → trailing (arrow/shortcut) gap | **6** |
+| Longest line → **arrow** column gap | **32** |
 | Trailing → right pad — arrow/shortcut → menu inner edge | **12** |
+
+*(Shortcuts right-align to the 12 right pad; they do not use the arrow-column gap.)*
 | Group divider | 1px `border`, 5 above/below |
 | Flyout radius | `radius::SM` (4) |
 
@@ -76,9 +81,8 @@ the painter, never to re-tune numbers locally.
 
 ## 2. Arrow-column alignment (rule — applies to EVERY menu/submenu)
 
-- The **arrow column x = (right edge of the longest full line in the menu) + the
-  name↔code gap (6)**. The longest line includes any parenthetical (e.g.
-  `Wall (t = thickness)`).
+- The **arrow column x = (right edge of the longest full line in the menu) + 32**.
+  The longest line includes any parenthetical (e.g. `Wall (t = thickness)`).
 - **All** submenu arrows in that menu align to that single column.
 - The menu is **exactly wide enough** to fit `icon + longest line + gap + arrow +
   edge padding` — no far-edge void, no arbitrary width.
@@ -208,10 +212,14 @@ Two extra row types:
   **11/500 UPPERCASE**, dim (`#66707A`), at the **name column** (icon slot empty), small
   top pad; a group divider above it (except the first). **No hover.**
 - **Checkbox / toggle row** (panel-visibility toggles: Command line, Layers, Pens,
-  Inspector, …): a normal 26 row; the **check indicator sits in the icon-column slot** —
-  **cyan (`accent`) check when ON**, empty when OFF. Name normal tone; full-width hover
-  like any row. *(If a toggle ever also needs a command icon, the check moves
-  right-aligned; default is check-in-slot.)*
+  Inspector, …): a normal 26 row; the **checkbox sits in the icon-column slot**, reusing
+  the **Inspector checkbox component** (`INSPECTOR_DESIGN_MENTOR.md` §5 / THEME §5.10):
+  - **OFF → empty stroked box** (16×16, radius 4, 1px `border`, muted). **Always shown**
+    — the empty box is what tells the user this row is a toggle and *can* receive a
+    check. Never render OFF as a blank slot.
+  - **ON → same box, cyan (`accent`)** with the check (accent check / `on-accent` glyph).
+  - Name normal tone; full-width hover like any row. *(If a toggle ever also needs a
+    command icon, the check moves right-aligned; default is check-in-slot.)*
 
 ---
 
@@ -224,3 +232,34 @@ arrow-column + hug width, `SM(4)` radius, and **hover-open / commit-on-click** (
 Submenus may **nest** (a flyout row opens a further flyout) — identical rules at every
 level. This is what lets File (Import), Formative, and Tools conform instead of staying
 native.
+
+---
+
+## 10. Menu-launched surface positioning (everywhere)
+
+**Any** surface opened from a menu item — a submenu flyout, a **dialog**, or a **panel**
+(Layers, Pens, …) — is **anchored to the launching item**. It must never open behind,
+to the left of, or otherwise away from where the user clicked (the user has to be able
+to track where it went).
+
+- **Parent menu STAYS open** (e.g. a submenu flyout): the new surface opens **adjacent
+  to the right, top-aligned** to the launching row. The method/submenu **flyout is the
+  reference — match it exactly.**
+- **Parent menu CLOSES** (e.g. a dialog/panel that dismisses the menu): the new surface
+  opens at the **same anchor where the click happened** — right at / just below the
+  clicked item, so the eye tracks from click → surface.
+- **Never** the current Layers/Pens bug: opened from Tools, they appear *backward /
+  left of* the dropdown with dead space — wrong. They should open at the click anchor
+  (menu side, upward), like the flyout.
+- **Bring to front (z-order):** the launched surface is **raised above** the menu and any
+  existing panels the moment it opens. It must **never** appear *behind* the dropdown or
+  another window — "opens backward the menu" is a bug even when the position is right.
+- **Remembered geometry wins:** once the user moves a floating panel, its saved position
+  is used (WORKSPACE_SYSTEM §5). This rule governs the **first open / no-remembered-pos**
+  case. (Bring-to-front applies **every** open, remembered position or not.)
+- **Applies to ALL menu-launched panels — no subset.** Route **every** panel toggled from
+  a menu through the same anchor + raise choke point: Layers, Pens, DObjects list,
+  Inspector, Snap, Session Recorder, Command line, … A panel left on its own ad-hoc
+  positioning (opening left / behind) is the inconsistency this rule exists to remove.
+
+The flyout's placement is the **gold standard** for every menu-launched surface.

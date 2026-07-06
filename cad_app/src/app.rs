@@ -974,6 +974,17 @@ pub struct CadApp {
     /// (vertical strip). Corner docks pin position but leave size
     /// content-driven.
     docked_window_pos: HashMap<&'static str, DockState>,
+    /// §10 menu-launch anchor: window-id → the screen pos a menu item wants the
+    /// panel to FIRST open at (adjacent to the launching row). Applied as
+    /// `default_pos` in `apply_dock_pos`, so it only governs the first open /
+    /// no-remembered-position case — once the user moves the panel, egui's own
+    /// remembered geometry wins (WORKSPACE §5).
+    menu_launch_anchor: HashMap<&'static str, egui::Pos2>,
+    /// §10 bring-to-front: window-ids to raise above other panels this frame (a
+    /// menu just toggled them ON). Consumed (removed) when the window renders and
+    /// gets `move_to_top`'d — so it fires once on open regardless of render order,
+    /// and regardless of whether the panel uses a remembered position.
+    raise_windows: Vec<&'static str>,
     /// Accumulated hold-time on each docked window's title bar. Once
     /// it reaches `DOCK_UNDOCK_HOLD_SEC` (~200 ms), the dock state is
     /// cleared and the window goes back to free positioning so the
@@ -2667,6 +2678,8 @@ impl Default for CadApp {
             hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
+            menu_launch_anchor:  HashMap::new(),
+            raise_windows:       Vec::new(),
             dock_undock_hold:    HashMap::new(),
             dock_dragging:       std::collections::HashSet::new(),
             canvas_screen_rect:  None,
@@ -7162,15 +7175,50 @@ impl CadApp {
     /// Window goes back to free positioning + sizing.
     fn apply_dock_pos<'a>(
         &self,
-        _id: &'static str,
+        id: &'static str,
         _ctx: &egui::Context,
         window: egui::Window<'a>,
     ) -> egui::Window<'a> {
-        // Auto-docking + auto-resize disabled per user request — was
-        // wasting time on edge cases. Windows are now plain floating:
-        // user moves and resizes manually. Will be redone in a dedicated
-        // dock-system pass later.
-        window
+        // Auto-docking + auto-resize disabled per user request — windows are plain
+        // floating (user moves/resizes manually). §10 menu-launch positioning: if a
+        // menu item asked this panel to open at a specific anchor, use it as the
+        // `default_pos` (overriding the window's own default). `default_pos` only
+        // applies on the FIRST open / when egui has no remembered position — so once
+        // the user drags the panel, its saved geometry wins (WORKSPACE §5).
+        if let Some(&anchor) = self.menu_launch_anchor.get(id) {
+            window.default_pos(anchor)
+        } else {
+            window
+        }
+    }
+
+    /// §10 bring-to-front. Call right after a floating panel's `.show(...)`: if a
+    /// menu just toggled it ON (`id` is queued in `raise_windows`), raise its layer
+    /// above the other panels and consume the request. Fires once on open, whether
+    /// or not the panel used a remembered position. A no-op when nothing queued.
+    fn raise_after_show<R>(&mut self, id: &'static str, ctx: &egui::Context,
+                           resp: &Option<egui::InnerResponse<R>>) {
+        if let Some(i) = self.raise_windows.iter().position(|&x| x == id) {
+            if let Some(r) = resp {
+                ctx.move_to_top(r.response.layer_id);
+                self.raise_windows.remove(i);
+            }
+        }
+    }
+
+    /// §10 bring-to-front for a `dock::HOST` panel (Inspector, Command line). Call
+    /// after its `.show(...)`. The host's floating area id is `(dock_id, "float")`
+    /// at `Order::Middle`; raise it only when actually `floating` (a docked panel is
+    /// pinned to its edge — already visible, nothing to raise). Consumes the request.
+    fn raise_dock_after_show(&mut self, raise_key: &'static str, dock_id: &'static str,
+                             floating: bool, ctx: &egui::Context) {
+        if let Some(i) = self.raise_windows.iter().position(|&x| x == raise_key) {
+            if floating {
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle, egui::Id::new((dock_id, "float"))));
+            }
+            self.raise_windows.remove(i);
+        }
     }
 
     /// After a Window has been shown, compute whether any of its edges
@@ -8986,7 +9034,9 @@ impl CadApp {
             .default_size(egui::vec2(380.0, 220.0))
             .resizable(true)
             .collapsible(true);
-        win.show(ctx, |ui| {
+        // §10: anchor to the launching menu row (first open) + raise to front.
+        let win = self.apply_dock_pos("Session Recorder", ctx, win);
+        let resp = win.show(ctx, |ui| {
             let is_recording = self.dbg.recording;
             ui.horizontal(|ui| {
                 let start_btn = egui::Button::new(
@@ -9114,6 +9164,7 @@ impl CadApp {
                     .suffix(" events"));
             });
         });
+        self.raise_after_show("Session Recorder", ctx, &resp);
         self.dbg_window_open = open;
     }
 
@@ -9761,6 +9812,7 @@ impl CadApp {
                     self.aci_pick_request = Some(AciPickRequest::Layer(id));
                 }
             });
+        self.raise_after_show("Layers", ctx, &resp);
         self.process_dock_after_show("Layers", ctx, resp);
         self.layers_window_open = open;
     }
@@ -10085,6 +10137,7 @@ impl CadApp {
                     }
                 }
             });
+        self.raise_after_show("Pens", ctx, &resp);
         self.process_dock_after_show("Pens", ctx, resp);
         self.pens_window_open = open;
     }
@@ -10140,6 +10193,8 @@ impl CadApp {
         let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
             self.inspector_body(ui, cap, pill.as_deref());
         });
+        self.raise_dock_after_show("Inspector", "inspector",
+            matches!(state, crate::dock::DockState::Floating(_)), ctx);
         self.inspector_dock_state = state;
         self.info_window_open = open;
         if capturing && rect.is_finite() {
@@ -19697,7 +19752,8 @@ const MENU_ROW_H:   f32 = 26.0;   // row / hover band (§1)
 const MENU_PAD:     f32 = 12.0;   // inner pad — left (edge→icon) AND right (trailing→edge) (§1)
 const MENU_ICON:    f32 = 20.0;   // icon column width (box = ROW_H − 6 = 20)
 const MENU_ICON_GAP: f32 = 14.0;  // icon → name
-const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE), and longest-line → trailing zone
+const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE), and longest-line → shortcut zone
+const MENU_ARROW_GAP: f32 = 32.0; // longest-line → submenu-arrow column (§2, wide gap)
 const MENU_ARROW_W: f32 = 10.0;   // arrow column width
 /// Grace period before a hover-opened flyout closes after the pointer leaves both
 /// the arrow and the flyout — lets the user travel diagonally onto it (§2).
@@ -19818,7 +19874,7 @@ enum MenuIcon<'a> { Draw(&'static str), Cmd(GlyphKind), Method(&'a str, &'a str)
 /// and `paint_menu_row` (paint). LINE part (grouped right after the name): `Code` =
 /// cyan method (CODE) in Mono (§4), `Hint` = muted Wall parenthetical (§5). ZONE
 /// part (the trailing zone at/after the arrow column): `Arrow` = submenu ▸,
-/// `Shortcut` = right-aligned muted Mono keys. `CodeArrow` = a method row that ALSO
+/// `Shortcut` = right-aligned muted Geist keys (§1). `CodeArrow` = a method row that ALSO
 /// opens a submenu (`Circle (CR) ▸`). Per §1 a row has at most one ZONE element
 /// (shortcut XOR arrow); the zone element is what the width rule measures.
 #[derive(Clone, Copy)]
@@ -19867,13 +19923,26 @@ fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
             draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink, ibox / GLYPH_BOX_METHOD),
         MenuIcon::Qat(act) =>
             paint_qat_icon(&p, egui::Rect::from_center_size(gc, egui::vec2(ibox, ibox)), act, g_ink),
-        MenuIcon::Check(on) => if on {
-            // §8: cyan check in the icon slot when the toggle is ON (empty when off).
-            p.add(egui::Shape::line(vec![
-                egui::pos2(gc.x - 5.0, gc.y + 0.5), egui::pos2(gc.x - 1.5, gc.y + 4.0),
-                egui::pos2(gc.x + 5.5, gc.y - 4.5)],
-                egui::Stroke::new(1.6, PP_ACCENT)));
-        },
+        MenuIcon::Check(on) => {
+            // §8 toggle checkbox — the Inspector component (INSPECTOR_DESIGN §5 /
+            // THEME §5.10): a 16×16 r4 box ALWAYS rendered in the icon slot.
+            //   OFF → surface-0 fill + 1px muted `border` (tells the user it's a
+            //         toggle that can receive a check — never a blank slot).
+            //   ON  → same box in cyan `accent` with an on-accent check glyph.
+            let bx = egui::Rect::from_center_size(gc, egui::vec2(16.0, 16.0));
+            let r4 = egui::Rounding::same(crate::theme::radius::SM);
+            if on {
+                p.rect(bx, r4, PP_ACCENT, egui::Stroke::new(1.0, PP_ACCENT));
+                let oa = crate::theme::color::ON_ACCENT;
+                let cy = bx.center().y;
+                p.line_segment([egui::pos2(bx.left() + 3.5, cy + 0.5),
+                                egui::pos2(bx.left() + 6.5, cy + 3.5)], egui::Stroke::new(1.6, oa));
+                p.line_segment([egui::pos2(bx.left() + 6.5, cy + 3.5),
+                                egui::pos2(bx.right() - 3.0, cy - 3.5)], egui::Stroke::new(1.6, oa));
+            } else {
+                p.rect(bx, r4, PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
+            }
+        }
         MenuIcon::None => {}
     }
 
@@ -19894,7 +19963,8 @@ fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
     }
 
     // ZONE trailing (§1): a ▸ on the aligned arrow column, OR a right-aligned
-    // muted-Mono shortcut at the right inner edge. Never both.
+    // shortcut at the right inner edge. Never both. Shortcuts render in Geist
+    // sans (`typ::hint`, muted) — Mono is reserved for (CODE) + numbers (§1).
     let has_arrow = matches!(trail, RowT::Arrow | RowT::CodeArrow(..));
     if has_arrow {
         let ax = rect.left() + arrow_x;
@@ -19906,7 +19976,7 @@ fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
     if let RowT::Shortcut(sc) = trail {
         p.text(egui::pos2(rect.right() - MENU_PAD, rect.center().y),
             egui::Align2::RIGHT_CENTER, sc,
-            crate::theme::typ::data_code(), crate::theme::color::TEXT_MUTED);
+            crate::theme::typ::hint(), crate::theme::color::TEXT_MUTED);
     }
 
     // The ▸ opens the flyout on HOVER (§2); the row's CLICK runs the command.
@@ -19922,14 +19992,18 @@ fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
 /// shortcut). Every menu calls this so all hug + align identically, no per-menu
 /// math. Call under the popup `ui` (needs its fonts).
 fn menu_hug_geometry(ui: &egui::Ui, rows: &[(&str, RowT)]) -> (f32, f32) {
-    let fn_ = crate::theme::typ::body();
-    let fc_ = crate::theme::typ::data_code();
+    let fn_ = crate::theme::typ::body();       // name — Geist 13
+    let fc_ = crate::theme::typ::data_code();   // (CODE) — Mono 11
+    let fh_ = crate::theme::typ::hint();        // shortcut — Geist 11 (§1)
     let nw = |s: &str| ui.fonts(|f|
         f.layout_no_wrap(s.to_string(), fn_.clone(), egui::Color32::WHITE).size().x);
     let cw = |s: &str| ui.fonts(|f|
         f.layout_no_wrap(s.to_string(), fc_.clone(), egui::Color32::WHITE).size().x);
-    let mut line = 0.0_f32;   // icon → end of name (+ any left-grouped CODE/hint)
-    let mut zone = 0.0_f32;   // trailing zone: the widest arrow OR shortcut
+    let hw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fh_.clone(), egui::Color32::WHITE).size().x);
+    let mut line = 0.0_f32;      // icon → end of name (+ any left-grouped CODE/hint)
+    let mut has_arrow = false;   // any submenu ▸ in this menu
+    let mut max_sc = 0.0_f32;    // widest right-aligned shortcut
     for (name, trail) in rows {
         let lt = match trail {
             RowT::Code(c, _) | RowT::CodeArrow(c, _) => MENU_CODE_GAP + cw(&format!("({})", c)),
@@ -19937,15 +20011,21 @@ fn menu_hug_geometry(ui: &egui::Ui, rows: &[(&str, RowT)]) -> (f32, f32) {
             _ => 0.0,
         };
         line = line.max(nw(name) + lt);
-        let zt = match trail {
-            RowT::Arrow | RowT::CodeArrow(..) => MENU_ARROW_W,
-            RowT::Shortcut(s) => cw(s),
-            _ => 0.0,
-        };
-        zone = zone.max(zt);
+        match trail {
+            RowT::Arrow | RowT::CodeArrow(..) => has_arrow = true,
+            RowT::Shortcut(s) => max_sc = max_sc.max(hw(s)),
+            _ => {}
+        }
     }
-    let arrow_x = MENU_PAD + MENU_ICON + MENU_ICON_GAP + line + MENU_CODE_GAP;
-    (arrow_x, arrow_x + zone + MENU_PAD)
+    // `base` = right edge of the longest full line. The submenu-arrow column sits a
+    // WIDE gap past it (§2: line + 32); shortcuts keep the small 6 gap and right-align
+    // to the 12 right pad — so the arrow gap and shortcut spacing are independent.
+    let base = MENU_PAD + MENU_ICON + MENU_ICON_GAP + line;
+    let arrow_x = base + MENU_ARROW_GAP;
+    let mut right = base;
+    if has_arrow { right = right.max(arrow_x + MENU_ARROW_W); }
+    if max_sc > 0.0 { right = right.max(base + MENU_CODE_GAP + max_sc); }
+    (arrow_x, right + MENU_PAD)
 }
 
 /// Open a custom-painted category dropdown (MENU_DROPDOWN chrome, ONE place):
@@ -20775,26 +20855,27 @@ fn draw_cmd_glyph(
             }
         }
         GlyphKind::Undo => {
-            // curved arrow ←
+            // curved arrow ← — arc centered on x=0 (was drawn in the left half,
+            // making the icon look shifted vs its neighbours in the menu column).
             let mut pts = Vec::with_capacity(17);
             for i in 0..=16 {
                 let t = (i as f32 / 16.0) * std::f32::consts::PI;
-                pts.push(v(-9.0 + 9.0 * t.cos(), -9.0 * t.sin()));
+                pts.push(v(9.0 * t.cos(), -9.0 * t.sin()));
             }
             p.add(egui::Shape::line(pts, pen));
-            let tip = v(-9.0, 0.0);
+            let tip = v(0.0, 0.0);
             p.line_segment([tip, tip + vec2(4.0,-3.0)], pen);
             p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
         }
         GlyphKind::Redo => {
-            // mirror of undo →
+            // mirror of undo → — arc centered on x=0.
             let mut pts = Vec::with_capacity(17);
             for i in 0..=16 {
                 let t = (i as f32 / 16.0) * std::f32::consts::PI;
-                pts.push(v(9.0 - 9.0 * t.cos(), -9.0 * t.sin()));
+                pts.push(v(-9.0 * t.cos(), -9.0 * t.sin()));
             }
             p.add(egui::Shape::line(pts, pen));
-            let tip = v(9.0, 0.0);
+            let tip = v(0.0, 0.0);
             p.line_segment([tip, tip + vec2(-4.0,-3.0)], pen);
             p.line_segment([tip, tip + vec2(-4.0, 3.0)], pen);
         }
@@ -21697,17 +21778,25 @@ impl eframe::App for CadApp {
                 || self.text_draft != TextDraftState::Off
                 || self.text_waiting_height;
             if !editing_text {
-                let (copy, paste) = ctx.input_mut(|i| {
+                let (copy, paste, select_all, deselect_all) = ctx.input_mut(|i| {
                     // Key fallback in case the platform delivers raw keys.
                     let mut copy  = i.modifiers.command && i.key_pressed(egui::Key::C);
                     let mut paste = i.modifiers.command && i.key_pressed(egui::Key::V);
+                    // Edit shortcuts (MENU_DROPDOWN §1) — app-layer input, NOT parser
+                    // words: Select All = Shift+A, Deselect All = Ctrl/Cmd+D. Verified
+                    // conflict-free (no other A/D binding).
+                    let select_all   = i.modifiers.shift && !i.modifiers.command
+                                       && i.key_pressed(egui::Key::A);
+                    let deselect_all = i.modifiers.command && i.key_pressed(egui::Key::D);
                     // Primary path: eframe's clipboard events (Ctrl+C/X/V).
                     i.events.retain(|e| match e {
                         egui::Event::Copy | egui::Event::Cut => { copy = true; false }
                         egui::Event::Paste(_)                => { paste = true; false }
+                        // Drop the "A" text event so Shift+A selects (not types "A").
+                        egui::Event::Text(t) if select_all && t == "A" => false,
                         _ => true,
                     });
-                    (copy, paste)
+                    (copy, paste, select_all, deselect_all)
                 });
                 if copy {
                     self.copy_selection();
@@ -21723,6 +21812,9 @@ impl eframe::App for CadApp {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
                     self.group_selection();
                 }
+                // Shift+A / Ctrl+D — select-all / deselect-all (mirror the Edit menu).
+                if select_all { self.run_command("select"); self.run_command("all"); }
+                if deselect_all { self.selection.clear(); self.selected = None; }
             }
         }
 
@@ -22152,10 +22244,11 @@ impl eframe::App for CadApp {
                         { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
                     pp_cap_ui(ui, "menu: File");
                 });
-                // Edit — custom rows (MENU_DROPDOWN). Undo/Redo/Copy/Erase/Match
-                // have Cmd glyphs; the rest reserve the empty 20px slot (§1). The
-                // Ctrl+ shortcuts render as a muted hint (spec has no shortcut
-                // column — flagged for a label decision).
+                // Edit — custom rows (MENU_DROPDOWN §1). Undo/Redo/Copy/Erase/Match
+                // have Cmd glyphs; the rest reserve the empty 20px slot so all names
+                // align at the fixed name column. Shortcuts render right-aligned in
+                // the trailing zone (Mono-11, muted) — Ctrl+C/V/G + Shift+A (Select
+                // All) / Ctrl+D (Deselect All), wired in the input block below.
                 custom_menu(ui, "Edit", |ui| {
                     let nc = PP_TEXT;
                     let (arrow_x, w) = menu_hug_geometry(ui, &[
@@ -22164,8 +22257,9 @@ impl eframe::App for CadApp {
                         ("Paste", RowT::Shortcut("Ctrl+V")),
                         ("Group", RowT::Shortcut("Ctrl+G")),
                         ("Add to Group", RowT::Plain), ("Ungroup", RowT::Plain),
-                        ("Select All", RowT::Plain), ("Deselect All", RowT::Plain),
-                        ("Erase selection", RowT::Plain),
+                        ("Select All", RowT::Shortcut("Shift+A")),
+                        ("Deselect All", RowT::Shortcut("Ctrl+D")),
+                        ("Erase", RowT::Plain),
                         ("Match Properties", RowT::Plain),
                         ("Settings…", RowT::Plain),
                     ]);
@@ -22191,12 +22285,12 @@ impl eframe::App for CadApp {
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Ungroup", nc, RowT::Plain).0
                         { self.ungroup_selection(); ui.close_menu(); }
                     menu_divider(ui, w);
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Select All", nc, RowT::Plain).0
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Select All", nc, RowT::Shortcut("Shift+A")).0
                         { self.run_command("select"); self.run_command("all"); ui.close_menu(); }
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Deselect All", nc, RowT::Plain).0
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Deselect All", nc, RowT::Shortcut("Ctrl+D")).0
                         { self.selection.clear(); self.selected = None; ui.close_menu(); }
                     menu_divider(ui, w);
-                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.erase"), "Erase selection", nc, RowT::Plain).0
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.erase"), "Erase", nc, RowT::Plain).0
                         { self.run_command("erase"); ui.close_menu(); }
                     if paint_menu_row(ui, w, arrow_x, icon_for("edit.matchprop"), "Match Properties", nc, RowT::Plain).0
                         { self.run_command("matchprop"); ui.close_menu(); }
@@ -22439,8 +22533,7 @@ impl eframe::App for CadApp {
                         ("Command rails", RowT::Plain),
                         ("Draw rail (left)", RowT::Plain), ("Modify rail (left)", RowT::Plain),
                         ("Snap window", RowT::Plain), ("Toggle Grips", RowT::Plain),
-                        ("Text Style…", RowT::Plain),
-                        ("🛰 Session Recorder", RowT::Plain),
+                        ("Session Recorder", RowT::Plain),
                         ("Inquiry", RowT::Plain),
                         ("Distance", RowT::Plain), ("List", RowT::Plain),
                         ("Debug tools", RowT::Arrow),
@@ -22451,17 +22544,32 @@ impl eframe::App for CadApp {
                         if paint_menu_row(ui, w, arrow_x, MenuIcon::Check($field), $name, nc, RowT::Plain).0
                             { $field = !$field; }
                     }; }
+                    // §10 panel toggle: like check_row, but on OPEN it (a) records the
+                    // menu-launch anchor (adjacent-right, top-aligned to this row) so the
+                    // panel first opens beside the menu — not backward/left — and (b)
+                    // queues a bring-to-front so it opens ON TOP, never behind the
+                    // dropdown or other panels. `$id` must match the panel's dock id.
+                    macro_rules! panel_row { ($name:expr, $field:expr, $id:expr) => {{
+                        let (clk, _, r) = paint_menu_row(ui, w, arrow_x, MenuIcon::Check($field), $name, nc, RowT::Plain);
+                        if clk {
+                            $field = !$field;
+                            if $field {
+                                self.menu_launch_anchor.insert($id, egui::pos2(r.right() + 8.0, r.top()));
+                                self.raise_windows.push($id);
+                            }
+                        }
+                    }}; }
                     menu_heading_row(ui, w, "Palettes");
-                    check_row!("Command line", self.cmd_window_open);
+                    panel_row!("Command line", self.cmd_window_open, "Command line");
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command palette…", nc, RowT::Shortcut("Ctrl+Shift+P")).0 {
                         self.palette_open = true; self.palette_focus = true;
                         self.palette_query.clear(); self.palette_sel = 0;
                         ui.close_menu();
                     }
-                    check_row!("Layers", self.layers_window_open);
-                    check_row!("Pens", self.pens_window_open);
-                    check_row!("Inspector", self.info_window_open);
-                    check_row!("DObjects list", self.dobjects_window_open);
+                    panel_row!("Layers", self.layers_window_open, "Layers");
+                    panel_row!("Pens", self.pens_window_open, "Pens");
+                    panel_row!("Inspector", self.info_window_open, "Inspector");
+                    panel_row!("DObjects list", self.dobjects_window_open, "DObjects");
                     menu_divider(ui, w);
                     menu_heading_row(ui, w, "Command rails");
                     check_row!("Draw rail (left)", self.draw_rail_open);
@@ -22471,16 +22579,19 @@ impl eframe::App for CadApp {
                     if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Toggle Grips", nc, RowT::Plain).0 {
                         self.env.GrpEnb = !self.env.GrpEnb; let _ = self.env.save(); ui.close_menu();
                     }
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Text Style…", nc, RowT::Plain).0 {
-                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuClick {
-                            path: "Tools → Text Style…".into() });
-                        self.run_command("style"); ui.close_menu();
-                    }
+                    // (Text Style… removed — it lives in Formative → Styles now.)
                     menu_divider(ui, w);
-                    if paint_menu_row(ui, w, arrow_x, MenuIcon::Check(self.dbg_window_open), "🛰 Session Recorder", nc, RowT::Plain).0 {
+                    // Session Recorder — a §8 toggle row that also anchors + raises (§10).
+                    let (sr_clk, _, sr_r) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Check(self.dbg_window_open), "Session Recorder", nc, RowT::Plain);
+                    if sr_clk {
                         self.dbg_window_open = !self.dbg_window_open;
+                        if self.dbg_window_open {
+                            self.menu_launch_anchor.insert("Session Recorder", egui::pos2(sr_r.right() + 8.0, sr_r.top()));
+                            self.raise_windows.push("Session Recorder");
+                        }
                         crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuClick {
-                            path: format!("Tools → 🛰 Session Recorder ({})",
+                            path: format!("Tools → Session Recorder ({})",
                                 if self.dbg_window_open { "open" } else { "close" }) });
                     }
                     menu_divider(ui, w);
@@ -22875,6 +22986,7 @@ impl eframe::App for CadApp {
                 }
             });
         });
+        self.raise_after_show("DObjects", ctx, &resp);
         self.process_dock_after_show("DObjects", ctx, resp);
         self.dobjects_window_open = dobjects_open;
 
@@ -23132,6 +23244,8 @@ impl eframe::App for CadApp {
             crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
                 self.command_bar_body(ui, cap);
             });
+            self.raise_dock_after_show("Command line", "command",
+                matches!(state, crate::dock::DockState::Floating(_)), ctx);
             self.cmd_dock_state = state;
             self.cmd_window_open = open;
         }

@@ -151,8 +151,14 @@ Depth via the surface ladder (§5.3); in-flow elements flat (border + tone). One
 `shadow-popover` reserved for floating/overlay layers only.
 
 ### 5.10 Menus
+> **Superseded for the current dropdown-menu design by `mentor MD/MENU_DROPDOWN_MENTOR.md`
+> (authoritative).** That spec differs here: 26px band, SM(4) corners, `surface-2`
+> hover, 20px icon column, cyan `(CODE)` current-method marker, cyan-check-in-slot
+> toggles, `▸` arrow, and **right-aligned muted-SANS (Geist `hint`) shortcuts**. The
+> line below is the original spec, kept for history.
+
 Item 28px (26 in selects), square corners, `surface-3` + popover shadow, hover
-white 6%, right-aligned muted-mono shortcuts, `›` submenu arrow, hairline
+white 6%, right-aligned **muted-sans (Geist `hint`)** shortcuts, `▸` submenu arrow, hairline
 dividers; **toggle = stroked box (empty off / cyan-check on)**, **current =
 solid cyan ■**, 16px aligned lead column, disabled = dimmed + reason.
 
