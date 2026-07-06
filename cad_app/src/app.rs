@@ -340,13 +340,6 @@ fn text_button(ui: &mut egui::Ui, text: &str, size: f32) -> egui::Response {
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-/// A menu section heading — readable caption size + a legible muted token
-/// (the old `.small()` at ~9px was too small/low-contrast to read).
-fn menu_heading(ui: &mut egui::Ui, text: &str) {
-    ui.label(egui::RichText::new(text).font(crate::theme::typ::caption())
-        .color(crate::theme::color::TEXT_SECONDARY));
-}
-
 /// A 1px full-width divider line in the panel border colour.
 fn pp_divider(ui: &mut egui::Ui) {
     let w = ui.available_width();
@@ -669,54 +662,6 @@ fn card_lock_vec(v: Vec2) -> Vec2 {
     if v.x.abs() >= v.y.abs() { Vec2::new(v.x, 0.0) } else { Vec2::new(0.0, v.y) }
 }
 
-/// An acquired object-snap TRACKING anchor (AutoCAD EXT / OTRACK). Set when
-/// an END snap on a line fires during a point-pick; the cursor then tracks
-/// the collinear ray from `origin` along `dir` so a new segment CONTINUES
-/// the touched line ("get the endpoint, move, it extends the line"). The
-/// analog of CARD's H/V lock, but the lock axis is the line's own direction.
-#[derive(Clone, Copy, Debug)]
-struct TrackAnchor {
-    /// The acquired endpoint — ray origin, world space.
-    origin: Vec2,
-    /// Unit OUTWARD extension direction (points away from the segment body,
-    /// i.e. the direction that continues the line past the endpoint).
-    dir: Vec2,
-}
-
-impl TrackAnchor {
-    /// Build from a line's two endpoints and the endpoint that was snapped.
-    /// `dir` points outward from the segment (away from the far end), so the
-    /// ray continues the line. Returns None for a degenerate (zero-length)
-    /// line.
-    fn from_line_end(snapped: Vec2, a: Vec2, b: Vec2) -> Option<TrackAnchor> {
-        // Pick whichever endpoint the snap landed on; the other end defines
-        // the inward direction, so outward = (endpoint - other).
-        let (origin, other) = if snapped.dist(a) <= snapped.dist(b) { (a, b) } else { (b, a) };
-        // Guard: the snapped point must ACTUALLY be this endpoint. An END hit
-        // sourced from the in-progress-polyline phantom or a block phantom
-        // carries a `dobject` index relative to its OWN slice (often Some(0)),
-        // which can collide with a real `doc.dobjects[0]`. If the looked-up
-        // line's endpoints aren't at the snap point, this isn't its endpoint —
-        // reject rather than acquire a bogus ray. (END returns the exact
-        // vertex, so a real hit matches to the bit.)
-        if snapped.dist(origin) > 1e-6 { return None; }
-        let d = origin - other;
-        let l = d.len();
-        if l < EPS { return None; }
-        Some(TrackAnchor { origin, dir: d * (1.0 / l) })
-    }
-
-    /// Project `raw` onto the OUTWARD extension ray when it's within `tol`
-    /// (perpendicular) of the ray AND on the outward side. Returns the foot
-    /// on the ray, else None (cursor isn't tracking the extension this frame).
-    fn project(&self, raw: Vec2, tol: f64) -> Option<Vec2> {
-        let along = (raw - self.origin).dot(self.dir);
-        if along <= 0.0 { return None; }              // only continue outward
-        let foot = self.origin + self.dir * along;
-        if raw.dist(foot) <= tol { Some(foot) } else { None }
-    }
-}
-
 /// Collect the defining endpoints of a (cut-edge) geom — used to build the
 /// opening region a block cuts into host geometry.
 fn edge_endpoints(g: &Geom, out: &mut Vec<Vec2>) {
@@ -990,12 +935,6 @@ pub struct CadApp {
     /// clear any stale dock-pos so the window appears at its default
     /// position instead of getting stuck behind a panel.
     screen_stats_was_open: bool,
-    /// SIMLUX lighting: engine state + the Light panel (IES, materials,
-    /// room height, computed lux grid). Driven by the `cad_light` crate.
-    light: crate::light::LightState,
-    /// SIMLUX 3D viewport renderer (offscreen-FBO glow). Shared into the egui
-    /// PaintCallback, so it lives behind an Arc<Mutex> like `gpu_renderer`.
-    light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
     /// Background worker for hatch trace. `None` when no trace is in
     /// flight. While `Some`, every frame `poll_hatch_worker` tries to
     /// receive the result; on receipt the loops are materialised as
@@ -1035,6 +974,17 @@ pub struct CadApp {
     /// (vertical strip). Corner docks pin position but leave size
     /// content-driven.
     docked_window_pos: HashMap<&'static str, DockState>,
+    /// §10 menu-launch anchor: window-id → the screen pos a menu item wants the
+    /// panel to FIRST open at (adjacent to the launching row). Applied as
+    /// `default_pos` in `apply_dock_pos`, so it only governs the first open /
+    /// no-remembered-position case — once the user moves the panel, egui's own
+    /// remembered geometry wins (WORKSPACE §5).
+    menu_launch_anchor: HashMap<&'static str, egui::Pos2>,
+    /// §10 bring-to-front: window-ids to raise above other panels this frame (a
+    /// menu just toggled them ON). Consumed (removed) when the window renders and
+    /// gets `move_to_top`'d — so it fires once on open regardless of render order,
+    /// and regardless of whether the panel uses a remembered position.
+    raise_windows: Vec<&'static str>,
     /// Accumulated hold-time on each docked window's title bar. Once
     /// it reaches `DOCK_UNDOCK_HOLD_SEC` (~200 ms), the dock state is
     /// cleared and the window goes back to free positioning so the
@@ -1143,6 +1093,21 @@ pub struct CadApp {
     palette_sel:         usize,
     /// One-shot: request focus on the search box the frame after opening.
     palette_focus:       bool,
+    /// Palette window position — `None` until first dragged (then it's user-
+    /// placed and persists for the session). Dragging the Floating header band
+    /// moves it (§3.1).
+    palette_pos:         Option<egui::Pos2>,
+    /// Open flyout STACK (§9) — frame 0 spawned by a menubar row's ▸, deeper frames
+    /// by a flyout row's ▸ (nesting). Rendered at the top level so it survives the
+    /// parent dropdown closing (MENU_DROPDOWN §2.1); opens on HOVER, closes after a
+    /// short delay once the pointer leaves the whole stack. Empty = nothing open.
+    menu_flyouts:        Vec<FlyFrame>,
+    /// Set true each frame the pointer is over an arrow (by the menu) or the
+    /// flyout (by `render_menu_flyouts`); drives the hover stay-open + close delay.
+    menu_flyout_hot:     bool,
+    /// `ctx.input().time` when the pointer left both the arrow and the flyout —
+    /// the flyout closes `MENU_FLYOUT_CLOSE_DELAY` seconds later (travel tolerance).
+    menu_flyout_leave_t: Option<f64>,
     /// Per-command **preferred method** (dispatch token → method key), session
     /// level. Set by a command's ▼ flyout; APPLIED by `execute(id)` so every
     /// surface (menu, rail, palette, shortcut) runs the remembered method. The
@@ -1237,11 +1202,6 @@ pub struct CadApp {
     /// Enter/Space uses this point — so a new line/arc/circle/… continues from
     /// where the previous command ended.
     last_point:    Option<Vec2>,
-    /// Acquired object-snap TRACKING anchor (AutoCAD EXT / OTRACK). Set when
-    /// an END snap on a line fires during a point-pick; the cursor then
-    /// tracks the collinear ray so a new segment CONTINUES the touched line.
-    /// Auto-cleared when no point-pick phase is active.
-    track_anchor:  Option<TrackAnchor>,
     pending:       Vec<Vec2>,
     /// Per-segment bulge for the polyline tool. `pending_bulges[i]` is the
     /// AutoCAD bulge (tan(theta/4)) of the segment from `pending[i]` to
@@ -1395,6 +1355,12 @@ pub struct CadApp {
     render_mode:  RenderMode,
     debug_open:   bool,
     gpu_renderer: StdArc<Mutex<GpuShapeRenderer>>,
+    /// SIMLUX lighting: engine state + Light panel (IES, materials, room
+    /// height, computed lux grid). Driven by the `cad_light` crate.
+    light: crate::light::LightState,
+    /// SIMLUX 3D viewport renderer (offscreen-FBO glow), shared into the egui
+    /// PaintCallback like `gpu_renderer`.
+    light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
     gpu_dirty:    bool,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
@@ -2715,11 +2681,11 @@ impl Default for CadApp {
             last_render_stats:   RenderStats::default(),
             screen_stats_open:   false,
             screen_stats_was_open: false,
-            light:               crate::light::LightState::new(),
-            light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             hatch_worker:        None,
             op_cancel:           StdArc::new(AtomicBool::new(false)),
             docked_window_pos:   HashMap::new(),
+            menu_launch_anchor:  HashMap::new(),
+            raise_windows:       Vec::new(),
             dock_undock_hold:    HashMap::new(),
             dock_dragging:       std::collections::HashSet::new(),
             canvas_screen_rect:  None,
@@ -2750,6 +2716,10 @@ impl Default for CadApp {
             palette_query:        String::new(),
             palette_sel:          0,
             palette_focus:        false,
+            palette_pos:          None,
+            menu_flyouts:         Vec::new(),
+            menu_flyout_hot:      false,
+            menu_flyout_leave_t:  None,
             command_method:    std::collections::HashMap::new(),
             dobjects_window_open: false,
             aci_picker:          {
@@ -2768,7 +2738,6 @@ impl Default for CadApp {
             selected:      None,
             tool:          Tool::None,
             last_point:    None,
-            track_anchor:  None,
             arc_method:    ArcMethod::ThreePoints,
             arc_picker_open: false,
             pending:       Vec::new(),
@@ -2837,6 +2806,8 @@ impl Default for CadApp {
             hatch_cache: HashMap::new(),
             debug_open:   false,
             gpu_renderer: StdArc::new(Mutex::new(GpuShapeRenderer::default())),
+            light:               crate::light::LightState::new(),
+            light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             gpu_dirty:    true,
             layer_panel_open:   true,
             layer_rename:       None,
@@ -3018,6 +2989,200 @@ enum CmdUndo { Handled, NothingLeft, NoCommand }
 
 impl CadApp {
     // ---- commands & math -----------------------------------------------
+
+    // ===== SIMLUX lighting integration (grafted from simLUX main) ========
+    /// Drives the `cad_light` engine on the shared document; `Calculate` needs
+    /// `&self.doc`, so the panel returns an action instead of touching it.
+    fn render_light_panel(&mut self, ctx: &egui::Context) {
+        if !self.light.window_open { return; }
+        let mut open = self.light.window_open;
+        let mut action = crate::light::LightAction::default();
+        egui::Window::new("SIMLUX — Light")
+            .open(&mut open)
+            .default_width(288.0)
+            .resizable(true)
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical().show(ui, |ui| {
+                    action = self.light.panel_ui(ui);
+                });
+            });
+        self.light.window_open = open;
+        if action.calculate {
+            self.light.calculate(&self.doc);
+        }
+    }
+
+    /// Paint the computed lux grid as a 2D false-colour overlay on the plan,
+    /// mapping each work-plane cell through the same `w2s` view transform as the
+    /// geometry so the heatmap tracks pan/zoom exactly. Clipped to the canvas.
+    fn paint_lux_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if !self.light.show_overlay {
+            return;
+        }
+        let (Some(grid), Some(plane)) = (self.light.grid.as_ref(), self.light.plane.as_ref())
+        else {
+            return;
+        };
+        if grid.values.is_empty() {
+            return;
+        }
+        let maxv = self.light.scale_ceiling();
+        let dx = plane.width / plane.cols.max(1) as f32;
+        let dy = plane.depth / plane.rows.max(1) as f32;
+        let clip = painter.with_clip_rect(rect);
+        for row in 0..plane.rows {
+            for col in 0..plane.cols {
+                let v = grid.values[(row * plane.cols + col) as usize];
+                let color = crate::light::lux_color((v / maxv) as f32);
+                let x0 = plane.origin.x + col as f32 * dx;
+                let y0 = plane.origin.y + row as f32 * dy;
+                let p0 = self.w2s(Vec2::new(x0 as f64, y0 as f64), rect);
+                let p1 = self.w2s(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
+                clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0, color);
+            }
+        }
+    }
+
+    /// Paint placed luminaires as markers on the 2D plan.
+    fn paint_luminaires_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
+        if self.light.luminaires.is_empty() {
+            return;
+        }
+        let clip = painter.with_clip_rect(rect);
+        let gold = egui::Color32::from_rgb(255, 214, 90);
+        let dark = egui::Color32::from_rgb(70, 48, 0);
+        for l in &self.light.luminaires {
+            let p = self.w2s(Vec2::new(l.position.x as f64, l.position.y as f64), rect);
+            clip.circle_filled(p, 5.0, gold);
+            clip.circle_stroke(p, 8.0, egui::Stroke::new(1.5, dark));
+            clip.line_segment([egui::pos2(p.x - 9.0, p.y), egui::pos2(p.x + 9.0, p.y)], egui::Stroke::new(1.0, gold));
+            clip.line_segment([egui::pos2(p.x, p.y - 9.0), egui::pos2(p.x, p.y + 9.0)], egui::Stroke::new(1.0, gold));
+        }
+    }
+
+    /// Build the flat-shaded (+ optional lux floor) triangle soup for the 3D view.
+    fn build_scene3d_verts(&self) -> Vec<crate::light3d::V3> {
+        if self.light.meshes.is_empty() {
+            return Vec::new();
+        }
+        let floor = if self.light.floor_heatmap {
+            match (self.light.grid.as_ref(), self.light.plane.as_ref()) {
+                (Some(g), Some(p)) => Some((
+                    g,
+                    p,
+                    self.light.scale_ceiling(),
+                    crate::light::lux_rgb as fn(f32) -> (f32, f32, f32),
+                )),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let mut verts = crate::light3d::build_scene_verts(&self.light.meshes, &self.light.materials, floor);
+        let s = (self.light.cam_dist * 0.02).clamp(0.05, 0.3);
+        for l in &self.light.luminaires {
+            crate::light3d::push_luminaire_marker(&mut verts, l.position.x, l.position.y, l.position.z, s);
+        }
+        verts
+    }
+
+    /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
+    /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
+    /// be added BEFORE the CentralPanel so it reserves the right edge.
+    fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
+        if !self.light.view3d_open {
+            return;
+        }
+        let mut open = self.light.view3d_open;
+        egui::SidePanel::right("simlux_3d_panel")
+            .resizable(true)
+            .default_width(360.0)
+            .min_width(220.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("SIMLUX — 3D");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Close 3D view").clicked() {
+                            open = false;
+                        }
+                        ui.label(egui::RichText::new("drag: orbit · scroll: zoom").small().weak());
+                    });
+                });
+                ui.separator();
+
+                if let Some(g) = self.light.grid.as_ref() {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("avg {:.0}", g.avg)).small());
+                        ui.label(egui::RichText::new(format!("· min {:.0}", g.min)).small().weak());
+                        ui.label(egui::RichText::new(format!("· max {:.0} lx", g.max)).small().weak());
+                    });
+                    crate::light::legend_bar(ui, self.light.scale_ceiling());
+                    ui.separator();
+                }
+
+                let size = ui.available_size();
+                let (resp, painter) = ui.allocate_painter(size, egui::Sense::drag());
+                let rect = resp.rect;
+
+                // ---- orbit + zoom ------------------------------------------
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    self.light.cam_yaw -= d.x * 0.01;
+                    self.light.cam_pitch = (self.light.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
+                }
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.0 {
+                        self.light.cam_dist =
+                            (self.light.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.5, 500.0);
+                    }
+                }
+
+                // ---- scene + camera ----------------------------------------
+                let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.0 };
+                let mvp = crate::light3d::mvp(
+                    self.light.cam_yaw,
+                    self.light.cam_pitch,
+                    self.light.cam_dist,
+                    self.light.cam_target,
+                    aspect,
+                );
+                let verts = self.build_scene3d_verts();
+
+                if verts.is_empty() {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Draw a room, then press Calculate",
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_gray(150),
+                    );
+                } else {
+                    let renderer = self.light3d_renderer.clone();
+                    let cb = egui::PaintCallback {
+                        rect,
+                        callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
+                            let gl = gp.gl();
+                            let vp = info.viewport_in_pixels();
+                            let s = info.screen_size_px;
+                            if let Ok(mut r) = renderer.lock() {
+                                r.render(
+                                    gl, &verts, &mvp,
+                                    vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
+                                    s[0] as i32, s[1] as i32,
+                                );
+                            }
+                        })),
+                    };
+                    painter.add(egui::Shape::Callback(cb));
+                }
+                if resp.dragged() || (resp.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0)) {
+                    ui.ctx().request_repaint();
+                }
+            });
+        self.light.view3d_open = open;
+    }
+    // ===== end SIMLUX lighting ==========================================
 
     /// True when ANY command / draw tool / modify flow is mid-operation. Used
     /// by command-internal undo to decide whether a bare "U" is an in-command
@@ -7212,15 +7377,50 @@ impl CadApp {
     /// Window goes back to free positioning + sizing.
     fn apply_dock_pos<'a>(
         &self,
-        _id: &'static str,
+        id: &'static str,
         _ctx: &egui::Context,
         window: egui::Window<'a>,
     ) -> egui::Window<'a> {
-        // Auto-docking + auto-resize disabled per user request — was
-        // wasting time on edge cases. Windows are now plain floating:
-        // user moves and resizes manually. Will be redone in a dedicated
-        // dock-system pass later.
-        window
+        // Auto-docking + auto-resize disabled per user request — windows are plain
+        // floating (user moves/resizes manually). §10 menu-launch positioning: if a
+        // menu item asked this panel to open at a specific anchor, use it as the
+        // `default_pos` (overriding the window's own default). `default_pos` only
+        // applies on the FIRST open / when egui has no remembered position — so once
+        // the user drags the panel, its saved geometry wins (WORKSPACE §5).
+        if let Some(&anchor) = self.menu_launch_anchor.get(id) {
+            window.default_pos(anchor)
+        } else {
+            window
+        }
+    }
+
+    /// §10 bring-to-front. Call right after a floating panel's `.show(...)`: if a
+    /// menu just toggled it ON (`id` is queued in `raise_windows`), raise its layer
+    /// above the other panels and consume the request. Fires once on open, whether
+    /// or not the panel used a remembered position. A no-op when nothing queued.
+    fn raise_after_show<R>(&mut self, id: &'static str, ctx: &egui::Context,
+                           resp: &Option<egui::InnerResponse<R>>) {
+        if let Some(i) = self.raise_windows.iter().position(|&x| x == id) {
+            if let Some(r) = resp {
+                ctx.move_to_top(r.response.layer_id);
+                self.raise_windows.remove(i);
+            }
+        }
+    }
+
+    /// §10 bring-to-front for a `dock::HOST` panel (Inspector, Command line). Call
+    /// after its `.show(...)`. The host's floating area id is `(dock_id, "float")`
+    /// at `Order::Middle`; raise it only when actually `floating` (a docked panel is
+    /// pinned to its edge — already visible, nothing to raise). Consumes the request.
+    fn raise_dock_after_show(&mut self, raise_key: &'static str, dock_id: &'static str,
+                             floating: bool, ctx: &egui::Context) {
+        if let Some(i) = self.raise_windows.iter().position(|&x| x == raise_key) {
+            if floating {
+                ctx.move_to_top(egui::LayerId::new(
+                    egui::Order::Middle, egui::Id::new((dock_id, "float"))));
+            }
+            self.raise_windows.remove(i);
+        }
     }
 
     /// After a Window has been shown, compute whether any of its edges
@@ -9036,7 +9236,9 @@ impl CadApp {
             .default_size(egui::vec2(380.0, 220.0))
             .resizable(true)
             .collapsible(true);
-        win.show(ctx, |ui| {
+        // §10: anchor to the launching menu row (first open) + raise to front.
+        let win = self.apply_dock_pos("Session Recorder", ctx, win);
+        let resp = win.show(ctx, |ui| {
             let is_recording = self.dbg.recording;
             ui.horizontal(|ui| {
                 let start_btn = egui::Button::new(
@@ -9164,6 +9366,7 @@ impl CadApp {
                     .suffix(" events"));
             });
         });
+        self.raise_after_show("Session Recorder", ctx, &resp);
         self.dbg_window_open = open;
     }
 
@@ -9811,6 +10014,7 @@ impl CadApp {
                     self.aci_pick_request = Some(AciPickRequest::Layer(id));
                 }
             });
+        self.raise_after_show("Layers", ctx, &resp);
         self.process_dock_after_show("Layers", ctx, resp);
         self.layers_window_open = open;
     }
@@ -10135,6 +10339,7 @@ impl CadApp {
                     }
                 }
             });
+        self.raise_after_show("Pens", ctx, &resp);
         self.process_dock_after_show("Pens", ctx, resp);
         self.pens_window_open = open;
     }
@@ -10149,199 +10354,6 @@ impl CadApp {
     //      panel) → full geometry breakdown + editable style fields.
     //   2. Multi-Dobject selection (`self.selection`) → summary counts +
     //      bulk-edit layer / visibility / color.
-
-    /// SIMLUX Light panel — floats over the canvas; toggled from Tools ▸ SIMLUX.
-    /// Drives the `cad_light` engine on the shared document; `Calculate` needs
-    /// `&self.doc`, so the panel returns an action instead of touching it.
-    fn render_light_panel(&mut self, ctx: &egui::Context) {
-        if !self.light.window_open { return; }
-        let mut open = self.light.window_open;
-        let mut action = crate::light::LightAction::default();
-        egui::Window::new("SIMLUX — Light")
-            .open(&mut open)
-            .default_width(288.0)
-            .resizable(true)
-            .show(ctx, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    action = self.light.panel_ui(ui);
-                });
-            });
-        self.light.window_open = open;
-        if action.calculate {
-            self.light.calculate(&self.doc);
-        }
-    }
-
-    /// Paint the computed lux grid as a 2D false-colour overlay on the plan,
-    /// mapping each work-plane cell through the same `w2s` view transform as the
-    /// geometry so the heatmap tracks pan/zoom exactly. Clipped to the canvas.
-    fn paint_lux_overlay(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if !self.light.show_overlay {
-            return;
-        }
-        let (Some(grid), Some(plane)) = (self.light.grid.as_ref(), self.light.plane.as_ref())
-        else {
-            return;
-        };
-        if grid.values.is_empty() {
-            return;
-        }
-        let maxv = self.light.scale_ceiling();
-        let dx = plane.width / plane.cols.max(1) as f32;
-        let dy = plane.depth / plane.rows.max(1) as f32;
-        let clip = painter.with_clip_rect(rect);
-        for row in 0..plane.rows {
-            for col in 0..plane.cols {
-                let v = grid.values[(row * plane.cols + col) as usize];
-                let color = crate::light::lux_color((v / maxv) as f32);
-                let x0 = plane.origin.x + col as f32 * dx;
-                let y0 = plane.origin.y + row as f32 * dy;
-                let p0 = self.w2s(Vec2::new(x0 as f64, y0 as f64), rect);
-                let p1 = self.w2s(Vec2::new((x0 + dx) as f64, (y0 + dy) as f64), rect);
-                clip.rect_filled(egui::Rect::from_two_pos(p0, p1), 0.0, color);
-            }
-        }
-    }
-
-    /// Paint placed luminaires as markers on the 2D plan.
-    fn paint_luminaires_2d(&self, painter: &egui::Painter, rect: egui::Rect) {
-        if self.light.luminaires.is_empty() {
-            return;
-        }
-        let clip = painter.with_clip_rect(rect);
-        let gold = egui::Color32::from_rgb(255, 214, 90);
-        let dark = egui::Color32::from_rgb(70, 48, 0);
-        for l in &self.light.luminaires {
-            let p = self.w2s(Vec2::new(l.position.x as f64, l.position.y as f64), rect);
-            clip.circle_filled(p, 5.0, gold);
-            clip.circle_stroke(p, 8.0, egui::Stroke::new(1.5, dark));
-            clip.line_segment([egui::pos2(p.x - 9.0, p.y), egui::pos2(p.x + 9.0, p.y)], egui::Stroke::new(1.0, gold));
-            clip.line_segment([egui::pos2(p.x, p.y - 9.0), egui::pos2(p.x, p.y + 9.0)], egui::Stroke::new(1.0, gold));
-        }
-    }
-
-    /// Build the flat-shaded (+ optional lux floor) triangle soup for the 3D view.
-    fn build_scene3d_verts(&self) -> Vec<crate::light3d::V3> {
-        if self.light.meshes.is_empty() {
-            return Vec::new();
-        }
-        let floor = if self.light.floor_heatmap {
-            match (self.light.grid.as_ref(), self.light.plane.as_ref()) {
-                (Some(g), Some(p)) => Some((
-                    g,
-                    p,
-                    self.light.scale_ceiling(),
-                    crate::light::lux_rgb as fn(f32) -> (f32, f32, f32),
-                )),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let mut verts = crate::light3d::build_scene_verts(&self.light.meshes, &self.light.materials, floor);
-        let s = (self.light.cam_dist * 0.02).clamp(0.05, 0.3);
-        for l in &self.light.luminaires {
-            crate::light3d::push_luminaire_marker(&mut verts, l.position.x, l.position.y, l.position.z, s);
-        }
-        verts
-    }
-
-    /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
-    /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
-    /// be added BEFORE the CentralPanel so it reserves the right edge.
-    fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
-        if !self.light.view3d_open {
-            return;
-        }
-        let mut open = self.light.view3d_open;
-        egui::SidePanel::right("simlux_3d_panel")
-            .resizable(true)
-            .default_width(360.0)
-            .min_width(220.0)
-            .show(ctx, |ui| {
-                ui.horizontal(|ui| {
-                    ui.strong("SIMLUX — 3D");
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").on_hover_text("Close 3D view").clicked() {
-                            open = false;
-                        }
-                        ui.label(egui::RichText::new("drag: orbit · scroll: zoom").small().weak());
-                    });
-                });
-                ui.separator();
-
-                if let Some(g) = self.light.grid.as_ref() {
-                    ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new(format!("avg {:.0}", g.avg)).small());
-                        ui.label(egui::RichText::new(format!("· min {:.0}", g.min)).small().weak());
-                        ui.label(egui::RichText::new(format!("· max {:.0} lx", g.max)).small().weak());
-                    });
-                    crate::light::legend_bar(ui, self.light.scale_ceiling());
-                    ui.separator();
-                }
-
-                let size = ui.available_size();
-                let (resp, painter) = ui.allocate_painter(size, egui::Sense::drag());
-                let rect = resp.rect;
-
-                // ---- orbit + zoom ------------------------------------------
-                if resp.dragged() {
-                    let d = resp.drag_delta();
-                    self.light.cam_yaw -= d.x * 0.01;
-                    self.light.cam_pitch = (self.light.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
-                }
-                if resp.hovered() {
-                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
-                    if scroll.abs() > 0.0 {
-                        self.light.cam_dist =
-                            (self.light.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.5, 500.0);
-                    }
-                }
-
-                // ---- scene + camera ----------------------------------------
-                let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.0 };
-                let mvp = crate::light3d::mvp(
-                    self.light.cam_yaw,
-                    self.light.cam_pitch,
-                    self.light.cam_dist,
-                    self.light.cam_target,
-                    aspect,
-                );
-                let verts = self.build_scene3d_verts();
-
-                if verts.is_empty() {
-                    painter.text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        "Draw a room, then press Calculate",
-                        egui::FontId::proportional(13.0),
-                        egui::Color32::from_gray(150),
-                    );
-                } else {
-                    let renderer = self.light3d_renderer.clone();
-                    let cb = egui::PaintCallback {
-                        rect,
-                        callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
-                            let gl = gp.gl();
-                            let vp = info.viewport_in_pixels();
-                            let s = info.screen_size_px;
-                            if let Ok(mut r) = renderer.lock() {
-                                r.render(
-                                    gl, &verts, &mvp,
-                                    vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
-                                    s[0] as i32, s[1] as i32,
-                                );
-                            }
-                        })),
-                    };
-                    painter.add(egui::Shape::Callback(cb));
-                }
-                if resp.dragged() || (resp.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0)) {
-                    ui.ctx().request_repaint();
-                }
-            });
-        self.light.view3d_open = open;
-    }
 
     fn render_info_panel(&mut self, ctx: &egui::Context) {
         if !self.info_window_open { return; }
@@ -10383,6 +10395,8 @@ impl CadApp {
         let rect = crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
             self.inspector_body(ui, cap, pill.as_deref());
         });
+        self.raise_dock_after_show("Inspector", "inspector",
+            matches!(state, crate::dock::DockState::Floating(_)), ctx);
         self.inspector_dock_state = state;
         self.info_window_open = open;
         if capturing && rect.is_finite() {
@@ -10505,14 +10519,14 @@ impl CadApp {
     ///
     /// It **applies the command-level preferred method** (`command_method`, set
     /// via a ▼ flyout): if this command has a remembered method, run it
-    /// (`rail_flyout_dispatch`); otherwise the base/default form (`dispatch_base`).
+    /// (`dispatch_method`); otherwise the base/default form (`dispatch_base`).
     /// So the remembered method is honored consistently from every surface —
     /// menu, rail, palette, shortcut. (The command line is exempt; it stays
     /// base/explicit until the deferred command-methods track.)
     fn execute(&mut self, id: &str) {
         if let Some(dispatch) = self.command_registry.get(id).map(|c| c.dispatch) {
             if let Some(key) = self.command_method.get(dispatch).cloned() {
-                self.rail_flyout_dispatch(dispatch, &key);
+                self.dispatch_method(dispatch, &key);
             } else {
                 self.dispatch_base(dispatch);
             }
@@ -10561,17 +10575,56 @@ impl CadApp {
         let cmd_ctx = self.build_ctx();
         let q = self.palette_query.to_lowercase();
 
-        // Filtered, visible commands in canonical order (owned — the registry
-        // borrow drops before we execute).
-        struct Hit { id: String, title: String, icon: crate::command::IconId, enabled: bool }
+        // Build the result rows (owned — the registry borrow drops before we
+        // execute). A method-bearing command (arc/circle/fillet) contributes a
+        // BASE entry (method-aware glyph → runs the remembered method) plus an
+        // inline "methods" GROUP of variant rows (each its own construction glyph
+        // → runs AND sets that method). ONE source (`rail_flyout_items`) + method
+        // memory (`command_method`), same as rail + menu. §1 label = `Name (CODE)`.
+        // Per-row fuzzy so typing `2P` filters straight to that method (§3).
+        enum HitGlyph { Base(crate::command::IconId), Method { cmd: String, key: String } }
+        #[derive(Clone)]
+        enum HitRun { Execute(String), Method { cmd: String, key: String } }
+        struct Hit { name: String, code: String, enabled: bool, glyph: HitGlyph,
+                     run: HitRun, variant: bool, current: bool }
         let mut hits: Vec<Hit> = Vec::new();
         for id in &self.command_registry.order {
             if let Some(info) = self.command_registry.commands.get(id) {
                 if !(info.visible)(&cmd_ctx) { continue; }              // 6b: hidden
-                let hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
-                if palette_fuzzy(&q, &hay) {
-                    hits.push(Hit { id: id.clone(), title: info.title.clone(),
-                                    icon: info.icon, enabled: (info.enabled)(&cmd_ctx) });
+                let ena = (info.enabled)(&cmd_ctx);
+                let dispatch = info.dispatch;
+                let methods  = rail_flyout_items(dispatch);
+                if methods.is_empty() {
+                    // Non-method command — a plain row (no code).
+                    let hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
+                    if !palette_fuzzy(&q, &hay) { continue; }
+                    hits.push(Hit { name: info.title.clone(), code: String::new(),
+                        enabled: ena, glyph: HitGlyph::Base(info.icon),
+                        run: HitRun::Execute(id.clone()), variant: false, current: false });
+                } else {
+                    let cur_key   = self.current_method_key(dispatch);
+                    let cur_short = self.current_method_short(dispatch);
+                    // Base entry — method-aware glyph; `(CODE)` names the current
+                    // method (cyan, §3). Matches on command title + keywords.
+                    let base_hay = format!("{} {}", info.title, info.keywords.join(" ")).to_lowercase();
+                    if palette_fuzzy(&q, &base_hay) {
+                        hits.push(Hit { name: info.title.clone(), code: cur_short.clone(),
+                            enabled: ena,
+                            glyph: HitGlyph::Method { cmd: dispatch.to_string(), key: cur_key.clone() },
+                            run: HitRun::Execute(id.clone()), variant: false, current: false });
+                    }
+                    // Methods group — method-only rows (`3-Point (3P)`, §3). Each
+                    // matches on the command word + its own name/code, so `2P`
+                    // filters to the 2-Point variant. Current row = cyan (§5).
+                    for (m_short, m_full, key) in &methods {
+                        let var_hay = format!("{} {} {}", info.title, m_full, m_short).to_lowercase();
+                        if !palette_fuzzy(&q, &var_hay) { continue; }
+                        hits.push(Hit { name: m_full.clone(), code: m_short.clone(),
+                            enabled: ena,
+                            glyph: HitGlyph::Method { cmd: dispatch.to_string(), key: key.clone() },
+                            run: HitRun::Method { cmd: dispatch.to_string(), key: key.clone() },
+                            variant: true, current: key == &cur_key });
+                    }
                 }
             }
         }
@@ -10587,99 +10640,209 @@ impl CadApp {
         });
         if down && !hits.is_empty() { self.palette_sel = (self.palette_sel + 1).min(hits.len() - 1); }
         if up { self.palette_sel = self.palette_sel.saturating_sub(1); }
-        if esc { self.palette_open = false; }
 
         let sel = self.palette_sel;
         let mut click: Option<usize> = None;
+        let mut close_x = false;
         let mut open = self.palette_open;
+
+        // ---- Layout columns + HUG width (§3.1/§7). The width follows the longest
+        // RESULT line (measured), NOT the search text — clamped so it never gets
+        // too narrow or too wide. No arbitrary fixed width.
+        const PAD: f32 = 12.0;
+        const ICON: f32 = 20.0;
+        const ICON_GAP: f32 = 14.0;   // icon → name (§3.1)
+        const CODE_GAP: f32 = 6.0;    // name → (CODE)
+        const ROW_H: f32 = 26.0;      // row / hover band; icon box = ROW_H − 6
+        const PAL_MIN_W: f32 = 300.0;
+        const PAL_MAX_W: f32 = 560.0;
+        let font_name = crate::theme::typ::body();
+        let font_code = crate::theme::typ::data_code();
+        let mut longest = 0.0_f32;
+        for h in &hits {
+            let name_w = ctx.fonts(|f| f.layout_no_wrap(h.name.clone(),
+                font_name.clone(), egui::Color32::WHITE).size().x);
+            let code_w = if h.code.is_empty() { 0.0 } else {
+                CODE_GAP + ctx.fonts(|f| f.layout_no_wrap(format!("({})", h.code),
+                    font_code.clone(), egui::Color32::WHITE).size().x)
+            };
+            let indent = if h.variant { ICON + ICON_GAP } else { 0.0 };
+            longest = longest.max(indent + name_w + code_w);
+        }
+        let hug_w = (PAD + ICON + ICON_GAP + longest + PAD).clamp(PAL_MIN_W, PAL_MAX_W);
+
+        // Dragging the Floating band moves the window (§3.1): we own the position
+        // (`palette_pos`) and feed it via `current_pos`; the band's drag_delta
+        // nudges it. `None` until first drag → opens at the default spot.
+        let start_pos = self.palette_pos.unwrap_or(egui::pos2(80.0, 70.0));
+        let mut drag_delta = egui::Vec2::ZERO;
+
+        // Body: surface-1, 1px rounded border. NO egui title bar — it paints the
+        // shared HEADER_STANDARD band itself. Top/side margins 0 so the band is
+        // flush; a 6px BOTTOM inset stops the last result row AT the hairline
+        // (no droop past the rounded border, §3.1).
+        let frame = egui::Frame::none()
+            .fill(crate::theme::color::SURFACE_1)
+            .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER))
+            .rounding(egui::Rounding::same(crate::theme::radius::SM))
+            .inner_margin(egui::Margin { left: 0.0, right: 0.0, top: 0.0, bottom: 6.0 });
         egui::Window::new("Command palette")
             .open(&mut open)
+            .title_bar(false)
             .collapsible(false)
             .resizable(false)
-            .default_width(440.0)
-            .default_pos(egui::pos2(80.0, 70.0))
+            .default_width(hug_w)
+            .current_pos(start_pos)
+            .frame(frame)
             .show(ctx, |ui| {
-                let te = ui.add(egui::TextEdit::singleline(&mut self.palette_query)
-                    .hint_text("Search commands — title + keywords")
-                    .desired_width(f32::INFINITY));
-                if self.palette_focus { te.request_focus(); self.palette_focus = false; }
-                if te.changed() { self.palette_sel = 0; }
-                ui.separator();
-                if hits.is_empty() { ui.weak("No matching commands."); }
-                egui::ScrollArea::vertical().max_height(360.0).auto_shrink([false, true])
+                // ---- shared Floating header band (HEADER_STANDARD) — drag handle ----
+                let hb = crate::dock::header_band(ui, "Command palette", None, true);
+                if hb.close_clicked { close_x = true; }
+                if hb.band.dragged() { drag_delta = hb.band.drag_delta(); }
+
+                // ---- sticky search block: full-round pill + 1px divider ----
+                egui::Frame::none()
+                    .inner_margin(egui::Margin { left: 12.0, right: 12.0, top: 8.0, bottom: 8.0 })
                     .show(ui, |ui| {
-                        for (i, h) in hits.iter().enumerate() {
-                            ui.horizontal(|ui| {
-                                // small icon glyph (via IconId)
-                                let (r, _) = ui.allocate_exact_size(
-                                    egui::vec2(18.0, 18.0), egui::Sense::hover());
-                                let ink = if h.enabled { PP_TEXT }
-                                          else { crate::theme::color::TEXT_DISABLED };
-                                let p = ui.painter_at(r);
-                                let gc = r.center();
-                                let pen = egui::Stroke::new(1.4, ink);
-                                let dot = |q| { p.circle_filled(q, 1.3, ink); };
-                                match h.icon {
-                                    crate::command::IconId::DrawGlyph(s) =>
-                                        draw_draw_glyph(&p, gc, s, pen, dot, ink),
-                                    crate::command::IconId::ModifyGlyph(k) =>
-                                        draw_cmd_glyph(&p, gc, k, pen, dot, ink),
-                                }
-                                let resp = ui.add_enabled(h.enabled,
-                                    egui::SelectableLabel::new(i == sel, h.title.as_str()));
-                                if resp.clicked() { click = Some(i); }
+                        egui::Frame::none()
+                            .fill(crate::theme::color::SURFACE_0)
+                            .rounding(egui::Rounding::same(12.0))   // full-round: r = h/2
+                            .stroke(egui::Stroke::new(1.0, crate::theme::color::BORDER))
+                            .inner_margin(egui::Margin::symmetric(12.0, 3.0))
+                            .show(ui, |ui| {
+                                let te = ui.add(egui::TextEdit::singleline(&mut self.palette_query)
+                                    .frame(false)
+                                    .desired_width(f32::INFINITY)
+                                    .font(crate::theme::typ::body())
+                                    .hint_text(egui::RichText::new("Search commands")
+                                        .color(crate::theme::color::TEXT_MUTED)));
+                                if self.palette_focus { te.request_focus(); self.palette_focus = false; }
+                                if te.changed() { self.palette_sel = 0; }
                             });
+                    });
+                // divider pinned beneath the search (list scrolls under it)
+                let dv = ui.available_rect_before_wrap();
+                ui.painter().hline(dv.x_range(), dv.top(),
+                    egui::Stroke::new(1.0, crate::theme::color::BORDER));
+
+                if hits.is_empty() {
+                    ui.add_space(10.0);
+                    ui.horizontal(|ui| { ui.add_space(12.0);
+                        ui.weak("No matching commands."); });
+                }
+                // ---- result list (full-width rows; hand-painted) ----
+                egui::ScrollArea::vertical().max_height(380.0).auto_shrink([false, true])
+                    .show(ui, |ui| {
+                        // Layout columns (§3/§3.1/§4) — consts defined at fn scope:
+                        // left pad, aligned icon column, icon→name gap 14; variants
+                        // indent so the method glyph sits under the base command's
+                        // NAME (indent A); row band 26, icon box = 26−6.
+                        for (i, h) in hits.iter().enumerate() {
+                            let (rect, resp) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), ROW_H), egui::Sense::click());
+                            let p = ui.painter_at(rect);
+                            let is_cursor = i == sel;
+                            // Row bg: hover OR keyboard cursor → surface-2 (like rails).
+                            if resp.hovered() || is_cursor {
+                                p.rect_filled(rect, 0.0, crate::theme::color::SURFACE_2);
+                            }
+                            // Keyboard cursor also gets a 2px cyan left bar (§3.1) —
+                            // independent of the current-method cyan text.
+                            if is_cursor {
+                                p.rect_filled(egui::Rect::from_min_size(
+                                    rect.left_top(), egui::vec2(2.0, rect.height())), 0.0, PP_ACCENT);
+                            }
+                            // Uniform glyph — one thin stroke + muted tone for EVERY
+                            // row, method or not, in the aligned icon column (§4).
+                            let g_ink = if h.enabled { crate::theme::color::TEXT_MUTED }
+                                        else { crate::theme::color::TEXT_DISABLED };
+                            let g_pen = egui::Stroke::new(1.0, g_ink);
+                            // Base name column; variants indent by one icon+gap so
+                            // the method glyph aligns under the base command's name.
+                            let base_name_x = rect.left() + PAD + ICON + ICON_GAP;
+                            let (glyph_cx, name_x) = if h.variant {
+                                (base_name_x + ICON / 2.0, base_name_x + ICON + ICON_GAP)
+                            } else {
+                                (rect.left() + PAD + ICON / 2.0, base_name_x)
+                            };
+                            let gc = egui::pos2(glyph_cx, rect.center().y);
+                            // Uniform icon box = row band − 6 (§4/§7). Each glyph
+                            // fn normalises its own natural box to this, so all
+                            // icons are one physical size regardless of source fn.
+                            let icon_box = ROW_H - 6.0;
+                            match &h.glyph {
+                                HitGlyph::Base(icon) => {
+                                    let dot = |qq| { p.circle_filled(qq, 1.1, g_ink); };
+                                    match *icon {
+                                        crate::command::IconId::DrawGlyph(s) =>
+                                            draw_draw_glyph(&p, gc, s, g_pen, dot, g_ink,
+                                                icon_box / GLYPH_BOX_DRAW),
+                                        crate::command::IconId::ModifyGlyph(k) =>
+                                            draw_cmd_glyph(&p, gc, k, g_pen, dot, g_ink,
+                                                icon_box / GLYPH_BOX_CMD),
+                                    }
+                                }
+                                HitGlyph::Method { cmd, key } =>
+                                    draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink,
+                                        icon_box / GLYPH_BOX_METHOD),
+                            }
+                            // Name + `(CODE)` — §5 colour marker. Current method =
+                            // whole row cyan; base command = name primary + code
+                            // cyan; other method rows = dim tier; disabled = greyed.
+                            let (name_col, code_col) = if !h.enabled {
+                                (crate::theme::color::TEXT_DISABLED, crate::theme::color::TEXT_DISABLED)
+                            } else if h.current {
+                                (PP_ACCENT, PP_ACCENT)
+                            } else if h.variant {
+                                (crate::theme::color::TEXT_MUTED, crate::theme::color::TEXT_MUTED)
+                            } else {
+                                (PP_TEXT, PP_ACCENT)
+                            };
+                            let nr = p.text(egui::pos2(name_x, rect.center().y),
+                                egui::Align2::LEFT_CENTER, &h.name,
+                                crate::theme::typ::body(), name_col);
+                            if !h.code.is_empty() {
+                                // Code left-grouped right after the name (never right-aligned).
+                                p.text(egui::pos2(nr.right() + CODE_GAP, rect.center().y),
+                                    egui::Align2::LEFT_CENTER, format!("({})", h.code),
+                                    crate::theme::typ::data_code(), code_col);
+                            }
+                            if resp.clicked() { click = Some(i); }
+                            pp_capture(ui, &format!("palette{} · {} ({})",
+                                if h.variant { " variant" } else { "" }, h.name, h.code), rect);
                         }
                     });
             });
+        // Commit a header-band drag to the stored window position (§3.1).
+        if drag_delta != egui::Vec2::ZERO {
+            self.palette_pos = Some(start_pos + drag_delta);
+        }
 
         // Resolve the action: a click runs the clicked item; else Enter runs the
-        // highlighted one. Dispatch via execute(id) (never run_command).
-        let run: Option<String> = if let Some(i) = click {
-            hits.get(i).filter(|h| h.enabled).map(|h| { self.palette_sel = i; h.id.clone() })
-        } else if enter {
-            hits.get(sel).filter(|h| h.enabled).map(|h| h.id.clone())
-        } else {
-            None
-        };
-        self.palette_open = open;   // window × close
-        if let Some(id) = run {
-            self.execute(&id);
+        // highlighted one. A BASE entry dispatches via `execute(id)`; a method
+        // VARIANT via `dispatch_method` (runs AND sets `command_method`). Neither
+        // touches the parser / `run_command`.
+        let chosen = click.or(if enter { Some(sel) } else { None });
+        let picked: Option<(usize, HitRun)> = chosen
+            .and_then(|i| hits.get(i).filter(|h| h.enabled).map(|h| (i, h.run.clone())));
+        // Open state: egui window (no × since title_bar off), header ×, or Esc.
+        self.palette_open = open && !close_x && !esc;
+        if let Some((i, run)) = picked {
+            self.palette_sel = i;
+            match run {
+                HitRun::Execute(id)            => self.execute(&id),
+                HitRun::Method { cmd, key }    => self.dispatch_method(&cmd, &key),
+            }
             self.palette_open = false;
             self.palette_query.clear();
         }
     }
 
-    /// Render a CURATED ordered list of plain command menu items (Phase 6):
-    /// `(menu label, registry id)` pairs. The menu is a *designed arrangement*
-    /// (COMMAND_SYSTEM §4), not a `by_category` dump — order/membership are the
-    /// caller's config. Labels are kept VERBATIM (not the registry `title`,
-    /// which is a temporary Phase-2 seed); each click dispatches through the
-    /// `execute(id)` seam. Defensive: `execute` no-ops on a stale/unknown id.
-    /// Special items (dialogs, submenus, custom-tooltip / non-registry commands)
-    /// stay hand-authored and interleaved by the caller.
-    fn menu_cmd_items(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
-                      items: &[(&str, &str)]) {
-        for &(label, id) in items {
-            // Phase 6b: apply the command's predicates. visible==false hides the
-            // item; enabled==false renders it disabled (greyed, non-clickable via
-            // add_enabled). Pure — no mutation/execution here. (All default now.)
-            let (vis, ena) = self.command_registry.get(id)
-                .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
-                .unwrap_or((false, false));
-            if !vis { continue; }
-            if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
-                self.execute(id);
-                ui.close_menu();
-            }
-        }
-    }
-
     /// The ONE canonical short-code (`"3P"`, `"CR"`, `"F"`, …) for a command's
     /// CURRENT method — the remembered `command_method`, or the command's default
-    /// (first ▼-flyout item) when none is set. Sourced from `rail_flyout_items` /
-    /// `ArcMethod::short()` so the rail flyout, rail tooltip, and menus all use
-    /// the SAME notation. Empty for commands without methods.
+    /// (first ▼-flyout item) when none is set. Sourced from `rail_flyout_items` so
+    /// the rail flyout, rail tooltip, and menus all use the SAME notation. Empty
+    /// for commands without methods.
     fn current_method_short(&self, cmd: &str) -> String {
         let methods = rail_flyout_items(cmd);
         match self.command_method.get(cmd) {
@@ -10689,24 +10852,16 @@ impl CadApp {
         }
     }
 
-    /// Render an arc/circle/fillet menu item whose label reflects the CURRENT
-    /// method via the canonical short-code — e.g. `"Circle (3P)"`, `"Arc (SCE)"`.
-    /// The default method is shown explicitly (e.g. `"Circle (CR)"`), so the label
-    /// always carries a method and never flickers in/out. (This deliberately
-    /// overrides "labels verbatim" for these three commands only.) Dispatches via
-    /// the `execute(id)` seam like any plain item.
-    fn menu_cmd_item_method(&mut self, ui: &mut egui::Ui, ctx: &crate::command::Ctx,
-                            base: &str, id: &str, cmd: &str) {
-        let (vis, ena) = self.command_registry.get(id)
-            .map(|c| ((c.visible)(ctx), (c.enabled)(ctx)))
-            .unwrap_or((false, false));
-        if !vis { return; }
-        let short = self.current_method_short(cmd);
-        let label = if short.is_empty() { base.to_string() }
-                    else { format!("{} ({})", base, short) };
-        if ui.add_enabled(ena, egui::Button::new(label)).clicked() {
-            self.execute(id);
-            ui.close_menu();
+    /// The canonical KEY of a command's CURRENT method — the remembered
+    /// `command_method`, or the default (first `rail_flyout_items` entry) when
+    /// none is set. Empty for commands without methods. Companion to
+    /// `current_method_short` — returns the dispatch key the glyph +
+    /// `dispatch_method` need. Same ONE source, no per-surface lists.
+    fn current_method_key(&self, cmd: &str) -> String {
+        let methods = rail_flyout_items(cmd);
+        match self.command_method.get(cmd) {
+            Some(k) if methods.iter().any(|(_, _, key)| key == k) => k.clone(),
+            _ => methods.first().map(|(_, _, key)| key.clone()).unwrap_or_default(),
         }
     }
 
@@ -10726,7 +10881,7 @@ impl CadApp {
     /// Start a rail command in a SPECIFIC creation method, chosen from the ▼
     /// flyout. Reuses each command's normal start (via `run_command`) and then
     /// nudges it into the requested method/option so all the usual setup runs.
-    fn rail_flyout_dispatch(&mut self, cmd: &str, key: &str) {
+    fn dispatch_method(&mut self, cmd: &str, key: &str) {
         // Remember the chosen method so the rail icon shows its glyph.
         if matches!(cmd, "arc" | "circle" | "fillet") {
             self.command_method.insert(cmd.to_string(), key.to_string());
@@ -10816,14 +10971,14 @@ impl CadApp {
                     // tags the rail so a Draw icon can't drop onto Modify.
                     let resp = rail_icon_btn(ui, active, &tip_owned, |p, c, pen, ink| {
                         if let Some(k) = &last_m {
-                            draw_method_glyph(p, c, cmd, k, pen, ink);
+                            draw_method_glyph(p, c, cmd, k, pen, ink, 1.0);
                         } else {
                             let dot = |q| { p.circle_filled(q, 1.6, ink); };
                             match icon {
                                 crate::command::IconId::DrawGlyph(s) =>
-                                    draw_draw_glyph(p, c, s, pen, dot, ink),
+                                    draw_draw_glyph(p, c, s, pen, dot, ink, 1.0),
                                 crate::command::IconId::ModifyGlyph(k) =>
-                                    draw_cmd_glyph(p, c, k, pen, dot, ink),
+                                    draw_cmd_glyph(p, c, k, pen, dot, ink, 1.0),
                             }
                         }
                     });
@@ -10902,7 +11057,7 @@ impl CadApp {
                                             }
                                             let gc = egui::pos2(rect.left() + 24.0, rect.center().y);
                                             let pen = egui::Stroke::new(1.4, txt);
-                                            draw_method_glyph(&rp, gc, cmd, key, pen, txt);
+                                            draw_method_glyph(&rp, gc, cmd, key, pen, txt, 1.0);
                                             rp.text(egui::pos2(rect.left() + 40.0, rect.center().y),
                                                 egui::Align2::LEFT_CENTER,
                                                 format!("{} ({})", full, short),
@@ -10913,7 +11068,7 @@ impl CadApp {
                                     });
                             });
                         if let Some(key) = pick {
-                            self.rail_flyout_dispatch(cmd, &key);
+                            self.dispatch_method(cmd, &key);
                             ui.memory_mut(|m| m.close_popup());
                         } else if ui.ctx().input(|i| i.pointer.any_click()) {
                             // Click outside the popup AND the ▼ corner closes it.
@@ -11052,9 +11207,9 @@ impl CadApp {
                             let dot = |q| { painter.circle_filled(q, 1.5, ink); };
                             match *icon {
                                 crate::command::IconId::DrawGlyph(s) =>
-                                    draw_draw_glyph(&painter, c, s, pen, dot, ink),
+                                    draw_draw_glyph(&painter, c, s, pen, dot, ink, 1.0),
                                 crate::command::IconId::ModifyGlyph(k) =>
-                                    draw_cmd_glyph(&painter, c, k, pen, dot, ink),
+                                    draw_cmd_glyph(&painter, c, k, pen, dot, ink, 1.0),
                             }
                             painter.text(egui::pos2(rect.center().x, rect.bottom() - 6.0),
                                 egui::Align2::CENTER_CENTER, short, egui::FontId::proportional(7.5), ink);
@@ -12392,10 +12547,9 @@ impl CadApp {
         let v = dest - base;
         self.snapshot_doc();
         let start = self.doc.dobjects.len();
-        // Fresh handles + hatch boundary remap: a pasted hatch whose
-        // boundary was also on the clipboard re-links to the PASTED
-        // boundary, not the source still in the document.
-        let clones = duplicate_dobjects(&self.clipboard_dobjects, |g| g.translated(v));
+        let clones: Vec<DObject> = self.clipboard_dobjects.iter()
+            .map(|d| DObject::with_style(d.geom.translated(v), d.style))
+            .collect();
         let n = clones.len();
         for nd in clones {
             self.doc.push(nd);
@@ -17071,10 +17225,15 @@ impl CadApp {
     fn apply_copy(&mut self, v: Vec2) {
         if v.x.abs() < EPS && v.y.abs() < EPS { return; }
         self.snapshot_doc();
-        let sources: Vec<DObject> = self.selection.iter()
-            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+        let copies: Vec<DObject> = self.selection.iter()
+            .filter_map(|&i| self.doc.dobjects.get(i))
+            .map(|d| {
+                let g = d.geom.translated(v);
+                let mut new = DObject::new(g);
+                new.style = d.style;
+                new
+            })
             .collect();
-        let copies = duplicate_dobjects(&sources, |g| g.translated(v));
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.selection_prev = self.selection.clone();
@@ -17114,10 +17273,14 @@ impl CadApp {
             return;
         }
         self.snapshot_doc();
-        let sources: Vec<DObject> = self.selection.iter()
-            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
-            .collect();
-        let copies = duplicate_dobjects(&sources, |g| g.rotated(pivot, angle));
+        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i).map(|d| {
+                let mut copy = d.clone();
+                copy.geom = copy.geom.rotated(pivot, angle);
+                copy.handle = cad_kernel::next_handle();
+                copy
+            })
+        }).collect();
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.history.push(format!(
@@ -17156,10 +17319,14 @@ impl CadApp {
             return;
         }
         self.snapshot_doc();
-        let sources: Vec<DObject> = self.selection.iter()
-            .filter_map(|&i| self.doc.dobjects.get(i).cloned())
-            .collect();
-        let copies = duplicate_dobjects(&sources, |g| g.scaled(pivot, factor));
+        let copies: Vec<DObject> = self.selection.iter().filter_map(|&i| {
+            self.doc.dobjects.get(i).map(|d| {
+                let mut copy = d.clone();
+                copy.geom = copy.geom.scaled(pivot, factor);
+                copy.handle = cad_kernel::next_handle();
+                copy
+            })
+        }).collect();
         let n = copies.len();
         for c in copies { self.doc.push(c); }
         self.history.push(format!(
@@ -17179,10 +17346,14 @@ impl CadApp {
         self.snapshot_doc();
         let n = self.selection.len();
         if keep_original {
-            let sources: Vec<DObject> = self.selection.iter()
-                .filter_map(|&i| self.doc.dobjects.get(i).cloned())
+            let copies: Vec<DObject> = self.selection.iter()
+                .filter_map(|&i| self.doc.dobjects.get(i))
+                .map(|d| {
+                    let mut new = DObject::new(d.geom.mirrored(a, b));
+                    new.style = d.style;
+                    new
+                })
                 .collect();
-            let copies = duplicate_dobjects(&sources, |g| g.mirrored(a, b));
             for c in copies { self.doc.push(c); }
             self.selection_prev = self.selection.clone();
             self.selection.clear();
@@ -17825,20 +17996,9 @@ impl CadApp {
         p
     }
 
-    /// Extension-tracking projection: if a `track_anchor` is acquired and the
-    /// raw world cursor is near its outward ray, return the point on the ray.
-    /// The aperture matches the snap target size (`SpTGSZ` px → world), so the
-    /// tracking "grabs" the extension with the same feel as an osnap. None
-    /// when no anchor, or the cursor isn't near the ray this frame.
-    fn track_project(&self, raw: Vec2) -> Option<Vec2> {
-        let t = self.track_anchor?;
-        let tol = self.env.SpTGSZ as f64 / (self.scale as f64).max(1e-6);
-        t.project(raw, tol)
-    }
-
     /// World position of the cursor with all current constraints applied
-    /// in priority order: osnap > extension-tracking > CARD > grid-snap > raw.
-    /// Used both for click-capture and for live-preview rendering so the user
+    /// in priority order: osnap > CARD > grid-snap > raw. Used both
+    /// for click-capture and for live-preview rendering so the user
     /// sees exactly what the click will produce.
     fn cursor_world_constrained(
         &self,
@@ -17847,9 +18007,7 @@ impl CadApp {
         snap_hit: Option<Vec2>,
     ) -> Option<Vec2> {
         if let Some(w) = snap_hit { return Some(w); }    // osnap wins
-        let raw = self.s2w(screen_pos?, rect);
-        if let Some(w) = self.track_project(raw) { return Some(w); } // extension track
-        Some(self.apply_constraints(raw))
+        screen_pos.map(|p| self.apply_constraints(self.s2w(p, rect)))
     }
 
     /// Find the dobject nearest to a world point, within `tol_world`. Uses the
@@ -18195,42 +18353,13 @@ impl CadApp {
         let cells = cols * rows;
         let new_dobjects = cells.saturating_sub(1) * sources.len();
 
-        // APX (Approximate) render draws each dobject as one dot, so it
-        // makes even a huge array RENDER fast, but it can't shrink STORAGE:
-        // N dobjects cost N × size_of::<DObject>() of RAM regardless of the
-        // render mode, so past the memory budget we refuse (document
-        // untouched) instead of allocating into an out-of-memory abort.
-        let per = std::mem::size_of::<DObject>().max(1);
-        let mem_ceiling = ARRAY_MEM_BUDGET_BYTES / per;
-        if new_dobjects > mem_ceiling {
-            self.history.push(format!(
-                "  ! array DROPPED — {}×{} × {} src = {} new dobjects ≈ {} MB exceeds the {} MB memory budget. Reduce the grid (APX speeds rendering, not storage).",
-                cols, rows, sources.len(), new_dobjects,
-                new_dobjects.saturating_mul(per) / (1024 * 1024),
-                ARRAY_MEM_BUDGET_BYTES / (1024 * 1024)));
-            return;
-        }
-        // Heavy but memory-safe → switch render to APX so the result draws
-        // fast (one dot per dobject) instead of bogging the CPU/GPU paths.
-        // (The FPS watchdog would do this anyway on the next slow frame;
-        // doing it up-front avoids even one stalled frame.)
-        if new_dobjects > ARRAY_APX_THRESHOLD && self.render_mode != RenderMode::Apx {
-            self.set_render_mode(RenderMode::Apx);
-            self.history.push(format!(
-                "  ⚡ large array ({} new dobjects) — render switched to APX for speed",
-                new_dobjects));
-        }
-
         self.doc.dobjects.reserve(new_dobjects);
         for r in 0..rows {
             for c in 0..cols {
                 if r == 0 && c == 0 { continue; }   // skip the source cell
                 let off = Vec2::new(c as f64 * dx, r as f64 * dy);
-                // Fresh handles + per-cell hatch boundary remap, so each
-                // cell's hatch resolves to ITS OWN copied boundary (not the
-                // source) and copies never collide handles.
-                for d in duplicate_dobjects(&sources, |g| g.translated(off)) {
-                    self.doc.dobjects.push(d);
+                for s in &sources {
+                    self.doc.dobjects.push(s.translated(off));
                 }
             }
         }
@@ -18244,41 +18373,6 @@ impl CadApp {
         ));
         self.ensure_index();
     }
-}
-
-/// Duplicate a set of dobjects with fresh handles, applying `xform` to
-/// each copy's geom. Critically, any **Hatch** whose `boundary_handles`
-/// point at another dobject IN THE SAME duplicated set is remapped to
-/// that dobject's NEW handle — so copying a hatch together with its
-/// boundary keeps the fill attached to the COPY, not the original.
-/// Boundary handles referencing a dobject *outside* the set are left
-/// intact (the copied hatch still resolves to the original boundary,
-/// AutoCAD's behaviour when you copy a hatch alone).
-///
-/// This is the single duplication primitive for copy / rotate-copy /
-/// scale-copy / mirror-copy / array. Without the remap, every copied
-/// hatch would resolve to the source boundary and render at the source
-/// location (the "hatch doesn't copy" bug).
-fn duplicate_dobjects(
-    sources: &[DObject],
-    xform: impl Fn(&Geom) -> Geom,
-) -> Vec<DObject> {
-    let mut hmap: HashMap<cad_kernel::Handle, cad_kernel::Handle> =
-        HashMap::with_capacity(sources.len());
-    let mut out: Vec<DObject> = Vec::with_capacity(sources.len());
-    for s in sources {
-        let nh = cad_kernel::next_handle();
-        hmap.insert(s.handle, nh);
-        out.push(DObject { geom: xform(&s.geom), style: s.style, handle: nh });
-    }
-    for d in &mut out {
-        if let Geom::Hatch(h) = &mut d.geom {
-            for bh in &mut h.boundary_handles {
-                if let Some(&nh) = hmap.get(bh) { *bh = nh; }
-            }
-        }
-    }
-    out
 }
 
 /// Short one-letter badge string for the active osnap kinds, shown on the
@@ -19845,18 +19939,676 @@ const MODIFY_CMDS: &[(GlyphKind, &str, &'static str)] = &[
 
 /// Line-art glyphs for the Draw rail — parallels `draw_cmd_glyph`, same
 /// stroke style, centered at `c` (~±10px).
+/// Natural bounding-box sizes (max extent × 2) the glyph fns were designed at.
+/// A caller passes `scale = target_icon_box / GLYPH_BOX_*` so every glyph fills
+/// the SAME icon box regardless of which fn drew it (§4/§7 — one uniform icon
+/// size). The rail passes 1.0 (its glyphs are unchanged).
+const GLYPH_BOX_DRAW:   f32 = 18.0;
+const GLYPH_BOX_METHOD: f32 = 18.0;
+const GLYPH_BOX_CMD:    f32 = 24.0;
+
+// ---- Category-dropdown row metrics (MENU_DROPDOWN_MENTOR) — matched to the
+// palette so a menu row is dimensionally identical (band 26 / icon box 20 /
+// icon-gap 14). Every value a named const; no magic numbers at the call sites.
+const MENU_ROW_H:   f32 = 26.0;   // row / hover band (§1)
+const MENU_PAD:     f32 = 12.0;   // inner pad — left (edge→icon) AND right (trailing→edge) (§1)
+const MENU_ICON:    f32 = 20.0;   // icon column width (box = ROW_H − 6 = 20)
+const MENU_ICON_GAP: f32 = 14.0;  // icon → name
+const MENU_CODE_GAP: f32 = 6.0;   // name → (CODE), and longest-line → shortcut zone
+const MENU_ARROW_GAP: f32 = 32.0; // longest-line → submenu-arrow column (§2, wide gap)
+const MENU_ARROW_W: f32 = 10.0;   // arrow column width
+/// Grace period before a hover-opened flyout closes after the pointer leaves both
+/// the arrow and the flyout — lets the user travel diagonally onto it (§2).
+const MENU_FLYOUT_CLOSE_DELAY: f64 = 0.30;
+
+/// §9 — which generalized flyout a frame shows. Its rows are BUILT FRESH each frame
+/// from `&self` (`flyout_items`) so dynamic content (block names, current
+/// method/style, toggle state, live labels) is always current; a click commits via
+/// `flyout_activate`. Submenus nest: a `Styles` row opens `DimStylePick`, etc.
+#[derive(Clone, PartialEq)]
+enum FlyMenu {
+    Method(String),   // arc/circle/fillet method list
+    Insert,           // block names → `insert <name>`
+    Import,           // File → Import (raster / vector)
+    Dimension,        // Formative → Dimension
+    Styles,           // Formative → Styles
+    DimStylePick,     // Styles → current dim-style picker
+    WallStylePick,    // Styles → current wall-style picker
+    Debug,            // Tools → Debug tools
+}
+
+/// One open flyout in the stack (`menu_flyouts`): which menu + the row rect it hangs
+/// off (the flyout is placed to that rect's right). Frame 0 is spawned by a menubar
+/// row's ▸; deeper frames by a flyout row's ▸ (§9 nesting).
+#[derive(Clone)]
+struct FlyFrame { menu: FlyMenu, anchor: egui::Rect }
+
+/// The icon slot for a flyout row (§7). `Key` → `icon_for`; `Method` → the
+/// method-aware glyph; `None` → reserved empty slot (or overridden by a §8 check).
+enum FlyIcon { Key(&'static str), Method(String, String), None }
+
+/// One generalized-flyout row (§9), built fresh from `&self`. `Row` renders through
+/// the shared `paint_menu_row`; `Heading`/`Divider`/`Disabled` are the §8 non-command
+/// rows. `check` = a §8 toggle (cyan check in the slot); `submenu` = opens a child
+/// flyout on hover; `act` = what a click commits (`flyout_activate`).
+enum FlyItem {
+    Row {
+        icon: FlyIcon,
+        name: String,
+        col: egui::Color32,
+        code: Option<(String, egui::Color32)>,
+        check: Option<bool>,
+        submenu: Option<FlyMenu>,
+        act: Option<FlyAct>,
+    },
+    Heading(String),
+    Divider,
+    Disabled(String),
+}
+
+impl FlyItem {
+    /// A plain command row: icon + name → `act` on click.
+    fn act(icon: FlyIcon, name: &str, act: FlyAct) -> Self {
+        FlyItem::Row { icon, name: name.into(), col: PP_TEXT, code: None,
+                       check: None, submenu: None, act: Some(act) }
+    }
+    /// A §8 checkbox row: cyan check in the slot when `on`; click toggles via `act`.
+    fn toggle(name: &str, on: bool, act: FlyAct) -> Self {
+        FlyItem::Row { icon: FlyIcon::None, name: name.into(), col: PP_TEXT, code: None,
+                       check: Some(on), submenu: None, act: Some(act) }
+    }
+    /// A submenu row: opens child `menu` on ▸ hover (§9 nesting).
+    fn sub(icon: FlyIcon, name: &str, menu: FlyMenu) -> Self {
+        FlyItem::Row { icon, name: name.into(), col: PP_TEXT, code: None,
+                       check: None, submenu: Some(menu), act: None }
+    }
+    /// The `(name, RowT)` this row measures + paints as (color-correct; §1/§2).
+    fn meas(&self) -> (&str, RowT<'_>) {
+        match self {
+            FlyItem::Divider => ("", RowT::Plain),
+            FlyItem::Heading(t) | FlyItem::Disabled(t) => (t.as_str(), RowT::Plain),
+            FlyItem::Row { name, code, submenu, .. } => {
+                let rt = match (code, submenu.is_some()) {
+                    (Some((c, cc)), true)  => RowT::CodeArrow(c, *cc),
+                    (Some((c, cc)), false) => RowT::Code(c, *cc),
+                    (None, true)  => RowT::Arrow,
+                    (None, false) => RowT::Plain,
+                };
+                (name.as_str(), rt)
+            }
+        }
+    }
+}
+
+/// What a flyout row commits on click (`flyout_activate`) — a data enum so flyout
+/// content stays pure data (no stored closures). Covers every submenu's actions:
+/// method pick, block insert, image import, style set, and the Tools→Debug toggles
+/// / index / intersect / destructive-clear.
+#[derive(Clone)]
+enum FlyAct {
+    Run(String),
+    Method(String, String),
+    Insert(String),
+    Import(bool),                 // true = raster underlay, false = vector trace
+    SetDimStyle(u32),
+    SetWallStyle(u32),
+    ToggleBool(BoolField),
+    EnsureIndex,
+    IntersectView,
+    IntersectArm,
+    IntersectClear,
+    ClearAll,
+}
+
+/// A `&mut self` bool a flyout toggle flips (Tools→Debug), named so `FlyAct` stays
+/// `Clone` data instead of a stored `&mut`.
+#[derive(Clone, Copy)]
+enum BoolField { ScreenStats, Debug, TrimDebug, HatchDebug, UiInspect, CmdDump }
+
+/// Icon spec for a custom-painted menu row (§7 — the caller resolves it via
+/// `icon_for`, never hardcoded inline). `Method` carries `(cmd, key)` for the
+/// method-aware glyph; `Qat` reuses the toolbar New/Open/Save art; `Check(on)` is
+/// a §8 toggle (cyan check in the slot when on). `None` reserves the empty 20px slot.
+enum MenuIcon<'a> { Draw(&'static str), Cmd(GlyphKind), Method(&'a str, &'a str),
+                    Qat(QatAction), Check(bool), None }
+
+/// A row's trailing content (§1) — ONE enum for both `menu_hug_geometry` (measure)
+/// and `paint_menu_row` (paint). LINE part (grouped right after the name): `Code` =
+/// cyan method (CODE) in Mono (§4), `Hint` = muted Wall parenthetical (§5). ZONE
+/// part (the trailing zone at/after the arrow column): `Arrow` = submenu ▸,
+/// `Shortcut` = right-aligned muted Geist keys (§1). `CodeArrow` = a method row that ALSO
+/// opens a submenu (`Circle (CR) ▸`). Per §1 a row has at most one ZONE element
+/// (shortcut XOR arrow); the zone element is what the width rule measures.
+#[derive(Clone, Copy)]
+enum RowT<'a> {
+    Plain,
+    Code(&'a str, egui::Color32),
+    Hint(&'a str),
+    Arrow,
+    CodeArrow(&'a str, egui::Color32),
+    Shortcut(&'a str),
+}
+
+/// Paint ONE conformant dropdown row (MENU_DROPDOWN §1) — the SINGLE painter every
+/// category menu + flyout routes through. Full-width surface-2 hover band (26),
+/// aligned 20px icon box (`icon_for`-resolved), Geist-13 `name` in `name_col`, the
+/// `trail` line/zone content, on the shared `arrow_x` column (§2). Returns
+/// `(body_clicked, arrow_hovered, rect)` — body runs the command, the ▸ opens a
+/// submenu on hover.
+fn paint_menu_row(ui: &mut egui::Ui, width: f32, arrow_x: f32, icon: MenuIcon,
+                  name: &str, name_col: egui::Color32, trail: RowT)
+                  -> (bool, bool, egui::Rect) {
+    // Interaction is a REAL frameless Button so egui's menu recognises it as an
+    // item (keeps the menu open through the click, fires `clicked()` on release);
+    // a bare allocated rect makes egui close the menu on press → clicks are lost.
+    // §3: the highlight spans the FRAME's own inner x-range (`max_rect`), not the
+    // row's w-wide rect, so it reaches both borders. `ui.set_width(w)` upstream
+    // makes the two equal → the highlight physically touches both inner borders.
+    let hl_x = ui.max_rect().x_range();
+    let resp = ui.add_sized(egui::vec2(width, MENU_ROW_H),
+        egui::Button::new("").frame(false));
+    let rect = resp.rect;
+    let band = egui::Rect::from_x_y_ranges(hl_x, rect.y_range());
+    let p = ui.painter_at(band);
+    if resp.hovered() { p.rect_filled(band, 0.0, crate::theme::color::SURFACE_2); }
+
+    // Icon — uniform thin muted glyph, box = ROW_H − 6, aligned column.
+    let g_ink = crate::theme::color::TEXT_MUTED;
+    let g_pen = egui::Stroke::new(1.0, g_ink);
+    let ibox  = MENU_ROW_H - 6.0;
+    let gc = egui::pos2(rect.left() + MENU_PAD + MENU_ICON / 2.0, rect.center().y);
+    let dot = |q: egui::Pos2| { p.circle_filled(q, 1.1, g_ink); };
+    match icon {
+        MenuIcon::Draw(s) => draw_draw_glyph(&p, gc, s, g_pen, dot, g_ink, ibox / GLYPH_BOX_DRAW),
+        MenuIcon::Cmd(k)  => draw_cmd_glyph(&p, gc, k, g_pen, dot, g_ink, ibox / GLYPH_BOX_CMD),
+        MenuIcon::Method(cmd, key) =>
+            draw_method_glyph(&p, gc, cmd, key, g_pen, g_ink, ibox / GLYPH_BOX_METHOD),
+        MenuIcon::Qat(act) =>
+            paint_qat_icon(&p, egui::Rect::from_center_size(gc, egui::vec2(ibox, ibox)), act, g_ink),
+        MenuIcon::Check(on) => {
+            // §8 toggle checkbox — the Inspector component (INSPECTOR_DESIGN §5 /
+            // THEME §5.10): a 16×16 r4 box ALWAYS rendered in the icon slot.
+            //   OFF → surface-0 fill + 1px muted `border` (tells the user it's a
+            //         toggle that can receive a check — never a blank slot).
+            //   ON  → same box in cyan `accent` with an on-accent check glyph.
+            let bx = egui::Rect::from_center_size(gc, egui::vec2(16.0, 16.0));
+            let r4 = egui::Rounding::same(crate::theme::radius::SM);
+            if on {
+                p.rect(bx, r4, PP_ACCENT, egui::Stroke::new(1.0, PP_ACCENT));
+                let oa = crate::theme::color::ON_ACCENT;
+                let cy = bx.center().y;
+                p.line_segment([egui::pos2(bx.left() + 3.5, cy + 0.5),
+                                egui::pos2(bx.left() + 6.5, cy + 3.5)], egui::Stroke::new(1.6, oa));
+                p.line_segment([egui::pos2(bx.left() + 6.5, cy + 3.5),
+                                egui::pos2(bx.right() - 3.0, cy - 3.5)], egui::Stroke::new(1.6, oa));
+            } else {
+                p.rect(bx, r4, PP_BG_LO, egui::Stroke::new(1.0, PP_BORDER));
+            }
+        }
+        MenuIcon::None => {}
+    }
+
+    // Name, then any LINE trailing right after it (Code cyan / Hint muted, §1/§5).
+    let name_x = rect.left() + MENU_PAD + MENU_ICON + MENU_ICON_GAP;
+    let nr = p.text(egui::pos2(name_x, rect.center().y), egui::Align2::LEFT_CENTER,
+        name, crate::theme::typ::body(), name_col);
+    match trail {
+        RowT::Code(c, col) | RowT::CodeArrow(c, col) =>
+            { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
+                egui::Align2::LEFT_CENTER, format!("({})", c),
+                crate::theme::typ::data_code(), col); }
+        RowT::Hint(h) =>
+            { p.text(egui::pos2(nr.right() + MENU_CODE_GAP, rect.center().y),
+                egui::Align2::LEFT_CENTER, h,
+                crate::theme::typ::body(), crate::theme::color::TEXT_MUTED); }
+        _ => {}
+    }
+
+    // ZONE trailing (§1): a ▸ on the aligned arrow column, OR a right-aligned
+    // shortcut at the right inner edge. Never both. Shortcuts render in Geist
+    // sans (`typ::hint`, muted) — Mono is reserved for (CODE) + numbers (§1).
+    let has_arrow = matches!(trail, RowT::Arrow | RowT::CodeArrow(..));
+    if has_arrow {
+        let ax = rect.left() + arrow_x;
+        let cy = rect.center().y;
+        p.add(egui::Shape::convex_polygon(
+            vec![egui::pos2(ax, cy - 3.5), egui::pos2(ax + 5.0, cy), egui::pos2(ax, cy + 3.5)],
+            crate::theme::color::TEXT_MUTED, egui::Stroke::NONE));
+    }
+    if let RowT::Shortcut(sc) = trail {
+        p.text(egui::pos2(rect.right() - MENU_PAD, rect.center().y),
+            egui::Align2::RIGHT_CENTER, sc,
+            crate::theme::typ::hint(), crate::theme::color::TEXT_MUTED);
+    }
+
+    // The ▸ opens the flyout on HOVER (§2); the row's CLICK runs the command.
+    let arrow_hovered = has_arrow && ui.ctx().pointer_hover_pos()
+        .is_some_and(|q| rect.contains(q) && q.x >= rect.left() + arrow_x - MENU_CODE_GAP);
+    (resp.clicked(), arrow_hovered, rect)
+}
+
+/// The ONE hug-geometry source for every category dropdown + flyout (MENU_DROPDOWN
+/// §1/§2/§7): from each row's `(name, RowT)`, return `(arrow_x, width)` — the shared
+/// arrow column and the hug width. `line` = the longest icon→name(+CODE/hint) run
+/// (arrow column = line + gap, §2); `zone` = the widest trailing element (arrow OR
+/// shortcut). Every menu calls this so all hug + align identically, no per-menu
+/// math. Call under the popup `ui` (needs its fonts).
+fn menu_hug_geometry(ui: &egui::Ui, rows: &[(&str, RowT)]) -> (f32, f32) {
+    let fn_ = crate::theme::typ::body();       // name — Geist 13
+    let fc_ = crate::theme::typ::data_code();   // (CODE) — Mono 11
+    let fh_ = crate::theme::typ::hint();        // shortcut — Geist 11 (§1)
+    let nw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fn_.clone(), egui::Color32::WHITE).size().x);
+    let cw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fc_.clone(), egui::Color32::WHITE).size().x);
+    let hw = |s: &str| ui.fonts(|f|
+        f.layout_no_wrap(s.to_string(), fh_.clone(), egui::Color32::WHITE).size().x);
+    let mut line = 0.0_f32;      // icon → end of name (+ any left-grouped CODE/hint)
+    let mut has_arrow = false;   // any submenu ▸ in this menu
+    let mut max_sc = 0.0_f32;    // widest right-aligned shortcut
+    for (name, trail) in rows {
+        let lt = match trail {
+            RowT::Code(c, _) | RowT::CodeArrow(c, _) => MENU_CODE_GAP + cw(&format!("({})", c)),
+            RowT::Hint(h) => MENU_CODE_GAP + nw(h),
+            _ => 0.0,
+        };
+        line = line.max(nw(name) + lt);
+        match trail {
+            RowT::Arrow | RowT::CodeArrow(..) => has_arrow = true,
+            RowT::Shortcut(s) => max_sc = max_sc.max(hw(s)),
+            _ => {}
+        }
+    }
+    // `base` = right edge of the longest full line. The submenu-arrow column sits a
+    // WIDE gap past it (§2: line + 32); shortcuts keep the small 6 gap and right-align
+    // to the 12 right pad — so the arrow gap and shortcut spacing are independent.
+    let base = MENU_PAD + MENU_ICON + MENU_ICON_GAP + line;
+    let arrow_x = base + MENU_ARROW_GAP;
+    let mut right = base;
+    if has_arrow { right = right.max(arrow_x + MENU_ARROW_W); }
+    if max_sc > 0.0 { right = right.max(base + MENU_CODE_GAP + max_sc); }
+    (arrow_x, right + MENU_PAD)
+}
+
+/// Open a custom-painted category dropdown (MENU_DROPDOWN chrome, ONE place):
+/// zero the popup's horizontal inner margin so a full-width row reaches the frame
+/// border (edge-to-edge hover, §3) — saved + restored on the menubar `ui` around
+/// the button — and flush the row spacing to 0. The `body` then measures via
+/// `menu_hug_geometry`, `ui.set_width(w)`, and paints rows with `paint_menu_row`.
+fn custom_menu(ui: &mut egui::Ui, title: &str, body: impl FnOnce(&mut egui::Ui)) {
+    let saved_mm = ui.style().spacing.menu_margin;
+    ui.style_mut().spacing.menu_margin.left  = 0.0;
+    ui.style_mut().spacing.menu_margin.right = 0.0;
+    ui.menu_button(title, |ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+        body(ui);
+    });
+    ui.style_mut().spacing.menu_margin = saved_mm;   // restore for native menus
+}
+
+/// A group-divider hairline spanning the menu's full content width (MENU_DROPDOWN
+/// §5) — 1px `border`, edge-to-edge like the hover (painted at `max_rect().x`),
+/// with a little vertical breathing room. `w` sizes the allocated spacer row.
+fn menu_divider(ui: &mut egui::Ui, w: f32) {
+    let x = ui.max_rect().x_range();
+    let (dr, _) = ui.allocate_exact_size(egui::vec2(w, 5.0), egui::Sense::hover());
+    ui.painter().hline(x, dr.center().y,
+        egui::Stroke::new(1.0, crate::theme::color::BORDER));
+}
+
+/// §8 section heading — a non-interactive caption row (`PALETTES`, `INQUIRY`, …):
+/// Geist-Medium **11/500 UPPERCASE**, dim (`#66707A`), at the NAME column (icon slot
+/// empty), no hover. The caller puts a `menu_divider` above it (except the first).
+fn menu_heading_row(ui: &mut egui::Ui, w: f32, text: &str) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(w, MENU_ROW_H - 4.0), egui::Sense::hover());
+    let name_x = rect.left() + MENU_PAD + MENU_ICON + MENU_ICON_GAP;
+    ui.painter_at(rect).text(egui::pos2(name_x, rect.center().y + 1.0),
+        egui::Align2::LEFT_CENTER, text.to_uppercase(),
+        crate::theme::typ::caption(), egui::Color32::from_rgb(0x66, 0x70, 0x7A));
+}
+
+/// §7 — the ONE icon source, keyed by a stable command key. Returns the row's icon
+/// SLOT so a menu NEVER hardcodes a glyph inline; a later icon = one entry here, a
+/// full redesign = swap the glyph bodies behind these keys. Existing toolbar art
+/// (New/Open/Save/Undo/Redo) is reused via `Qat`. Missing → `None` (reserved slot).
+/// Method commands aren't keyed here — their row builds `MenuIcon::Method(cmd, key)`
+/// with the runtime current method (method-aware, §1); the glyph itself still lives
+/// in one place (`draw_method_glyph`).
+fn icon_for(key: &str) -> MenuIcon<'static> {
+    match key {
+        // File — reuse the QAT toolbar glyphs.
+        "file.new"     => MenuIcon::Qat(QatAction::New),
+        "file.open"    => MenuIcon::Qat(QatAction::Open),
+        "file.save"    => MenuIcon::Qat(QatAction::Save),
+        "file.saveas"  => MenuIcon::Qat(QatAction::SaveAs),
+        // Draw.
+        "draw.line"       => MenuIcon::Draw("line"),
+        "draw.rectangle"  => MenuIcon::Draw("rect"),
+        "draw.ellipse"    => MenuIcon::Draw("ellipse"),
+        "draw.ellipsearc" => MenuIcon::Draw("ellarc"),
+        "draw.pline"      => MenuIcon::Draw("pline"),
+        "draw.spline"     => MenuIcon::Draw("spline"),
+        "draw.point"      => MenuIcon::Draw("point"),
+        "draw.hatch"      => MenuIcon::Draw("hatch"),
+        "draw.wall"       => MenuIcon::Draw("wall"),
+        "draw.block"      => MenuIcon::Cmd(GlyphKind::Block),
+        "draw.insert"     => MenuIcon::Cmd(GlyphKind::Insert),
+        // Edit.
+        "edit.undo"      => MenuIcon::Cmd(GlyphKind::Undo),
+        "edit.redo"      => MenuIcon::Cmd(GlyphKind::Redo),
+        "edit.copy"      => MenuIcon::Cmd(GlyphKind::Copy),
+        "edit.erase"     => MenuIcon::Cmd(GlyphKind::Erase),
+        "edit.matchprop" => MenuIcon::Cmd(GlyphKind::MatchProps),
+        // Modify.
+        "modify.move"     => MenuIcon::Cmd(GlyphKind::Move),
+        "modify.copy"     => MenuIcon::Cmd(GlyphKind::Copy),
+        "modify.rotate"   => MenuIcon::Cmd(GlyphKind::Rotate),
+        "modify.scale"    => MenuIcon::Cmd(GlyphKind::Scale),
+        "modify.mirror"   => MenuIcon::Cmd(GlyphKind::Mirror),
+        "modify.stretch"  => MenuIcon::Cmd(GlyphKind::Stretch),
+        "modify.align"    => MenuIcon::Cmd(GlyphKind::Align),
+        "modify.trim"     => MenuIcon::Cmd(GlyphKind::Trim),
+        "modify.extend"   => MenuIcon::Cmd(GlyphKind::Extend),
+        "modify.chamfer"  => MenuIcon::Cmd(GlyphKind::Chamfer),
+        "modify.offset"   => MenuIcon::Cmd(GlyphKind::Offset),
+        "modify.join"     => MenuIcon::Cmd(GlyphKind::Join),
+        "modify.break"    => MenuIcon::Cmd(GlyphKind::Break),
+        "modify.lengthen" => MenuIcon::Cmd(GlyphKind::Lengthen),
+        "modify.reverse"  => MenuIcon::Cmd(GlyphKind::Reverse),
+        "modify.array"    => MenuIcon::Cmd(GlyphKind::ArrayGrid),
+        "modify.explode"  => MenuIcon::Cmd(GlyphKind::Explode),
+        "modify.matchprop"=> MenuIcon::Cmd(GlyphKind::MatchProps),
+        "modify.chlayer"  => MenuIcon::Cmd(GlyphKind::ChangeLayer),
+        "modify.erase"    => MenuIcon::Cmd(GlyphKind::Erase),
+        // Utilities / inquiry.
+        "util.dist" => MenuIcon::Cmd(GlyphKind::Dist),
+        "util.list" => MenuIcon::Cmd(GlyphKind::List),
+        // Formative.
+        "formative.dimension" => MenuIcon::Draw("dim"),
+        _ => MenuIcon::None,
+    }
+}
+
+/// Hand-rolled method submenu popup (MENU_DROPDOWN §2.1) — the rail's `Area`
+/// pattern reused inside a menubar dropdown: lists a command's methods (icon +
+/// `Name (CODE)`), current row cyan, click → `key`. Returns the picked key.
+impl CadApp {
+    /// Open (or re-anchor) a top-level flyout `menu` off `anchor` (§9). Called from a
+    /// menubar row's ▸ hover. If the SAME base menu is already open, only its anchor
+    /// updates (its child submenu is preserved); a different base resets the stack.
+    fn open_flyout(&mut self, menu: FlyMenu, anchor: egui::Rect) {
+        match self.menu_flyouts.first() {
+            Some(f) if f.menu == menu => { self.menu_flyouts[0].anchor = anchor; }
+            _ => { self.menu_flyouts = vec![FlyFrame { menu, anchor }]; }
+        }
+        self.menu_flyout_hot = true;
+    }
+
+    /// The rows a flyout shows — BUILT FRESH from `&self` each frame (§9) so dynamic
+    /// content (block names, current method/style, toggle state, live labels) is
+    /// always current. Pure data; a click's effect lives in `flyout_activate`.
+    fn flyout_items(&self, menu: &FlyMenu) -> Vec<FlyItem> {
+        let mut_ = crate::theme::color::TEXT_MUTED;
+        match menu {
+            FlyMenu::Method(cmd) => {
+                let cur = self.current_method_key(cmd);
+                rail_flyout_items(cmd).into_iter().map(|(short, full, key)| {
+                    let is_cur = key == cur;   // §5: current method row = cyan
+                    FlyItem::Row {
+                        icon: FlyIcon::Method(cmd.clone(), key.clone()),
+                        name: full,
+                        col: if is_cur { PP_ACCENT } else { PP_TEXT },
+                        code: Some((short, if is_cur { PP_ACCENT } else { mut_ })),
+                        check: None, submenu: None,
+                        act: Some(FlyAct::Method(cmd.clone(), key)),
+                    }
+                }).collect()
+            }
+            FlyMenu::Insert => {
+                let names: Vec<String> = self.doc.blocks.blocks.iter().map(|b| b.name.clone()).collect();
+                if names.is_empty() { return vec![FlyItem::Disabled("(no blocks defined)".into())]; }
+                names.into_iter().map(|n|
+                    FlyItem::act(FlyIcon::Key("draw.block"), &n, FlyAct::Insert(n.clone()))).collect()
+            }
+            FlyMenu::Import => vec![
+                FlyItem::act(FlyIcon::None, "Image as raster (underlay)…", FlyAct::Import(true)),
+                FlyItem::act(FlyIcon::None, "Image → vector (trace editor)…", FlyAct::Import(false)),
+            ],
+            FlyMenu::Dimension => vec![
+                FlyItem::act(FlyIcon::Key("formative.dimension"),
+                    "Dimension  (smart: linear · radius · diameter)", FlyAct::Run("dim".into())),
+                FlyItem::Divider,
+                FlyItem::act(FlyIcon::None, "Dimension Style…", FlyAct::Run("dimstyle".into())),
+            ],
+            FlyMenu::Styles => {
+                let dimn = self.doc.dim_styles.styles.get(self.current_dim_style as usize)
+                    .map(|s| s.name.clone()).unwrap_or_else(|| "STANDARD".into());
+                let walln = self.doc.wall_styles.styles.get(self.current_wall_style as usize)
+                    .map(|s| s.name.clone()).unwrap_or_else(|| "STANDARD".into());
+                vec![
+                    FlyItem::Heading("Managers".into()),
+                    FlyItem::act(FlyIcon::None, "Text Style…", FlyAct::Run("style".into())),
+                    FlyItem::act(FlyIcon::None, "Dimension Style…", FlyAct::Run("dimstyle".into())),
+                    FlyItem::act(FlyIcon::None, "Wall Style…", FlyAct::Run("wallstyle".into())),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Current".into()),
+                    FlyItem::sub(FlyIcon::None, &format!("Dim style:  {}", dimn), FlyMenu::DimStylePick),
+                    FlyItem::sub(FlyIcon::None, &format!("Wall style:  {}", walln), FlyMenu::WallStylePick),
+                    FlyItem::Divider,
+                    FlyItem::Disabled("Opening Style…  (planned)".into()),
+                ]
+            }
+            FlyMenu::DimStylePick => self.doc.dim_styles.styles.iter().enumerate().map(|(i, s)| {
+                let cur = i as u32 == self.current_dim_style;
+                FlyItem::Row { icon: FlyIcon::None, name: s.name.clone(),
+                    col: if cur { PP_ACCENT } else { PP_TEXT },
+                    code: None, check: None, submenu: None,
+                    act: Some(FlyAct::SetDimStyle(i as u32)) }
+            }).collect(),
+            FlyMenu::WallStylePick => self.doc.wall_styles.styles.iter().enumerate().map(|(i, s)| {
+                let cur = i as u32 == self.current_wall_style;
+                FlyItem::Row { icon: FlyIcon::None, name: s.name.clone(),
+                    col: if cur { PP_ACCENT } else { PP_TEXT },
+                    code: None, check: None, submenu: None,
+                    act: Some(FlyAct::SetWallStyle(i as u32)) }
+            }).collect(),
+            FlyMenu::Debug => {
+                let idx_fresh = !(self.index_dirty || self.index.is_none());
+                let idx_label = if idx_fresh { "Spatial index ✓ (fresh)" } else { "Rebuild spatial index ⟲" };
+                let click_label = if self.intersect_pending_click {
+                    "∩ click — waiting for click…" } else { "∩ click — arm for next click" };
+                vec![
+                    FlyItem::toggle("Screen Stats", self.screen_stats_open, FlyAct::ToggleBool(BoolField::ScreenStats)),
+                    FlyItem::toggle("Render mode (CPU/GPU + APX)", self.debug_open, FlyAct::ToggleBool(BoolField::Debug)),
+                    FlyItem::toggle("Trim Debug Log", self.trim_debug_open, FlyAct::ToggleBool(BoolField::TrimDebug)),
+                    FlyItem::toggle("Hatch Debug Log", self.hatch_debug_open, FlyAct::ToggleBool(BoolField::HatchDebug)),
+                    FlyItem::toggle("UI inspect (element sizes)", self.ui_inspect, FlyAct::ToggleBool(BoolField::UiInspect)),
+                    FlyItem::toggle("Command registry dump", self.cmd_dump_open, FlyAct::ToggleBool(BoolField::CmdDump)),
+                    FlyItem::Divider,
+                    FlyItem::act(FlyIcon::None, idx_label, FlyAct::EnsureIndex),
+                    FlyItem::Divider,
+                    FlyItem::Heading("Intersect visualizer".into()),
+                    FlyItem::act(FlyIcon::None, "∩ view (whole viewport)", FlyAct::IntersectView),
+                    FlyItem::act(FlyIcon::None, click_label, FlyAct::IntersectArm),
+                    FlyItem::act(FlyIcon::None, "Clear ∩ overlay", FlyAct::IntersectClear),
+                    FlyItem::Divider,
+                    FlyItem::act(FlyIcon::None, "Clear all dobjects (DESTRUCTIVE)", FlyAct::ClearAll),
+                ]
+            }
+        }
+    }
+
+    /// Commit a flyout row's action (§9). Pure dispatch — `&mut self` here, so the
+    /// data-only `FlyAct` resolves against live state.
+    fn flyout_activate(&mut self, act: FlyAct) {
+        match act {
+            FlyAct::Run(cmd) => self.run_command(&cmd),
+            FlyAct::Method(cmd, key) => self.dispatch_method(&cmd, &key),
+            FlyAct::Insert(n) => self.run_command(&format!("insert {}", n)),
+            FlyAct::Import(raster) => self.open_file_dialog(
+                if raster { FileDialogMode::ImportRaster } else { FileDialogMode::ImportImage }, ""),
+            FlyAct::SetDimStyle(id) => {
+                let name = self.doc.dim_styles.styles.get(id as usize).map(|s| s.name.clone());
+                self.current_dim_style = id;
+                if let Some(n) = name {
+                    self.history.push(format!("  dim style: '{}' set current", n));
+                }
+            }
+            FlyAct::SetWallStyle(id) => {
+                // Capture thickness + name in ONE immutable borrow, then mutate env
+                // (the same WlThk sync the Wall Style Manager's Set Current does).
+                let info = self.doc.wall_styles.get(id).map(|s| (s.thickness, s.name.clone()));
+                self.current_wall_style = id;
+                if let Some((thk, name)) = info {
+                    self.env.WlThk = thk;
+                    let _ = self.env.save();
+                    self.history.push(format!("  wall style: '{}' set current", name));
+                }
+            }
+            FlyAct::ToggleBool(f) => {
+                let b = match f {
+                    BoolField::ScreenStats => &mut self.screen_stats_open,
+                    BoolField::Debug       => &mut self.debug_open,
+                    BoolField::TrimDebug   => &mut self.trim_debug_open,
+                    BoolField::HatchDebug  => &mut self.hatch_debug_open,
+                    BoolField::UiInspect   => &mut self.ui_inspect,
+                    BoolField::CmdDump     => &mut self.cmd_dump_open,
+                };
+                *b = !*b;
+            }
+            FlyAct::EnsureIndex   => { self.ensure_index(); }
+            FlyAct::IntersectView => self.intersect_view_pending = true,
+            FlyAct::IntersectArm  => self.intersect_pending_click = !self.intersect_pending_click,
+            FlyAct::IntersectClear=> { self.intersections.clear(); self.last_intersect_label.clear(); }
+            FlyAct::ClearAll      => { self.clear_all(); self.history.push("  cleared".into()); }
+        }
+    }
+
+    /// Render the open flyout STACK at the TOP LEVEL (§9) — independent of the parent
+    /// dropdown so it survives egui auto-closing the dropdown on the ▸, and captures
+    /// its own clicks (no leak to the canvas). Every frame is the SAME custom rows;
+    /// submenu ▸-hover opens a child frame; a click commits + closes; leaving the
+    /// whole stack for `MENU_FLYOUT_CLOSE_DELAY` closes it (travel-tolerant, §2).
+    fn render_menu_flyouts(&mut self, ctx: &egui::Context) {
+        if self.menu_flyouts.is_empty() { self.menu_flyout_hot = false; return; }
+        let frames = self.menu_flyouts.clone();
+        let mut frame_rects: Vec<egui::Rect> = Vec::with_capacity(frames.len());
+        // child[i] = the submenu (menu, anchor) whose ▸ is hovered in frame i.
+        let mut child: Vec<Option<(FlyMenu, egui::Rect)>> = vec![None; frames.len()];
+        let mut action: Option<FlyAct> = None;
+
+        for (i, frame) in frames.iter().enumerate() {
+            let anchor = frame.anchor;
+            let area = egui::Area::new(egui::Id::new(("menu_flyout", i)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(egui::pos2(anchor.right() + 2.0, anchor.top()))
+                .constrain(true)
+                .show(ctx, |ui| {
+                    egui::Frame::popup(ui.style())
+                        .rounding(egui::Rounding::same(crate::theme::radius::SM))
+                        .show(ui, |ui| {
+                            ui.spacing_mut().item_spacing = egui::vec2(0.0, 0.0);
+                            let items = self.flyout_items(&frame.menu);
+                            let rows: Vec<(&str, RowT)> = items.iter().map(|it| it.meas()).collect();
+                            let (arrow_x, w) = menu_hug_geometry(ui, &rows);
+                            ui.set_width(w);
+                            for it in &items {
+                                match it {
+                                    FlyItem::Divider   => menu_divider(ui, w),
+                                    FlyItem::Heading(t) => menu_heading_row(ui, w, t),
+                                    FlyItem::Disabled(t) => {
+                                        let _ = paint_menu_row(ui, w, arrow_x, MenuIcon::None, t,
+                                            crate::theme::color::TEXT_MUTED, RowT::Plain);
+                                    }
+                                    FlyItem::Row { icon, name, col, code, check, submenu, act } => {
+                                        let micon = if let Some(on) = check { MenuIcon::Check(*on) }
+                                            else { match icon {
+                                                FlyIcon::Key(k) => icon_for(k),
+                                                FlyIcon::Method(c, k) => MenuIcon::Method(c, k),
+                                                FlyIcon::None => MenuIcon::None,
+                                            } };
+                                        let rowt = match (code, submenu.is_some()) {
+                                            (Some((c, cc)), true)  => RowT::CodeArrow(c, *cc),
+                                            (Some((c, cc)), false) => RowT::Code(c, *cc),
+                                            (None, true)  => RowT::Arrow,
+                                            (None, false) => RowT::Plain,
+                                        };
+                                        let (clk, ahov, rrect) =
+                                            paint_menu_row(ui, w, arrow_x, micon, name, *col, rowt);
+                                        if let Some(sm) = submenu {
+                                            if ahov { child[i] = Some((sm.clone(), rrect)); }
+                                        }
+                                        if clk {
+                                            if let Some(a) = act { if action.is_none() { action = Some(a.clone()); } }
+                                        }
+                                    }
+                                }
+                            }
+                            pp_cap_ui(ui, "menu flyout");
+                        });
+                });
+            frame_rects.push(area.response.rect);
+        }
+
+        let ptr = ctx.pointer_hover_pos();
+        let over_any  = ptr.map_or(false, |p| frame_rects.iter().any(|r| r.contains(p)));
+        let arrow_any = child.iter().any(|c| c.is_some());
+
+        // Rebuild the stack from arrow-hovers: keep frame 0 (menubar-spawned), extend
+        // with any hovered submenu child (§9 nesting).
+        let mut new_stack: Vec<FlyFrame> = vec![frames[0].clone()];
+        for i in 0..frames.len() {
+            if i + 1 > new_stack.len() { break; }
+            if let Some((menu, anchor)) = &child[i] {
+                new_stack.truncate(i + 1);
+                new_stack.push(FlyFrame { menu: menu.clone(), anchor: *anchor });
+            }
+        }
+        // Travel tolerance: if no new arrow extended but the pointer is over a deeper
+        // existing frame, keep the deeper frames (don't trim while traversing them).
+        if new_stack.len() < frames.len() {
+            let deeper = ptr.map_or(false, |p|
+                frame_rects[new_stack.len()..].iter().any(|r| r.contains(p)));
+            if deeper { new_stack = frames.clone(); }
+        }
+
+        // Global close: pointer off everything, no top-arrow / submenu-arrow hovered.
+        let mut close_all = false;
+        if self.menu_flyout_hot || over_any || arrow_any {
+            self.menu_flyout_leave_t = None;
+        } else {
+            let now = ctx.input(|i| i.time);
+            match self.menu_flyout_leave_t {
+                Some(t) if now - t >= MENU_FLYOUT_CLOSE_DELAY => close_all = true,
+                _ => {
+                    if self.menu_flyout_leave_t.is_none() { self.menu_flyout_leave_t = Some(now); }
+                    ctx.request_repaint_after(std::time::Duration::from_millis(60));
+                }
+            }
+        }
+        self.menu_flyout_hot = false;   // re-armed by the menubar each frame
+
+        if let Some(a) = action { self.flyout_activate(a); close_all = true; }
+        if close_all { self.menu_flyouts.clear(); self.menu_flyout_leave_t = None; }
+        else { self.menu_flyouts = new_stack; }
+    }
+}
+
 fn draw_draw_glyph(
     p: &egui::Painter, c: egui::Pos2, id: &str,
-    pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32,
+    pen: egui::Stroke, dot: impl Fn(egui::Pos2), _ink: egui::Color32, scale: f32,
 ) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_DRAW`) to the caller's icon
+    // box so glyphs are one uniform physical size across surfaces (§4/§7). The
+    // rail passes 1.0 (unchanged); palette/menus pass `icon_box / natural`.
     use egui::vec2;
-    let v = |x: f32, y: f32| c + vec2(x, y);
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
     let poly = |pts: Vec<egui::Pos2>| { p.add(egui::Shape::line(pts, pen)); };
     let ring = |cx: f32, cy: f32, rx: f32, ry: f32, a0: f32, a1: f32| {
         let n = 22; let mut pts = Vec::with_capacity(n + 1);
         for i in 0..=n {
             let t = a0 + (a1 - a0) * (i as f32 / n as f32);
-            pts.push(c + vec2(cx + rx * t.cos(), cy - ry * t.sin()));
+            pts.push(c + vec2((cx + rx * t.cos()) * scale, (cy - ry * t.sin()) * scale));
         }
         p.add(egui::Shape::line(pts, pen));
     };
@@ -19868,7 +20620,7 @@ fn draw_draw_glyph(
                                  v(4.0, 7.0), v(1.0, 1.0), v(6.0, 1.0), v(-5.0, -8.0)]); }
         "line"    => { p.line_segment([v(-7.0, 7.0), v(7.0, -7.0)], pen); dot(v(-7.0, 7.0)); dot(v(7.0, -7.0)); }
         "pline"   => { poly(vec![v(-8.0, 5.0), v(-3.0, -3.0), v(2.0, 3.0), v(8.0, -5.0)]); }
-        "circle"  => { p.circle_stroke(c, 8.0, pen); dot(c); }
+        "circle"  => { p.circle_stroke(c, 8.0 * scale, pen); dot(c); }
         "arc"     => { ring(0.0, 4.0, 9.0, 9.0, 0.06 * tau, 0.44 * tau); }
         "rect"    => { rstroke(v(-8.0, -5.0), v(8.0, 5.0)); }
         "ellipse" => { ring(0.0, 0.0, 9.0, 5.5, 0.0, tau); }
@@ -19902,7 +20654,7 @@ struct RailDnd { is_draw: bool, pos: usize }
 
 /// Method list for a rail command's ▼ flyout, as `(short, full, key)` triples.
 /// `short` is the compact code shown next to the glyph (e.g. "3P", "TTR"),
-/// `full` is the hover tooltip, `key` is interpreted by `rail_flyout_dispatch`.
+/// `full` is the hover tooltip, `key` is interpreted by `dispatch_method`.
 /// Empty = the command has no methods (no ▼ shown).
 /// Command-palette fuzzy match: `true` if every char of `q` (already lowercased)
 /// appears IN ORDER (subsequence) within `hay` (lowercased `title` + `keywords`).
@@ -19945,14 +20697,16 @@ fn rail_flyout_items(cmd: &str) -> Vec<(String, String, String)> {
 /// flyout size. `cmd`+`key` select the variant; falls back to nothing if
 /// unknown (caller then draws the base command glyph).
 fn draw_method_glyph(p: &egui::Painter, c: egui::Pos2, cmd: &str, key: &str,
-                     pen: egui::Stroke, ink: egui::Color32) {
+                     pen: egui::Stroke, ink: egui::Color32, scale: f32) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_METHOD`) to the caller's icon
+    // box (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`.
     use std::f32::consts::{PI, TAU};
-    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx, c.y + dy);
-    let d = |q: egui::Pos2| p.circle_filled(q, 1.5, ink);
+    let v = |dx: f32, dy: f32| egui::pos2(c.x + dx * scale, c.y + dy * scale);
+    let d = |q: egui::Pos2| p.circle_filled(q, 1.5 * scale.max(0.8), ink);
     match cmd {
         "circle" => {
             let r = 7.0;
-            p.circle_stroke(c, r, pen);
+            p.circle_stroke(c, r * scale, pen);
             match key {
                 "3p" => for k in 0..3 {
                     let a = TAU * (k as f32 / 3.0) - PI / 2.0;
@@ -20062,7 +20816,7 @@ fn cmd_button_resp(
     let ink = egui::Color32::from_rgb(225, 235, 245);
     let pen = egui::Stroke::new(1.6, ink);
     let dot = |p: egui::Pos2| { painter.circle_filled(p, 1.8, ink); };
-    draw_cmd_glyph(&painter, c, glyph_kind, pen, dot, ink);
+    draw_cmd_glyph(&painter, c, glyph_kind, pen, dot, ink, 1.0);
     // Label centered below the glyph.
     painter.text(
         egui::pos2(rect.center().x, rect.bottom() - 9.0),
@@ -20094,9 +20848,13 @@ fn draw_cmd_glyph(
     pen: egui::Stroke,
     dot: impl Fn(egui::Pos2),
     ink: egui::Color32,
+    scale: f32,
 ) {
+    // `scale` maps the fn's natural box (`GLYPH_BOX_CMD`) to the caller's icon box
+    // (§4/§7). Rail passes 1.0; palette/menus pass `icon_box / natural`. All the
+    // glyph geometry flows through `v`, so scaling it scales the whole icon.
     use egui::{Pos2 as _, vec2};
-    let v = |x: f32, y: f32| c + vec2(x, y);
+    let v = |x: f32, y: f32| c + vec2(x * scale, y * scale);
     match kind {
         GlyphKind::Move => {
             // four-headed arrow
@@ -20299,26 +21057,27 @@ fn draw_cmd_glyph(
             }
         }
         GlyphKind::Undo => {
-            // curved arrow ←
+            // curved arrow ← — arc centered on x=0 (was drawn in the left half,
+            // making the icon look shifted vs its neighbours in the menu column).
             let mut pts = Vec::with_capacity(17);
             for i in 0..=16 {
                 let t = (i as f32 / 16.0) * std::f32::consts::PI;
-                pts.push(v(-9.0 + 9.0 * t.cos(), -9.0 * t.sin()));
+                pts.push(v(9.0 * t.cos(), -9.0 * t.sin()));
             }
             p.add(egui::Shape::line(pts, pen));
-            let tip = v(-9.0, 0.0);
+            let tip = v(0.0, 0.0);
             p.line_segment([tip, tip + vec2(4.0,-3.0)], pen);
             p.line_segment([tip, tip + vec2(4.0, 3.0)], pen);
         }
         GlyphKind::Redo => {
-            // mirror of undo →
+            // mirror of undo → — arc centered on x=0.
             let mut pts = Vec::with_capacity(17);
             for i in 0..=16 {
                 let t = (i as f32 / 16.0) * std::f32::consts::PI;
-                pts.push(v(9.0 - 9.0 * t.cos(), -9.0 * t.sin()));
+                pts.push(v(-9.0 * t.cos(), -9.0 * t.sin()));
             }
             p.add(egui::Shape::line(pts, pen));
-            let tip = v(9.0, 0.0);
+            let tip = v(0.0, 0.0);
             p.line_segment([tip, tip + vec2(-4.0,-3.0)], pen);
             p.line_segment([tip, tip + vec2(-4.0, 3.0)], pen);
         }
@@ -21221,17 +21980,25 @@ impl eframe::App for CadApp {
                 || self.text_draft != TextDraftState::Off
                 || self.text_waiting_height;
             if !editing_text {
-                let (copy, paste) = ctx.input_mut(|i| {
+                let (copy, paste, select_all, deselect_all) = ctx.input_mut(|i| {
                     // Key fallback in case the platform delivers raw keys.
                     let mut copy  = i.modifiers.command && i.key_pressed(egui::Key::C);
                     let mut paste = i.modifiers.command && i.key_pressed(egui::Key::V);
+                    // Edit shortcuts (MENU_DROPDOWN §1) — app-layer input, NOT parser
+                    // words: Select All = Shift+A, Deselect All = Ctrl/Cmd+D. Verified
+                    // conflict-free (no other A/D binding).
+                    let select_all   = i.modifiers.shift && !i.modifiers.command
+                                       && i.key_pressed(egui::Key::A);
+                    let deselect_all = i.modifiers.command && i.key_pressed(egui::Key::D);
                     // Primary path: eframe's clipboard events (Ctrl+C/X/V).
                     i.events.retain(|e| match e {
                         egui::Event::Copy | egui::Event::Cut => { copy = true; false }
                         egui::Event::Paste(_)                => { paste = true; false }
+                        // Drop the "A" text event so Shift+A selects (not types "A").
+                        egui::Event::Text(t) if select_all && t == "A" => false,
                         _ => true,
                     });
-                    (copy, paste)
+                    (copy, paste, select_all, deselect_all)
                 });
                 if copy {
                     self.copy_selection();
@@ -21247,6 +22014,9 @@ impl eframe::App for CadApp {
                 if ctx.input(|i| i.modifiers.command && i.key_pressed(egui::Key::G)) {
                     self.group_selection();
                 }
+                // Shift+A / Ctrl+D — select-all / deselect-all (mirror the Edit menu).
+                if select_all { self.run_command("select"); self.run_command("all"); }
+                if deselect_all { self.selection.clear(); self.selected = None; }
             }
         }
 
@@ -21627,51 +22397,42 @@ impl eframe::App for CadApp {
                 // Phase 6b: one read-only Ctx snapshot per frame; the registry-
                 // driven Draw/Modify items filter/grey against it (all-default now).
                 let cmd_ctx = self.build_ctx();
-                ui.menu_button("File", |ui| {
-                    if ui.button("New").clicked() {
-                        self.run_command("clear");
-                        ui.close_menu();
-                    }
-                    if ui.button("Open .rsm / .dxf…").clicked() {
-                        // Default the Open type filter to the native format.
-                        self.open_file_dialog(FileDialogMode::Open, ".rsm");
-                        ui.close_menu();
-                    }
-                    // Save to the current file (Save As if none yet). The label
-                    // shows the active file name so it's clear where it writes.
+                // File — custom rows (MENU_DROPDOWN). New/Open/Save/Save-As show the
+                // toolbar glyphs via `icon_for` (§7); Import opens the generalized
+                // flyout (§9). The Save label shows the active file so it's clear
+                // where it writes; the rest reserve the empty slot.
+                custom_menu(ui, "File", |ui| {
+                    let nc = PP_TEXT;
                     let save_label = match &self.current_file {
                         Some(p) => format!("Save  ({})", p.file_name()
                             .map(|n| n.to_string_lossy().to_string())
                             .unwrap_or_else(|| "current".into())),
                         None => "Save".to_string(),
                     };
-                    if ui.button(save_label).clicked() {
-                        self.do_save_current();
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As .dxf…").clicked() {
-                        self.open_file_dialog(FileDialogMode::Save, ".dxf");
-                        ui.close_menu();
-                    }
-                    if ui.button("Save As .rsm…").clicked() {
-                        self.open_file_dialog(FileDialogMode::Save, ".rsm");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    ui.menu_button("Import", |ui| {
-                        if ui.button("Image as raster (underlay)…").clicked() {
-                            self.open_file_dialog(FileDialogMode::ImportRaster, "");
-                            ui.close_menu();
-                        }
-                        if ui.button("Image → vector (trace editor)…").clicked() {
-                            self.open_file_dialog(FileDialogMode::ImportImage, "");
-                            ui.close_menu();
-                        }
-                    });
-                    ui.separator();
-                    if ui.button("New parametric sketch").clicked() {
-                        // Parametric MODE: clear, then draw with the NORMAL tools;
-                        // the Parametric panel adds constraints + Solve.
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("New", RowT::Plain), ("Open .rsm / .dxf…", RowT::Plain),
+                        (save_label.as_str(), RowT::Plain),
+                        ("Save As .dxf…", RowT::Plain), ("Save As .rsm…", RowT::Plain),
+                        ("Import", RowT::Arrow),
+                        ("New parametric sketch", RowT::Plain), ("Exit", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.new"), "New", nc, RowT::Plain).0
+                        { self.run_command("clear"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.open"), "Open .rsm / .dxf…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Open, ".rsm"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.save"), &save_label, nc, RowT::Plain).0
+                        { self.do_save_current(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.saveas"), "Save As .dxf…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Save, ".dxf"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("file.saveas"), "Save As .rsm…", nc, RowT::Plain).0
+                        { self.open_file_dialog(FileDialogMode::Save, ".rsm"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    // Import ▸ — generalized flyout (raster / vector).
+                    let (_ib, ia, irect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Import", nc, RowT::Arrow);
+                    if ia { self.open_flyout(FlyMenu::Import, irect); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "New parametric sketch", nc, RowT::Plain).0 {
                         self.run_command("clear");
                         self.parametric = crate::param_editor::ParamSession::new();
                         self.parametric.active = true;
@@ -21680,534 +22441,412 @@ impl eframe::App for CadApp {
                              add constraints, then Solve".into();
                         ui.close_menu();
                     }
-                    ui.separator();
-                    if ui.button("Exit").clicked() {
-                        ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-                    }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Exit", nc, RowT::Plain).0
+                        { ctx.send_viewport_cmd(egui::ViewportCommand::Close); }
                     pp_cap_ui(ui, "menu: File");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Edit", |ui| {
-                    if ui.button("Undo").clicked() {
-                        self.run_command("undo");
-                        ui.close_menu();
-                    }
-                    if ui.button("Redo").clicked() {
-                        self.run_command("redo");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Copy    Ctrl+C").clicked() {
+                // Edit — custom rows (MENU_DROPDOWN §1). Undo/Redo/Copy/Erase/Match
+                // have Cmd glyphs; the rest reserve the empty 20px slot so all names
+                // align at the fixed name column. Shortcuts render right-aligned in
+                // the trailing zone (Mono-11, muted) — Ctrl+C/V/G + Shift+A (Select
+                // All) / Ctrl+D (Deselect All), wired in the input block below.
+                custom_menu(ui, "Edit", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Undo", RowT::Plain), ("Redo", RowT::Plain),
+                        ("Copy", RowT::Shortcut("Ctrl+C")),
+                        ("Paste", RowT::Shortcut("Ctrl+V")),
+                        ("Group", RowT::Shortcut("Ctrl+G")),
+                        ("Add to Group", RowT::Plain), ("Ungroup", RowT::Plain),
+                        ("Select All", RowT::Shortcut("Shift+A")),
+                        ("Deselect All", RowT::Shortcut("Ctrl+D")),
+                        ("Erase", RowT::Plain),
+                        ("Match Properties", RowT::Plain),
+                        ("Settings…", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.undo"), "Undo", nc, RowT::Plain).0
+                        { self.run_command("undo"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.redo"), "Redo", nc, RowT::Plain).0
+                        { self.run_command("redo"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.copy"), "Copy", nc, RowT::Shortcut("Ctrl+C")).0 {
                         self.copy_selection();
                         let n = self.clipboard_dobjects.len();
-                        ui.ctx().copy_text(format!(
-                            "RUST-AutoRASM: {} object(s) on clipboard", n));
+                        ui.ctx().copy_text(format!("RUST-AutoRASM: {} object(s) on clipboard", n));
                         ui.close_menu();
                     }
-                    if ui.button("Paste   Ctrl+V").clicked() {
-                        self.start_paste();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Group   Ctrl+G").clicked() {
-                        self.group_selection();
-                        ui.close_menu();
-                    }
-                    if ui.button("Add to Group").clicked() {
-                        self.add_to_group();
-                        ui.close_menu();
-                    }
-                    if ui.button("Ungroup").clicked() {
-                        self.ungroup_selection();
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Select All").clicked() {
-                        self.run_command("select");
-                        self.run_command("all");
-                        ui.close_menu();
-                    }
-                    if ui.button("Deselect All").clicked() {
-                        self.selection.clear();
-                        self.selected = None;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Erase selection").clicked() {
-                        self.run_command("erase");
-                        ui.close_menu();
-                    }
-                    if ui.button("Match Properties").clicked() {
-                        self.run_command("matchprop");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.button("Settings…").clicked() {
-                        self.settings_open = true;
-                        ui.close_menu();
-                    }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Paste", nc, RowT::Shortcut("Ctrl+V")).0
+                        { self.start_paste(); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Group", nc, RowT::Shortcut("Ctrl+G")).0
+                        { self.group_selection(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Add to Group", nc, RowT::Plain).0
+                        { self.add_to_group(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Ungroup", nc, RowT::Plain).0
+                        { self.ungroup_selection(); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Select All", nc, RowT::Shortcut("Shift+A")).0
+                        { self.run_command("select"); self.run_command("all"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Deselect All", nc, RowT::Shortcut("Ctrl+D")).0
+                        { self.selection.clear(); self.selected = None; ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.erase"), "Erase", nc, RowT::Plain).0
+                        { self.run_command("erase"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("edit.matchprop"), "Match Properties", nc, RowT::Plain).0
+                        { self.run_command("matchprop"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Settings…", nc, RowT::Plain).0
+                        { self.settings_open = true; ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Edit");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Draw", |ui| {
-                    // Plain command items — curated id-list (COMMAND_SYSTEM §4),
-                    // labels verbatim, dispatch via execute(id). Order/membership
-                    // preserved exactly; `block`/`insert` (Modify-category) still
-                    // live below via the hand-authored Block…/Insert Block ▸.
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Line",      "draw.line"),
-                        ("Rectangle", "draw.rectangle"),
+                // Draw — custom-painted rows (MENU_DROPDOWN_MENTOR): every command
+                // iconized in one aligned column, 26 band / 20 icon box / 14 gap
+                // (palette-identical), cyan (CODE) marker, surface-2 hover, ▸ on one
+                // aligned column, hug width. `custom_menu` owns the edge-to-edge
+                // chrome (§3); `menu_hug_geometry` owns the width (§2/§7).
+                custom_menu(ui, "Draw", |ui| {
+                    let circle_key  = self.current_method_key("circle");
+                    let circle_code = self.current_method_short("circle");
+                    let arc_key     = self.current_method_key("arc");
+                    let arc_code    = self.current_method_short("arc");
+                    let nc = PP_TEXT;   // command-name colour
+
+                    // Pass 1 — hug geometry from every FULL line (incl. (CODE)/hint).
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Line", RowT::Plain), ("Rectangle", RowT::Plain),
+                        ("Circle", RowT::CodeArrow(&circle_code, PP_ACCENT)),
+                        ("Arc",    RowT::CodeArrow(&arc_code, PP_ACCENT)),
+                        ("Ellipse", RowT::Plain), ("Ellipse Arc", RowT::Plain),
+                        ("Polyline", RowT::Plain), ("Spline", RowT::Plain),
+                        ("Point", RowT::Plain), ("Hatch…", RowT::Plain),
+                        ("Wall", RowT::Hint("(t = thickness)")),
+                        ("Block…", RowT::Plain), ("Insert Block", RowT::Plain),
                     ]);
-                    // Circle / Arc — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Circle", "draw.circle", "circle");
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Arc", "draw.arc", "arc");
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
+
+                    // Pass 2 — render + dispatch. §3: pin frame inner width to `w`.
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.line"), "Line", nc, RowT::Plain).0
+                        { self.execute("draw.line"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.rectangle"), "Rectangle", nc, RowT::Plain).0
+                        { self.execute("draw.rectangle"); ui.close_menu(); }
+                    // Circle — body runs remembered; ▸ opens the method flyout
+                    // (top-level, survives the dropdown closing — §2.1).
+                    let (cb, ca, crect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("circle", &circle_key), "Circle", nc,
+                        RowT::CodeArrow(&circle_code, PP_ACCENT));
+                    if cb { self.execute("draw.circle"); ui.close_menu(); }
+                    if ca { self.open_flyout(FlyMenu::Method("circle".into()), crect); }
+                    // Arc
+                    let (ab, aa, arect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("arc", &arc_key), "Arc", nc,
+                        RowT::CodeArrow(&arc_code, PP_ACCENT));
+                    if ab { self.execute("draw.arc"); ui.close_menu(); }
+                    if aa { self.open_flyout(FlyMenu::Method("arc".into()), arect); }
+                    for (name, id) in [
                         ("Ellipse",     "draw.ellipse"),
                         ("Ellipse Arc", "draw.ellipsearc"),
                         ("Polyline",    "draw.pline"),
                         ("Spline",      "draw.spline"),
                         ("Point",       "draw.point"),
-                    ]);
-                    // Hatch… — dialog special, hand-authored (unchanged).
-                    if ui.button("Hatch…").clicked() {
-                        self.run_command("hatch");
-                        ui.close_menu();
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(id), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    if ui.button("Wall  (chained run — t = thickness)")
-                        .on_hover_text("Click points for a connected run; corners auto-join. Enter ends the run")
-                        .clicked()
-                    {
-                        self.run_command("wall");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    // Blocks — the dialog collects the name; insert lists
-                    // the defined blocks as a submenu.
-                    if ui.button("Block…")
-                        .on_hover_text("Create a block from the selection \
-                                        (opens the Block dialog)")
-                        .clicked()
-                    {
-                        self.run_command("block");
-                        ui.close_menu();
-                    }
-                    let block_names: Vec<String> = self.doc.blocks.blocks.iter()
-                        .map(|b| b.name.clone()).collect();
-                    let mut insert_pick: Option<String> = None;
-                    ui.menu_button("Insert Block", |ui| {
-                        if block_names.is_empty() {
-                            ui.label("(no blocks defined)");
-                        }
-                        for n in &block_names {
-                            if ui.button(n).clicked() {
-                                insert_pick = Some(n.clone());
-                                ui.close_menu();
-                            }
-                        }
-                        pp_cap_ui(ui, "menu: Draw ▸ Insert Block");
-                    });
-                    if let Some(n) = insert_pick {
-                        self.run_command(&format!("insert {}", n));
-                        ui.close_menu();
-                    }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.hatch"), "Hatch…", nc, RowT::Plain).0
+                        { self.run_command("hatch"); ui.close_menu(); }
+                    // Wall (t = thickness) — muted parenthetical hint.
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.wall"), "Wall", nc, RowT::Hint("(t = thickness)")).0
+                        { self.run_command("wall"); ui.close_menu(); }
+                    menu_divider(ui, w);   // group divider hairline (kept)
+                    if paint_menu_row(ui, w, arrow_x, icon_for("draw.block"), "Block…", nc, RowT::Plain).0
+                        { self.run_command("block"); ui.close_menu(); }
+                    // Insert Block ▸ — opens the block-name flyout (top-level, §2.1).
+                    let (ib, ia, irect) = paint_menu_row(ui, w, arrow_x, icon_for("draw.insert"), "Insert Block", nc, RowT::Arrow);
+                    if ia { self.open_flyout(FlyMenu::Insert, irect); }
+                    let _ = ib;
                     pp_cap_ui(ui, "menu: Draw");
                 });
-                ui.menu_button("Modify", |ui| {
-                    // Transform group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Move",     "modify.move"),
-                        ("Copy",     "modify.copy"),
-                        ("Rotate",   "modify.rotate"),
-                        ("Scale",    "modify.scale"),
-                        ("Mirror",   "modify.mirror"),
-                        ("Stretch",  "modify.stretch"),
-                        ("Align",    "modify.align"),
+                // Modify — custom rows (MENU_DROPDOWN). Every command has a Cmd
+                // glyph except Inspector (reserved slot). Fillet is the ONE method
+                // row: cyan (CODE) + ▸ hover flyout (MenuFlyout::Method), body runs
+                // the remembered method (§4). Explode/Inspector keep their hover
+                // tooltips. `cmd_ctx` predicates are all-default now (as in Draw) —
+                // dispatch straight through execute(id).
+                let _ = &cmd_ctx;
+                custom_menu(ui, "Modify", |ui| {
+                    let nc = PP_TEXT;
+                    let fillet_key  = self.current_method_key("fillet");
+                    let fillet_code = self.current_method_short("fillet");
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Move", RowT::Plain), ("Copy", RowT::Plain),
+                        ("Rotate", RowT::Plain), ("Scale", RowT::Plain),
+                        ("Mirror", RowT::Plain), ("Stretch", RowT::Plain),
+                        ("Align", RowT::Plain), ("Trim", RowT::Plain),
+                        ("Extend", RowT::Plain),
+                        ("Fillet", RowT::CodeArrow(&fillet_code, PP_ACCENT)),
+                        ("Chamfer", RowT::Plain), ("Offset", RowT::Plain),
+                        ("Join", RowT::Plain), ("Break", RowT::Plain),
+                        ("Lengthen", RowT::Plain), ("Reverse", RowT::Plain),
+                        ("Array…", RowT::Plain), ("Explode", RowT::Plain),
+                        ("Inspector…", RowT::Plain),
+                        ("Match Properties", RowT::Plain),
+                        ("Change Layer to Current", RowT::Plain),
+                        ("Erase", RowT::Plain),
                     ]);
-                    ui.separator();
-                    // Edit-geometry group — plain items via execute(id).
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Trim",   "modify.trim"),
-                        ("Extend", "modify.extend"),
-                    ]);
-                    // Fillet — dynamic label reflecting the current method.
-                    self.menu_cmd_item_method(ui, &cmd_ctx, "Fillet", "modify.fillet", "fillet");
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
-                        ("Chamfer",  "modify.chamfer"),
-                        ("Offset",   "modify.offset"),
-                        ("Join",     "modify.join"),
-                        ("Break",    "modify.break"),
-                        ("Lengthen", "modify.lengthen 1"),
-                        ("Reverse",  "modify.reverse"),
-                    ]);
-                    ui.separator();
-                    // Multi-instance / properties group. Array… (dialog),
-                    // Explode (custom tooltip), Inspector… (`props` — not a
-                    // registry command) stay hand-authored, interleaved.
-                    if ui.button("Array…").clicked() {
-                        self.array_open = true;
-                        ui.close_menu();
+                    ui.set_width(w);
+                    // Transform group. Icon via `icon_for` on the id's base (before
+                    // any arg, e.g. "modify.lengthen 1"); dispatch via the full id.
+                    let icon_key = |id: &'static str| id.split(' ').next().unwrap_or(id);
+                    for (name, id) in [
+                        ("Move", "modify.move"), ("Copy", "modify.copy"),
+                        ("Rotate", "modify.rotate"), ("Scale", "modify.scale"),
+                        ("Mirror", "modify.mirror"), ("Stretch", "modify.stretch"),
+                        ("Align", "modify.align"),
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    if ui.button("Explode")
-                        .on_hover_text("Break selected block instances back \
-                                        into their component dobjects")
-                        .clicked()
-                    {
-                        self.run_command("explode");
-                        ui.close_menu();
+                    menu_divider(ui, w);
+                    // Edit-geometry group.
+                    for (name, id) in [("Trim", "modify.trim"), ("Extend", "modify.extend")] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    if ui.button("Inspector…")
-                        .on_hover_text("Edit common properties of the selected \
-                                        dobject(s) — layer, color, linetype, \
-                                        lineweight, and type-specific style")
-                        .clicked()
-                    {
-                        self.run_command("props");
-                        ui.close_menu();
+                    // Fillet — method row (cyan CODE + ▸ hover flyout, §4/§2.1).
+                    let (fb, fa, frect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Method("fillet", &fillet_key), "Fillet", nc,
+                        RowT::CodeArrow(&fillet_code, PP_ACCENT));
+                    if fb { self.execute("modify.fillet"); ui.close_menu(); }
+                    if fa { self.open_flyout(FlyMenu::Method("fillet".into()), frect); }
+                    for (name, id) in [
+                        ("Chamfer", "modify.chamfer"), ("Offset", "modify.offset"),
+                        ("Join", "modify.join"), ("Break", "modify.break"),
+                        ("Lengthen", "modify.lengthen 1"), ("Reverse", "modify.reverse"),
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
                     }
-                    self.menu_cmd_items(ui, &cmd_ctx, &[
+                    menu_divider(ui, w);
+                    // Multi-instance / properties group.
+                    if paint_menu_row(ui, w, arrow_x, icon_for("modify.array"), "Array…", nc, RowT::Plain).0
+                        { self.array_open = true; ui.close_menu(); }
+                    let (eb, _, erect) = paint_menu_row(ui, w, arrow_x, icon_for("modify.explode"), "Explode", nc, RowT::Plain);
+                    ui.interact(erect, egui::Id::new(("modtip", "explode")), egui::Sense::hover())
+                        .on_hover_text("Break selected block instances back into their component dobjects");
+                    if eb { self.run_command("explode"); ui.close_menu(); }
+                    // Inspector… — `props`, not a registry command; reserved slot.
+                    let (ipb, _, iprect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Inspector…", nc, RowT::Plain);
+                    ui.interact(iprect, egui::Id::new(("modtip", "inspector")), egui::Sense::hover())
+                        .on_hover_text("Edit common properties of the selected dobject(s) — \
+                                        layer, color, linetype, lineweight, and type-specific style");
+                    if ipb { self.run_command("props"); ui.close_menu(); }
+                    for (name, id) in [
                         ("Match Properties", "modify.matchprop"),
                         ("Change Layer to Current", "modify.chlayer"),
-                    ]);
-                    ui.separator();
-                    self.menu_cmd_items(ui, &cmd_ctx, &[("Erase", "modify.erase")]);
+                    ] {
+                        if paint_menu_row(ui, w, arrow_x, icon_for(icon_key(id)), name, nc, RowT::Plain).0
+                            { self.execute(id); ui.close_menu(); }
+                    }
+                    menu_divider(ui, w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("modify.erase"), "Erase", nc, RowT::Plain).0
+                        { self.execute("modify.erase"); ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Modify");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("View", |ui| {
-                    if ui.button("Zoom Extents (fit all)").clicked() {
-                        self.zoom_extents();
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Window").clicked() {
-                        self.zoom_start("w");
-                        ui.close_menu();
-                    }
-                    if ui.button("Zoom Previous").clicked() {
-                        self.zoom_previous();
-                        ui.close_menu();
-                    }
-                    if ui.button("Reset View").clicked() {
+                // View — custom rows (MENU_DROPDOWN). None of the zoom commands
+                // have a glyph yet → all reserve the empty 20px slot (§1); labels
+                // kept verbatim ("Zoom Extents (fit all)" flagged for a trim).
+                custom_menu(ui, "View", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Zoom Extents", RowT::Plain),
+                        ("Zoom Window", RowT::Plain),
+                        ("Zoom Previous", RowT::Plain),
+                        ("Reset View", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Extents", nc, RowT::Plain).0
+                        { self.zoom_extents(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Window", nc, RowT::Plain).0
+                        { self.zoom_start("w"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Zoom Previous", nc, RowT::Plain).0
+                        { self.zoom_previous(); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Reset View", nc, RowT::Plain).0 {
                         self.view_push_history();
                         self.scale = 20.0;
                         self.world_offset = egui::vec2(0.0, 0.0);
                         ui.close_menu();
                     }
                     pp_cap_ui(ui, "menu: View");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Formative", |ui| {
-                    if ui.button("Layers…").clicked() {
-                        self.layer_panel_open = !self.layer_panel_open;
-                        ui.close_menu();
-                    }
-                    if ui.button("Pens…").clicked() {
-                        self.pen_panel_open = !self.pen_panel_open;
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    // Dimension — a formative sub-category (not a top-level menu).
-                    ui.menu_button("Dimension", |ui| {
-                        // Smart dim auto-decides Linear / Radius / Diameter
-                        // from what the first click hits (single `dim`
-                        // command — no separate dimlinear/dimradius words).
-                        if ui.button("Dimension  (smart: linear · radius · diameter)")
-                            .on_hover_text(
-                                "Click a defining point for a linear dim, or a \
-                                 circle/arc for radius (press D for diameter)")
-                            .clicked()
-                        {
-                            self.run_command("dim");
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        if ui.button("Dimension Style…")
-                            .on_hover_text("Add or edit a dimension style \
-                                            (arrow size, text height, decimals, color)")
-                            .clicked()
-                        {
-                            self.run_command("dimstyle");
-                            ui.close_menu();
-                        }
-                        pp_cap_ui(ui, "menu: Formative ▸ Dimension");
-                    });
-                    // Styles — a formative sub-category. ONE home for every
-                    // style table. Managers first, then current-style switchers.
-                    ui.menu_button("Styles", |ui| {
-                        ui.label(egui::RichText::new("Managers").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
-                        for (label, cmd, tip) in [
-                            ("Text Style…", "style",
-                             "Named text styles (font, default height)"),
-                            ("Dimension Style…", "dimstyle",
-                             "Arrow size, text height/placement, decimals, colors"),
-                            ("Wall Style…", "wallstyle",
-                             "Wall types (Dry Wall / Structural / …): thickness, poché fill, face color"),
-                        ] {
-                            if ui.button(label).on_hover_text(tip).clicked() {
-                                self.run_command(cmd);
-                                ui.close_menu();
-                            }
-                        }
-                        ui.separator();
-                        ui.label(egui::RichText::new("Current").small().color(
-                            egui::Color32::from_rgb(150, 165, 185)));
-                        // Snapshot names so the submenu closures don't borrow doc.
-                        let dim_names: Vec<(u32, String)> = self.doc.dim_styles.styles
-                            .iter().enumerate()
-                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                        let wall_names: Vec<(u32, String)> = self.doc.wall_styles.styles
-                            .iter().enumerate()
-                            .map(|(i, s)| (i as u32, s.name.clone())).collect();
-                        let mut set_dim:  Option<u32> = None;
-                        let mut set_wall: Option<u32> = None;
-                        ui.menu_button(
-                            format!("Dim style:  {}", dim_names
-                                .get(self.current_dim_style as usize)
-                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                            |ui| {
-                                for (id, name) in &dim_names {
-                                    if ui.selectable_label(
-                                        *id == self.current_dim_style, name).clicked()
-                                    {
-                                        set_dim = Some(*id);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        ui.menu_button(
-                            format!("Wall style:  {}", wall_names
-                                .get(self.current_wall_style as usize)
-                                .map(|(_, n)| n.as_str()).unwrap_or("STANDARD")),
-                            |ui| {
-                                for (id, name) in &wall_names {
-                                    if ui.selectable_label(
-                                        *id == self.current_wall_style, name).clicked()
-                                    {
-                                        set_wall = Some(*id);
-                                        ui.close_menu();
-                                    }
-                                }
-                            });
-                        if let Some(id) = set_dim {
-                            self.current_dim_style = id;
-                            self.history.push(format!(
-                                "  dim style: '{}' set current",
-                                dim_names[id as usize].1));
-                        }
-                        if let Some(id) = set_wall {
-                            self.current_wall_style = id;
-                            // Same WlThk sync the Wall Style Manager's Set
-                            // Current does, so the next wall draws at the
-                            // style's thickness.
-                            if let Some(s) = self.doc.wall_styles.get(id) {
-                                self.env.WlThk = s.thickness;
-                                let _ = self.env.save();
-                            }
-                            self.history.push(format!(
-                                "  wall style: '{}' set current",
-                                wall_names[id as usize].1));
-                        }
-                        ui.separator();
-                        // Future style tables — visible intent, honestly disabled.
-                        ui.add_enabled(false, egui::Button::new("Opening Style…  (planned)"))
-                            .on_disabled_hover_text(
-                                "Door / window / niche styles riding on walls — \
-                                 see Smart_Dobjects.md §2.6");
-                        pp_cap_ui(ui, "menu: Formative ▸ Styles");
-                    });
+                // Formative — custom rows (MENU_DROPDOWN). Layers/Pens toggle their
+                // panels; Dimension + Styles open the generalized flyout (§9) — the
+                // Styles flyout itself nests the current dim/wall-style pickers.
+                custom_menu(ui, "Formative", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Layers…", RowT::Plain), ("Pens…", RowT::Plain),
+                        ("Dimension", RowT::Arrow), ("Styles", RowT::Arrow),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Layers…", nc, RowT::Plain).0
+                        { self.layer_panel_open = !self.layer_panel_open; ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Pens…", nc, RowT::Plain).0
+                        { self.pen_panel_open = !self.pen_panel_open; ui.close_menu(); }
+                    menu_divider(ui, w);
+                    let (_db, da, drect) = paint_menu_row(ui, w, arrow_x,
+                        icon_for("formative.dimension"), "Dimension", nc, RowT::Arrow);
+                    if da { self.open_flyout(FlyMenu::Dimension, drect); }
+                    let (_sb, sa, srect) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::None, "Styles", nc, RowT::Arrow);
+                    if sa { self.open_flyout(FlyMenu::Styles, srect); }
                     pp_cap_ui(ui, "menu: Formative");
                 });
-                ui.menu_button("Utilities", |ui| {
-                    if ui.button("Distance (2 clicks)").clicked() {
-                        self.run_command("dist");
-                        ui.close_menu();
-                    }
-                    if ui.button("List selected dobjects").clicked() {
-                        self.run_command("list");
-                        ui.close_menu();
-                    }
+                // Utilities — custom rows (MENU_DROPDOWN). Both inquiry commands
+                // have Cmd glyphs (Dist / List). Labels kept verbatim ("Distance
+                // (2 clicks)" flagged for a trim).
+                custom_menu(ui, "Utilities", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Distance", RowT::Plain),
+                        ("List", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.dist"), "Distance", nc, RowT::Plain).0
+                        { self.run_command("dist"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.list"), "List", nc, RowT::Plain).0
+                        { self.run_command("list"); ui.close_menu(); }
                     pp_cap_ui(ui, "menu: Utilities");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Tools", |ui| {
-                    ui.label(egui::RichText::new("Palettes").small().color(
-                        egui::Color32::from_rgb(150, 165, 185)));
-                    // NOTE: this toggles the command-LINE dock (`cmd_window_open`),
-                    // not a palette — the old "Command palette" label was wrong.
-                    ui.checkbox(&mut self.cmd_window_open,      "Command line");
-                    if ui.button("Command palette…   (Ctrl+Shift+P)")
-                        .on_hover_text("Search all commands by name or keyword; ↑/↓ to move, Enter to run")
-                        .clicked()
-                    {
-                        self.palette_open = true;
-                        self.palette_focus = true;
-                        self.palette_query.clear();
-                        self.palette_sel = 0;
-                        ui.close_menu();
-                    }
-                    ui.checkbox(&mut self.layers_window_open,   "Layers");
-                    ui.checkbox(&mut self.pens_window_open,     "Pens");
-                    ui.checkbox(&mut self.info_window_open,     "Inspector");
-                    ui.checkbox(&mut self.dobjects_window_open, "DObjects list");
-                    ui.separator();
-                    menu_heading(ui, "Command rails");
-                    ui.checkbox(&mut self.draw_rail_open,   "Draw rail (left)");
-                    ui.checkbox(&mut self.modify_rail_open, "Modify rail (left)");
-                    ui.separator();
-                    if ui.button("Snap window").clicked() {
-                        self.snap_window_open = !self.snap_window_open;
-                        ui.close_menu();
-                    }
-                    if ui.button("Toggle Grips").clicked() {
-                        self.env.GrpEnb = !self.env.GrpEnb;
-                        let _ = self.env.save();
-                        ui.close_menu();
-                    }
-                    if ui.button("Text Style…").clicked() {
-                        crate::dbg_event!(self,
-                            crate::dbg_recorder::DbgEvent::MenuClick {
-                                path: "Tools → Text Style…".into() });
-                        self.run_command("style");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    if ui.checkbox(&mut self.dbg_window_open,
-                        "🛰 Session Recorder").clicked() {
-                        crate::dbg_event!(self,
-                            crate::dbg_recorder::DbgEvent::MenuClick {
-                                path: format!(
-                                    "Tools → 🛰 Session Recorder ({})",
-                                    if self.dbg_window_open { "open" } else { "close" }) });
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    menu_heading(ui, "Inquiry");
-                    if ui.button("Distance (2 clicks)").clicked() {
-                        self.run_command("dist");
-                        ui.close_menu();
-                    }
-                    if ui.button("List selected dobjects").clicked() {
-                        self.run_command("list");
-                        ui.close_menu();
-                    }
-                    ui.separator();
-                    // ---- Debug tools submenu --------------------------
-                    // All diagnostic / development toggles live here in
-                    // one place. Adding new debug instruments? Put the
-                    // toggle here, not on the toolbar.
-                    ui.menu_button("Debug tools", |ui| {
-                        ui.checkbox(&mut self.screen_stats_open, "Screen Stats")
-                            .on_hover_text(
-                                "Renderer's view of the doc: total / in viewport / drawn / skipped");
-                        ui.checkbox(&mut self.debug_open, "Render mode (CPU/GPU + APX)")
-                            .on_hover_text("CPU/GPU toggle, APX (draft display), render stats");
-                        ui.checkbox(&mut self.trim_debug_open, "Trim Debug Log")
-                            .on_hover_text("Log every click + state transition during trim/extend");
-                        ui.checkbox(&mut self.hatch_debug_open, "Hatch Debug Log")
-                            .on_hover_text("Log dialog + pick-point + apply + render for hatch");
-                        ui.checkbox(&mut self.ui_inspect, "UI inspect (element sizes)")
-                            .on_hover_text("Devtools ruler: hover any panel element to read its \
-                                exact w×h + position, to compare the build against the design spec");
-                        ui.checkbox(&mut self.cmd_dump_open, "Command registry dump")
-                            .on_hover_text("Phase-2 verify: list every command the registry was \
-                                derived from (id / dispatch / title / category / icon)");
-                        ui.separator();
-                        // Spatial index — rebuild + status
-                        let idx_label = if self.index_dirty || self.index.is_none() {
-                            "Rebuild spatial index ⟲"
-                        } else {
-                            "Spatial index ✓ (fresh)"
-                        };
-                        if ui.button(idx_label).clicked() {
-                            self.ensure_index();
-                            ui.close_menu();
+                // Tools — custom rows (MENU_DROPDOWN). §8 section headings +
+                // cyan-checkbox rows for the panel-visibility toggles; the Command
+                // palette shows its shortcut (right-aligned, §1); Debug tools opens
+                // the generalized flyout (§9). Checkbox rows omit `close_menu` so you
+                // can flip several without the menu closing.
+                custom_menu(ui, "Tools", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Palettes", RowT::Plain),
+                        ("Command line", RowT::Plain),
+                        ("Command palette…", RowT::Shortcut("Ctrl+Shift+P")),
+                        ("Layers", RowT::Plain), ("Pens", RowT::Plain),
+                        ("Inspector", RowT::Plain), ("DObjects list", RowT::Plain),
+                        ("Command rails", RowT::Plain),
+                        ("Draw rail (left)", RowT::Plain), ("Modify rail (left)", RowT::Plain),
+                        ("Snap window", RowT::Plain), ("Toggle Grips", RowT::Plain),
+                        ("Session Recorder", RowT::Plain),
+                        ("Inquiry", RowT::Plain),
+                        ("Distance", RowT::Plain), ("List", RowT::Plain),
+                        ("Debug tools", RowT::Arrow),
+                    ]);
+                    ui.set_width(w);
+                    // §8 checkbox row: cyan check in the slot; click toggles, menu stays open.
+                    macro_rules! check_row { ($name:expr, $field:expr) => {
+                        if paint_menu_row(ui, w, arrow_x, MenuIcon::Check($field), $name, nc, RowT::Plain).0
+                            { $field = !$field; }
+                    }; }
+                    // §10 panel toggle: like check_row, but on OPEN it (a) records the
+                    // menu-launch anchor (adjacent-right, top-aligned to this row) so the
+                    // panel first opens beside the menu — not backward/left — and (b)
+                    // queues a bring-to-front so it opens ON TOP, never behind the
+                    // dropdown or other panels. `$id` must match the panel's dock id.
+                    macro_rules! panel_row { ($name:expr, $field:expr, $id:expr) => {{
+                        let (clk, _, r) = paint_menu_row(ui, w, arrow_x, MenuIcon::Check($field), $name, nc, RowT::Plain);
+                        if clk {
+                            $field = !$field;
+                            if $field {
+                                self.menu_launch_anchor.insert($id, egui::pos2(r.right() + 8.0, r.top()));
+                                self.raise_windows.push($id);
+                            }
                         }
-                        ui.separator();
-                        // Intersection visualizer (diagnostic — shows ∩
-                        // points so the user can verify a query).
-                        menu_heading(ui, "Intersect visualizer");
-                        if ui.button("∩ view (whole viewport)").clicked() {
-                            self.intersect_view_pending = true;
-                            ui.close_menu();
+                    }}; }
+                    menu_heading_row(ui, w, "Palettes");
+                    panel_row!("Command line", self.cmd_window_open, "Command line");
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command palette…", nc, RowT::Shortcut("Ctrl+Shift+P")).0 {
+                        self.palette_open = true; self.palette_focus = true;
+                        self.palette_query.clear(); self.palette_sel = 0;
+                        ui.close_menu();
+                    }
+                    panel_row!("Layers", self.layers_window_open, "Layers");
+                    panel_row!("Pens", self.pens_window_open, "Pens");
+                    panel_row!("Inspector", self.info_window_open, "Inspector");
+                    panel_row!("DObjects list", self.dobjects_window_open, "DObjects");
+                    menu_divider(ui, w);
+                    menu_heading_row(ui, w, "Command rails");
+                    check_row!("Draw rail (left)", self.draw_rail_open);
+                    check_row!("Modify rail (left)", self.modify_rail_open);
+                    menu_divider(ui, w);
+                    check_row!("Snap window", self.snap_window_open);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Toggle Grips", nc, RowT::Plain).0 {
+                        self.env.GrpEnb = !self.env.GrpEnb; let _ = self.env.save(); ui.close_menu();
+                    }
+                    // (Text Style… removed — it lives in Formative → Styles now.)
+                    menu_divider(ui, w);
+                    // Session Recorder — a §8 toggle row that also anchors + raises (§10).
+                    let (sr_clk, _, sr_r) = paint_menu_row(ui, w, arrow_x,
+                        MenuIcon::Check(self.dbg_window_open), "Session Recorder", nc, RowT::Plain);
+                    if sr_clk {
+                        self.dbg_window_open = !self.dbg_window_open;
+                        if self.dbg_window_open {
+                            self.menu_launch_anchor.insert("Session Recorder", egui::pos2(sr_r.right() + 8.0, sr_r.top()));
+                            self.raise_windows.push("Session Recorder");
                         }
-                        let click_lbl = if self.intersect_pending_click {
-                            "∩ click — waiting for click…"
-                        } else {
-                            "∩ click — arm for next click"
-                        };
-                        if ui.button(click_lbl).clicked() {
-                            self.intersect_pending_click = !self.intersect_pending_click;
-                            ui.close_menu();
-                        }
-                        if ui.button("Clear ∩ overlay").clicked() {
-                            self.intersections.clear();
-                            self.last_intersect_label.clear();
-                            ui.close_menu();
-                        }
-                        ui.separator();
-                        // Destructive — moved to Debug tools because it
-                        // wipes the entire document with no confirmation.
-                        if ui.button("Clear all dobjects (DESTRUCTIVE)").clicked() {
-                            self.clear_all();
-                            self.history.push("  cleared".into());
-                            ui.close_menu();
-                        }
-                        pp_cap_ui(ui, "menu: Tools ▸ Debug tools");
-                    });
+                        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::MenuClick {
+                            path: format!("Tools → Session Recorder ({})",
+                                if self.dbg_window_open { "open" } else { "close" }) });
+                    }
+                    menu_divider(ui, w);
+                    menu_heading_row(ui, w, "Inquiry");
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.dist"), "Distance", nc, RowT::Plain).0
+                        { self.run_command("dist"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, icon_for("util.list"), "List", nc, RowT::Plain).0
+                        { self.run_command("list"); ui.close_menu(); }
+                    menu_divider(ui, w);
+                    // Debug tools ▸ — generalized flyout (§9): toggles, index, ∩, clear.
+                    let (_gb, ga, grect) = paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Debug tools", nc, RowT::Arrow);
+                    if ga { self.open_flyout(FlyMenu::Debug, grect); }
                     pp_cap_ui(ui, "menu: Tools");
                 });
-                // ---- SIMLUX: independent lighting (lux) section -----------
-                ui.menu_button("SIMLUX", |ui| {
-                    ui.label(egui::RichText::new("Lighting  ·  lux calculation").small()
+                // Help — custom rows (MENU_DROPDOWN). Neither command has a glyph
+                // yet → both reserve the empty 20px slot (§1).
+                // SIMLUX — independent lighting (lux) section. Plain egui widgets
+                // inside the custom dropdown chrome; opens the grafted Light panels.
+                custom_menu(ui, "SIMLUX", |ui| {
+                    ui.set_min_width(232.0);
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("  Lighting · lux calculation").small()
                         .color(egui::Color32::from_rgb(150, 165, 185)));
-                    if ui.add(egui::Button::new(
-                            egui::RichText::new("⚡  Calculate lux").strong()))
-                        .on_hover_text("Extrude the drawn room, then run the IES + ray-traced lux engine")
-                        .clicked()
-                    {
+                    if ui.button("  ⚡  Calculate lux").clicked() {
                         self.light.window_open = true;
                         self.light.calculate(&self.doc);
                         ui.close_menu();
                     }
                     ui.separator();
-                    menu_heading(ui, "Panels");
-                    ui.checkbox(&mut self.light.window_open, "Light panel  (settings + results)")
-                        .on_hover_text("IES photometry, reflectances, room height, quality, readouts");
-                    ui.checkbox(&mut self.light.view3d_open, "3D view")
-                        .on_hover_text("Docked 3D viewport of the extruded room (drag: orbit, scroll: zoom)");
+                    ui.checkbox(&mut self.light.window_open, "  Light panel (settings + results)");
+                    ui.checkbox(&mut self.light.view3d_open, "  3D view");
+                    ui.checkbox(&mut self.light.place_mode, "  Place luminaire (click plan)");
                     ui.separator();
-                    menu_heading(ui, "Fixtures");
-                    ui.checkbox(&mut self.light.place_mode, "Place luminaire (click plan)")
-                        .on_hover_text("Click points on the 2D plan to drop IES fixtures; Esc to stop");
-                    ui.separator();
-                    menu_heading(ui, "Display");
-                    ui.checkbox(&mut self.light.show_overlay, "Lux overlay on 2D plan");
-                    ui.checkbox(&mut self.light.floor_heatmap, "Heatmap floor in 3D");
-                    ui.separator();
-                    if ui.button("Import IES…")
-                        .on_hover_text("Opens the Light panel — paste an .ies path and press Load")
-                        .clicked()
-                    {
-                        self.light.window_open = true;
-                        ui.close_menu();
-                    }
+                    ui.checkbox(&mut self.light.show_overlay, "  Lux overlay on 2D plan");
+                    ui.checkbox(&mut self.light.floor_heatmap, "  Heatmap floor in 3D");
+                    ui.add_space(4.0);
                     pp_cap_ui(ui, "menu: SIMLUX");
-                    menu_autoclose(ui, bar_rect);
                 });
-                ui.menu_button("Help", |ui| {
-                    if ui.button("Command help").clicked() {
-                        self.run_command("help");
-                        ui.close_menu();
-                    }
-                    if ui.button("About RUST_CAD").clicked() {
-                        self.history.push(
-                            "  RUST_CAD — pure-Rust 2-D CAD math workbench".into());
-                        self.history.push(
-                            "  github.com/HSI-Lighting/RUST-AutoRASM".into());
+                custom_menu(ui, "Help", |ui| {
+                    let nc = PP_TEXT;
+                    let (arrow_x, w) = menu_hug_geometry(ui, &[
+                        ("Command help", RowT::Plain),
+                        ("About RUST_CAD", RowT::Plain),
+                    ]);
+                    ui.set_width(w);
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "Command help", nc, RowT::Plain).0
+                        { self.run_command("help"); ui.close_menu(); }
+                    if paint_menu_row(ui, w, arrow_x, MenuIcon::None, "About RUST_CAD", nc, RowT::Plain).0 {
+                        self.history.push("  RUST_CAD — pure-Rust 2-D CAD math workbench".into());
+                        self.history.push("  github.com/HSI-Lighting/RUST-AutoRASM".into());
                         ui.close_menu();
                     }
                     pp_cap_ui(ui, "menu: Help");
-                    menu_autoclose(ui, bar_rect);
                 });
             });
                     });
@@ -22571,6 +23210,7 @@ impl eframe::App for CadApp {
                 }
             });
         });
+        self.raise_after_show("DObjects", ctx, &resp);
         self.process_dock_after_show("DObjects", ctx, resp);
         self.dobjects_window_open = dobjects_open;
 
@@ -22805,10 +23445,13 @@ impl eframe::App for CadApp {
         if self.info_panel_open {
             self.render_info_panel(ctx);
         }
-        // SIMLUX Light panel (Tools ▸ SIMLUX ▸ Light) — bails if closed.
+        // SIMLUX Light panel (SIMLUX menu ▸ Light panel) — bails if closed.
         self.render_light_panel(ctx);
+        // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
+        self.render_light_3d_panel(ctx);
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
+        self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
 
         // ---- Command bar — rendered through the UNIFIED dock host (dock.rs),
         // the same swappable engine the Inspector uses. Floats by default
@@ -22829,12 +23472,11 @@ impl eframe::App for CadApp {
             crate::dock::HOST.show(ctx, &cfg, &mut state, &mut open, |ui, cap| {
                 self.command_bar_body(ui, cap);
             });
+            self.raise_dock_after_show("Command line", "command",
+                matches!(state, crate::dock::DockState::Floating(_)), ctx);
             self.cmd_dock_state = state;
             self.cmd_window_open = open;
         }
-
-        // ---- SIMLUX 3D viewport (docked right; before CentralPanel) -----
-        self.render_light_3d_panel(ctx);
 
         // ---- central panel: canvas --------------------------------------
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -22930,13 +23572,12 @@ impl eframe::App for CadApp {
 
             painter.rect_filled(rect, 0.0, egui::Color32::from_rgb(18, 22, 28));
 
-            // ---- SIMLUX lux overlay (false-colour, behind the geometry) ----
-            self.paint_lux_overlay(&painter, rect);
-            self.paint_luminaires_2d(&painter, rect);
-
             // ---- Reference raster underlays (behind everything) -----------
             self.sync_underlay_textures(ctx);
             self.draw_raster_underlays(&painter, rect);
+            // SIMLUX: lux heatmap + luminaire markers on the 2D plan (overlay default off).
+            self.paint_lux_overlay(&painter, rect);
+            self.paint_luminaires_2d(&painter, rect);
 
             // ---- Background grid (GrdEnb) ---------------------------------
             //
@@ -23155,33 +23796,6 @@ impl eframe::App for CadApp {
             let snap_hit: Option<SnapHit> = snap_candidates
                 .get(self.snap_cycle_index).copied();
 
-            // OBJECT-SNAP TRACKING acquisition (AutoCAD EXT / OTRACK):
-            // whenever an END snap on a LINE fires during a point-pick phase,
-            // remember its endpoint + outward direction. After the user moves
-            // off the endpoint (the END snap stops firing) the acquired ray
-            // persists, and `track_project` snaps the cursor onto the line's
-            // collinear extension so the next point CONTINUES the line.
-            // The anchor lives only while a point-pick phase is active — the
-            // moment the command/tool ends (`!snap_phase_active`) it clears,
-            // so no hunting every Esc / cancel site.
-            if snap_phase_active {
-                if let Some(h) = snap_hit {
-                    if h.kind == SnapKind::End {
-                        if let Some(anchor) = h.dobject
-                            .and_then(|i| self.doc.dobjects.get(i))
-                            .and_then(|d| match &d.geom {
-                                Geom::Line(l) => TrackAnchor::from_line_end(h.point, l.a, l.b),
-                                _ => None,   // v1: line endpoints only
-                            })
-                        {
-                            self.track_anchor = Some(anchor);
-                        }
-                    }
-                }
-            } else {
-                self.track_anchor = None;
-            }
-
             // Left-click handling:
             //   - if SELECT MODE is active: toggle dobject under cursor, or
             //     start / close a window-selection rectangle.
@@ -23194,22 +23808,8 @@ impl eframe::App for CadApp {
             // resp.clicked() fires only when egui classifies the press+release
             // as a click (small motion); drag_stopped() fires when a release
             // ends a drag — including a "click" that egui saw as a tiny drag.
-            let mut click_now = resp.clicked() && !canvas_locked && !rt_zoom;
+            let click_now    = resp.clicked() && !canvas_locked && !rt_zoom;
             let drag_stopped = resp.drag_stopped() && !canvas_locked && !rt_zoom;
-            // SIMLUX: placement mode consumes canvas clicks to drop luminaires.
-            if self.light.place_mode && !canvas_locked {
-                if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-                    self.light.place_mode = false;
-                } else if click_now {
-                    if let Some(pos) = resp.hover_pos() {
-                        if rect.contains(pos) {
-                            let w = self.s2w(pos, rect);
-                            self.light.add_luminaire_at(w.x as f32, w.y as f32);
-                        }
-                    }
-                    click_now = false; // consume — no select / draw this click
-                }
-            }
             // SESSION RECORDER — every mouse press/release with the
             // FULL gesture context. Press position is stashed on self
             // and re-read at release time to derive the real drag
@@ -23656,13 +24256,10 @@ impl eframe::App for CadApp {
                     // for downstream branches that need it unconstrained
                     // (selection hit-test, intersect-click, etc.).
                     let world = self.s2w(pos, rect);
-                    // Priority for the captured POINT: osnap > extension-track
-                    // > CARD > grid-snap > raw. Used wherever a click commits a
-                    // point (line endpoint, move base/dest, …). Extension track
-                    // lets a click LAND on the collinear extension of a line
-                    // whose endpoint was just acquired.
+                    // Priority for the captured POINT: osnap > CARD
+                    // > grid-snap > raw. Used wherever a click commits a
+                    // point (line endpoint, move base/dest, …).
                     let click_world = snap_hit.map(|h| h.point)
-                        .or_else(|| self.track_project(world))
                         .unwrap_or_else(|| self.apply_constraints(world));
                     // Remember the last picked point during a draw tool/flow, so
                     // Enter/Space at the next command's first-point prompt
@@ -24422,16 +25019,12 @@ impl eframe::App for CadApp {
                                     self.history.push(
                                         "  ! snap missed — used raw click".into());
                                 }
-                                // Priority: osnap > extension-track > CARD >
-                                // grid > raw, IDENTICAL to the preview /
-                                // move/copy click_world. WITHOUT track_project
-                                // here, the committed draw point ignored
-                                // extension tracking (and, before, CARD/grid)
-                                // even though the live preview honoured it —
-                                // the click landed on the raw pointer, not the
-                                // tracked extension point.
-                                self.track_project(world)
-                                    .unwrap_or_else(|| self.apply_constraints(world))
+                                // Apply CARD + grid-snap (priority osnap >
+                                // CARD > grid > raw), same as the click_world
+                                // used for move/copy/etc. WITHOUT this the
+                                // committed draw point ignored CARD and grid
+                                // even though the live preview honoured them.
+                                self.apply_constraints(world)
                             }
                         };
                         if self.snap_override.is_some() {
@@ -25511,41 +26104,6 @@ impl eframe::App for CadApp {
                     if let Some((i, _)) = best {
                         draw_dobject(&painter, rect, self, &self.doc.dobjects[i].geom,
                                     egui::Color32::from_rgb(120, 240, 255));
-                    }
-                }
-            }
-
-            // EXTENSION TRACKING guide: when no direct osnap fires but the
-            // cursor is tracking an acquired line's collinear ray, draw a
-            // dashed guide from the acquired endpoint through the tracked
-            // foot, plus a small "✛" marker at the foot — the visual cue that
-            // the click will land on the line's extension. Skipped when a
-            // direct snap_hit is present (that marker wins).
-            if snap_hit.is_none() {
-                if let (Some(t), Some(cur)) = (self.track_anchor, resp.hover_pos()) {
-                    let raw = self.s2w(cur, rect);
-                    if let Some(foot) = t.project(
-                        raw, self.env.SpTGSZ as f64 / (self.scale as f64).max(1e-6))
-                    {
-                        let time  = ctx.input(|i| i.time) as f32;
-                        let phase = time * 60.0;
-                        let a = (0.55 + 0.35 * (time * 4.0).sin()).clamp(0.25, 0.95);
-                        let trk_col = egui::Color32::from_rgba_unmultiplied(
-                            120, 235, 140, (a * 255.0) as u8);
-                        let os = self.w2s(t.origin, rect);
-                        let fs = self.w2s(foot, rect);
-                        draw_dashed_line(&painter, os, fs, 7.0, 4.0, phase,
-                            egui::Stroke::new(1.2, trk_col));
-                        // "✛" at the acquired endpoint (acquisition marker)…
-                        let mk = egui::Color32::from_rgb(120, 235, 140);
-                        painter.line_segment([os + egui::vec2(-4.0, 0.0), os + egui::vec2(4.0, 0.0)],
-                            egui::Stroke::new(1.4, mk));
-                        painter.line_segment([os + egui::vec2(0.0, -4.0), os + egui::vec2(0.0, 4.0)],
-                            egui::Stroke::new(1.4, mk));
-                        // …and a hollow square at the tracked foot (where the click lands).
-                        painter.rect_stroke(
-                            egui::Rect::from_center_size(fs, egui::vec2(9.0, 9.0)),
-                            0.0, egui::Stroke::new(1.4, mk));
                     }
                 }
             }
@@ -29040,19 +29598,6 @@ fn draw_dobject_dashed(
 /// bounded, so the UI stays responsive and the mode badges remain clickable.
 const CPU_DRAW_BUDGET: usize = 20_000;
 
-/// Upper bound on RAM an array command may allocate for NEW dobjects before it
-/// is DROPPED — APX makes a huge array RENDER fast, but it can't shrink
-/// STORAGE (N dobjects cost N × size_of::<DObject>() of RAM regardless of
-/// render mode), so allocating past this risks an OOM crash, which is worse
-/// than a graceful refusal. The real ceiling is this budget ÷ the struct
-/// size at call time, so it tracks DObject's actual size.
-const ARRAY_MEM_BUDGET_BYTES: usize = 1_500_000_000;   // ~1.5 GB
-
-/// Above this many NEW dobjects, generating an array auto-switches the
-/// render to APX (one dot per dobject) so the result stays fast instead of
-/// bogging the CPU/GPU paths. Below it the current mode is kept.
-const ARRAY_APX_THRESHOLD: usize = 50_000;
-
 /// Max GENERATED primitives (segments + circles + fill/hole triangles) the
 /// hatch cache builds in ONE frame. A big paste/array of hatches builds over
 /// a few frames instead of freezing one; the left-corner note shows how many
@@ -29181,9 +29726,9 @@ fn ear_clip(poly: &[Vec2]) -> Vec<[Vec2; 3]> {
 }
 
 /// WORLD-space wall faces (left, right), each a LIST of pieces. World-space
-/// analog of `wall_face_screen_pts`; both use the X-junction-aware
-/// `cad_wall::solve_face_segments` (dokkandar merge exception), so GPU walls
-/// render identically to the CPU path AND miter at junctions.
+/// analog of `wall_face_screen_pts` (uses `cad_wall::solve_faces`), so GPU
+/// walls render identically to the CPU path. X-junction face splitting is a
+/// separate ext feature not ported here.
 fn wall_face_world_pts(
     app: &CadApp,
     w:   &cad_kernel::Wall,
@@ -29205,17 +29750,13 @@ fn wall_face_world_pts(
             .filter_map(|d| if let Geom::Wall(x) = &d.geom {
                 Some(x.clone()) } else { None })
             .collect();
-        // dokkandar exception (per MERGE_HANDOFF): use the X-junction
-        // solve_face_segments (world-space, shared CPU/GPU) — more complete
-        // than HSI's solve_faces, so GPU walls miter at junctions too.
-        match cad_wall::solve_face_segments(w, &walls) {
-            Some((ls, rs)) => (
-                ls.iter().map(|(a, b)| vec![*a, *b]).collect(),
-                rs.iter().map(|(a, b)| vec![*a, *b]).collect(),
+        match cad_wall::solve_faces(w, &walls) {
+            Some(f) => (
+                vec![vec![f.left.0, f.left.1]],
+                vec![vec![f.right.0, f.right.1]],
             ),
             None => match (w.left_line(), w.right_line()) {
-                (Some(l), Some(r)) =>
-                    (vec![vec![l.a, l.b]], vec![vec![r.a, r.b]]),
+                (Some(l), Some(r)) => (vec![vec![l.a, l.b]], vec![vec![r.a, r.b]]),
                 _ => (Vec::new(), Vec::new()),
             },
         }

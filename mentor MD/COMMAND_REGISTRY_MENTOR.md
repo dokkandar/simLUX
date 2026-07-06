@@ -260,7 +260,7 @@ map derived from the registry; execution/parser untouched.
 | 6 | Convert menus (Draw/Modify, hybrid, ordered) | ✔ locked |
 | 6b | Context predicates (`visible`/`enabled` as `fn(&Ctx)`) | ✔ locked |
 | 7 | Command palette + shortcut map | ✔ locked |
-| — | Command methods / variants (arc/circle/fillet ▼ flyouts) | **partly done:** method memory reconceptualized as COMMAND-LEVEL (`command_method`); `execute(id)` applies it, so menus/rails/palette/shortcuts share one per-command preferred method (owner-approved feature, slightly beyond app-identical). **Deferred:** the command line reading/writing that memory (touches the frozen parser/flow), and giving menus their own method submenus (variant modeling) — that's the post-migration tool/parser track |
+| — | Command methods / variants (arc/circle/fillet ▼ flyouts) | **method memory done** (command-level `command_method`; `execute` applies it everywhere). **Menu + palette method ACCESS specced** → `mentor MD/METHOD_ACCESS_MENTOR.md` (split-click menu item + palette variants + method-aware glyphs; app-layer). **Still deferred:** the command line reading/writing that memory (touches the frozen parser/flow) |
 | — | Plugin registration + reserved fields | deferred |
 
 > Stop-anywhere: shipping through Phase 3 already delivers registry-driven,

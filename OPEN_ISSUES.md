@@ -164,6 +164,115 @@ Legend: 🔴 broken / confirmed not working · 🟡 partial / needs follow-up ·
 - **Where:** dump block in `cad_app/src/app.rs` (search `cmd_dump_open` /
   "Command registry dump"); data from `cad_app/src/command.rs` `build()`.
 
+### M1. Dropdown-menu conformance (MENU_DROPDOWN_MENTOR) 🟡
+- **ALL 9 category menus DONE** — File / Edit / Draw / Modify / View / Formative /
+  Utilities / Tools / Help all route through the ONE shared painter with the §1
+  metrics (12 pad, 14 gap, 26 band, 20 icon, aligned arrow column, SM(4) flyout).
+  Draw is committed+pushed (`5aba313`); the rest are working-tree (builds green,
+  **UNCOMMITTED**). Verified on-screen (File icons, Formative→Styles→picker nesting,
+  Tools headings+checkboxes, Import/Debug flyouts).
+- **Shared machinery** (`cad_app/src/app.rs`): `paint_menu_row` (row painter),
+  `menu_hug_geometry` (ONE width/arrow source, LINE vs ZONE trailing), `custom_menu`
+  (edge-to-edge chrome), `menu_divider`, `menu_heading_row` (§8 caption),
+  `RowT` (unified Code/Hint/Arrow/Shortcut/CodeArrow), `icon_for(key)` (§7 single
+  icon lookup — File reuses the QAT New/Open/Save glyphs via `MenuIcon::Qat`),
+  `MenuIcon::Check` (§8 cyan checkbox).
+- **§9 generalized flyout** — `FlyMenu`/`FlyFrame`/`FlyItem`/`FlyAct` + a frame
+  STACK (`menu_flyouts: Vec<FlyFrame>`), `flyout_items(&self)` (built fresh each
+  frame) + `flyout_activate(&mut self)` + `render_menu_flyouts`. Hosts Method,
+  Insert, Import, Dimension, Styles (→ nested DimStylePick / WallStylePick), Debug
+  (checkboxes + headings + dynamic labels + destructive). Hover-open, commit-on-
+  click, arbitrary nesting (verified 3 levels: Formative→Styles→picker).
+- **Label trims applied:** `Zoom Extents`, `Distance`, `List` (Tools + Utilities).
+  Kept verbatim (flagged): `Zoom Extents (fit all)`→done; Dimension flyout's
+  `Dimension  (smart: linear · radius · diameter)` — owner may trim. Edit shortcuts
+  `Ctrl+C/V/G` + Tools `Ctrl+Shift+P` now render right-aligned muted Mono (§1).
+- **Edit category pass (2026-07-13):** `Erase selection`→`Erase` (label only, cmd
+  unchanged). **New app-layer shortcuts** wired alongside Ctrl+C/V/G in the `update`
+  input block: **Select All = Shift+A**, **Deselect All = Ctrl/Cmd+D** — both shown
+  right-aligned in the menu, both verified on-screen (Shift+A→6 sel, Ctrl+D→0 sel),
+  **no binding conflicts** (no prior A/D global bind). Shift+A drops its `"A"` text
+  event so it selects instead of typing (gated by cmd-empty like Ctrl+C/V/G).
+- **Shortcut font → Geist (GLOBAL, 2026-07-13):** the shared `RowT::Shortcut` path
+  now renders in `typ::hint` (Geist 11, muted) not Mono — one change point in
+  `paint_menu_row` + matching `hw` measurer in `menu_hug_geometry`. Mono stays only
+  for `(CODE)` + numbers. Verified in Edit (Ctrl+C/V/G, Shift+A, Ctrl+D) AND Tools
+  (Ctrl+Shift+P). **Undo/Redo cmd-glyphs recentered** on x=0 (`draw_cmd_glyph`) so
+  they align in the icon column — those glyphs are Edit-menu-only, safe to change.
+- **Arrow-column gap 6→32 (GLOBAL, §2, 2026-07-13):** new `MENU_ARROW_GAP=32` const;
+  `menu_hug_geometry` decoupled so the submenu-▸ column = `base + 32` while shortcuts
+  keep the 6 gap and right-align to the 12 right pad (independent). One change point →
+  every menu. Verified on Draw (Circle/Arc/Insert-Block arrows ~32px past `Wall
+  (t = thickness)`, menu hugs to the column). Shortcuts unaffected.
+- **Tools category pass (2026-07-13):**
+  - **§8 real checkbox in `MenuIcon::Check`** — now ALWAYS draws the Inspector-style
+    16×16 r4 box: OFF = surface-0 fill + 1px `border` (muted, never a blank slot);
+    ON = cyan fill + on-accent check. Applies to every toggle row (Command line,
+    Layers, Pens, Inspector, DObjects, rails, Snap, Session Recorder).
+  - **Session Recorder** — dropped the `🛰` (tofu □); now a plain toggle row.
+  - **Text Style…** removed from Tools (lives in Formative → Styles).
+  - **§10 menu-launch positioning + bring-to-front (2026-07-13):**
+    - **Position:** `apply_dock_pos` applies a `menu_launch_anchor` (id→pos) as
+      `default_pos` (first-open only; egui remembers user moves after). Tools records
+      the anchor adjacent-right/top-aligned to the clicked row (`r.right()+8, r.top()`).
+    - **Bring-to-front (`raise_windows` queue):** on every menu-open, the panel id is
+      queued; consumed once when it renders. `raise_after_show` `move_to_top`s the
+      egui::Window panels (Layers / Pens / DObjects / **Session Recorder**);
+      `raise_dock_after_show` raises the `dock::HOST` float area `(id,"float")` for
+      **Inspector / Command line** when floating (docked = pinned edge, no-op).
+    - **Session Recorder** now anchors adjacent-right + raises (was left/behind); given
+      `apply_dock_pos("Session Recorder")`.
+    - Remembered geometry still wins for position; raise fires regardless of position.
+    - **Snap window** toggle has NO renderer (dead toggle — nothing to position); left
+      as a plain checkbox. Inspector/Command-line anchor entries are inert (those use
+      the dock host, not `apply_dock_pos`) — raise is what applies to them.
+- **Missing icons (reserved 20px slot — later icon-assign pass):** Edit → Paste,
+  Group, Add to Group, Ungroup, Select All, Deselect All, Settings…; Modify →
+  Inspector…; View → all 4 zoom; Help → both; File → Import/parametric/Exit;
+  Formative → Layers/Pens/Styles; most of Tools. (Add via one `icon_for` entry each.)
+- **Pending / notes:**
+  1. **Owner visual review** → then assign missing icons (one `icon_for` line each)
+     + confirm the Dimension-flyout label trim.
+  2. **Commit** the whole conversion once reviewed.
+  3. **`🛰` (Session Recorder) / `∩` (intersect) render as tofu □** — pre-existing
+     (glyphs absent from Geist/JetBrains Mono; original had the same). Swap to ASCII
+     or add an emoji fallback font if wanted.
+  4. **Tools checkbox rows** omit `close_menu` so you can flip several — confirm egui
+     keeps the menu open on a frameless-Button click (if it auto-closes, revisit).
+  5. **Parked global hover sliver** (§3) — untouched by design; fixes everywhere at
+     once when solved.
+
+### M2. Dialog header conformance (HEADER_STANDARD_MENTOR §4) 🔵
+- The ~25 `egui::Window` dialogs (Hatch, Block, Insert Block, DWG, raster,
+  parametric, + managers) still use egui's default title bar. Adopt the shared
+  **Floating `dock::header_band`** (32 chrome band, close ×). Deferred — separate
+  pass from the palette (which already conforms).
+
+### E6. "End command" gesture — right-click = Esc = smart end 🔵
+- **Requested (2026-07-04):** in the middle of any command, **right-click and Esc
+  should do the SAME thing** — an "end command" that resolves by context:
+  - **Multi-point draw with enough points** (Line ≥2, Polyline ≥2, Spline ≥3,
+    Wall run ≥1 seg) → **commit up to the last PLACED point** (finish, keep the
+    geometry; drop the rubber-band segment to the cursor) → then fresh
+    (`Tool::None`). The exact primitive already exists: `commit_active_draw()`.
+  - **Too few points / non-draw commands / prompt flows / block-insert** →
+    **cancel** to fresh (clear pending, cancel flows, `Tool::None`).
+  - **Active sub-session** (trim/extend/hatch/offset/array/select) → finish the
+    session (as its Enter/Esc do today).
+- **Decisions to confirm before building:**
+  1. This **changes Esc's current pline/spline behaviour** (today Esc *drops only
+     the last vertex*, stays in the tool). New rule = Esc/right-click *finish the
+     run*. → move "remove last vertex" to **Backspace** (recommended), or make
+     ONLY right-click finish while Esc keeps drop-last (breaks "Esc = right-click").
+  2. Which tools commit-partial: proposed **Line / Polyline / Spline / Wall**;
+     Circle/Arc/Ellipse/Rectangle/Point just cancel.
+  3. **Right-click isn't wired to command-end today** (only logged; primary does
+     the clicking) — confirm it doesn't collide with pan / context-menu first.
+- **Where:** Esc handler `cad_app/src/app.rs` (search `Key::Escape` ~L21101 — the
+  pline drop-last block); Enter/finish path (`commit_active_draw` ~L17964, called
+  ~L21550); canvas right-click (`PointerButton::Secondary` ~L23293).
+- **Status:** DEFERRED by owner — pending the three decisions above.
+
 ### 5. Groups not persisted to `.rsm`
 - Groups are in-session only; saving/reloading drops them.
 
