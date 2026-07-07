@@ -2995,6 +2995,11 @@ impl CadApp {
     /// `&self.doc`, so the panel returns an action instead of touching it.
     fn render_light_panel(&mut self, ctx: &egui::Context) {
         if !self.light.window_open { return; }
+        // Snapshot (layer id, name) OUTSIDE the window closure so panel_ui never
+        // borrows self.doc while self.light is borrowed mutably (Phase B picker).
+        let layers: Vec<(u32, String)> = self.doc.layers.layers.iter().enumerate()
+            .map(|(i, l)| (i as u32, l.name.clone()))
+            .collect();
         let mut open = self.light.window_open;
         let mut action = crate::light::LightAction::default();
         egui::Window::new("SIMLUX — Light")
@@ -3003,10 +3008,12 @@ impl CadApp {
             .resizable(true)
             .show(ctx, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    action = self.light.panel_ui(ui);
+                    action = self.light.panel_ui(ui, &layers);
                 });
             });
         self.light.window_open = open;
+        if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
+        if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
         if action.calculate {
             self.light.calculate(&self.doc);
         }

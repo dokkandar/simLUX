@@ -66,20 +66,40 @@ fn arc_pts(a: &KArc) -> Vec<Vec2> {
         .collect()
 }
 
+/// Extrude ONE geometry to surfaces at `height` (closed paths also get
+/// floor + ceiling). Shared by `extrude` (whole doc) and `extrude_handles`
+/// (SIMLUX per-layer room build), so both stay in lock-step.
+fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>) {
+    match geom {
+        Geom::Line(l) => extrude_path(&[l.a, l.b], false, height, out),
+        Geom::Wall(w) => extrude_path(&[w.start, w.end], false, height, out),
+        Geom::Polyline(p) => {
+            let v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
+            extrude_path(&v, p.closed, height, out);
+        }
+        Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, out),
+        Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out),
+        _ => {}
+    }
+}
+
 /// Extrude every drafted entity to surfaces (closed paths also get floor + ceiling).
 pub fn extrude(doc: &Document, height: f32) -> Vec<Mesh> {
     let mut out = Vec::new();
     for d in &doc.dobjects {
-        match &d.geom {
-            Geom::Line(l) => extrude_path(&[l.a, l.b], false, height, &mut out),
-            Geom::Wall(w) => extrude_path(&[w.start, w.end], false, height, &mut out),
-            Geom::Polyline(p) => {
-                let v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
-                extrude_path(&v, p.closed, height, &mut out);
-            }
-            Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, &mut out),
-            Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, &mut out),
-            _ => {}
+        extrude_geom(&d.geom, height, &mut out);
+    }
+    out
+}
+
+/// Extrude ONLY the dobjects named by `handles`, at `height` — the SIMLUX
+/// per-layer room build (each imported layer extrudes to its own height).
+/// Handles that no longer exist in `doc` are silently skipped.
+pub fn extrude_handles(doc: &Document, handles: &[u64], height: f32) -> Vec<Mesh> {
+    let mut out = Vec::new();
+    for &h in handles {
+        if let Some(d) = doc.find_by_handle(h) {
+            extrude_geom(&d.geom, height, &mut out);
         }
     }
     out

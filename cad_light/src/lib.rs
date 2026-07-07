@@ -13,7 +13,7 @@ pub mod rt;
 pub mod types;
 
 pub use calc::calculate;
-pub use extrude::{bbox, box_room, extrude, triangulate};
+pub use extrude::{bbox, box_room, extrude, extrude_handles, triangulate};
 pub use ies::{parse as parse_ies, IesProfile, PhotometryType};
 pub use types::{
     default_materials, CalcPlane, LuxGrid, Luminaire, Material, MaterialId, Mesh, RaySettings,

@@ -9,8 +9,8 @@
 use std::collections::HashMap;
 
 use cad_light::{
-    bbox, calculate as calc_lux, default_materials, extrude, parse_ies, CalcPlane, IesProfile,
-    LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
+    bbox, calculate as calc_lux, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
+    IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
 };
 use cad_kernel::Document;
 
@@ -43,6 +43,21 @@ fn builtin_downlight() -> IesProfile {
 #[derive(Default)]
 pub struct LightAction {
     pub calculate: bool,
+    /// Import every dobject on this source-layer id into the room (Phase B).
+    pub import_layer: Option<u32>,
+    /// Drop this imported room layer.
+    pub remove_layer: Option<u32>,
+}
+
+/// One imported source layer of the room: the drafted dobjects on `layer_id`,
+/// extruded to a per-layer `height` (SIMLUX layer-grouped room model — D1/D2).
+/// Handle-based so the set survives redraws / re-ordering of the document.
+#[derive(Clone)]
+pub struct RoomLayer {
+    pub layer_id: u32,
+    pub name: String,
+    pub height: f32,
+    pub handles: Vec<u64>,
 }
 
 /// All lighting UI + engine state, owned by `CadApp`.
@@ -55,8 +70,12 @@ pub struct LightState {
     pub active_profile: String,
     /// Surface materials [floor, wall, ceiling] — reflectances are editable.
     pub materials: Vec<Material>,
-    /// Room (extrusion) height, metres.
+    /// Room (extrusion) height, metres — default height for newly imported
+    /// layers and the fallback when no layer has been imported yet.
     pub room_height: f32,
+    /// SIMLUX room (Phase B/C): imported source layers, each extruded to its
+    /// own `height`. Empty ⇒ `calculate` falls back to extruding the whole doc.
+    pub room: Vec<RoomLayer>,
     /// Work-plane height above the floor, metres (typ. 0.8 m desk height).
     pub plane_height: f32,
     /// Target grid cell size, metres (clamped to 8..64 cells per axis).
@@ -113,6 +132,7 @@ impl LightState {
             active_profile: BUILTIN.to_string(),
             materials: default_materials(),
             room_height: 3.0,
+            room: Vec::new(),
             plane_height: 0.8,
             cell_size: 0.25,
             settings: RaySettings::default(),
@@ -185,6 +205,38 @@ impl LightState {
         self.last_msg = format!("Placed fixture #{id} at ({x:.2}, {y:.2}) — press Calculate.");
     }
 
+    /// Import (Phase B) every drafted dobject on `layer_id` into the room, at
+    /// the current default height. Re-importing the same layer refreshes its
+    /// handle set and keeps its chosen height.
+    pub fn import_layer(&mut self, doc: &Document, layer_id: u32) {
+        let handles: Vec<u64> = doc.dobjects.iter()
+            .filter(|d| d.style.layer == layer_id)
+            .map(|d| d.handle)
+            .collect();
+        let name = doc.layers.get(layer_id)
+            .map(|l| l.name.clone())
+            .unwrap_or_else(|| format!("layer {layer_id}"));
+        let n = handles.len();
+        if let Some(g) = self.room.iter_mut().find(|g| g.layer_id == layer_id) {
+            g.handles = handles;
+            g.name = name.clone();
+        } else {
+            self.room.push(RoomLayer { layer_id, name: name.clone(), height: self.room_height, handles });
+        }
+        self.last_msg =
+            format!("Imported {n} object(s) from layer '{name}' — set height, then Calculate.");
+    }
+
+    /// Drop one imported room layer (Phase B).
+    pub fn remove_room_layer(&mut self, layer_id: u32) {
+        self.room.retain(|g| g.layer_id != layer_id);
+    }
+
+    /// Every handle across all imported room layers (for plan highlight / count).
+    pub fn room_handles(&self) -> Vec<u64> {
+        self.room.iter().flat_map(|g| g.handles.iter().copied()).collect()
+    }
+
     /// Run the lux engine on `doc` and store the grid + plane + scene.
     pub fn calculate(&mut self, doc: &Document) {
         let Some((min_x, min_y, max_x, max_y)) = bbox(doc) else {
@@ -203,7 +255,18 @@ impl LightState {
             cols,
             rows,
         };
-        let meshes = extrude(doc, self.room_height);
+        // Phase C: build the room from imported per-layer groups (each at its
+        // own height); fall back to extruding the whole document when nothing
+        // has been imported yet, so the legacy one-click flow still works.
+        let meshes = if self.room.is_empty() {
+            extrude(doc, self.room_height)
+        } else {
+            let mut m = Vec::new();
+            for g in &self.room {
+                m.extend(extrude_handles(doc, &g.handles, g.height));
+            }
+            m
+        };
         let lums = if self.luminaires.is_empty() && self.auto_center_light {
             vec![Luminaire {
                 id: 1,
@@ -232,9 +295,70 @@ impl LightState {
     }
 
     /// Draw the panel body. Returns actions the app must run (they need `&Document`).
-    pub fn panel_ui(&mut self, ui: &mut egui::Ui) -> LightAction {
+    pub fn panel_ui(&mut self, ui: &mut egui::Ui, layers: &[(u32, String)]) -> LightAction {
         let mut action = LightAction::default();
         ui.set_min_width(260.0);
+
+        // ---- ① Room — import source layers, extrude each to its own height ----
+        ui.label(egui::RichText::new("① Room  ·  import layers").strong());
+        ui.label(
+            egui::RichText::new("Pick the drawing layers that form the room.")
+                .small()
+                .weak(),
+        );
+        egui::Grid::new("simlux_layer_import")
+            .num_columns(3)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                for (id, name) in layers {
+                    let imported = self.room.iter().any(|g| g.layer_id == *id);
+                    ui.label(name.as_str());
+                    let btn = if imported { "Re-import" } else { "Import" };
+                    if ui.button(btn).clicked() {
+                        action.import_layer = Some(*id);
+                    }
+                    ui.label(
+                        egui::RichText::new(if imported { "✔ in room" } else { "" })
+                            .small()
+                            .weak(),
+                    );
+                    ui.end_row();
+                }
+            });
+        if self.room.is_empty() {
+            ui.label(
+                egui::RichText::new("No layers imported → Calculate extrudes the whole drawing.")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            ui.add_space(4.0);
+            ui.label(egui::RichText::new("② Extrude  ·  per-layer height (m)").strong());
+            egui::Grid::new("simlux_room_groups")
+                .num_columns(4)
+                .spacing([8.0, 4.0])
+                .show(ui, |ui| {
+                    for g in &mut self.room {
+                        ui.label(egui::RichText::new(&g.name).strong());
+                        ui.label(
+                            egui::RichText::new(format!("{} obj", g.handles.len()))
+                                .small()
+                                .weak(),
+                        );
+                        ui.add(
+                            egui::DragValue::new(&mut g.height)
+                                .speed(0.05)
+                                .suffix(" m")
+                                .range(0.1..=20.0),
+                        );
+                        if ui.button("✕").on_hover_text("Remove from room").clicked() {
+                            action.remove_layer = Some(g.layer_id);
+                        }
+                        ui.end_row();
+                    }
+                });
+        }
+        ui.separator();
 
         // ---- Luminaire / IES --------------------------------------------
         ui.label(egui::RichText::new("Luminaire").strong());
