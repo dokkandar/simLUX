@@ -12405,11 +12405,33 @@ impl CadApp {
                 // Jump straight to the drawing — no manual ZOOM needed.
                 self.fit_view_to_drawing();
                 self.current_file = Some(std::path::PathBuf::from(path));
+                self.load_simlux_sidecar(std::path::Path::new(path));
                 self.history.push(format!(
                     "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
                 ));
             }
             Err(e) => self.history.push(format!("  ! open '{}': {}", path, e)),
+        }
+    }
+
+    /// Write the SIMLUX sidecar (`<drawing>.simlux.json`) next to `drawing`.
+    fn write_simlux_sidecar(&mut self, drawing: &std::path::Path) {
+        let cfg = self.light.to_config(&self.doc);
+        match crate::simlux_io::save(drawing, &cfg) {
+            Ok(p) => self.history.push(format!("  SIMLUX setup → '{}'", p.display())),
+            Err(e) => self.history.push(format!("  ! SIMLUX save: {}", e)),
+        }
+    }
+
+    /// Load the SIMLUX sidecar for `drawing` (if present) onto the current doc.
+    fn load_simlux_sidecar(&mut self, drawing: &std::path::Path) {
+        match crate::simlux_io::load(drawing) {
+            Ok(Some(cfg)) => {
+                self.light.apply_config(cfg, &self.doc);
+                self.history.push("  SIMLUX setup loaded (sidecar)".into());
+            }
+            Ok(None) => {}
+            Err(e) => self.history.push(format!("  ! SIMLUX load: {}", e)),
         }
     }
 
@@ -12428,6 +12450,7 @@ impl CadApp {
         match std::fs::write(path, &bytes) {
             Ok(()) => {
                 self.current_file = Some(std::path::PathBuf::from(path));
+                self.write_simlux_sidecar(std::path::Path::new(path));
                 self.history.push(format!(
                     "  saved '{}'  ({} bytes)", path, bytes.len()));
             }

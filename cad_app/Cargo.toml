@@ -13,6 +13,8 @@ cad_io     = { path = "../cad_io" }
 cad_wall   = { path = "../cad_wall" }
 cad_raster = { path = "../cad_raster" }
 cad_param  = { path = "../cad_param" }
+serde      = { version = "1", features = ["derive"] }   # SIMLUX sidecar (drawing.simlux.json)
+serde_json = "1"
 cad_light  = { path = "../cad_light" }   # SIMLUX lighting engine (IES + lux + Document extrude)
 glam       = "0.29"                       # SIMLUX 3D camera math (same version cad_light uses)
 image      = { version = "0.25", default-features = false, features = ["png", "jpeg", "bmp", "tiff"] }

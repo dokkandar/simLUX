@@ -1,7 +1,9 @@
 //! IES LM-63 photometric file support (Type A/B/C, TILT=NONE).
 
+use serde::{Deserialize, Serialize};
+
 /// Goniometer geometry declared in the IES header.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PhotometryType {
     A,
     B,
@@ -10,7 +12,7 @@ pub enum PhotometryType {
 
 /// A parsed IES luminous-intensity distribution. `candela[h][v]` is indexed by
 /// horizontal-angle row then vertical-angle column (LM-63 layout).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IesProfile {
     pub name: String,
     pub photometry: PhotometryType,

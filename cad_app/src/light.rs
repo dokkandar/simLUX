@@ -330,6 +330,77 @@ impl LightState {
         }
     }
 
+    /// Snapshot the SIMLUX-side state into a serialisable sidecar config,
+    /// keyed by STABLE NAMES (layer name, profile name) so it round-trips a
+    /// save/reopen. The built-in synthetic downlight is NOT persisted (it is
+    /// regenerated in `new`).
+    pub fn to_config(&self, doc: &Document) -> crate::simlux_io::SimluxConfig {
+        use std::collections::BTreeMap;
+        let mut layers_3d = BTreeMap::new();
+        for g in &self.room {
+            let name = doc
+                .layers
+                .get(g.layer_id)
+                .map(|l| l.name.clone())
+                .unwrap_or_else(|| g.name.clone());
+            layers_3d.insert(name, g.height);
+        }
+        let mut ies_library = BTreeMap::new();
+        for (k, v) in &self.profiles {
+            if k != BUILTIN {
+                ies_library.insert(k.clone(), v.clone());
+            }
+        }
+        crate::simlux_io::SimluxConfig {
+            layers_3d,
+            ies_library,
+            active_profile: self.active_profile.clone(),
+            lux_block_ies: BTreeMap::new(),
+            materials: self.materials.clone(),
+            settings: self.settings,
+            room_height: self.room_height,
+            plane_height: self.plane_height,
+            cell_size: self.cell_size,
+        }
+    }
+
+    /// Apply a loaded sidecar config onto the current document — merge the IES
+    /// library, restore materials/settings/defaults, and rebuild the room by
+    /// resolving persisted layer NAMES back to ids + their current handles.
+    pub fn apply_config(&mut self, cfg: crate::simlux_io::SimluxConfig, doc: &Document) {
+        for (k, v) in cfg.ies_library {
+            self.profiles.insert(k, v);
+        }
+        if self.profiles.contains_key(&cfg.active_profile) {
+            self.active_profile = cfg.active_profile;
+        }
+        if !cfg.materials.is_empty() {
+            self.materials = cfg.materials;
+        }
+        self.settings = cfg.settings;
+        if cfg.room_height > 0.0 {
+            self.room_height = cfg.room_height;
+        }
+        if cfg.plane_height > 0.0 {
+            self.plane_height = cfg.plane_height;
+        }
+        if cfg.cell_size > 0.0 {
+            self.cell_size = cfg.cell_size;
+        }
+        self.room.clear();
+        for (name, height) in cfg.layers_3d {
+            if let Some(lid) = doc.layers.find(&name) {
+                let handles: Vec<u64> = doc
+                    .dobjects
+                    .iter()
+                    .filter(|d| d.style.layer == lid)
+                    .map(|d| d.handle)
+                    .collect();
+                self.room.push(RoomLayer { layer_id: lid, name, height, handles });
+            }
+        }
+    }
+
     /// Draw the panel body. Returns actions the app must run (they need `&Document`).
     pub fn panel_ui(&mut self, ui: &mut egui::Ui, layers: &[(u32, String)]) -> LightAction {
         let mut action = LightAction::default();

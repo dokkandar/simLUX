@@ -3,11 +3,12 @@
 //! Geometry is `glam` f32 (ample precision at room scale, in metres). Photometric
 //! scalars (candela, lux, lumens) are `f64`.
 use glam::Vec3;
+use serde::{Deserialize, Serialize};
 
 pub type MaterialId = u32;
 
 /// A 3D vertex (metres).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct Vertex {
     pub x: f32,
     pub y: f32,
@@ -42,6 +43,7 @@ pub struct Mesh {
 
 /// A Lambertian surface material.
 #[derive(Debug, Clone)]
+#[derive(Serialize, Deserialize)]
 pub struct Material {
     pub id: MaterialId,
     pub name: String,
@@ -61,7 +63,7 @@ pub fn default_materials() -> Vec<Material> {
 }
 
 /// A luminaire placed in the scene: an IES profile at a pose.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Luminaire {
     pub id: u32,
     /// Key into the profile table.
@@ -99,7 +101,7 @@ impl CalcPlane {
 }
 
 /// Ray-tracing / radiosity controls.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RaySettings {
     /// Hemisphere samples per point for the indirect pass.
     pub rays_per_point: u32,

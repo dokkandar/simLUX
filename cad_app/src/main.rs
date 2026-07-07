@@ -9,6 +9,7 @@ mod light;
 mod light3d;
 mod param_editor;
 mod settings;
+mod simlux_io;
 mod theme;
 mod varreg;
 // wall feature logic now lives in the `cad_wall` crate (see ARCHITECTURE.md).
