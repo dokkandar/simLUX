@@ -966,6 +966,19 @@ impl Geom {
             }
             Geom::Arc(a) => Geom::Circle(Circle { center: a.center, radius: a.radius }),
             Geom::EllipseArc(ea) => Geom::Ellipse(ea.ellipse),
+            // A Wall's "infinite form" is its centerline lengthened past the
+            // drawing — same as a Line. WITHOUT this, a Wall TARGET (or an
+            // edge-mode Wall boundary) fails the `hits.is_empty()` guard in
+            // `extend_to` before the `Geom::Wall` arm can extend the centerline,
+            // so "extend a wall to a boundary" silently no-ops.
+            Geom::Wall(w) => {
+                let cl = w.centerline();
+                let d = cl.b - cl.a;
+                let len = d.len();
+                if len < EPS { return self.clone(); }
+                let u = d / len;
+                Geom::Line(Line { a: cl.a - u * EXT, b: cl.b + u * EXT })
+            }
             other => other.clone(),
         }
     }
@@ -1937,6 +1950,28 @@ mod transform_tests {
             assert!(approx_eq(l.a.x, 0.0));
             assert!(approx_eq(l.b.x, 10.0));
         } else { panic!(); }
+    }
+
+    #[test]
+    fn extend_wall_target_reaches_boundary() {
+        // Regression: a WALL target used to fail extend because
+        // `extended_for_edgemode` didn't lengthen walls, so the early
+        // hits-empty guard bailed before the Wall arm could run. The wall's
+        // top end (y=4) must extend up to the boundary at y=10.
+        let target = Geom::Wall(Wall {
+            start: Vec2::new(2.0, 0.0), end: Vec2::new(2.0, 4.0),
+            thickness: 0.3, style: 0, bulge: 0.0,
+        });
+        let boundary = Geom::Line(Line { a: Vec2::new(-5.0, 10.0), b: Vec2::new(5.0, 10.0) });
+        // Click near the top end (y=4) → extend that side up to y=10.
+        let out = target.extend_to(&[boundary], Vec2::new(2.0, 3.5), false).unwrap();
+        if let Geom::Wall(w) = out {
+            assert!(approx_eq(w.start.y, 0.0));
+            assert!(approx_eq(w.end.y, 10.0));
+            assert!(approx_eq(w.thickness, 0.3));
+        } else {
+            panic!("expected a Wall back");
+        }
     }
 
     #[test]
