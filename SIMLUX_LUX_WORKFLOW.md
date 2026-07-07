@@ -22,6 +22,31 @@ Legend:  🟢 exists (reuse) · 🟡 exists but change · 🔴 new
 
 ---
 
+## Data model (2026-07-08 — the architecture)
+Two halves: **2D = drafting** (easy plan management), **3D = modeling + lux
+calc**. State that isn't kernel geometry lives **SIMLUX-side** (keeps
+`cad_kernel` untouched) and persists alongside the drawing.
+
+- **Layers drive 3D.** Every layer can be flagged **"use for 3D"** — a
+  SIMLUX-side per-layer flag keyed by layer id, NOT a new kernel `Layer` field.
+  The room is drafted, then shifted onto a dedicated **SIMLUX** layer; any
+  flagged layer extrudes into the 3D model at its per-layer height. *(This
+  generalises the earlier "import layer into a room list" — the flag IS the
+  room membership; supersedes B1's list model.)*
+- **Luminaires are LUX blocks.** A luminaire is a real 2D dobject — a **block
+  reference** on the plan (move/snap/copy like any block), tagged as a **LUX
+  block**. Position + rotation come from the block instance; the calc **derives**
+  `Luminaire`s from the LUX-block instances in the document *(replaces the
+  `LightState.luminaires` side-list)*.
+- **IES entered once, referenced many.** IES files load into a library
+  (`profiles: name → IesProfile`, persisted with the drawing). A LUX block stores
+  only the **IES name** (a reference), never a copy. N blocks → 1 IES entry —
+  the block define-once / insert-many pattern applied to photometry.
+
+Reuse: `cad_kernel::block` (BlockTable/Block/BlockRef) + the existing IES-by-name
+reference. New (SIMLUX-side): the layer-3D flags, the LUX-block tag + IES-name
+attribute, deriving luminaires from blocks, and persistence of all three.
+
 ## Phase A — SIMLUX workflow shell
 Make the pipeline explicit and stateful instead of implicit.
 - **A1** 🔴 Add a **Room** to `LightState`: `room_handles: Vec<Handle>` (the
