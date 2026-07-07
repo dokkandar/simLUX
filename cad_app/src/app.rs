@@ -1429,6 +1429,11 @@ pub struct CadApp {
     /// Armed by the dialog's "Pick ⊕" button — the next canvas click is
     /// captured as the block's insertion point and the dialog reopens.
     block_dialog_pick_base: bool,
+    /// The **Insert Block** dialog (bare `insert`). `None` when closed.
+    insert_dialog:   Option<InsertDialog>,
+    /// Armed by the Insert dialog's "Pick ⊕" — next canvas click sets the
+    /// insertion point and reopens the dialog.
+    insert_dialog_pick: bool,
     /// Live cursor in world coords (RAW, before constraints), refreshed
     /// every canvas frame. Lets the command line's direct-distance entry
     /// know which direction to throw a typed distance.
@@ -1866,6 +1871,38 @@ pub enum InsertState {
     /// Insertion point chosen; waiting for the ROTATION angle — click a
     /// direction point (angle = direction from `insert`), or Enter = 0.
     WaitingForAngle { block: u32, insert: Vec2 },
+}
+
+/// The **Insert Block** dialog — pick a defined block, set scale + rotation +
+/// insertion point (typed X/Y or picked on screen), then place it. Opened by
+/// bare `insert` (no name) or Draw ▸ Insert Block…
+pub struct InsertDialog {
+    /// Selected block definition id (index into `Document.blocks`).
+    pub block: Option<u32>,
+    pub scale: String,
+    pub rotation: String,
+    pub at_x: String,
+    pub at_y: String,
+}
+
+impl InsertDialog {
+    fn new(block: Option<u32>) -> Self {
+        InsertDialog {
+            block,
+            scale: "1.0".into(),
+            rotation: "0".into(),
+            at_x: "0.0000".into(),
+            at_y: "0.0000".into(),
+        }
+    }
+    fn scale_f(&self) -> f64 { self.scale.trim().parse().unwrap_or(1.0) }
+    fn rot_rad(&self) -> f64 { self.rotation.trim().parse::<f64>().unwrap_or(0.0).to_radians() }
+    fn at(&self) -> Vec2 {
+        Vec2::new(
+            self.at_x.trim().parse().unwrap_or(0.0),
+            self.at_y.trim().parse().unwrap_or(0.0),
+        )
+    }
 }
 
 /// Pick-two-blocks-on-screen flow for `blockdiff` / the dialog Compare
@@ -2846,6 +2883,8 @@ impl Default for CadApp {
             groups: Vec::new(),
             insert_state:    InsertState::Off,
             block_dialog:    None,
+            insert_dialog:   None,
+            insert_dialog_pick: false,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             props_edit_gesture: false,
@@ -5104,9 +5143,8 @@ impl CadApp {
                             self.history.push(
                                 "  ! insert: no blocks defined — create one with `block <name>`".into());
                         } else {
-                            self.history.push(format!(
-                                "  insert: usage `insert <name>` — available: {}",
-                                names.join(", ")));
+                            // Bare `insert` → open the Insert Block dialog.
+                            self.insert_dialog = Some(InsertDialog::new(Some(0)));
                         }
                     }
                     Some(ref name) => match self.doc.blocks.find(name) {
@@ -14260,12 +14298,127 @@ impl CadApp {
                 self.block_dialog = Some(dialog);
             } else {
                 let base = dialog.base_point();
-                self.apply_block_create(&name, base, dialog.color_aci, dialog.smart);
+                let smart = dialog.smart;
+                self.apply_block_create(&name, base, dialog.color_aci, smart);
+                // Smart block → jump STRAIGHT into the isolated Block Editor to
+                // define the parametric modifier vectors (user request): ticking
+                // "Smart block" + OK opens the editor on the new definition.
+                if smart {
+                    if let Some(id) = self.doc.blocks.find(&name) {
+                        self.open_block_editor(id);
+                    }
+                }
                 // success → dialog closes (not restored)
             }
             return;
         }
         self.block_dialog = Some(dialog);
+    }
+
+    /// The **Insert Block** dialog: pick a block, set scale + rotation +
+    /// insertion point (typed or picked on screen), then place it. Bare
+    /// `insert` opens it. Parked (not drawn) while "Pick ⊕" waits for a click.
+    fn render_insert_dialog(&mut self, ctx: &egui::Context) {
+        if self.insert_dialog_pick { return; } // parked during on-canvas pick
+        let Some(mut dlg) = self.insert_dialog.take() else { return };
+        let blocks: Vec<(u32, String)> = self.doc.blocks.blocks.iter().enumerate()
+            .map(|(i, b)| (i as u32, b.name.clone()))
+            .collect();
+        if blocks.is_empty() { return; }
+        let mut open = true;
+        let mut do_insert = false;
+        let mut do_pick = false;
+        let mut do_cancel = false;
+        egui::Window::new("Insert Block")
+            .id(egui::Id::new("insert_dialog"))
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.set_min_width(300.0);
+                ui.horizontal(|ui| {
+                    ui.label("Block");
+                    let cur = dlg.block
+                        .and_then(|id| blocks.iter().find(|(i, _)| *i == id))
+                        .map(|(_, n)| n.clone())
+                        .unwrap_or_else(|| "(pick)".into());
+                    egui::ComboBox::from_id_source("insert_block_pick")
+                        .selected_text(cur)
+                        .show_ui(ui, |ui| {
+                            for (id, name) in &blocks {
+                                ui.selectable_value(&mut dlg.block, Some(*id), name);
+                            }
+                        });
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Scale");
+                    ui.add(egui::TextEdit::singleline(&mut dlg.scale).desired_width(70.0));
+                    ui.add_space(8.0);
+                    ui.label("Rotation°");
+                    ui.add(egui::TextEdit::singleline(&mut dlg.rotation).desired_width(70.0));
+                });
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("At  X");
+                    ui.add(egui::TextEdit::singleline(&mut dlg.at_x).desired_width(80.0));
+                    ui.label("Y");
+                    ui.add(egui::TextEdit::singleline(&mut dlg.at_y).desired_width(80.0));
+                    if ui.button("Pick ⊕")
+                        .on_hover_text("Click the insertion point on the drawing")
+                        .clicked()
+                    {
+                        do_pick = true;
+                    }
+                });
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Cancel").clicked() { do_cancel = true; }
+                        if ui.add_enabled(dlg.block.is_some(), egui::Button::new("Insert"))
+                            .clicked()
+                        {
+                            do_insert = true;
+                        }
+                    });
+                });
+            });
+        if do_pick {
+            self.insert_dialog = Some(dlg);          // keep it, hidden while picking
+            self.insert_dialog_pick = true;
+            self.set_prompt("insert: click the insertion point  [Esc=cancel]");
+            return;
+        }
+        if do_insert {
+            if let Some(id) = dlg.block {
+                self.place_block_scaled(id, dlg.at(), dlg.scale_f(), dlg.rot_rad());
+            }
+            return; // dialog closes
+        }
+        if !open || do_cancel {
+            return; // Cancel / × — dialog closes
+        }
+        self.insert_dialog = Some(dlg); // keep open across frames
+    }
+
+    /// Place a block instance at `insert` with the given uniform `scale` and
+    /// `rotation` (radians) — the Insert-dialog placement path (mirrors
+    /// `apply_insert`'s plain-block branch but honours scale).
+    fn place_block_scaled(&mut self, block: u32, insert: Vec2, scale: f64, rotation: f64) {
+        self.snapshot_doc();
+        let s = if scale.abs() < 1e-6 { 1.0 } else { scale.abs() };
+        let br = cad_kernel::BlockRef {
+            block, insert, scale: s, scale_y: s, rotation,
+            mirror_x: false,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        };
+        self.add_dobject(Geom::BlockRef(br), "insert");
+        self.apply_block_cut(br);
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!(
+            "  + inserted block #{} at ({:.2}, {:.2})  s={:.3}  rot={:.1}°",
+            block, insert.x, insert.y, s, rotation.to_degrees()));
     }
 
     /// `block <name>` final step — store the definition (contents = the
@@ -21906,6 +22059,9 @@ impl eframe::App for CadApp {
             // Abandon any parked Block-dialog round-trip (Select / Pick).
             self.block_dialog_stash = None;
             self.block_dialog_pick_base = false;
+            // Close / cancel the Insert dialog + its pick.
+            self.insert_dialog = None;
+            self.insert_dialog_pick = false;
             // Drop any captured stretch crossing box (e.g. Esc mid-select).
             self.stretch_window_box = None;
             // Dismiss the block-diff parametric-point highlight + cancel a
@@ -23250,6 +23406,7 @@ impl eframe::App for CadApp {
         self.render_wall_style_manager(ctx);
         self.render_wall_style_dialog(ctx);
         self.render_block_dialog(ctx);
+        self.render_insert_dialog(ctx);
         self.render_param_name_dialog(ctx);
         self.render_block_editor(ctx);
         self.render_file_dialog(ctx);
@@ -24131,6 +24288,7 @@ impl eframe::App for CadApp {
                 // selected source dobjects steal the press (`grip_drag`) and
                 // the point is never captured.
                 || self.block_dialog_pick_base
+                || self.insert_dialog_pick
                 || self.block_def_state != BlockDefState::Off
                 || self.insert_state    != InsertState::Off
                 || self.cmd_flow.is_some()
@@ -24896,6 +25054,15 @@ impl eframe::App for CadApp {
                             dlg.base_x = format!("{:.4}", click_world.x);
                             dlg.base_y = format!("{:.4}", click_world.y);
                             self.block_dialog = Some(dlg);
+                        }
+                        self.clear_prompt();
+                        self.refocus_cmd = true;
+                    } else if self.insert_dialog_pick {
+                        // Insert-dialog "Pick ⊕" — this click is the insertion point.
+                        self.insert_dialog_pick = false;
+                        if let Some(dlg) = self.insert_dialog.as_mut() {
+                            dlg.at_x = format!("{:.4}", click_world.x);
+                            dlg.at_y = format!("{:.4}", click_world.y);
                         }
                         self.clear_prompt();
                         self.refocus_cmd = true;
