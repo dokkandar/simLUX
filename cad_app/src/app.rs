@@ -3097,20 +3097,33 @@ impl CadApp {
     /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
     /// be added BEFORE the CentralPanel so it reserves the right edge.
     fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
-        if !self.light.view3d_open {
+        // SIMLUX workspace mode force-shows this as the right HALF of the window
+        // and keeps it in sync with the 2D drawing; else it's the toggled panel.
+        let split = self.light.simlux_mode;
+        if !self.light.view3d_open && !split {
             return;
         }
+        if split {
+            // Live: re-extrude the current room so the 3D tracks the 2D plan.
+            self.light.rebuild_live_meshes(&self.doc);
+        }
+        let half = ctx.screen_rect().width() * 0.5;
         let mut open = self.light.view3d_open;
-        egui::SidePanel::right("simlux_3d_panel")
-            .resizable(true)
-            .default_width(360.0)
-            .min_width(220.0)
+        let mut leave_workspace = false;
+        let base = egui::SidePanel::right("simlux_3d_panel").min_width(220.0);
+        let base = if split {
+            base.exact_width(half)
+        } else {
+            base.resizable(true).default_width(360.0)
+        };
+        base
             .show(ctx, |ui| {
                 ui.horizontal(|ui| {
-                    ui.strong("SIMLUX — 3D");
+                    ui.strong(if split { "SIMLUX — 3D  (live)" } else { "SIMLUX — 3D" });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("✕").on_hover_text("Close 3D view").clicked() {
-                            open = false;
+                        let tip = if split { "Exit SIMLUX workspace" } else { "Close 3D view" };
+                        if ui.button("✕").on_hover_text(tip).clicked() {
+                            if split { leave_workspace = true; } else { open = false; }
                         }
                         ui.label(egui::RichText::new("drag: orbit · scroll: zoom").small().weak());
                     });
@@ -3187,7 +3200,13 @@ impl CadApp {
                     ui.ctx().request_repaint();
                 }
             });
-        self.light.view3d_open = open;
+        if leave_workspace {
+            // ✕ in workspace mode exits the split entirely.
+            self.light.simlux_mode = false;
+            self.light.view3d_open = false;
+        } else {
+            self.light.view3d_open = open;
+        }
     }
     // ===== end SIMLUX lighting ==========================================
 
@@ -22822,6 +22841,16 @@ impl eframe::App for CadApp {
                 custom_menu(ui, "SIMLUX", |ui| {
                     ui.set_min_width(232.0);
                     ui.add_space(4.0);
+                    // Workspace: split the screen into 2D plan (left) + live 3D (right).
+                    if ui.checkbox(&mut self.light.simlux_mode, "  ◧  SIMLUX workspace  (2D | 3D)")
+                        .on_hover_text("Split view: 2D plan + tools on the left, a live 3D of the drawing on the right")
+                        .changed()
+                        && self.light.simlux_mode
+                    {
+                        self.light.view3d_open = true;
+                        self.light.simlux_fit_pending = true;
+                    }
+                    ui.separator();
                     ui.label(egui::RichText::new("  Lighting · lux calculation").small()
                         .color(egui::Color32::from_rgb(150, 165, 185)));
                     if ui.button("  ⚡  Calculate lux").clicked() {

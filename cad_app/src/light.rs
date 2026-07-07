@@ -107,6 +107,13 @@ pub struct LightState {
     // ---- 3D viewport (P2) -------------------------------------------------
     /// Show the docked 3D viewport panel.
     pub view3d_open: bool,
+    /// SIMLUX workspace mode — a persistent half-screen 2D | 3D split. The 3D
+    /// panel is force-shown at ~half the window width and tracks the 2D drawing
+    /// LIVE (extrudes the current room every frame, no Calculate needed).
+    pub simlux_mode: bool,
+    /// One-shot: fit the orbit camera the next time live meshes rebuild (set
+    /// when the workspace is entered so the drawing is framed on arrival).
+    pub simlux_fit_pending: bool,
     /// Orbit camera: yaw + pitch (radians), distance (m), target (world, Z-up).
     pub cam_yaw: f32,
     pub cam_pitch: f32,
@@ -149,6 +156,8 @@ impl LightState {
             ies_path: String::new(),
             last_msg: "Draw a room, set the height, then Calculate.".to_string(),
             view3d_open: false,
+            simlux_mode: false,
+            simlux_fit_pending: false,
             cam_yaw: 0.7,
             cam_pitch: 0.6,
             cam_dist: 10.0,
@@ -292,6 +301,33 @@ impl LightState {
         self.cam_target = [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * self.room_height];
         let diag = (w * w + d * d + self.room_height * self.room_height).sqrt();
         self.cam_dist = (diag * 1.3).max(3.0);
+    }
+
+    /// SIMLUX workspace live sync: extrude the current room (imported per-layer
+    /// groups, else the whole document) into `meshes` WITHOUT running the lux
+    /// calc, so the right-hand 3D view tracks whatever is drawn/imported on the
+    /// left 2D plan. Cheap (geometry only). Fits the orbit camera ONCE, the
+    /// first frame after the workspace is entered (`simlux_fit_pending`).
+    pub fn rebuild_live_meshes(&mut self, doc: &Document) {
+        self.meshes = if self.room.is_empty() {
+            extrude(doc, self.room_height)
+        } else {
+            let mut m = Vec::new();
+            for g in &self.room {
+                m.extend(extrude_handles(doc, &g.handles, g.height));
+            }
+            m
+        };
+        if self.simlux_fit_pending {
+            if let Some((min_x, min_y, max_x, max_y)) = bbox(doc) {
+                let (w, d) = ((max_x - min_x).max(1e-3), (max_y - min_y).max(1e-3));
+                self.cam_target =
+                    [0.5 * (min_x + max_x), 0.5 * (min_y + max_y), 0.5 * self.room_height];
+                let diag = (w * w + d * d + self.room_height * self.room_height).sqrt();
+                self.cam_dist = (diag * 1.3).max(3.0);
+                self.simlux_fit_pending = false;
+            }
+        }
     }
 
     /// Draw the panel body. Returns actions the app must run (they need `&Document`).
