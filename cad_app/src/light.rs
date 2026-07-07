@@ -47,6 +47,8 @@ pub struct LightAction {
     pub import_layer: Option<u32>,
     /// Drop this imported room layer.
     pub remove_layer: Option<u32>,
+    /// Move the current selection onto the dedicated SIMLUX layer + use it for 3D.
+    pub shift_to_simlux: bool,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -406,26 +408,41 @@ impl LightState {
         let mut action = LightAction::default();
         ui.set_min_width(260.0);
 
-        // ---- ① Room — import source layers, extrude each to its own height ----
-        ui.label(egui::RichText::new("① Room  ·  import layers").strong());
+        // ---- ① Room — mark layers "use for 3D"; each extrudes to its height ----
+        ui.label(egui::RichText::new("① Room  ·  use layers for 3D").strong());
         ui.label(
-            egui::RichText::new("Pick the drawing layers that form the room.")
+            egui::RichText::new("Tick the layers that form the room.")
                 .small()
                 .weak(),
         );
-        egui::Grid::new("simlux_layer_import")
-            .num_columns(3)
+        if ui
+            .button("⬚  Move selection → SIMLUX layer")
+            .on_hover_text("Put the selected geometry on a dedicated SIMLUX layer and use it for 3D")
+            .clicked()
+        {
+            action.shift_to_simlux = true;
+        }
+        egui::Grid::new("simlux_layer_use3d")
+            .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 for (id, name) in layers {
-                    let imported = self.room.iter().any(|g| g.layer_id == *id);
-                    ui.label(name.as_str());
-                    let btn = if imported { "Re-import" } else { "Import" };
-                    if ui.button(btn).clicked() {
-                        action.import_layer = Some(*id);
+                    let group = self.room.iter().find(|g| g.layer_id == *id);
+                    let mut on = group.is_some();
+                    let n = group.map(|g| g.handles.len()).unwrap_or(0);
+                    if ui
+                        .checkbox(&mut on, name.as_str())
+                        .on_hover_text("Use this layer's geometry in the 3D model / lux calc")
+                        .changed()
+                    {
+                        if on {
+                            action.import_layer = Some(*id);
+                        } else {
+                            action.remove_layer = Some(*id);
+                        }
                     }
                     ui.label(
-                        egui::RichText::new(if imported { "✔ in room" } else { "" })
+                        egui::RichText::new(if on { format!("{n} obj") } else { String::new() })
                             .small()
                             .weak(),
                     );

@@ -3012,6 +3012,7 @@ impl CadApp {
                 });
             });
         self.light.window_open = open;
+        if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
         if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
         if action.calculate {
@@ -12412,6 +12413,32 @@ impl CadApp {
             }
             Err(e) => self.history.push(format!("  ! open '{}': {}", path, e)),
         }
+    }
+
+    /// Move the current selection onto a dedicated **SIMLUX** layer (created if
+    /// absent) and mark that layer for 3D — the "shift the room into a SIMLUX
+    /// layer" step. Undoable.
+    fn shift_selection_to_simlux_layer(&mut self) {
+        if self.selection.is_empty() {
+            self.history.push("  ! SIMLUX: select geometry first, then Move".into());
+            return;
+        }
+        self.snapshot_doc();
+        let lid = match self.doc.layers.find("SIMLUX") {
+            Some(id) => id,
+            None => self.doc.layers.add(Layer { name: "SIMLUX".into(), ..Layer::layer_zero() }),
+        };
+        let mut n = 0;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get_mut(i) {
+                d.style.layer = lid;
+                n += 1;
+            }
+        }
+        self.light.import_layer(&self.doc, lid); // use it for 3D straight away
+        self.index_dirty = true;
+        self.gpu_dirty = true;
+        self.history.push(format!("  moved {n} object(s) to layer 'SIMLUX' (now used for 3D)"));
     }
 
     /// Write the SIMLUX sidecar (`<drawing>.simlux.json`) next to `drawing`.
