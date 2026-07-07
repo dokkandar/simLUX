@@ -16245,6 +16245,47 @@ impl CadApp {
         geoms.into_iter().map(DObject::new).collect()
     }
 
+    /// Paint the translucent "shade" of the block currently being inserted —
+    /// it follows the cursor during `WaitingForPoint`, then pivots about the
+    /// chosen insertion point during `WaitingForAngle`. Purely visual (no state
+    /// change): resolves the block definition at the live pose via
+    /// `expand_cutter_geoms` and strokes it dashed/ghosted. (HSI's insert had
+    /// no preview at all — the block only appeared after the final click.)
+    fn paint_insert_preview(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let (block, insert, rotation) = match self.insert_state {
+            InsertState::WaitingForPoint { block } => {
+                let Some(p) = painter.ctx().input(|i| i.pointer.hover_pos()) else { return };
+                (block, self.s2w(p, rect), 0.0_f64)
+            }
+            InsertState::WaitingForAngle { block, insert } => {
+                let rot = painter
+                    .ctx()
+                    .input(|i| i.pointer.hover_pos())
+                    .map(|p| (self.s2w(p, rect) - insert).angle())
+                    .unwrap_or(0.0);
+                (block, insert, rot)
+            }
+            InsertState::Off => return,
+        };
+        let preview = Geom::BlockRef(cad_kernel::BlockRef {
+            block,
+            insert,
+            scale: 1.0,
+            scale_y: 1.0,
+            rotation,
+            mirror_x: false,
+            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+        });
+        let mut geoms: Vec<Geom> = Vec::new();
+        self.expand_cutter_geoms(&preview, &mut geoms, 0);
+        let ghost = egui::Color32::from_rgba_unmultiplied(150, 200, 255, 140);
+        for g in &geoms {
+            draw_dobject_dashed(painter, rect, self, g, ghost, 6.0, 4.0);
+        }
+        let ip = self.w2s(insert, rect);
+        painter.circle_stroke(ip, 4.0, egui::Stroke::new(1.0, ghost));
+    }
+
     fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
         let before_dobj_count = self.doc.dobjects.len();
         let _trim_pick_dbg = (cutters.to_vec(), target_idx, pick);
@@ -25988,6 +26029,9 @@ impl eframe::App for CadApp {
             if self.parametric.active && self.parametric.show_dof {
                 draw_param_overlay(&painter, rect, self);
             }
+
+            // Insert preview — the translucent "shade" of the block being placed.
+            self.paint_insert_preview(&painter, rect);
 
             // Grip handles on the selected dobject (drawn on top of the
             // geometry, under the snap marker / rubber band).
