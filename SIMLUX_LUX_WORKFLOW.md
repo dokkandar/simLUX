@@ -99,6 +99,12 @@ Make the pipeline explicit and stateful instead of implicit.
 - **D2 — Per-LAYER extrude height.** Each imported layer carries its own height
   (walls 3 m, partitions 1.2 m, …). Layers drive both import *and* height.
 - **D3 — Interactive heatmap only.** No file export for now (Phase F3 dropped).
+- **D4 — LUX block ↔ IES is TYPE-level.** One LUX block definition per fixture,
+  IES assigned to the definition; every inserted instance shares that one IES.
+- **D5 — Persistence = sidecar.** `drawing.simlux.json` beside `drawing.rsm`
+  (serde) holds all SIMLUX state (layer-3D flags + heights, LUX-block-def↔IES
+  map, the IES library, materials, ray settings). `cad_kernel` / `cad_io`
+  stay UNTOUCHED. Load on open, write on save, keyed by the drawing path.
 
 → Consequence: the room model is **layer-grouped**. `room` = a set of
 `{layer_name, height, handles[]}` groups; extrude iterates groups, each at its
