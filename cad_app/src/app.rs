@@ -1434,6 +1434,9 @@ pub struct CadApp {
     /// Armed by the Insert dialog's "Pick ⊕" — next canvas click sets the
     /// insertion point and reopens the dialog.
     insert_dialog_pick: bool,
+    /// Set when the Insert dialog is committed — the next canvas click places
+    /// this configured block at the clicked insertion point (with live shade).
+    pending_insert:  Option<PendingInsert>,
     /// Live cursor in world coords (RAW, before constraints), refreshed
     /// every canvas frame. Lets the command line's direct-distance entry
     /// know which direction to throw a typed distance.
@@ -1907,6 +1910,18 @@ impl InsertDialog {
             self.at_y.trim().parse().unwrap_or(0.0),
         )
     }
+}
+
+/// A block configured in the Insert dialog, waiting for the user to CLICK its
+/// insertion point on the canvas. Carries the dialog's scale / rotation /
+/// parametric values so the click places the fully-configured instance. A block
+/// is NEVER placed without a clicked insertion point (user rule 2026-07-09).
+#[derive(Clone)]
+pub struct PendingInsert {
+    pub block: u32,
+    pub scale: f64,
+    pub rotation: f64,
+    pub param_values: [f64; cad_kernel::MAX_BLOCK_PARAMS],
 }
 
 /// Pick-two-blocks-on-screen flow for `blockdiff` / the dialog Compare
@@ -2889,6 +2904,7 @@ impl Default for CadApp {
             block_dialog:    None,
             insert_dialog:   None,
             insert_dialog_pick: false,
+            pending_insert:  None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             props_edit_gesture: false,
@@ -5131,7 +5147,9 @@ impl CadApp {
                 // Bare `block` opens the Block dialog to collect the name.
                 match name_opt {
                     None => {
-                        let base = self.selection_min_corner();
+                        // Default base = the selection's gravity centre, so an
+                        // undefined insertion point lands the block on its centre.
+                        let base = self.selection_centroid();
                         self.block_dialog = Some(BlockDialog::new(base));
                         self.history.push("  Block dialog opened".into());
                     }
@@ -13265,6 +13283,28 @@ impl CadApp {
         if any { min } else { Vec2::ZERO }
     }
 
+    /// Centre of the selection's combined bounding box — the "gravity centre"
+    /// used as the DEFAULT block base/insertion point (user rule 2026-07-09:
+    /// if the user doesn't set one, the block's centre is the insertion point).
+    fn selection_centroid(&self) -> Vec2 {
+        let (mut mnx, mut mny) = (f64::INFINITY, f64::INFINITY);
+        let (mut mxx, mut mxy) = (f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut any = false;
+        for &i in &self.selection {
+            if let Some(d) = self.doc.dobjects.get(i) {
+                let (mn, mx) = d.geom.bbox();
+                mnx = mnx.min(mn.x); mny = mny.min(mn.y);
+                mxx = mxx.max(mx.x); mxy = mxy.max(mx.y);
+                any = true;
+            }
+        }
+        if any {
+            Vec2::new(0.5 * (mnx + mxx), 0.5 * (mny + mxy))
+        } else {
+            Vec2::ZERO
+        }
+    }
+
     /// Combined bbox (min,max) of the current selection. Degenerate
     /// (0,0)-(0,0) when empty. Used as the stretch test region for a
     /// pickfirst selection that has no crossing window.
@@ -14343,7 +14383,6 @@ impl CadApp {
         }
         let mut open = true;
         let mut do_insert = false;
-        let mut do_pick = false;
         let mut do_cancel = false;
         egui::Window::new("Insert Block")
             .id(egui::Id::new("insert_dialog"))
@@ -14374,19 +14413,10 @@ impl CadApp {
                     ui.label("Rotation°");
                     ui.add(egui::TextEdit::singleline(&mut dlg.rotation).desired_width(70.0));
                 });
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("At  X");
-                    ui.add(egui::TextEdit::singleline(&mut dlg.at_x).desired_width(80.0));
-                    ui.label("Y");
-                    ui.add(egui::TextEdit::singleline(&mut dlg.at_y).desired_width(80.0));
-                    if ui.button("Pick ⊕")
-                        .on_hover_text("Click the insertion point on the drawing")
-                        .clicked()
-                    {
-                        do_pick = true;
-                    }
-                });
+                ui.add_space(2.0);
+                ui.label(egui::RichText::new(
+                    "Insertion point: click on the drawing after Insert.")
+                    .small().weak());
                 // ---- Smart-block parameters (the "vector" values) ----------
                 if !dlg.params.is_empty() {
                     ui.add_space(6.0);
@@ -14414,12 +14444,6 @@ impl CadApp {
                     });
                 });
             });
-        if do_pick {
-            self.insert_dialog = Some(dlg);          // keep it, hidden while picking
-            self.insert_dialog_pick = true;
-            self.set_prompt("insert: click the insertion point  [Esc=cancel]");
-            return;
-        }
         if do_insert {
             if let Some(id) = dlg.block {
                 let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
@@ -14428,9 +14452,18 @@ impl CadApp {
                         pv[k] = txt.trim().parse().unwrap_or(0.0);
                     }
                 }
-                self.place_block_full(id, dlg.at(), dlg.scale_f(), dlg.rot_rad(), pv);
+                // Do NOT place yet — insert ALWAYS follows a click. Arm the
+                // configured block; the next canvas click sets its insertion
+                // point (with a live shade preview following the cursor).
+                self.pending_insert = Some(PendingInsert {
+                    block: id, scale: dlg.scale_f(), rotation: dlg.rot_rad(),
+                    param_values: pv,
+                });
+                self.insert_state = InsertState::WaitingForPoint { block: id };
+                self.set_prompt(
+                    "insert: click the insertion point on the drawing  [Esc=cancel]");
             }
-            return; // dialog closes
+            return; // dialog closes; the click places it
         }
         if !open || do_cancel {
             return; // Cancel / × — dialog closes
@@ -16445,10 +16478,14 @@ impl CadApp {
     /// `expand_cutter_geoms` and strokes it dashed/ghosted. (HSI's insert had
     /// no preview at all — the block only appeared after the final click.)
     fn paint_insert_preview(&self, painter: &egui::Painter, rect: egui::Rect) {
-        let (block, insert, rotation) = match self.insert_state {
+        let (block, insert, rotation, scale, pv) = match self.insert_state {
             InsertState::WaitingForPoint { block } => {
                 let Some(p) = painter.ctx().input(|i| i.pointer.hover_pos()) else { return };
-                (block, self.s2w(p, rect), 0.0_f64)
+                // Reflect the dialog's scale/rotation/params in the ghost.
+                let (scale, rot, pv) = self.pending_insert.as_ref()
+                    .map(|pd| (pd.scale, pd.rotation, pd.param_values))
+                    .unwrap_or((1.0, 0.0, [0.0; cad_kernel::MAX_BLOCK_PARAMS]));
+                (block, self.s2w(p, rect), rot, scale, pv)
             }
             InsertState::WaitingForAngle { block, insert } => {
                 let rot = painter
@@ -16456,18 +16493,19 @@ impl CadApp {
                     .input(|i| i.pointer.hover_pos())
                     .map(|p| (self.s2w(p, rect) - insert).angle())
                     .unwrap_or(0.0);
-                (block, insert, rot)
+                (block, insert, rot, 1.0, [0.0; cad_kernel::MAX_BLOCK_PARAMS])
             }
             InsertState::Off => return,
         };
+        let s = if scale.abs() < 1e-6 { 1.0 } else { scale.abs() };
         let preview = Geom::BlockRef(cad_kernel::BlockRef {
             block,
             insert,
-            scale: 1.0,
-            scale_y: 1.0,
+            scale: s,
+            scale_y: s,
             rotation,
             mirror_x: false,
-            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            param_values: pv,
         });
         let mut geoms: Vec<Geom> = Vec::new();
         self.expand_cutter_geoms(&preview, &mut geoms, 0);
@@ -22099,9 +22137,10 @@ impl eframe::App for CadApp {
             // Abandon any parked Block-dialog round-trip (Select / Pick).
             self.block_dialog_stash = None;
             self.block_dialog_pick_base = false;
-            // Close / cancel the Insert dialog + its pick.
+            // Close / cancel the Insert dialog + its pick + a pending placement.
             self.insert_dialog = None;
             self.insert_dialog_pick = false;
+            self.pending_insert = None;
             // Drop any captured stretch crossing box (e.g. Esc mid-select).
             self.stretch_window_box = None;
             // Dismiss the block-diff parametric-point highlight + cancel a
@@ -25116,14 +25155,26 @@ impl eframe::App for CadApp {
                         }
                         self.refocus_cmd = true;
                     } else if let InsertState::WaitingForPoint { block } = self.insert_state {
-                        // insert — point chosen; now ask for the rotation ANGLE
-                        // (click a direction, or Enter = 0).
-                        self.insert_state = InsertState::WaitingForAngle {
-                            block, insert: click_world };
-                        self.set_prompt(
-                            "insert: specify ROTATION — click a direction point  \
-                             (Enter = 0°)  [Esc=cancel]");
-                        self.refocus_cmd = true;
+                        if let Some(pend) = self.pending_insert.take() {
+                            // Dialog-configured insert: the click IS the insertion
+                            // point. Rotation/scale/params came from the dialog, so
+                            // place NOW (no separate angle step).
+                            self.insert_state = InsertState::Off;
+                            self.place_block_full(
+                                pend.block, click_world, pend.scale, pend.rotation,
+                                pend.param_values);
+                            self.clear_prompt();
+                            self.refocus_cmd = true;
+                        } else {
+                            // Legacy flow: point chosen; now ask for the rotation
+                            // ANGLE (click a direction, or Enter = 0).
+                            self.insert_state = InsertState::WaitingForAngle {
+                                block, insert: click_world };
+                            self.set_prompt(
+                                "insert: specify ROTATION — click a direction point  \
+                                 (Enter = 0°)  [Esc=cancel]");
+                            self.refocus_cmd = true;
+                        }
                     } else if let InsertState::WaitingForAngle { block, insert } =
                         self.insert_state
                     {
