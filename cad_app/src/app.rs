@@ -1883,6 +1883,9 @@ pub struct InsertDialog {
     pub rotation: String,
     pub at_x: String,
     pub at_y: String,
+    /// Parametric values for a SMART block: (param name, value text). Synced
+    /// from the selected block's definition each frame; edited by the user.
+    pub params: Vec<(String, String)>,
 }
 
 impl InsertDialog {
@@ -1893,6 +1896,7 @@ impl InsertDialog {
             rotation: "0".into(),
             at_x: "0.0000".into(),
             at_y: "0.0000".into(),
+            params: Vec::new(),
         }
     }
     fn scale_f(&self) -> f64 { self.scale.trim().parse().unwrap_or(1.0) }
@@ -5149,9 +5153,10 @@ impl CadApp {
                     }
                     Some(ref name) => match self.doc.blocks.find(name) {
                         Some(id) => {
-                            self.insert_state = InsertState::WaitingForPoint { block: id };
-                            self.set_prompt(format!(
-                                "insert '{}': click insertion point  [Esc=cancel]", name));
+                            // Open the Insert dialog with this block preselected —
+                            // it shows scale/rotation/point AND, for a smart block,
+                            // a field per parameter (the "vector" values).
+                            self.insert_dialog = Some(InsertDialog::new(Some(id)));
                         }
                         None => {
                             self.history.push(format!(
@@ -14325,6 +14330,17 @@ impl CadApp {
             .map(|(i, b)| (i as u32, b.name.clone()))
             .collect();
         if blocks.is_empty() { return; }
+        // Sync the parametric value fields to the SELECTED block's definition:
+        // a smart block with N params shows N value boxes; a plain block none.
+        let want: Vec<(String, f64)> = dlg.block
+            .and_then(|id| self.doc.blocks.get(id))
+            .map(|b| b.params.iter().map(|p| (p.name.clone(), p.original)).collect())
+            .unwrap_or_default();
+        let same_names = dlg.params.len() == want.len()
+            && dlg.params.iter().zip(&want).all(|((n, _), (wn, _))| n == wn);
+        if !same_names {
+            dlg.params = want.iter().map(|(n, v)| (n.clone(), format!("{v}"))).collect();
+        }
         let mut open = true;
         let mut do_insert = false;
         let mut do_pick = false;
@@ -14371,6 +14387,21 @@ impl CadApp {
                         do_pick = true;
                     }
                 });
+                // ---- Smart-block parameters (the "vector" values) ----------
+                if !dlg.params.is_empty() {
+                    ui.add_space(6.0);
+                    ui.separator();
+                    ui.label(egui::RichText::new("Parameters  (smart block)").strong());
+                    ui.label(egui::RichText::new(
+                        "Set each vector value; the block deforms on insert.")
+                        .small().weak());
+                    for (name, val) in &mut dlg.params {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(name.as_str()).monospace());
+                            ui.add(egui::TextEdit::singleline(val).desired_width(90.0));
+                        });
+                    }
+                }
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -14391,7 +14422,13 @@ impl CadApp {
         }
         if do_insert {
             if let Some(id) = dlg.block {
-                self.place_block_scaled(id, dlg.at(), dlg.scale_f(), dlg.rot_rad());
+                let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
+                for (k, (_, txt)) in dlg.params.iter().enumerate() {
+                    if k < cad_kernel::MAX_BLOCK_PARAMS {
+                        pv[k] = txt.trim().parse().unwrap_or(0.0);
+                    }
+                }
+                self.place_block_full(id, dlg.at(), dlg.scale_f(), dlg.rot_rad(), pv);
             }
             return; // dialog closes
         }
@@ -14401,16 +14438,19 @@ impl CadApp {
         self.insert_dialog = Some(dlg); // keep open across frames
     }
 
-    /// Place a block instance at `insert` with the given uniform `scale` and
-    /// `rotation` (radians) — the Insert-dialog placement path (mirrors
-    /// `apply_insert`'s plain-block branch but honours scale).
-    fn place_block_scaled(&mut self, block: u32, insert: Vec2, scale: f64, rotation: f64) {
+    /// Place a block instance at `insert` with uniform `scale`, `rotation`
+    /// (radians) and explicit `param_values` — the Insert-dialog placement path.
+    /// ALWAYS places (unlike `apply_insert`, whose parametric branch waits for a
+    /// command-line prompt), so a smart block appears immediately with its
+    /// vector values applied.
+    fn place_block_full(&mut self, block: u32, insert: Vec2, scale: f64, rotation: f64,
+                        param_values: [f64; cad_kernel::MAX_BLOCK_PARAMS]) {
         self.snapshot_doc();
         let s = if scale.abs() < 1e-6 { 1.0 } else { scale.abs() };
         let br = cad_kernel::BlockRef {
             block, insert, scale: s, scale_y: s, rotation,
             mirror_x: false,
-            param_values: [0.0; cad_kernel::MAX_BLOCK_PARAMS],
+            param_values,
         };
         self.add_dobject(Geom::BlockRef(br), "insert");
         self.apply_block_cut(br);
