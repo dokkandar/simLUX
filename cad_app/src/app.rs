@@ -1437,6 +1437,9 @@ pub struct CadApp {
     /// Set when the Insert dialog is committed — the next canvas click places
     /// this configured block at the clicked insertion point (with live shade).
     pending_insert:  Option<PendingInsert>,
+    /// Insert-dialog "↔" distance pick for a smart parameter: (param index,
+    /// FIRST point once captured). Two clicks → their distance = the value.
+    insert_param_pick: Option<(usize, Option<Vec2>)>,
     /// Live cursor in world coords (RAW, before constraints), refreshed
     /// every canvas frame. Lets the command line's direct-distance entry
     /// know which direction to throw a typed distance.
@@ -2905,6 +2908,7 @@ impl Default for CadApp {
             insert_dialog:   None,
             insert_dialog_pick: false,
             pending_insert:  None,
+            insert_param_pick: None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             props_edit_gesture: false,
@@ -14364,7 +14368,8 @@ impl CadApp {
     /// insertion point (typed or picked on screen), then place it. Bare
     /// `insert` opens it. Parked (not drawn) while "Pick ⊕" waits for a click.
     fn render_insert_dialog(&mut self, ctx: &egui::Context) {
-        if self.insert_dialog_pick { return; } // parked during on-canvas pick
+        // Parked while an on-canvas pick (insertion point or a param distance) runs.
+        if self.insert_dialog_pick || self.insert_param_pick.is_some() { return; }
         let Some(mut dlg) = self.insert_dialog.take() else { return };
         let blocks: Vec<(u32, String)> = self.doc.blocks.blocks.iter().enumerate()
             .map(|(i, b)| (i as u32, b.name.clone()))
@@ -14384,6 +14389,7 @@ impl CadApp {
         let mut open = true;
         let mut do_insert = false;
         let mut do_cancel = false;
+        let mut pick_param: Option<usize> = None;
         egui::Window::new("Insert Block")
             .id(egui::Id::new("insert_dialog"))
             .collapsible(false)
@@ -14425,10 +14431,17 @@ impl CadApp {
                     ui.label(egui::RichText::new(
                         "Set each vector value; the block deforms on insert.")
                         .small().weak());
-                    for (name, val) in &mut dlg.params {
+                    for (k, (name, val)) in dlg.params.iter_mut().enumerate() {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new(name.as_str()).monospace());
                             ui.add(egui::TextEdit::singleline(val).desired_width(90.0));
+                            if ui.button("↔")
+                                .on_hover_text("Pick two points on the drawing — \
+                                    their distance becomes this value")
+                                .clicked()
+                            {
+                                pick_param = Some(k);
+                            }
                         });
                     }
                 }
@@ -14444,6 +14457,16 @@ impl CadApp {
                     });
                 });
             });
+        if let Some(k) = pick_param {
+            // Park the dialog (hidden) and pick two points; their distance fills
+            // this parameter's value box.
+            let name = dlg.params.get(k).map(|(n, _)| n.clone()).unwrap_or_default();
+            self.insert_dialog = Some(dlg);
+            self.insert_param_pick = Some((k, None));
+            self.set_prompt(format!(
+                "insert {name}: click the FIRST point of the distance  [Esc=cancel]"));
+            return;
+        }
         if do_insert {
             if let Some(id) = dlg.block {
                 let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
@@ -22140,6 +22163,7 @@ impl eframe::App for CadApp {
             // Close / cancel the Insert dialog + its pick + a pending placement.
             self.insert_dialog = None;
             self.insert_dialog_pick = false;
+            self.insert_param_pick = None;
             self.pending_insert = None;
             // Drop any captured stretch crossing box (e.g. Esc mid-select).
             self.stretch_window_box = None;
@@ -24368,6 +24392,7 @@ impl eframe::App for CadApp {
                 // the point is never captured.
                 || self.block_dialog_pick_base
                 || self.insert_dialog_pick
+                || self.insert_param_pick.is_some()
                 || self.block_def_state != BlockDefState::Off
                 || self.insert_state    != InsertState::Off
                 || self.cmd_flow.is_some()
@@ -25144,6 +25169,26 @@ impl eframe::App for CadApp {
                             dlg.at_y = format!("{:.4}", click_world.y);
                         }
                         self.clear_prompt();
+                        self.refocus_cmd = true;
+                    } else if let Some((k, first)) = self.insert_param_pick {
+                        // Insert-dialog "↔" — two clicks; their distance = the value.
+                        match first {
+                            None => {
+                                self.insert_param_pick = Some((k, Some(click_world)));
+                                self.set_prompt(
+                                    "insert: click the SECOND point  [Esc=cancel]");
+                            }
+                            Some(p1) => {
+                                let dist = (click_world - p1).len();
+                                self.insert_param_pick = None;
+                                if let Some(dlg) = self.insert_dialog.as_mut() {
+                                    if let Some((_, val)) = dlg.params.get_mut(k) {
+                                        *val = format!("{dist:.4}");
+                                    }
+                                }
+                                self.clear_prompt();
+                            }
+                        }
                         self.refocus_cmd = true;
                     } else if self.block_def_state != BlockDefState::Off {
                         // block creation — this click is the BASE point.
@@ -26290,6 +26335,19 @@ impl eframe::App for CadApp {
 
             // Insert preview — the translucent "shade" of the block being placed.
             self.paint_insert_preview(&painter, rect);
+
+            // Insert-dialog "↔" parameter pick: rubber-band + live distance
+            // from the first clicked point to the cursor.
+            if let Some((_, Some(p1))) = self.insert_param_pick {
+                if let Some(cur) = painter.ctx().input(|i| i.pointer.hover_pos()) {
+                    let a = self.w2s(p1, rect);
+                    let d = (self.s2w(cur, rect) - p1).len();
+                    let col = egui::Color32::from_rgb(150, 200, 255);
+                    painter.line_segment([a, cur], egui::Stroke::new(1.5, col));
+                    painter.text(cur + egui::vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM,
+                        format!("{d:.3}"), egui::FontId::proportional(12.0), col);
+                }
+            }
 
             // Grip handles on the selected dobject (drawn on top of the
             // geometry, under the snap marker / rubber band).
