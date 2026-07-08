@@ -3938,6 +3938,44 @@ impl CadApp {
             }
         }
 
+        // ---- LIVE parametric insert: a typed number sets the current param ----
+        // (manual command-line input alongside the drag-to-set flow).
+        if self.insert_live.is_some() {
+            if trimmed.is_empty() { return; } // wait for a value or a click
+            let v = match trimmed.parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => {
+                    self.history.push(format!(
+                        "  ! insert: '{}' is not a number — type a value or click", trimmed));
+                    return;
+                }
+            };
+            let place = {
+                let live = self.insert_live.as_mut().unwrap();
+                if live.idx < live.values.len() { live.values[live.idx] = v; }
+                live.idx += 1;
+                live.idx >= live.values.len()
+            };
+            if place {
+                let live = self.insert_live.take().unwrap();
+                let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
+                for (k, vv) in live.values.iter().enumerate() {
+                    if k < cad_kernel::MAX_BLOCK_PARAMS { pv[k] = *vv; }
+                }
+                self.place_block_full(live.block, live.insert, live.scale, live.rotation, pv);
+                self.clear_prompt();
+            } else {
+                let name = {
+                    let lv = self.insert_live.as_ref().unwrap();
+                    self.doc.blocks.get(lv.block).and_then(|b| b.params.get(lv.idx))
+                        .map(|p| p.name.clone()).unwrap_or_default()
+                };
+                self.set_prompt(format!(
+                    "insert: drag to set '{name}', click to fix  (or type a value)  [Esc=cancel]"));
+            }
+            return;
+        }
+
         // ---- Insert ANGLE step: typed degrees (Enter=0 handled in key cascade) ----
         if let InsertState::WaitingForAngle { block, insert } = self.insert_state {
             let rot = match trimmed.parse::<f64>() {
