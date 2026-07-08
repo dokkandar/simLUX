@@ -1440,6 +1440,9 @@ pub struct CadApp {
     /// Insert-dialog "↔" distance pick for a smart parameter: (param index,
     /// FIRST point once captured). Two clicks → their distance = the value.
     insert_param_pick: Option<(usize, Option<Vec2>)>,
+    /// LIVE parametric insertion — base fixed, dragging sets each parameter with
+    /// a live-deforming preview. `None` unless mid-insert of a smart block.
+    insert_live:     Option<InsertLive>,
     /// Live cursor in world coords (RAW, before constraints), refreshed
     /// every canvas frame. Lets the command line's direct-distance entry
     /// know which direction to throw a typed distance.
@@ -1925,6 +1928,20 @@ pub struct PendingInsert {
     pub scale: f64,
     pub rotation: f64,
     pub param_values: [f64; cad_kernel::MAX_BLOCK_PARAMS],
+}
+
+/// LIVE parametric insertion (AutoCAD dynamic-block feel): the base point is
+/// fixed, then the user drags to set each smart parameter in turn — the block
+/// deforms under the cursor and a click fixes that value. `values[idx]` is the
+/// parameter currently being dragged.
+#[derive(Clone)]
+pub struct InsertLive {
+    pub block: u32,
+    pub insert: Vec2,
+    pub scale: f64,
+    pub rotation: f64,
+    pub values: Vec<f64>,
+    pub idx: usize,
 }
 
 /// Pick-two-blocks-on-screen flow for `blockdiff` / the dialog Compare
@@ -2909,6 +2926,7 @@ impl Default for CadApp {
             insert_dialog_pick: false,
             pending_insert:  None,
             insert_param_pick: None,
+            insert_live:     None,
             offset_state:   OffsetState::Off,
             dist_state:     DistState::Off,
             props_edit_gesture: false,
@@ -16450,6 +16468,22 @@ impl CadApp {
     /// its window by `dir·displacement(value)`. Non-parametric blocks
     /// (empty `params`) return the geoms unchanged. This is the single
     /// derive used by render / bbox / trim / snap / explode.
+    /// Cursor → value for the smart parameter `idx` during LIVE insertion:
+    /// project (cursor − base) onto the parameter's first vector direction
+    /// (rotated by the instance rotation, de-scaled), added to `original`. So
+    /// dragging away from the base along the parameter's direction grows it.
+    fn live_param_value(&self, live: &InsertLive, cursor: Vec2) -> f64 {
+        let Some(blk) = self.doc.blocks.get(live.block) else { return 0.0; };
+        let Some(p) = blk.params.get(live.idx) else { return 0.0; };
+        let dir = p.vectors.first().map(|v| v.dir).unwrap_or(Vec2::new(1.0, 0.0));
+        let (c, s) = (live.rotation.cos(), live.rotation.sin());
+        let dw = Vec2::new(dir.x * c - dir.y * s, dir.x * s + dir.y * c);
+        let l = dw.len();
+        if l < 1e-9 { return p.original; }
+        let u = dw / l;
+        p.original + (cursor - live.insert).dot(u) / live.scale.max(1e-9)
+    }
+
     fn block_derived_geoms(
         &self, blk: &cad_kernel::Block,
         param_values: &[f64; cad_kernel::MAX_BLOCK_PARAMS],
@@ -16538,6 +16572,43 @@ impl CadApp {
         }
         let ip = self.w2s(insert, rect);
         painter.circle_stroke(ip, 4.0, egui::Stroke::new(1.0, ghost));
+    }
+
+    /// Draw the live-deforming ghost during parametric insertion: the parameter
+    /// being set takes its value from the cursor, the block is RE-DERIVED
+    /// (`block_derived_geoms`) at that value, transformed by the insert pose, and
+    /// stroked dashed — so a door frame grows under the cursor.
+    fn paint_insert_live(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let Some(live) = &self.insert_live else { return };
+        let Some(cur) = painter.ctx().input(|i| i.pointer.hover_pos()) else { return };
+        let cursor = self.s2w(cur, rect);
+        let mut values = live.values.clone();
+        if live.idx < values.len() {
+            values[live.idx] = self.live_param_value(live, cursor);
+        }
+        let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
+        for (k, v) in values.iter().enumerate() {
+            if k < cad_kernel::MAX_BLOCK_PARAMS { pv[k] = *v; }
+        }
+        let Some(blk) = self.doc.blocks.get(live.block) else { return };
+        let base = blk.base;
+        let derived = self.block_derived_geoms(blk, &pv);
+        let br = cad_kernel::BlockRef {
+            block: live.block, insert: live.insert, scale: live.scale,
+            scale_y: live.scale, rotation: live.rotation, mirror_x: false,
+            param_values: pv,
+        };
+        let ghost = egui::Color32::from_rgba_unmultiplied(150, 200, 255, 180);
+        for g in &derived {
+            let gw = br.transform_geom(g, base);
+            draw_dobject_dashed(painter, rect, self, &gw, ghost, 6.0, 4.0);
+        }
+        let ip = self.w2s(live.insert, rect);
+        painter.circle_stroke(ip, 4.0, egui::Stroke::new(1.0, ghost));
+        if live.idx < values.len() {
+            painter.text(cur + egui::vec2(10.0, -10.0), egui::Align2::LEFT_BOTTOM,
+                format!("{:.3}", values[live.idx]), egui::FontId::proportional(12.0), ghost);
+        }
     }
 
     fn apply_trim_pick(&mut self, cutters: &[usize], target_idx: usize, pick: Vec2) -> bool {
@@ -22165,6 +22236,7 @@ impl eframe::App for CadApp {
             self.insert_dialog_pick = false;
             self.insert_param_pick = None;
             self.pending_insert = None;
+            self.insert_live = None;
             // Drop any captured stretch crossing box (e.g. Esc mid-select).
             self.stretch_window_box = None;
             // Dismiss the block-diff parametric-point highlight + cancel a
@@ -24393,6 +24465,7 @@ impl eframe::App for CadApp {
                 || self.block_dialog_pick_base
                 || self.insert_dialog_pick
                 || self.insert_param_pick.is_some()
+                || self.insert_live.is_some()
                 || self.block_def_state != BlockDefState::Off
                 || self.insert_state    != InsertState::Off
                 || self.cmd_flow.is_some()
@@ -25190,6 +25263,40 @@ impl eframe::App for CadApp {
                             }
                         }
                         self.refocus_cmd = true;
+                    } else if self.insert_live.is_some() {
+                        // LIVE parametric insert: this click FIXES the current
+                        // parameter (value read from the cursor), advances, and
+                        // places the block once every parameter is set.
+                        let val = {
+                            let live = self.insert_live.as_ref().unwrap();
+                            self.live_param_value(live, click_world)
+                        };
+                        let place = {
+                            let live = self.insert_live.as_mut().unwrap();
+                            if live.idx < live.values.len() { live.values[live.idx] = val; }
+                            live.idx += 1;
+                            live.idx >= live.values.len()
+                        };
+                        if place {
+                            let live = self.insert_live.take().unwrap();
+                            let mut pv = [0.0; cad_kernel::MAX_BLOCK_PARAMS];
+                            for (k, v) in live.values.iter().enumerate() {
+                                if k < cad_kernel::MAX_BLOCK_PARAMS { pv[k] = *v; }
+                            }
+                            self.place_block_full(live.block, live.insert, live.scale,
+                                live.rotation, pv);
+                            self.clear_prompt();
+                        } else {
+                            let name = {
+                                let lv = self.insert_live.as_ref().unwrap();
+                                self.doc.blocks.get(lv.block)
+                                    .and_then(|b| b.params.get(lv.idx))
+                                    .map(|p| p.name.clone()).unwrap_or_default()
+                            };
+                            self.set_prompt(format!(
+                                "insert: drag to set '{name}', click to fix  [Esc=cancel]"));
+                        }
+                        self.refocus_cmd = true;
                     } else if self.block_def_state != BlockDefState::Off {
                         // block creation — this click is the BASE point.
                         if let BlockDefState::WaitingForBase { name } =
@@ -25202,13 +25309,37 @@ impl eframe::App for CadApp {
                     } else if let InsertState::WaitingForPoint { block } = self.insert_state {
                         if let Some(pend) = self.pending_insert.take() {
                             // Dialog-configured insert: the click IS the insertion
-                            // point. Rotation/scale/params came from the dialog, so
-                            // place NOW (no separate angle step).
+                            // point. If the block is SMART, don't place yet — enter
+                            // LIVE parameter dragging (base fixed, drag each vector,
+                            // block deforms under the cursor, click fixes it).
                             self.insert_state = InsertState::Off;
-                            self.place_block_full(
-                                pend.block, click_world, pend.scale, pend.rotation,
-                                pend.param_values);
-                            self.clear_prompt();
+                            let nparams = self.doc.blocks.get(pend.block)
+                                .map(|b| b.params.len()).unwrap_or(0);
+                            if nparams == 0 {
+                                self.place_block_full(
+                                    pend.block, click_world, pend.scale, pend.rotation,
+                                    pend.param_values);
+                                self.clear_prompt();
+                            } else {
+                                let values: Vec<f64> = {
+                                    let blk = self.doc.blocks.get(pend.block).unwrap();
+                                    (0..nparams).map(|k| {
+                                        let dv = pend.param_values[k];
+                                        if dv.abs() > 1e-9 { dv } else { blk.params[k].original }
+                                    }).collect()
+                                };
+                                let name = self.doc.blocks.get(pend.block)
+                                    .and_then(|b| b.params.first())
+                                    .map(|p| p.name.clone()).unwrap_or_default();
+                                self.insert_live = Some(InsertLive {
+                                    block: pend.block, insert: click_world,
+                                    scale: pend.scale, rotation: pend.rotation,
+                                    values, idx: 0,
+                                });
+                                self.set_prompt(format!(
+                                    "insert: drag to set '{name}', click to fix  \
+                                     (or type a value)  [Esc=cancel]"));
+                            }
                             self.refocus_cmd = true;
                         } else {
                             // Legacy flow: point chosen; now ask for the rotation
@@ -26335,6 +26466,8 @@ impl eframe::App for CadApp {
 
             // Insert preview — the translucent "shade" of the block being placed.
             self.paint_insert_preview(&painter, rect);
+            // Live parametric insert — the block deforming under the cursor.
+            self.paint_insert_live(&painter, rect);
 
             // Insert-dialog "↔" parameter pick: rubber-band + live distance
             // from the first clicked point to the cursor.
