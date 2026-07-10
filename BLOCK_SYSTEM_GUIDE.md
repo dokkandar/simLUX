@@ -30,6 +30,18 @@ Document.blocks: BlockTable
 BlockRef { block: id, insert, scale, scale_y, rotation, mirror_x, param_values } ← instance (a Geom on the canvas)
 ```
 
+**Three block kinds.** The first two are kernel flags on the *definition*; the
+third is a SIMLUX-side marker, so the kernel stays lighting-agnostic:
+
+| Kind | Marker | Lives in | What it adds |
+|------|--------|----------|--------------|
+| **Plain** | — | — | a reusable symbol; define once, insert many |
+| **Smart** | `Block.smart` + `params[]` | `cad_kernel` | parameters that deform the geometry at insert (§2–§8) |
+| **Luminaire (LUX)** | an entry in `LightState.lux_blocks` (sidecar) | `cad_app` / sidecar | a photometric identity — links **many IES, one active**; instances DERIVE fixtures for the lux calc (§11) |
+
+`smart` and `luminaire` are **orthogonal** — a block can be neither, either, or (in
+principle) both. Ticking either checkbox in the Block dialog sets its marker.
+
 ---
 
 ## 2. Kernel data model (`cad_kernel/src/block.rs`)
@@ -250,6 +262,8 @@ that exists, test the live flow on a block whose `params` are already populated.
 | `paint_insert_preview` | app.rs | dashed shade during WaitingForPoint |
 | `resolved_blockref_bbox` / `expand_cutter_geoms` | app.rs | correct bbox / explode |
 | `open_block_editor` / `save_block_params` | app.rs | author parameter vectors |
+| `LuxBlock` / `lux_blocks` | `cad_app/src/simlux_io.rs`, `light.rs` | luminaire block: many IES linked, one active |
+| `derived_luminaires` / `derived_fixture_count` | `cad_app/src/light.rs` | derive fixtures from LUX-block instances |
 
 ## 10. Invariants / rules
 - **No block without a clicked insertion point** — the dialog arms; a click places.
@@ -257,3 +271,70 @@ that exists, test the live flow on a block whose `params` are already populated.
 - **`param_values` is a fixed `[f64; 8]`** so `BlockRef` stays `Copy`; parallel to `params` by index.
 - **Always resolve `BlockRef` bbox** via `resolved_blockref_bbox` before any cull/hit-test.
 - **Kernel stays 2D and UI-free**; new interaction goes in `cad_app`, not `cad_kernel`.
+- **Luminaire blocks keep photometry in the sidecar** (`lux_blocks`), never in the kernel; many IES linked, one active (§11).
+
+---
+
+## 11. Luminaire (LUX) blocks — photometry on a block
+
+A **luminaire block** is an ordinary block that also carries a **photometric
+identity** for the lux calculation. Its 2D geometry is the symbol that prints on
+the lighting layout; the assigned **IES** is what the calc uses; a future visual
+mesh is what a render uses — **one block, up to three consumers** (the
+"two-representation" rule, `SIMLUX_SCENE_AND_DAYLIGHT_PLAN` §3.2).
+
+### 11.1 Data model — kernel-clean, in the sidecar
+The kernel `Block` is UNCHANGED. Whether a block is a luminaire — and which IES it
+carries — lives SIMLUX-side, keyed by the block DEFINITION NAME:
+
+```
+// cad_app/src/simlux_io.rs — persisted in <drawing>.simlux.json
+LightState.lux_blocks: BTreeMap<BlockName, LuxBlock>
+LuxBlock {
+    ies_options: Vec<String>,    // MANY IES linked (names into the shared ies_library)
+    active:      Option<String>, // exactly ONE active (must be in ies_options) — calc + render use it
+}
+```
+
+- **A block IS a luminaire iff it has an entry in `lux_blocks`.** No kernel flag.
+- **Many linked, one active.** A fixture can hold several lamp/optic options
+  (e.g. one IES per mounting height 10′/20′/30′); only the **active** one is
+  calculated/rendered. `LuxBlock::active_ies()` returns the active name *iff* it is
+  still one of the options.
+- **IES referenced by NAME**, never copied — entered once into `ies_library`,
+  shared by every instance; swap the library entry → every fixture updates.
+
+### 11.2 How it wires (create → link → derive → calc)
+```
+Block dialog: tick "Luminaire (IES) block"      ─► lux_blocks[name] = LuxBlock::default()      (apply_block_create, then register)
+Light panel ▸ "Luminaire blocks"                ─► link IES options + pick the ◉ active         (panel_ui)
+Place instances (insert / copy / array)         ─► BlockRef(name) dobjects in the Document
+Calculate                                       ─► derived_luminaires(doc): each BlockRef whose def
+                                                   is a lux block with an active IES emits a
+                                                   Luminaire{ profile=active, pos=insert@mount, rot } (light.rs)
+                                                └► lums = derived + manually-placed; else auto-centre
+```
+The payoff: **placing luminaire blocks IS placing the calc's fixtures** — no
+separate luminaire list to keep in sync. (Manual fixtures still add on top; the
+old manual side-list is no longer the primary source.)
+
+### 11.3 Command line
+- `luxblock` — list luminaire blocks, each block's linked-IES count + active IES,
+  and how many fixtures currently derive from the drawing. (Linking/activation is
+  in the Light panel; a full `luxblock <name> <ies>` setter waits on quoted-name
+  parsing, since IES/block names contain spaces.)
+
+### 11.4 Pose of a derived fixture
+`position = (BlockRef.insert.x, .y, LightState.mount_height)` — the symbol sits on
+the plan; mount height lifts it to the ceiling — and `rotation_deg =
+BlockRef.rotation`. Per-instance mount height / dimming is a future refinement
+(today all derived fixtures share `mount_height`, dimming 1.0).
+
+### 11.5 Invariants
+- **Kernel stays lighting-agnostic** — luminaire state is sidecar-only, keyed by
+  block name (survives save/reopen; `cad_kernel` / `cad_io` untouched).
+- **One active IES** — `active` must be one of `ies_options`; removing the active
+  option re-points `active` to the first remaining (or `None`).
+- **No photometry ⇒ no light** — a luminaire block with `active_ies() == None`
+  still draws + prints its symbol but contributes nothing to the calc.
+- **IES by reference, never copied** — always a name into `ies_library`.
