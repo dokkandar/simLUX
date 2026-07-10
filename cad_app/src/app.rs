@@ -3104,6 +3104,17 @@ impl CadApp {
         if action.shift_to_simlux { self.shift_selection_to_simlux_layer(); }
         if let Some(id) = action.import_layer { self.light.import_layer(&self.doc, id); }
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
+        if let Some(p) = action.load_ies.take() {
+            if !p.is_empty() {
+                match self.import_ies_into_drawing(&p) {
+                    Ok(k) => {
+                        self.light.active_profile = k.clone();
+                        self.light.last_msg = format!("Loaded IES '{k}' (kept in the drawing).");
+                    }
+                    Err(e) => self.light.last_msg = e,
+                }
+            }
+        }
         if action.calculate {
             self.light.calculate(&self.doc);
         }
@@ -3119,6 +3130,34 @@ impl CadApp {
                     "  ! luminaire block '{}' not defined yet — create it first", name));
             }
         }
+    }
+
+    /// Import an IES file INTO the drawing: keep its raw text in the Document
+    /// (persisted in the .rsm, v8) and parse it into the runtime library.
+    /// Returns the profile name. Replaces any same-named entry. This is how IES
+    /// travels with the drawing — luminaire blocks reference it by name.
+    fn import_ies_into_drawing(&mut self, path: &str) -> Result<String, String> {
+        let path = path.trim().trim_matches('"');
+        let raw = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+        let mut prof = cad_light::parse_ies(&raw).map_err(|e| format!("IES parse error: {e}"))?;
+        let name = if prof.name.trim().is_empty() {
+            std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "IES".to_string())
+        } else {
+            prof.name.clone()
+        };
+        prof.name = name.clone();
+        // Keep the raw file in the drawing DB (replace same-named).
+        if let Some(f) = self.doc.ies_files.iter_mut().find(|f| f.name == name) {
+            f.data = raw;
+        } else {
+            self.doc.ies_files.push(cad_kernel::IesFile { name: name.clone(), data: raw });
+        }
+        // Runtime parsed library.
+        self.light.profiles.insert(name.clone(), prof);
+        Ok(name)
     }
 
     /// Paint the computed lux grid as a 2D false-colour overlay on the plan,
@@ -12639,6 +12678,7 @@ impl CadApp {
                 self.fit_view_to_drawing();
                 self.current_file = Some(std::path::PathBuf::from(path));
                 self.load_simlux_sidecar(std::path::Path::new(path));
+                self.light.load_embedded_ies(&self.doc); // IES kept in the drawing (RSM v8)
                 self.history.push(format!(
                     "  opened '{}'  ({} dobject(s), {} layer(s))", path, n, l
                 ));
@@ -13307,7 +13347,7 @@ impl CadApp {
                     // luminaire block being created (its dialog is stashed) and
                     // restore that dialog so the user continues where they were.
                     let path = dlg.dir.join(name);
-                    match self.light.load_ies_from(&path.to_string_lossy()) {
+                    match self.import_ies_into_drawing(&path.to_string_lossy()) {
                         Ok(key) => {
                             if let Some(mut d) = self.block_dialog_stash.take() {
                                 if !d.luminaire_ies.contains(&key) {
@@ -13317,7 +13357,7 @@ impl CadApp {
                             } else {
                                 self.light.active_profile = key.clone();
                             }
-                            self.history.push(format!("  linked IES '{}'", key));
+                            self.history.push(format!("  linked IES '{}' (kept in the drawing)", key));
                         }
                         Err(e) => {
                             if let Some(d) = self.block_dialog_stash.take() {

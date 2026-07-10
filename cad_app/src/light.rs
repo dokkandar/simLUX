@@ -65,6 +65,8 @@ pub struct LightAction {
     pub shift_to_simlux: bool,
     /// "Call" (insert) this luminaire block by name — arm the click-to-place flow.
     pub place_block: Option<String>,
+    /// Import this IES path INTO the drawing (needs the Document, so the app does it).
+    pub load_ies: Option<String>,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -203,37 +205,8 @@ impl LightState {
             .max(1e-3)
     }
 
-    /// Load an IES file into the shared library and return its profile name (the
-    /// key). Does NOT change the active profile. Reused by the Light panel's Load
-    /// and the Block dialog's luminaire IES linker.
-    pub fn load_ies_from(&mut self, path: &str) -> Result<String, String> {
-        let path = path.trim().trim_matches('"');
-        if path.is_empty() {
-            return Err("enter a .ies file path first".to_string());
-        }
-        let text = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
-        let mut prof = parse_ies(&text).map_err(|e| format!("IES parse error: {e}"))?;
-        if prof.name.trim().is_empty() {
-            prof.name = std::path::Path::new(path)
-                .file_stem()
-                .map(|s| s.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "IES".to_string());
-        }
-        let key = prof.name.clone();
-        self.profiles.insert(key.clone(), prof);
-        Ok(key)
-    }
-
-    fn import_ies(&mut self) {
-        let path = self.ies_path.clone();
-        match self.load_ies_from(&path) {
-            Ok(key) => {
-                self.active_profile = key.clone();
-                self.last_msg = format!("Loaded IES '{key}'.");
-            }
-            Err(e) => self.last_msg = e,
-        }
-    }
+    // IES import is handled by `CadApp::import_ies_into_drawing` (it needs the
+    // Document to embed the raw file). The panel signals it via `LightAction`.
 
     /// Drop a luminaire at plan position (x, y) on the mounting plane.
     pub fn add_luminaire_at(&mut self, x: f32, y: f32) {
@@ -477,6 +450,21 @@ impl LightState {
         }
     }
 
+    /// Populate the runtime IES library from the drawing's embedded IES files
+    /// (RSM v8 — IES is kept in the drawing DB). Called after opening a drawing;
+    /// these win over any legacy sidecar copy of the same name.
+    pub fn load_embedded_ies(&mut self, doc: &Document) {
+        for f in &doc.ies_files {
+            match parse_ies(&f.data) {
+                Ok(mut prof) => {
+                    prof.name = f.name.clone();
+                    self.profiles.insert(f.name.clone(), prof);
+                }
+                Err(e) => self.last_msg = format!("embedded IES '{}' parse error: {e}", f.name),
+            }
+        }
+    }
+
     /// Draw the panel body. Returns actions the app must run (they need `&Document`).
     pub fn panel_ui(&mut self, ui: &mut egui::Ui, layers: &[(u32, String)]) -> LightAction {
         let mut action = LightAction::default();
@@ -577,7 +565,7 @@ impl LightState {
                     .hint_text(r"C:\path\to\file.ies"),
             );
             if ui.button("Load").clicked() {
-                self.import_ies();
+                action.load_ies = Some(self.ies_path.trim().to_string());
             }
         });
         ui.checkbox(&mut self.auto_center_light, "Auto-place one at room centre if none placed");
