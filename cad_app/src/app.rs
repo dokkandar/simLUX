@@ -1975,10 +1975,8 @@ pub struct BlockDialog {
     /// (`lux_blocks`) as a fixture, with `luminaire_ies` linked as its options.
     pub luminaire: bool,
     /// IES profile names to link to this luminaire block on OK (many; the first
-    /// becomes active). Filled by the dialog's "＋ Add" / "Link existing".
+    /// becomes active). Filled by "＋ Add IES file…" (browser) / "Link existing".
     pub luminaire_ies: Vec<String>,
-    /// IES file path being added in the dialog (the "＋ Add" field).
-    pub ies_path: String,
 }
 
 impl BlockDialog {
@@ -1991,7 +1989,6 @@ impl BlockDialog {
             smart: false,
             luminaire: false,
             luminaire_ies: Vec::new(),
-            ies_path: String::new(),
         }
     }
     /// Parse the X/Y text fields into a world point (falls back to 0 for
@@ -2230,7 +2227,7 @@ pub struct BlockTaskRec {
 
 /// Open vs Save As for the in-app file browser.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster }
+pub enum FileDialogMode { Open, Save, ImportImage, ImportRaster, ImportIes }
 
 /// Pure-Rust file browser (no native-dialog dependency — `std::fs` only).
 /// Lists directories + .dxf/.rsm files, lets the user navigate, type/pick
@@ -13023,6 +13020,7 @@ impl CadApp {
                         FileDialogMode::ImportImage | FileDialogMode::ImportRaster =>
                             ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
                                 .iter().any(|x| lname.ends_with(&format!(".{x}"))),
+                        FileDialogMode::ImportIes => lname.ends_with(".ies"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
                     };
                     if is_dir {
@@ -13041,6 +13039,7 @@ impl CadApp {
             FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
+            FileDialogMode::ImportIes    => "Open IES  ·  luminaire photometry",
             FileDialogMode::Save => "Save As",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
@@ -13123,7 +13122,8 @@ impl CadApp {
                         ui.horizontal(|ui| {
                             ui.label(match dlg.mode {
                                 FileDialogMode::Open => "Type  ",
-                                FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "Type  ",
+                                FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                                | FileDialogMode::ImportIes => "Type  ",
                                 FileDialogMode::Save => "Format",
                             });
                             let before = dlg.ext.clone();
@@ -13142,6 +13142,7 @@ impl CadApp {
                                 .hint_text(match dlg.mode {
                                     FileDialogMode::Open => "pick a file above",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "pick an image above",
+                                    FileDialogMode::ImportIes => "pick an .ies file above",
                                     FileDialogMode::Save => "drawing name",
                                 }));
                         });
@@ -13155,7 +13156,8 @@ impl CadApp {
                                 if ui.button("Cancel").clicked() { do_cancel = true; }
                                 let label = match dlg.mode {
                                     FileDialogMode::Open => "Open",
-                                    FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "Open",
+                                    FileDialogMode::ImportImage | FileDialogMode::ImportRaster
+                                    | FileDialogMode::ImportIes => "Open",
                                     FileDialogMode::Save => "Save",
                                 };
                                 if ui.button(label).clicked() { do_confirm = true; }
@@ -13267,8 +13269,15 @@ impl CadApp {
             return;
         }
         if !open || do_cancel {
+            let was_ies = dlg.mode == FileDialogMode::ImportIes;
             self.file_dialog_dir = Some(dlg.dir);
             self.file_preview = None;   // drop cached preview doc
+            // Cancelling an IES browse must bring the stashed Block dialog back.
+            if was_ies {
+                if let Some(d) = self.block_dialog_stash.take() {
+                    self.block_dialog = Some(d);
+                }
+            }
             self.history.push("  file: cancelled".into());
             return;
         }
@@ -13292,6 +13301,31 @@ impl CadApp {
                 FileDialogMode::ImportRaster => {
                     let path = dlg.dir.join(name);
                     self.import_raster_underlay(&path.to_string_lossy());
+                }
+                FileDialogMode::ImportIes => {
+                    // Load the picked IES into the shared library; link it to the
+                    // luminaire block being created (its dialog is stashed) and
+                    // restore that dialog so the user continues where they were.
+                    let path = dlg.dir.join(name);
+                    match self.light.load_ies_from(&path.to_string_lossy()) {
+                        Ok(key) => {
+                            if let Some(mut d) = self.block_dialog_stash.take() {
+                                if !d.luminaire_ies.contains(&key) {
+                                    d.luminaire_ies.push(key.clone());
+                                }
+                                self.block_dialog = Some(d);
+                            } else {
+                                self.light.active_profile = key.clone();
+                            }
+                            self.history.push(format!("  linked IES '{}'", key));
+                        }
+                        Err(e) => {
+                            if let Some(d) = self.block_dialog_stash.take() {
+                                self.block_dialog = Some(d);
+                            }
+                            self.history.push(format!("  ! {e}"));
+                        }
+                    }
                 }
                 FileDialogMode::Save => {
                     // Ensure the chosen extension; if the name already ends
@@ -14241,7 +14275,7 @@ impl CadApp {
         let mut insert_id: Option<u32> = None;
         let mut do_compare  = false;   // diff the two chosen blocks
         let mut edit_id: Option<u32> = None;  // open Block Editor for this block
-        let mut do_load_ies = false;   // load + link an IES file to the luminaire
+        let mut do_browse_ies = false; // browse + link an IES file to the luminaire
 
         // Pre-extract the IES library names (self isn't reachable inside the
         // window closure) so the luminaire section can link existing profiles.
@@ -14424,14 +14458,13 @@ impl CadApp {
                                     });
                             });
                         }
-                        // Add a new IES file from disk.
-                        ui.horizontal(|ui| {
-                            ui.label("IES file:");
-                            ui.add(egui::TextEdit::singleline(&mut dialog.ies_path)
-                                .desired_width(150.0)
-                                .hint_text(r"C:\path\to\file.ies"));
-                            if ui.button("＋ Add").clicked() { do_load_ies = true; }
-                        });
+                        // Browse for an IES file on disk (in-app file browser).
+                        if ui.button("＋ Add IES file…")
+                            .on_hover_text("Browse for a .ies file and link it to this luminaire")
+                            .clicked()
+                        {
+                            do_browse_ies = true;
+                        }
                     });
                 }
 
@@ -14534,21 +14567,11 @@ impl CadApp {
             self.block_dialog = Some(dialog);
             return;
         }
-        if do_load_ies {
-            // Load the typed IES file into the shared library and link it to the
-            // luminaire-block-in-progress; keep the dialog open.
-            let path = dialog.ies_path.clone();
-            match self.light.load_ies_from(&path) {
-                Ok(key) => {
-                    if !dialog.luminaire_ies.contains(&key) {
-                        dialog.luminaire_ies.push(key.clone());
-                    }
-                    dialog.ies_path.clear();
-                    self.history.push(format!("  linked IES '{}' to the new luminaire block", key));
-                }
-                Err(e) => self.history.push(format!("  ! {e}")),
-            }
-            self.block_dialog = Some(dialog);
+        if do_browse_ies {
+            // Stash the Block dialog and open the in-app IES file browser; its
+            // ImportIes confirm links the picked IES + restores this dialog.
+            self.block_dialog_stash = Some(dialog);
+            self.open_file_dialog(FileDialogMode::ImportIes, ".ies");
             return;
         }
         if do_select {
