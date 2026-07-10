@@ -100,6 +100,45 @@ impl CalcPlane {
     }
 }
 
+/// The orientation rule for a measurement point — the "receiver normal" that
+/// every illuminance metric is a projection onto (see `SIMLUX_CALC_ENGINE_PLAN`
+/// §4: one field evaluator, many normals). Horizontal work-plane, a vertical
+/// wall/face facing, or an arbitrary custom direction (perpendicular / camera /
+/// custom). Integrated metrics (cylindrical / hemispherical) are built on top of
+/// this by averaging over a set of normals — that is a later slice.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum ReceiverNormal {
+    /// Faces straight up (+Z) — the classic work-plane, horizontal illuminance Eh.
+    Horizontal,
+    /// Faces horizontally toward `azimuth_deg` (0° = +X, CCW) — vertical illuminance Ev.
+    Vertical { azimuth_deg: f32 },
+    /// An arbitrary receiver normal (need not be unit; it is normalized on use) —
+    /// perpendicular / camera-oriented / custom-direction metrics.
+    Custom { x: f32, y: f32, z: f32 },
+}
+
+impl ReceiverNormal {
+    /// The unit outward normal this receiver measures illuminance onto. A
+    /// degenerate (zero-length) custom normal collapses to zero, so it measures
+    /// nothing rather than panicking.
+    pub fn normal(&self) -> Vec3 {
+        match *self {
+            ReceiverNormal::Horizontal => Vec3::Z,
+            ReceiverNormal::Vertical { azimuth_deg } => {
+                let a = azimuth_deg.to_radians();
+                Vec3::new(a.cos(), a.sin(), 0.0)
+            }
+            ReceiverNormal::Custom { x, y, z } => Vec3::new(x, y, z).normalize_or_zero(),
+        }
+    }
+}
+
+impl Default for ReceiverNormal {
+    fn default() -> Self {
+        ReceiverNormal::Horizontal
+    }
+}
+
 /// Ray-tracing / radiosity controls.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct RaySettings {
