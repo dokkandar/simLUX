@@ -3139,7 +3139,7 @@ impl CadApp {
     fn import_ies_into_drawing(&mut self, path: &str) -> Result<String, String> {
         let path = path.trim().trim_matches('"');
         let raw = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
-        let mut prof = cad_light::parse_ies(&raw).map_err(|e| format!("IES parse error: {e}"))?;
+        let mut prof = cad_light::parse_photometry(&raw).map_err(|e| format!("photometry parse error: {e}"))?;
         let name = if prof.name.trim().is_empty() {
             std::path::Path::new(path)
                 .file_stem()
@@ -13060,7 +13060,8 @@ impl CadApp {
                         FileDialogMode::ImportImage | FileDialogMode::ImportRaster =>
                             ["png", "jpg", "jpeg", "bmp", "tif", "tiff"]
                                 .iter().any(|x| lname.ends_with(&format!(".{x}"))),
-                        FileDialogMode::ImportIes => lname.ends_with(".ies"),
+                        FileDialogMode::ImportIes =>
+                            lname.ends_with(".ies") || lname.ends_with(".ldt"),
                         FileDialogMode::Save => lname.ends_with(&dlg.ext),
                     };
                     if is_dir {
@@ -13079,7 +13080,7 @@ impl CadApp {
             FileDialogMode::Open => "Open  .dxf / .rsm / .dwg",
             FileDialogMode::ImportImage  => "Open Image  ·  raster → vector",
             FileDialogMode::ImportRaster => "Open Image  ·  raster underlay",
-            FileDialogMode::ImportIes    => "Open IES  ·  luminaire photometry",
+            FileDialogMode::ImportIes    => "Open IES / LDT  ·  luminaire photometry",
             FileDialogMode::Save => "Save As",
         };
         // Cap the window to the screen so the bottom controls (Type / File /
@@ -13182,7 +13183,7 @@ impl CadApp {
                                 .hint_text(match dlg.mode {
                                     FileDialogMode::Open => "pick a file above",
                                     FileDialogMode::ImportImage | FileDialogMode::ImportRaster => "pick an image above",
-                                    FileDialogMode::ImportIes => "pick an .ies file above",
+                                    FileDialogMode::ImportIes => "pick an .ies / .ldt file above",
                                     FileDialogMode::Save => "drawing name",
                                 }));
                         });
@@ -14465,10 +14466,10 @@ impl CadApp {
                         (re-derive algorithm wired later).");
 
                 // ---- Luminaire (LUX) block ------------------------------
-                ui.checkbox(&mut dialog.luminaire, "Luminaire (IES) block")
-                    .on_hover_text("Mark this definition as a luminaire: link one \
-                        or more IES to it (one active at a time). Placing this block \
-                        IS placing a fixture for the lux calc.");
+                ui.checkbox(&mut dialog.luminaire, "Luminaire (IES / LDT) block")
+                    .on_hover_text("Mark this definition as a luminaire: link one or \
+                        more photometry files (IES or EULUMDAT .ldt), one active at a \
+                        time. Placing this block IS placing a fixture for the lux calc.");
                 if dialog.luminaire {
                     ui.indent("lum_ies", |ui| {
                         ui.label(egui::RichText::new("Assign IES (many; first = active)").small().weak());
@@ -14499,8 +14500,8 @@ impl CadApp {
                             });
                         }
                         // Browse for an IES file on disk (in-app file browser).
-                        if ui.button("＋ Add IES file…")
-                            .on_hover_text("Browse for a .ies file and link it to this luminaire")
+                        if ui.button("＋ Add IES / LDT file…")
+                            .on_hover_text("Browse for a .ies or .ldt file and link it to this luminaire")
                             .clicked()
                         {
                             do_browse_ies = true;

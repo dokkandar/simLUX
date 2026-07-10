@@ -9,9 +9,9 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cad_light::{
-    bbox, calculate_receiver, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
-    IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, ReceiverNormal,
-    Vertex,
+    bbox, calculate_receiver, default_materials, extrude, extrude_handles, parse_photometry,
+    CalcPlane, IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings,
+    ReceiverNormal, Vertex,
 };
 use cad_kernel::{Document, Geom};
 
@@ -455,12 +455,12 @@ impl LightState {
     /// these win over any legacy sidecar copy of the same name.
     pub fn load_embedded_ies(&mut self, doc: &Document) {
         for f in &doc.ies_files {
-            match parse_ies(&f.data) {
+            match parse_photometry(&f.data) {
                 Ok(mut prof) => {
                     prof.name = f.name.clone();
                     self.profiles.insert(f.name.clone(), prof);
                 }
-                Err(e) => self.last_msg = format!("embedded IES '{}' parse error: {e}", f.name),
+                Err(e) => self.last_msg = format!("embedded photometry '{}' parse error: {e}", f.name),
             }
         }
     }
