@@ -9,10 +9,21 @@
 use std::collections::HashMap;
 
 use cad_light::{
-    bbox, calculate as calc_lux, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
-    IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, Vertex,
+    bbox, calculate_receiver, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
+    IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, ReceiverNormal,
+    Vertex,
 };
 use cad_kernel::Document;
+
+/// Human-readable name for a lux metric (receiver-normal rule), for the panel
+/// readout and the `luxmetric` command echo.
+pub fn metric_label(m: ReceiverNormal) -> String {
+    match m {
+        ReceiverNormal::Horizontal => "Horizontal (Eh)".to_string(),
+        ReceiverNormal::Vertical { azimuth_deg } => format!("Vertical (Ev) @ {azimuth_deg:.0}°"),
+        ReceiverNormal::Custom { x, y, z } => format!("Custom ({x:.1}, {y:.1}, {z:.1})"),
+    }
+}
 
 /// Key for the always-available synthetic luminaire (works before any IES import).
 pub const BUILTIN: &str = "Built-in downlight (1000 cd)";
@@ -84,6 +95,10 @@ pub struct LightState {
     pub cell_size: f32,
     /// Ray-tracer controls.
     pub settings: RaySettings,
+    /// The illuminance metric: which receiver-normal rule the calc measures the
+    /// (single) light field onto — horizontal work-plane, a vertical facing, or a
+    /// custom direction. See `SIMLUX_CALC_ENGINE_PLAN` §4.
+    pub metric: ReceiverNormal,
     /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
     pub luminaires: Vec<Luminaire>,
     pub auto_center_light: bool,
@@ -145,6 +160,7 @@ impl LightState {
             plane_height: 0.8,
             cell_size: 0.25,
             settings: RaySettings::default(),
+            metric: ReceiverNormal::Horizontal,
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
@@ -289,10 +305,18 @@ impl LightState {
         } else {
             self.luminaires.clone()
         };
-        let grid = calc_lux(&meshes, &lums, &self.profiles, &self.materials, &plane, &self.settings);
+        let grid = calculate_receiver(
+            &meshes,
+            &lums,
+            &self.profiles,
+            &self.materials,
+            &plane,
+            &self.settings,
+            self.metric,
+        );
         self.last_msg = format!(
-            "{}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx",
-            cols, rows, grid.avg, grid.min, grid.max
+            "{} · {}×{} grid · avg {:.0} · min {:.0} · max {:.0} lx",
+            metric_label(self.metric), cols, rows, grid.avg, grid.min, grid.max
         );
         self.grid = Some(grid);
         self.plane = Some(plane);
@@ -575,6 +599,66 @@ impl LightState {
 
         ui.separator();
 
+        // ---- Metric (which receiver-normal rule the field is measured onto) ---
+        ui.label(egui::RichText::new("Metric  ·  illuminance direction").strong());
+        let metric_before = self.metric;
+        egui::ComboBox::from_id_source("simlux_metric")
+            .selected_text(metric_label(self.metric))
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(matches!(self.metric, ReceiverNormal::Horizontal), "Horizontal (Eh) — work plane")
+                    .clicked()
+                {
+                    self.metric = ReceiverNormal::Horizontal;
+                }
+                if ui
+                    .selectable_label(matches!(self.metric, ReceiverNormal::Vertical { .. }), "Vertical (Ev) — walls / faces")
+                    .clicked()
+                    && !matches!(self.metric, ReceiverNormal::Vertical { .. })
+                {
+                    self.metric = ReceiverNormal::Vertical { azimuth_deg: 0.0 };
+                }
+                if ui
+                    .selectable_label(matches!(self.metric, ReceiverNormal::Custom { .. }), "Custom direction")
+                    .clicked()
+                    && !matches!(self.metric, ReceiverNormal::Custom { .. })
+                {
+                    self.metric = ReceiverNormal::Custom { x: 1.0, y: 0.0, z: 1.0 };
+                }
+            });
+        match &mut self.metric {
+            ReceiverNormal::Vertical { azimuth_deg } => {
+                ui.add(
+                    egui::DragValue::new(azimuth_deg)
+                        .speed(1.0)
+                        .range(0.0..=360.0)
+                        .suffix("°")
+                        .prefix("azimuth "),
+                );
+            }
+            ReceiverNormal::Custom { x, y, z } => {
+                ui.horizontal(|ui| {
+                    ui.label("normal");
+                    ui.add(egui::DragValue::new(x).speed(0.1).prefix("x "));
+                    ui.add(egui::DragValue::new(y).speed(0.1).prefix("y "));
+                    ui.add(egui::DragValue::new(z).speed(0.1).prefix("z "));
+                });
+            }
+            ReceiverNormal::Horizontal => {}
+        }
+        ui.label(
+            egui::RichText::new("Also: type  luxmetric vertical 90  in the command line.")
+                .small()
+                .weak(),
+        );
+        // Switching metric with a grid already computed re-runs immediately so the
+        // 2D overlay updates live (the calc is sub-second at these grid sizes).
+        if metric_before != self.metric && self.grid.is_some() {
+            action.calculate = true;
+        }
+
+        ui.separator();
+
         // ---- Calculate --------------------------------------------------
         if ui
             .add(egui::Button::new(egui::RichText::new("  Calculate  ").strong()))
@@ -612,6 +696,7 @@ impl LightState {
         if let Some(g) = &self.grid {
             ui.separator();
             let uo = if g.avg > 0.0 { g.min / g.avg } else { 0.0 };
+            ui.label(egui::RichText::new(metric_label(self.metric)).strong());
             ui.label(format!("Average   {:.0} lx", g.avg));
             ui.label(format!("Min / Max   {:.0} / {:.0} lx", g.min, g.max));
             ui.label(format!("Uniformity Uo (min/avg)   {:.2}", uo));

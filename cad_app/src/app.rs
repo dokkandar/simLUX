@@ -3616,6 +3616,66 @@ impl CadApp {
                 return;
             }
         }
+        // ---- SIMLUX: `luxmetric [horizontal | vertical [az] | custom x y z]` ---
+        // Set the illuminance metric (receiver-normal rule) the lux calc measures
+        // onto; re-run immediately if a grid already exists. An app-layer intercept
+        // (like zoom / pedit / setvar) — the command line drives lux the same way
+        // it drives drafting, reusing the existing calc. Frozen parser untouched.
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            let is_lux = lc == "luxmetric"
+                || lc == "luxm"
+                || lc.starts_with("luxmetric ")
+                || lc.starts_with("luxm ");
+            if is_lux {
+                let rest = lc
+                    .strip_prefix("luxmetric")
+                    .or_else(|| lc.strip_prefix("luxm"))
+                    .unwrap_or("")
+                    .trim();
+                let mut parts = rest.split_whitespace();
+                let mut changed = false;
+                match parts.next() {
+                    None => {
+                        self.history.push(format!(
+                            "  lux metric = {}",
+                            crate::light::metric_label(self.light.metric)
+                        ));
+                    }
+                    Some("h") | Some("horizontal") | Some("eh") => {
+                        self.light.metric = cad_light::ReceiverNormal::Horizontal;
+                        changed = true;
+                    }
+                    Some("v") | Some("vertical") | Some("ev") => {
+                        let az = parts.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                        self.light.metric = cad_light::ReceiverNormal::Vertical { azimuth_deg: az };
+                        changed = true;
+                    }
+                    Some("c") | Some("custom") => {
+                        let x = parts.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+                        let y = parts.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(0.0);
+                        let z = parts.next().and_then(|s| s.parse::<f32>().ok()).unwrap_or(1.0);
+                        self.light.metric = cad_light::ReceiverNormal::Custom { x, y, z };
+                        changed = true;
+                    }
+                    Some(other) => {
+                        self.history.push(format!(
+                            "  ! unknown metric '{}' — use  horizontal | vertical [az] | custom x y z",
+                            other
+                        ));
+                    }
+                }
+                if changed {
+                    let label = crate::light::metric_label(self.light.metric);
+                    if self.light.grid.is_some() {
+                        self.light.calculate(&self.doc);
+                    }
+                    self.history.push(format!("  lux metric → {}", label));
+                }
+                self.clear_prompt();
+                return;
+            }
+        }
         // ---- SYSVAR access: `setvar [NAME [VALUE]]` / `setvar ?`, or a bare
         // variable name typed as a command (AutoCAD-style). ------------------
         {
