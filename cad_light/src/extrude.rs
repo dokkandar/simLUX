@@ -15,9 +15,9 @@ fn vtx(p: Vec2, z: f32) -> Vertex {
     Vertex::new(p.x as f32, p.y as f32, z)
 }
 
-fn surface(a: Vec2, b: Vec2, height: f32, material: MaterialId) -> Mesh {
+fn surface(a: Vec2, b: Vec2, z0: f32, z1: f32, material: MaterialId) -> Mesh {
     Mesh {
-        vertices: vec![vtx(a, 0.0), vtx(b, 0.0), vtx(b, height), vtx(a, height)],
+        vertices: vec![vtx(a, z0), vtx(b, z0), vtx(b, z1), vtx(a, z1)],
         triangles: vec![Triangle { a: 0, b: 1, c: 2 }, Triangle { a: 0, b: 2, c: 3 }],
         material,
     }
@@ -36,14 +36,14 @@ fn cap(poly: &[Vec2], z: f32, material: MaterialId, out: &mut Vec<Mesh>) {
     });
 }
 
-fn extrude_path(pts: &[Vec2], closed: bool, height: f32, out: &mut Vec<Mesh>) {
+fn extrude_path(pts: &[Vec2], closed: bool, z0: f32, z1: f32, out: &mut Vec<Mesh>) {
     for w in pts.windows(2) {
-        out.push(surface(w[0], w[1], height, WALL));
+        out.push(surface(w[0], w[1], z0, z1, WALL));
     }
     if closed && pts.len() >= 3 {
-        out.push(surface(pts[pts.len() - 1], pts[0], height, WALL));
-        cap(pts, 0.0, FLOOR, out);
-        cap(pts, height, CEILING, out);
+        out.push(surface(pts[pts.len() - 1], pts[0], z0, z1, WALL));
+        cap(pts, z0, FLOOR, out);
+        cap(pts, z1, CEILING, out);
     }
 }
 
@@ -66,40 +66,48 @@ fn arc_pts(a: &KArc) -> Vec<Vec2> {
         .collect()
 }
 
-/// Extrude ONE geometry to surfaces at `height` (closed paths also get
-/// floor + ceiling). Shared by `extrude` (whole doc) and `extrude_handles`
-/// (SIMLUX per-layer room build), so both stay in lock-step.
-fn extrude_geom(geom: &Geom, height: f32, out: &mut Vec<Mesh>) {
+/// Extrude ONE geometry into surfaces spanning elevations `z0`..`z1` (closed
+/// paths also get floor + ceiling caps). Shared by every extrude entry point so
+/// they stay in lock-step.
+fn extrude_geom(geom: &Geom, z0: f32, z1: f32, out: &mut Vec<Mesh>) {
     match geom {
-        Geom::Line(l) => extrude_path(&[l.a, l.b], false, height, out),
-        Geom::Wall(w) => extrude_path(&[w.start, w.end], false, height, out),
+        Geom::Line(l) => extrude_path(&[l.a, l.b], false, z0, z1, out),
+        Geom::Wall(w) => extrude_path(&[w.start, w.end], false, z0, z1, out),
         Geom::Polyline(p) => {
             let v: Vec<Vec2> = p.vertices.iter().map(|x| x.pos).collect();
-            extrude_path(&v, p.closed, height, out);
+            extrude_path(&v, p.closed, z0, z1, out);
         }
-        Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, height, out),
-        Geom::Arc(a) => extrude_path(&arc_pts(a), false, height, out),
+        Geom::Circle(c) => extrude_path(&circle_pts(c.center, c.radius), true, z0, z1, out),
+        Geom::Arc(a) => extrude_path(&arc_pts(a), false, z0, z1, out),
         _ => {}
     }
 }
 
-/// Extrude every drafted entity to surfaces (closed paths also get floor + ceiling).
+/// Extrude every drafted entity from the floor (z=0) up to `height`.
 pub fn extrude(doc: &Document, height: f32) -> Vec<Mesh> {
     let mut out = Vec::new();
     for d in &doc.dobjects {
-        extrude_geom(&d.geom, height, &mut out);
+        extrude_geom(&d.geom, 0.0, height, &mut out);
     }
     out
 }
 
-/// Extrude ONLY the dobjects named by `handles`, at `height` — the SIMLUX
-/// per-layer room build (each imported layer extrudes to its own height).
-/// Handles that no longer exist in `doc` are silently skipped.
+/// Extrude ONLY the dobjects named by `handles`, from z=0 up to `height` — the
+/// SIMLUX per-layer room build. Handles absent from `doc` are silently skipped.
 pub fn extrude_handles(doc: &Document, handles: &[u64], height: f32) -> Vec<Mesh> {
+    extrude_handles_range(doc, handles, 0.0, height)
+}
+
+/// Extrude the `handles` between elevations `z0` and `z1` (metres, Z-up) — the
+/// SIMLUX per-layer build with a base elevation + height + up/down direction.
+/// `z0`/`z1` may be in either order (walls span the range, floor caps the lower
+/// end, ceiling the upper). Handles absent from `doc` are silently skipped.
+pub fn extrude_handles_range(doc: &Document, handles: &[u64], z0: f32, z1: f32) -> Vec<Mesh> {
+    let (lo, hi) = if z0 <= z1 { (z0, z1) } else { (z1, z0) };
     let mut out = Vec::new();
     for &h in handles {
         if let Some(d) = doc.find_by_handle(h) {
-            extrude_geom(&d.geom, height, &mut out);
+            extrude_geom(&d.geom, lo, hi, &mut out);
         }
     }
     out

@@ -3206,6 +3206,10 @@ impl CadApp {
                 }
             }
         }
+        if action.rebuild_3d {
+            // Extrusion params changed → refresh the 3D meshes (no lux recalc).
+            self.light.rebuild_live_meshes(&self.doc);
+        }
         if action.calculate {
             self.light.calculate(&self.doc);
         }

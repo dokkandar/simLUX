@@ -19,6 +19,12 @@ pub struct SimluxConfig {
     /// Layer NAME → extrude height (m). Presence ⇒ "use for 3D".
     #[serde(default)]
     pub layers_3d: BTreeMap<String, f32>,
+    /// Layer NAME → base elevation (m) the extrusion starts from. Default 0.
+    #[serde(default)]
+    pub layers_3d_base: BTreeMap<String, f32>,
+    /// Layer NAME → extrude downward from the base instead of up. Default false.
+    #[serde(default)]
+    pub layers_3d_down: BTreeMap<String, bool>,
     /// IES library — profile name → profile. Entered ONCE, referenced by name.
     #[serde(default)]
     pub ies_library: BTreeMap<String, IesProfile>,

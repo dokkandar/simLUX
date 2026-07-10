@@ -9,7 +9,7 @@
 use std::collections::{BTreeMap, HashMap};
 
 use cad_light::{
-    bbox, calculate_receiver, default_materials, extrude, extrude_handles, parse_photometry,
+    bbox, calculate_receiver, default_materials, extrude, extrude_handles_range, parse_photometry,
     CalcPlane, IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings,
     ReceiverNormal, Vertex,
 };
@@ -67,6 +67,8 @@ pub struct LightAction {
     pub place_block: Option<String>,
     /// Import this IES path INTO the drawing (needs the Document, so the app does it).
     pub load_ies: Option<String>,
+    /// An extrusion parameter changed — rebuild the 3D meshes (no lux recalc).
+    pub rebuild_3d: bool,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -76,8 +78,22 @@ pub struct LightAction {
 pub struct RoomLayer {
     pub layer_id: u32,
     pub name: String,
+    /// Extrusion length (metres).
     pub height: f32,
+    /// Base elevation the extrusion starts from (metres, Z-up). Default 0 (floor).
+    pub base_z: f32,
+    /// Extrude downward from `base_z` instead of up.
+    pub dir_down: bool,
     pub handles: Vec<u64>,
+}
+
+impl RoomLayer {
+    /// The elevation span (z0, z1) this layer extrudes between, from its base +
+    /// height + direction. Passed straight to `extrude_handles_range`.
+    pub fn z_range(&self) -> (f32, f32) {
+        let z1 = if self.dir_down { self.base_z - self.height } else { self.base_z + self.height };
+        (self.base_z, z1)
+    }
 }
 
 /// All lighting UI + engine state, owned by `CadApp`.
@@ -238,7 +254,7 @@ impl LightState {
             g.handles = handles;
             g.name = name.clone();
         } else {
-            self.room.push(RoomLayer { layer_id, name: name.clone(), height: self.room_height, handles });
+            self.room.push(RoomLayer { layer_id, name: name.clone(), height: self.room_height, base_z: 0.0, dir_down: false, handles });
         }
         self.last_msg =
             format!("Imported {n} object(s) from layer '{name}' — set height, then Calculate.");
@@ -309,7 +325,8 @@ impl LightState {
         } else {
             let mut m = Vec::new();
             for g in &self.room {
-                m.extend(extrude_handles(doc, &g.handles, g.height));
+                let (z0, z1) = g.z_range();
+                m.extend(extrude_handles_range(doc, &g.handles, z0, z1));
             }
             m
         };
@@ -362,7 +379,8 @@ impl LightState {
         } else {
             let mut m = Vec::new();
             for g in &self.room {
-                m.extend(extrude_handles(doc, &g.handles, g.height));
+                let (z0, z1) = g.z_range();
+                m.extend(extrude_handles_range(doc, &g.handles, z0, z1));
             }
             m
         };
@@ -385,13 +403,17 @@ impl LightState {
     pub fn to_config(&self, doc: &Document) -> crate::simlux_io::SimluxConfig {
         use std::collections::BTreeMap;
         let mut layers_3d = BTreeMap::new();
+        let mut layers_3d_base = BTreeMap::new();
+        let mut layers_3d_down = BTreeMap::new();
         for g in &self.room {
             let name = doc
                 .layers
                 .get(g.layer_id)
                 .map(|l| l.name.clone())
                 .unwrap_or_else(|| g.name.clone());
-            layers_3d.insert(name, g.height);
+            layers_3d.insert(name.clone(), g.height);
+            layers_3d_base.insert(name.clone(), g.base_z);
+            layers_3d_down.insert(name, g.dir_down);
         }
         let mut ies_library = BTreeMap::new();
         for (k, v) in &self.profiles {
@@ -401,6 +423,8 @@ impl LightState {
         }
         crate::simlux_io::SimluxConfig {
             layers_3d,
+            layers_3d_base,
+            layers_3d_down,
             ies_library,
             active_profile: self.active_profile.clone(),
             lux_blocks: self.lux_blocks.clone(),
@@ -445,7 +469,9 @@ impl LightState {
                     .filter(|d| d.style.layer == lid)
                     .map(|d| d.handle)
                     .collect();
-                self.room.push(RoomLayer { layer_id: lid, name, height, handles });
+                let base_z = cfg.layers_3d_base.get(&name).copied().unwrap_or(0.0);
+                let dir_down = cfg.layers_3d_down.get(&name).copied().unwrap_or(false);
+                self.room.push(RoomLayer { layer_id: lid, name, height, base_z, dir_down, handles });
             }
         }
     }
@@ -519,30 +545,43 @@ impl LightState {
             );
         } else {
             ui.add_space(4.0);
-            ui.label(egui::RichText::new("② Extrude  ·  per-layer height (m)").strong());
-            egui::Grid::new("simlux_room_groups")
-                .num_columns(4)
-                .spacing([8.0, 4.0])
-                .show(ui, |ui| {
-                    for g in &mut self.room {
+            ui.label(egui::RichText::new("② Extrude  ·  base + height + direction").strong());
+            let mut remove_layer: Option<u32> = None;
+            let mut changed = false;
+            for g in &mut self.room {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
                         ui.label(egui::RichText::new(&g.name).strong());
-                        ui.label(
-                            egui::RichText::new(format!("{} obj", g.handles.len()))
-                                .small()
-                                .weak(),
-                        );
-                        ui.add(
-                            egui::DragValue::new(&mut g.height)
-                                .speed(0.05)
-                                .suffix(" m")
-                                .range(0.1..=20.0),
-                        );
-                        if ui.button("✕").on_hover_text("Remove from room").clicked() {
-                            action.remove_layer = Some(g.layer_id);
+                        ui.label(egui::RichText::new(format!("{} obj", g.handles.len())).small().weak());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui.small_button("✕").on_hover_text("Remove from room").clicked() {
+                                remove_layer = Some(g.layer_id);
+                            }
+                        });
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("base");
+                        changed |= ui.add(egui::DragValue::new(&mut g.base_z)
+                            .speed(0.05).suffix(" m").range(-50.0..=200.0)).changed();
+                        ui.label("height");
+                        changed |= ui.add(egui::DragValue::new(&mut g.height)
+                            .speed(0.05).suffix(" m").range(0.01..=200.0)).changed();
+                        let dir = if g.dir_down { "↓ down" } else { "↑ up" };
+                        if ui.selectable_label(false, dir)
+                            .on_hover_text("Toggle extrude direction (up / down from base)")
+                            .clicked()
+                        {
+                            g.dir_down = !g.dir_down;
+                            changed = true;
                         }
-                        ui.end_row();
-                    }
+                    });
+                    let (z0, z1) = g.z_range();
+                    ui.label(egui::RichText::new(
+                        format!("→ z {:.2} … {:.2} m", z0.min(z1), z0.max(z1))).small().weak());
                 });
+            }
+            if let Some(id) = remove_layer { action.remove_layer = Some(id); }
+            if changed { action.rebuild_3d = true; }
         }
         ui.separator();
 
