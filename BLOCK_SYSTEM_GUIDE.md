@@ -283,9 +283,10 @@ the lighting layout; the assigned **IES** is what the calc uses; a future visual
 mesh is what a render uses — **one block, up to three consumers** (the
 "two-representation" rule, `SIMLUX_SCENE_AND_DAYLIGHT_PLAN` §3.2).
 
-### 11.1 Data model — kernel-clean, in the sidecar
-The kernel `Block` is UNCHANGED. Whether a block is a luminaire — and which IES it
-carries — lives SIMLUX-side, keyed by the block DEFINITION NAME:
+### 11.1 Data model — IES in the drawing, mapping in the sidecar
+The kernel `Block` is UNCHANGED. Whether a block is a luminaire — and which IES
+*names* it carries — lives SIMLUX-side, keyed by the block DEFINITION NAME (the raw
+IES files themselves live in the drawing — see "Where the data lives" below):
 
 ```
 // cad_app/src/simlux_io.rs — persisted in <drawing>.simlux.json
@@ -301,8 +302,17 @@ LuxBlock {
   (e.g. one IES per mounting height 10′/20′/30′); only the **active** one is
   calculated/rendered. `LuxBlock::active_ies()` returns the active name *iff* it is
   still one of the options.
-- **IES referenced by NAME**, never copied — entered once into `ies_library`,
-  shared by every instance; swap the library entry → every fixture updates.
+- **IES referenced by NAME**, never copied — shared by every instance; swap the
+  file → every fixture updates.
+- **Where the data lives (two places, on purpose):**
+  - The **raw IES files** live IN the drawing: `Document.ies_files: Vec<IesFile{name,data}>`,
+    persisted in **RSM v8** (mirroring the v4 raster-underlay embedding; KB-sized, so
+    many per drawing is fine). On open, `LightState::load_embedded_ies` rebuilds the
+    runtime library from them. Import goes through `CadApp::import_ies_into_drawing`.
+  - The **luminaire mapping** (which block is a luminaire + its linked IES *names* +
+    the active one) stays SIMLUX-side in the sidecar `lux_blocks`. So: photometry
+    bytes = drawing; the block→IES wiring = sidecar. The kernel `Block` is unchanged;
+    the kernel stores `ies_files` opaquely (never parses them).
 
 ### 11.2 How it wires (create → link → derive → calc)
 ```
