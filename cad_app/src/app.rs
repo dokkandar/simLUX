@@ -2262,7 +2262,98 @@ struct FilePreview {
     path: std::path::PathBuf,
     doc:  Option<Document>,
     bbox: Option<(Vec2, Vec2)>,
+    /// Parsed photometry, when the selected file is an .ies/.ldt (drawn as a
+    /// polar candela distribution instead of a wireframe).
+    photometry: Option<cad_light::IesProfile>,
     info: String,
+}
+
+/// Beam angle (FWHM): twice the angle from the C0-plane peak direction to where
+/// the intensity falls to 50 % of peak — the datasheet "beam angle" for a
+/// symmetric downlight.
+fn beam_fwhm(prof: &cad_light::IesProfile) -> f64 {
+    let va = &prof.vertical_angles;
+    if va.is_empty() { return 0.0; }
+    let (mut peak, mut peak_g) = (0.0f64, va[0]);
+    for &g in va {
+        let i = prof.intensity(g, 0.0);
+        if i > peak { peak = i; peak_g = g; }
+    }
+    if peak <= 0.0 { return 0.0; }
+    let half = peak * 0.5;
+    let (mut prev_g, mut prev_i) = (peak_g, peak);
+    let mut hi = *va.last().unwrap();
+    for &g in va {
+        if g <= peak_g { continue; }
+        let i = prof.intensity(g, 0.0);
+        if i < half {
+            let t = (prev_i - half) / (prev_i - i).max(1e-9);
+            hi = prev_g + t * (g - prev_g);
+            break;
+        }
+        prev_g = g; prev_i = i;
+    }
+    2.0 * (hi - peak_g).abs()
+}
+
+/// A few lines of key photometric stats for the preview caption.
+fn photometry_info(prof: &cad_light::IesProfile) -> String {
+    let flux = if prof.lumens > 0.0 { format!("{:.0} lm", prof.lumens) } else { "—".into() };
+    format!(
+        "{}\nFlux {} · Peak {:.0} cd · Beam {:.0}°\nγ {:.0}–{:.0}° · {} C-plane(s)",
+        prof.name, flux, prof.peak_candela(), beam_fwhm(prof),
+        prof.vertical_angles.first().copied().unwrap_or(0.0),
+        prof.vertical_angles.last().copied().unwrap_or(0.0),
+        prof.horizontal_angles.len(),
+    )
+}
+
+/// Draw the classic polar candela distribution: the luminaire at the centre,
+/// nadir (γ=0) pointing down; C0–C180 in gold, C90–C270 in blue when the fixture
+/// has azimuth variation. Radius ∝ intensity / peak. Stats are shown by the
+/// caption under the preview.
+fn draw_photometry_preview(painter: &egui::Painter, prect: egui::Rect, prof: &cad_light::IesProfile) {
+    let clip = painter.with_clip_rect(prect);
+    let peak = prof.peak_candela().max(1e-6);
+    let plot = prect.shrink(14.0);
+    let r = (plot.width().min(plot.height()) * 0.46).max(10.0);
+    let (cx, cy) = (plot.center().x, plot.center().y);
+    let grid = egui::Color32::from_gray(66);
+    for f in [0.25f32, 0.5, 0.75, 1.0] {
+        clip.circle_stroke(egui::pos2(cx, cy), r * f, egui::Stroke::new(1.0, grid));
+    }
+    for k in 0..12 {
+        let a = (k as f32) * 30f32.to_radians();
+        clip.line_segment(
+            [egui::pos2(cx, cy), egui::pos2(cx + r * a.sin(), cy + r * a.cos())],
+            egui::Stroke::new(0.5, grid),
+        );
+    }
+    let lbl = egui::Color32::from_gray(120);
+    let fnt = egui::FontId::proportional(9.0);
+    clip.text(egui::pos2(cx, cy + r + 4.0), egui::Align2::CENTER_TOP, "0°", fnt.clone(), lbl);
+    clip.text(egui::pos2(cx, cy - r - 4.0), egui::Align2::CENTER_BOTTOM, "180°", fnt.clone(), lbl);
+    clip.text(egui::pos2(cx + r + 4.0, cy), egui::Align2::LEFT_CENTER, "90°", fnt.clone(), lbl);
+    clip.text(egui::pos2(cx - r - 4.0, cy), egui::Align2::RIGHT_CENTER, "90°", fnt, lbl);
+
+    let curve = |phi: f64, sign: f32, color: egui::Color32, width: f32| {
+        let pts: Vec<egui::Pos2> = prof.vertical_angles.iter().map(|&g| {
+            let rr = (prof.intensity(g, phi) / peak) as f32 * r;
+            let gr = (g as f32).to_radians();
+            egui::pos2(cx + sign * rr * gr.sin(), cy + rr * gr.cos())
+        }).collect();
+        if pts.len() >= 2 {
+            clip.add(egui::Shape::line(pts, egui::Stroke::new(width, color)));
+        }
+    };
+    let gold = egui::Color32::from_rgb(240, 200, 90);
+    let blue = egui::Color32::from_rgb(90, 170, 240);
+    if prof.horizontal_angles.len() > 1 {
+        curve(90.0, 1.0, blue, 1.0);
+        curve(270.0, -1.0, blue, 1.0);
+    }
+    curve(0.0, 1.0, gold, 1.6);
+    curve(180.0, -1.0, gold, 1.6);
 }
 
 /// Drive/root paths for the path-bar dropdown. On Windows, probe A:..Z: and
@@ -12931,6 +13022,23 @@ impl CadApp {
             return;
         }
         let lower = path.to_string_lossy().to_ascii_lowercase();
+        // Photometry files (.ies/.ldt) preview as a polar candela distribution.
+        if lower.ends_with(".ies") || lower.ends_with(".ldt") {
+            self.file_preview = Some(
+                match std::fs::read_to_string(path).map_err(|e| e.to_string())
+                    .and_then(|t| cad_light::parse_photometry(&t))
+                {
+                    Ok(prof) => {
+                        let info = photometry_info(&prof);
+                        FilePreview { path: path.to_path_buf(), doc: None, bbox: None,
+                                      photometry: Some(prof), info }
+                    }
+                    Err(e) => FilePreview { path: path.to_path_buf(), doc: None, bbox: None,
+                                            photometry: None, info: format!("cannot parse: {e}") },
+                },
+            );
+            return;
+        }
         let parsed: Result<Document, String> = if lower.ends_with(".dxf") {
             std::fs::read_to_string(path).map_err(|e| e.to_string())
                 .and_then(|t| cad_io::dxf::read_dxf(&t))
@@ -12955,10 +13063,10 @@ impl CadApp {
                 }
                 let info = format!("{} object(s) · {} layer(s)",
                     doc.dobjects.len(), doc.layers.len());
-                FilePreview { path: path.to_path_buf(), doc: Some(doc), bbox: bb, info }
+                FilePreview { path: path.to_path_buf(), doc: Some(doc), bbox: bb, photometry: None, info }
             }
             Err(e) => FilePreview {
-                path: path.to_path_buf(), doc: None, bbox: None,
+                path: path.to_path_buf(), doc: None, bbox: None, photometry: None,
                 info: format!("cannot preview: {}", e),
             },
         });
@@ -12972,6 +13080,11 @@ impl CadApp {
         painter.rect_stroke(prect, 2.0,
             egui::Stroke::new(1.0, egui::Color32::from_gray(70)));
         let Some(mut fp) = self.file_preview.take() else { return; };
+        if let Some(prof) = &fp.photometry {
+            draw_photometry_preview(painter, prect, prof);
+            self.file_preview = Some(fp);
+            return;
+        }
         if let (Some(doc), Some((mn, mx))) = (fp.doc.take(), fp.bbox) {
             let w = (mx.x - mn.x).abs();
             let h = (mx.y - mn.y).abs();
