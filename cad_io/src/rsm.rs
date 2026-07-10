@@ -72,7 +72,9 @@ const MAGIC: [u8; 4] = *b"RSM\x01";
 //     HSI windows-ui branch shipped this as "v4"; renumbered to v7 here because
 //     our v4/v5/v6 were already taken by raster / mirror_x / scale_y. The width
 //     reader is therefore gated on ver >= 7 so v4..v6 files (no widths) load.
-const VERSION: u16  = 7;
+// v8: + embedded IES/LDT photometry files section (after raster images), so
+//     luminaire blocks carry their photometry inside the drawing.
+const VERSION: u16  = 8;
 
 // =============================================================================
 //   WRITER
@@ -95,8 +97,19 @@ pub fn write_rsm(doc: &Document) -> Vec<u8> {
     write_dim_style_table(&mut w, &doc.dim_styles);
     write_wall_style_table(&mut w, &doc.wall_styles);
     write_raster_images(&mut w, &doc.raster_images);          // v4
+    write_ies_files(&mut w, &doc.ies_files);                  // v8
 
     w
+}
+
+/// v8 — embedded IES/LDT photometry files. Per file: name, then the raw file
+/// text (length-prefixed). Mirrors `write_raster_images` (v4).
+fn write_ies_files(w: &mut Vec<u8>, files: &[cad_kernel::IesFile]) {
+    write_u32(w, files.len() as u32);
+    for f in files {
+        write_str(w, &f.name);
+        write_str(w, &f.data);
+    }
 }
 
 /// v4 — embedded raster underlays. Per image: name, placement (insert + world
@@ -617,10 +630,24 @@ pub fn read_rsm(bytes: &[u8]) -> Result<Document, String> {
     };
     // v4 — embedded raster underlays. Older files have no section.
     let raster_images = if ver >= 4 { read_raster_images(&mut r)? } else { Vec::new() };
+    // v8 — embedded IES photometry files. Older files have no section.
+    let ies_files = if ver >= 8 { read_ies_files(&mut r)? } else { Vec::new() };
     Ok(Document {
         dobjects, layers, linetypes, pens, truecolors,
-        text_styles, dim_styles, wall_styles, blocks, raster_images,
+        text_styles, dim_styles, wall_styles, blocks, raster_images, ies_files,
     })
+}
+
+/// v8 — embedded IES photometry files (mirror of `write_ies_files`).
+fn read_ies_files(r: &mut R) -> Result<Vec<cad_kernel::IesFile>, String> {
+    let n = r.u32()? as usize;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let name = r.str()?;
+        let data = r.str()?;
+        out.push(cad_kernel::IesFile { name, data });
+    }
+    Ok(out)
 }
 
 /// v4 — embedded raster underlays (mirror of `write_raster_images`).
@@ -988,6 +1015,26 @@ mod tests {
         assert_eq!(r.insert, Vec2::new(-5.0, 42.0));
         assert_eq!(r.world_w, 1408.0);
         assert_eq!(r.world_h, 768.0);
+    }
+
+    #[test]
+    fn ies_files_round_trip() {
+        // v8 — embedded IES photometry text must survive save/load, and an old
+        // v7-style file (no section) must still read with an empty ies_files.
+        let mut doc = Document::default();
+        doc.ies_files.push(cad_kernel::IesFile {
+            name: "Downlight 20deg".into(),
+            data: "IESNA:LM-63-2002\nTILT=NONE\n1 1000 1.0 2 1 1 2 0 0 0\n0 90\n0\n1000 250\n".into(),
+        });
+        doc.ies_files.push(cad_kernel::IesFile {
+            name: "Wallwash".into(),
+            data: "IESNA:LM-63-1995\nTILT=NONE\n…".into(),
+        });
+        let back = round_trip(&doc);
+        assert_eq!(back.ies_files.len(), 2);
+        assert_eq!(back.ies_files[0].name, "Downlight 20deg");
+        assert!(back.ies_files[0].data.contains("TILT=NONE"));
+        assert_eq!(back.ies_files[1].name, "Wallwash");
     }
 
     #[test]

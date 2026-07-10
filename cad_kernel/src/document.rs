@@ -33,6 +33,16 @@ pub struct RasterImage {
     pub world_h: f64,
 }
 
+/// An IES/LDT photometry file embedded in the drawing, kept by NAME as its raw
+/// file text. Small (KB); persisted in RSM (v8+) so luminaire blocks that
+/// reference it by name carry their photometry inside the drawing. The kernel
+/// stores it opaquely — it never parses the contents.
+#[derive(Clone)]
+pub struct IesFile {
+    pub name: String,
+    pub data: String,
+}
+
 #[derive(Clone)]
 pub struct Document {
     pub dobjects:    Vec<DObject>,
@@ -58,6 +68,10 @@ pub struct Document {
     /// Embedded reference raster underlays. Drafted over, not vectorized;
     /// persisted in RSM (v4+). Empty by default.
     pub raster_images: Vec<RasterImage>,
+    /// Embedded IES/LDT photometry files (raw text, by name). Persisted in RSM
+    /// (v8+) so luminaire blocks carry their photometry inside the drawing.
+    /// Empty by default; the kernel never parses them.
+    pub ies_files: Vec<IesFile>,
     // Reserved for future slices — leave the field list extensible:
     // pub ucs_list:    UcsList,
     // pub named_views: NamedViewList,
@@ -77,6 +91,7 @@ impl Default for Document {
             wall_styles: WallStyleTable::with_defaults(),
             blocks:      BlockTable::default(),
             raster_images: Vec::new(),
+            ies_files:   Vec::new(),
         }
     }
 }
