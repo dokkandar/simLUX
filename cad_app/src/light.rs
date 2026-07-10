@@ -52,7 +52,8 @@ fn builtin_downlight() -> IesProfile {
     }
 }
 
-/// Side effects the panel asks the app to run (they need `&Document`).
+/// Side effects the panel asks the app to run (they need `&Document` / the app's
+/// insert machinery).
 #[derive(Default)]
 pub struct LightAction {
     pub calculate: bool,
@@ -62,6 +63,8 @@ pub struct LightAction {
     pub remove_layer: Option<u32>,
     /// Move the current selection onto the dedicated SIMLUX layer + use it for 3D.
     pub shift_to_simlux: bool,
+    /// "Call" (insert) this luminaire block by name — arm the click-to-place flow.
+    pub place_block: Option<String>,
 }
 
 /// One imported source layer of the room: the drafted dobjects on `layer_id`,
@@ -200,29 +203,35 @@ impl LightState {
             .max(1e-3)
     }
 
-    fn import_ies(&mut self) {
-        let path = self.ies_path.trim().trim_matches('"').to_string();
+    /// Load an IES file into the shared library and return its profile name (the
+    /// key). Does NOT change the active profile. Reused by the Light panel's Load
+    /// and the Block dialog's luminaire IES linker.
+    pub fn load_ies_from(&mut self, path: &str) -> Result<String, String> {
+        let path = path.trim().trim_matches('"');
         if path.is_empty() {
-            self.last_msg = "Enter a .ies file path first.".to_string();
-            return;
+            return Err("enter a .ies file path first".to_string());
         }
-        match std::fs::read_to_string(&path) {
-            Ok(text) => match parse_ies(&text) {
-                Ok(mut prof) => {
-                    if prof.name.trim().is_empty() {
-                        prof.name = std::path::Path::new(&path)
-                            .file_stem()
-                            .map(|s| s.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "IES".to_string());
-                    }
-                    let key = prof.name.clone();
-                    self.active_profile = key.clone();
-                    self.profiles.insert(key.clone(), prof);
-                    self.last_msg = format!("Loaded IES '{key}'.");
-                }
-                Err(e) => self.last_msg = format!("IES parse error: {e}"),
-            },
-            Err(e) => self.last_msg = format!("Read error: {e}"),
+        let text = std::fs::read_to_string(path).map_err(|e| format!("read error: {e}"))?;
+        let mut prof = parse_ies(&text).map_err(|e| format!("IES parse error: {e}"))?;
+        if prof.name.trim().is_empty() {
+            prof.name = std::path::Path::new(path)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "IES".to_string());
+        }
+        let key = prof.name.clone();
+        self.profiles.insert(key.clone(), prof);
+        Ok(key)
+    }
+
+    fn import_ies(&mut self) {
+        let path = self.ies_path.clone();
+        match self.load_ies_from(&path) {
+            Ok(key) => {
+                self.active_profile = key.clone();
+                self.last_msg = format!("Loaded IES '{key}'.");
+            }
+            Err(e) => self.last_msg = e,
         }
     }
 
@@ -597,8 +606,18 @@ impl LightState {
                 let mut set_active: Option<String> = None;
                 let mut remove_opt: Option<String> = None;
                 let mut add_opt: Option<String> = None;
+                let mut place_this = false;
                 ui.group(|ui| {
-                    ui.label(egui::RichText::new(format!("💡 {bname}")).strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(format!("💡 {bname}")).strong());
+                        if ui
+                            .small_button("＋ Place")
+                            .on_hover_text("Insert this luminaire on the plan (click to place)")
+                            .clicked()
+                        {
+                            place_this = true;
+                        }
+                    });
                     if lux.ies_options.is_empty() {
                         ui.label(egui::RichText::new("no IES linked").small().weak());
                     }
@@ -628,6 +647,9 @@ impl LightState {
                             });
                     });
                 });
+                if place_this {
+                    action.place_block = Some(bname.clone());
+                }
                 if let Some(o) = add_opt {
                     lux.ies_options.push(o.clone());
                     if lux.active.is_none() {

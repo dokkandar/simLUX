@@ -1972,8 +1972,13 @@ pub struct BlockDialog {
     /// algorithm is supplied later; today this only sets the flag + a badge.
     pub smart: bool,
     /// Luminaire (LUX) marker — on OK, registers the block in the SIMLUX sidecar
-    /// (`lux_blocks`) as a fixture whose IES is linked later in the Light panel.
+    /// (`lux_blocks`) as a fixture, with `luminaire_ies` linked as its options.
     pub luminaire: bool,
+    /// IES profile names to link to this luminaire block on OK (many; the first
+    /// becomes active). Filled by the dialog's "＋ Add" / "Link existing".
+    pub luminaire_ies: Vec<String>,
+    /// IES file path being added in the dialog (the "＋ Add" field).
+    pub ies_path: String,
 }
 
 impl BlockDialog {
@@ -1985,6 +1990,8 @@ impl BlockDialog {
             color_aci: None,
             smart: false,
             luminaire: false,
+            luminaire_ies: Vec::new(),
+            ies_path: String::new(),
         }
     }
     /// Parse the X/Y text fields into a world point (falls back to 0 for
@@ -3102,6 +3109,18 @@ impl CadApp {
         if let Some(id) = action.remove_layer { self.light.remove_room_layer(id); }
         if action.calculate {
             self.light.calculate(&self.doc);
+        }
+        if let Some(name) = action.place_block.take() {
+            // "Call" a luminaire block from the Light panel: arm the same
+            // click-to-place flow the Block dialog's Insert uses.
+            if let Some(id) = self.doc.blocks.find(&name) {
+                self.insert_state = InsertState::WaitingForPoint { block: id };
+                self.set_prompt(format!(
+                    "insert '{}': click insertion point  [Esc=cancel]", name));
+            } else {
+                self.history.push(format!(
+                    "  ! luminaire block '{}' not defined yet — create it first", name));
+            }
         }
     }
 
@@ -14222,6 +14241,12 @@ impl CadApp {
         let mut insert_id: Option<u32> = None;
         let mut do_compare  = false;   // diff the two chosen blocks
         let mut edit_id: Option<u32> = None;  // open Block Editor for this block
+        let mut do_load_ies = false;   // load + link an IES file to the luminaire
+
+        // Pre-extract the IES library names (self isn't reachable inside the
+        // window closure) so the luminaire section can link existing profiles.
+        let mut profile_names: Vec<String> = self.light.profiles.keys().cloned().collect();
+        profile_names.sort();
 
         let existing: Vec<(u32, String, usize, bool, bool)> = self.doc.blocks.blocks.iter()
             .enumerate()
@@ -14368,8 +14393,47 @@ impl CadApp {
                 // ---- Luminaire (LUX) block ------------------------------
                 ui.checkbox(&mut dialog.luminaire, "Luminaire (IES) block")
                     .on_hover_text("Mark this definition as a luminaire: link one \
-                        or more IES to it in the Light panel (one active at a time). \
-                        Placing this block IS placing a fixture for the lux calc.");
+                        or more IES to it (one active at a time). Placing this block \
+                        IS placing a fixture for the lux calc.");
+                if dialog.luminaire {
+                    ui.indent("lum_ies", |ui| {
+                        ui.label(egui::RichText::new("Assign IES (many; first = active)").small().weak());
+                        // Already-linked IES for this new block.
+                        let mut unlink: Option<usize> = None;
+                        for (i, nm) in dialog.luminaire_ies.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("• {nm}"));
+                                if ui.small_button("✕").clicked() { unlink = Some(i); }
+                            });
+                        }
+                        if let Some(i) = unlink { dialog.luminaire_ies.remove(i); }
+                        // Link one already in the IES library.
+                        if !profile_names.is_empty() {
+                            ui.horizontal(|ui| {
+                                ui.label("Link existing:");
+                                egui::ComboBox::from_id_source("block_lum_link")
+                                    .selected_text("choose…")
+                                    .show_ui(ui, |ui| {
+                                        for k in &profile_names {
+                                            if !dialog.luminaire_ies.contains(k)
+                                                && ui.selectable_label(false, k.as_str()).clicked()
+                                            {
+                                                dialog.luminaire_ies.push(k.clone());
+                                            }
+                                        }
+                                    });
+                            });
+                        }
+                        // Add a new IES file from disk.
+                        ui.horizontal(|ui| {
+                            ui.label("IES file:");
+                            ui.add(egui::TextEdit::singleline(&mut dialog.ies_path)
+                                .desired_width(150.0)
+                                .hint_text(r"C:\path\to\file.ies"));
+                            if ui.button("＋ Add").clicked() { do_load_ies = true; }
+                        });
+                    });
+                }
 
                 // ---- OK / Cancel ----------------------------------------
                 ui.add_space(8.0);
@@ -14470,6 +14534,23 @@ impl CadApp {
             self.block_dialog = Some(dialog);
             return;
         }
+        if do_load_ies {
+            // Load the typed IES file into the shared library and link it to the
+            // luminaire-block-in-progress; keep the dialog open.
+            let path = dialog.ies_path.clone();
+            match self.light.load_ies_from(&path) {
+                Ok(key) => {
+                    if !dialog.luminaire_ies.contains(&key) {
+                        dialog.luminaire_ies.push(key.clone());
+                    }
+                    dialog.ies_path.clear();
+                    self.history.push(format!("  linked IES '{}' to the new luminaire block", key));
+                }
+                Err(e) => self.history.push(format!("  ! {e}")),
+            }
+            self.block_dialog = Some(dialog);
+            return;
+        }
         if do_select {
             // Park the dialog, run a fresh selection session; BlockReopen
             // restores the dialog when the user presses Enter.
@@ -14508,13 +14589,21 @@ impl CadApp {
                 let base = dialog.base_point();
                 let smart = dialog.smart;
                 let luminaire = dialog.luminaire;
+                let luminaire_ies = dialog.luminaire_ies.clone();
                 self.apply_block_create(&name, base, dialog.color_aci, smart);
-                // Luminaire (LUX) block → register it in the SIMLUX sidecar so the
-                // Light panel can link IES to it; its instances then derive fixtures.
+                // Luminaire (LUX) block → register it in the SIMLUX sidecar with the
+                // IES linked in the dialog (first = active); its instances then
+                // derive fixtures. More IES can be linked later in the Light panel.
                 if luminaire {
-                    self.light.lux_blocks.entry(name.clone()).or_default();
+                    let active = luminaire_ies.first().cloned();
+                    let n_ies = luminaire_ies.len();
+                    self.light.lux_blocks.insert(
+                        name.clone(),
+                        crate::simlux_io::LuxBlock { ies_options: luminaire_ies, active },
+                    );
                     self.history.push(format!(
-                        "  💡 '{}' is a luminaire block — link IES in Light panel ▸ Luminaire blocks", name));
+                        "  💡 '{}' is a luminaire block ({} IES linked) — manage in Light panel ▸ Luminaire blocks",
+                        name, n_ies));
                 }
                 // Smart block → jump STRAIGHT into the isolated Block Editor to
                 // define the parametric modifier vectors (user request): ticking

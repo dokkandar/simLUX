@@ -306,9 +306,10 @@ LuxBlock {
 
 ### 11.2 How it wires (create → link → derive → calc)
 ```
-Block dialog: tick "Luminaire (IES) block"      ─► lux_blocks[name] = LuxBlock::default()      (apply_block_create, then register)
-Light panel ▸ "Luminaire blocks"                ─► link IES options + pick the ◉ active         (panel_ui)
-Place instances (insert / copy / array)         ─► BlockRef(name) dobjects in the Document
+Block dialog: tick "Luminaire (IES) block"      ─► register lux_blocks[name] with the IES linked there
+  + ＋ Add IES file / Link existing                 (first linked = active)          (apply_block_create → register)
+Light panel ▸ "Luminaire blocks"                ─► link more IES + pick the ◉ active; ＋ Place inserts an instance (panel_ui)
+Place instances (＋ Place / insert / copy / array) ─► BlockRef(name) dobjects in the Document
 Calculate                                       ─► derived_luminaires(doc): each BlockRef whose def
                                                    is a lux block with an active IES emits a
                                                    Luminaire{ profile=active, pos=insert@mount, rot } (light.rs)
@@ -318,11 +319,16 @@ The payoff: **placing luminaire blocks IS placing the calc's fixtures** — no
 separate luminaire list to keep in sync. (Manual fixtures still add on top; the
 old manual side-list is no longer the primary source.)
 
-### 11.3 Command line
-- `luxblock` — list luminaire blocks, each block's linked-IES count + active IES,
-  and how many fixtures currently derive from the drawing. (Linking/activation is
-  in the Light panel; a full `luxblock <name> <ies>` setter waits on quoted-name
-  parsing, since IES/block names contain spaces.)
+### 11.3 Where the user links IES + places fixtures
+- **At creation** — the Block dialog's luminaire section: **＋ Add** an IES file
+  (loads it into the shared library) or **Link existing** from the library; the
+  first linked becomes active.
+- **Later** — Light panel ▸ **Luminaire blocks**: link/unlink more IES, pick the
+  ◉ active, and **＋ Place** to insert (\"call\") an instance onto the plan.
+- **Command line** — `luxblock` lists luminaire blocks, each block's linked-IES
+  count + active IES, and how many fixtures currently derive from the drawing. (A
+  full `luxblock <name> <ies>` setter waits on quoted-name parsing, since IES /
+  block names contain spaces.)
 
 ### 11.4 Pose of a derived fixture
 `position = (BlockRef.insert.x, .y, LightState.mount_height)` — the symbol sits on
