@@ -25,9 +25,10 @@ pub struct SimluxConfig {
     /// Selected / active IES profile name.
     #[serde(default)]
     pub active_profile: String,
-    /// LUX block DEFINITION name → IES profile name (Slice 3; type-level D4).
+    /// LUX-block registry: block DEFINITION name → its luminaire descriptor
+    /// (Slice 3; type-level D4). A block is a luminaire iff it has an entry here.
     #[serde(default)]
-    pub lux_block_ies: BTreeMap<String, String>,
+    pub lux_blocks: BTreeMap<String, LuxBlock>,
     /// Surface materials [floor, wall, ceiling].
     #[serde(default)]
     pub materials: Vec<Material>,
@@ -41,6 +42,29 @@ pub struct SimluxConfig {
     pub plane_height: f32,
     #[serde(default)]
     pub cell_size: f32,
+}
+
+/// A luminaire block's photometry: **many IES linked, only one active** at a
+/// time (the active one drives calc + render). The linked set lets one fixture
+/// carry several lamp/optic options (e.g. one IES per mounting height 10′/20′/30′)
+/// and switch between them without redefining the block. IES are referenced BY
+/// NAME into the shared `ies_library` — entered once, never copied.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LuxBlock {
+    /// IES profile names linked to this luminaire block — the candidate set.
+    #[serde(default)]
+    pub ies_options: Vec<String>,
+    /// The ONE active option (must be in `ies_options`); `None` = luminaire block
+    /// with no photometry assigned yet (draws its symbol, contributes no light).
+    #[serde(default)]
+    pub active: Option<String>,
+}
+
+impl LuxBlock {
+    /// The active IES name, but only if it is still one of the linked options.
+    pub fn active_ies(&self) -> Option<&String> {
+        self.active.as_ref().filter(|a| self.ies_options.contains(a))
+    }
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

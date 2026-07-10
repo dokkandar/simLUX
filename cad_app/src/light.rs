@@ -6,14 +6,16 @@
 //! shared `cad_kernel::Document`; the app paints the resulting grid as a 2D
 //! false-colour overlay on the plan (see `CadApp::paint_lux_overlay`).
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 use cad_light::{
     bbox, calculate_receiver, default_materials, extrude, extrude_handles, parse_ies, CalcPlane,
     IesProfile, LuxGrid, Luminaire, Material, Mesh, PhotometryType, RaySettings, ReceiverNormal,
     Vertex,
 };
-use cad_kernel::Document;
+use cad_kernel::{Document, Geom};
+
+use crate::simlux_io::LuxBlock;
 
 /// Human-readable name for a lux metric (receiver-normal rule), for the panel
 /// readout and the `luxmetric` command echo.
@@ -99,7 +101,12 @@ pub struct LightState {
     /// (single) light field onto — horizontal work-plane, a vertical facing, or a
     /// custom direction. See `SIMLUX_CALC_ENGINE_PLAN` §4.
     pub metric: ReceiverNormal,
-    /// Placed luminaires (P4); empty ⇒ auto-place one at room centre.
+    /// LUX-block registry: block DEFINITION name → its luminaire descriptor
+    /// (many IES linked, one active). A block is a luminaire iff it is a key
+    /// here. Fixtures are then DERIVED from the block instances in the drawing.
+    pub lux_blocks: BTreeMap<String, LuxBlock>,
+    /// Manually placed luminaires (P4). Combined with the LUX-block-derived
+    /// fixtures at calc time; if BOTH are empty ⇒ auto-place one at room centre.
     pub luminaires: Vec<Luminaire>,
     pub auto_center_light: bool,
     /// When set, canvas clicks drop a luminaire (P4 placement mode).
@@ -161,6 +168,7 @@ impl LightState {
             cell_size: 0.25,
             settings: RaySettings::default(),
             metric: ReceiverNormal::Horizontal,
+            lux_blocks: BTreeMap::new(),
             luminaires: Vec::new(),
             auto_center_light: true,
             place_mode: false,
@@ -264,6 +272,35 @@ impl LightState {
         self.room.iter().flat_map(|g| g.handles.iter().copied()).collect()
     }
 
+    /// Fixtures DERIVED from the drawing (Slice 4): every `BlockRef` whose
+    /// definition is a registered LUX block contributes a `Luminaire`, posed at
+    /// the instance and using that block's ACTIVE IES. Placing luminaire blocks
+    /// on the plan IS placing the fixtures — no separate list to keep in sync.
+    pub fn derived_luminaires(&self, doc: &Document) -> Vec<Luminaire> {
+        let mut out = Vec::new();
+        let mut id = 10_000; // keep clear of manually-placed fixture ids
+        for d in &doc.dobjects {
+            let Geom::BlockRef(br) = &d.geom else { continue };
+            let Some(def) = doc.blocks.get(br.block) else { continue };
+            let Some(lux) = self.lux_blocks.get(&def.name) else { continue };
+            let Some(ies) = lux.active_ies() else { continue };
+            id += 1;
+            out.push(Luminaire {
+                id,
+                profile: ies.clone(),
+                position: Vertex::new(br.insert.x as f32, br.insert.y as f32, self.mount_height),
+                rotation_deg: br.rotation.to_degrees() as f32,
+                dimming: 1.0,
+            });
+        }
+        out
+    }
+
+    /// Count of LUX-block instances in the drawing that resolve to an active IES.
+    pub fn derived_fixture_count(&self, doc: &Document) -> usize {
+        self.derived_luminaires(doc).len()
+    }
+
     /// Run the lux engine on `doc` and store the grid + plane + scene.
     pub fn calculate(&mut self, doc: &Document) {
         let Some((min_x, min_y, max_x, max_y)) = bbox(doc) else {
@@ -294,17 +331,20 @@ impl LightState {
             }
             m
         };
-        let lums = if self.luminaires.is_empty() && self.auto_center_light {
-            vec![Luminaire {
+        // Fixtures come from LUX-block instances in the drawing (derived) PLUS
+        // any manually placed luminaires; only when BOTH are empty do we
+        // auto-place one at the room centre so the legacy one-click flow works.
+        let mut lums = self.derived_luminaires(doc);
+        lums.extend(self.luminaires.iter().cloned());
+        if lums.is_empty() && self.auto_center_light {
+            lums.push(Luminaire {
                 id: 1,
                 profile: self.active_profile.clone(),
                 position: Vertex::new(0.5 * (min_x + max_x), 0.5 * (min_y + max_y), self.room_height),
                 rotation_deg: 0.0,
                 dimming: 1.0,
-            }]
-        } else {
-            self.luminaires.clone()
-        };
+            });
+        }
         let grid = calculate_receiver(
             &meshes,
             &lums,
@@ -381,7 +421,7 @@ impl LightState {
             layers_3d,
             ies_library,
             active_profile: self.active_profile.clone(),
-            lux_block_ies: BTreeMap::new(),
+            lux_blocks: self.lux_blocks.clone(),
             materials: self.materials.clone(),
             settings: self.settings,
             room_height: self.room_height,
@@ -404,6 +444,7 @@ impl LightState {
             self.materials = cfg.materials;
         }
         self.settings = cfg.settings;
+        self.lux_blocks = cfg.lux_blocks;
         if cfg.room_height > 0.0 {
             self.room_height = cfg.room_height;
         }
@@ -531,6 +572,79 @@ impl LightState {
             }
         });
         ui.checkbox(&mut self.auto_center_light, "Auto-place one at room centre if none placed");
+
+        ui.separator();
+
+        // ---- Luminaire blocks (LUX blocks: many IES linked, one active) --
+        ui.label(egui::RichText::new("Luminaire blocks").strong());
+        ui.label(
+            egui::RichText::new(
+                "Blocks ticked ‘Luminaire (IES)’ in the Block dialog. Link IES options; the ◉ active one drives calc + render.",
+            )
+            .small()
+            .weak(),
+        );
+        if self.lux_blocks.is_empty() {
+            ui.label(
+                egui::RichText::new("None yet — make a block and tick ‘Luminaire (IES)’.")
+                    .small()
+                    .weak(),
+            );
+        } else {
+            let mut profile_keys: Vec<String> = self.profiles.keys().cloned().collect();
+            profile_keys.sort();
+            for (bname, lux) in self.lux_blocks.iter_mut() {
+                let mut set_active: Option<String> = None;
+                let mut remove_opt: Option<String> = None;
+                let mut add_opt: Option<String> = None;
+                ui.group(|ui| {
+                    ui.label(egui::RichText::new(format!("💡 {bname}")).strong());
+                    if lux.ies_options.is_empty() {
+                        ui.label(egui::RichText::new("no IES linked").small().weak());
+                    }
+                    for opt in &lux.ies_options {
+                        ui.horizontal(|ui| {
+                            let active = lux.active.as_deref() == Some(opt.as_str());
+                            if ui.radio(active, opt.as_str()).clicked() {
+                                set_active = Some(opt.clone());
+                            }
+                            if ui.small_button("✕").on_hover_text("Unlink this IES").clicked() {
+                                remove_opt = Some(opt.clone());
+                            }
+                        });
+                    }
+                    ui.horizontal(|ui| {
+                        ui.label("Link IES:");
+                        egui::ComboBox::from_id_source(format!("luxlink_{bname}"))
+                            .selected_text("add…")
+                            .show_ui(ui, |ui| {
+                                for k in &profile_keys {
+                                    if !lux.ies_options.contains(k)
+                                        && ui.selectable_label(false, k.as_str()).clicked()
+                                    {
+                                        add_opt = Some(k.clone());
+                                    }
+                                }
+                            });
+                    });
+                });
+                if let Some(o) = add_opt {
+                    lux.ies_options.push(o.clone());
+                    if lux.active.is_none() {
+                        lux.active = Some(o); // first linked option becomes active
+                    }
+                }
+                if let Some(o) = set_active {
+                    lux.active = Some(o);
+                }
+                if let Some(o) = remove_opt {
+                    lux.ies_options.retain(|x| x != &o);
+                    if lux.active.as_deref() == Some(o.as_str()) {
+                        lux.active = lux.ies_options.first().cloned();
+                    }
+                }
+            }
+        }
 
         ui.separator();
 

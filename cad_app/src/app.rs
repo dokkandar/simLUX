@@ -1971,6 +1971,9 @@ pub struct BlockDialog {
     /// Smart-block marker — stored on the created `Block`. The re-derive
     /// algorithm is supplied later; today this only sets the flag + a badge.
     pub smart: bool,
+    /// Luminaire (LUX) marker — on OK, registers the block in the SIMLUX sidecar
+    /// (`lux_blocks`) as a fixture whose IES is linked later in the Light panel.
+    pub luminaire: bool,
 }
 
 impl BlockDialog {
@@ -1981,6 +1984,7 @@ impl BlockDialog {
             base_y: format!("{:.4}", base.y),
             color_aci: None,
             smart: false,
+            luminaire: false,
         }
     }
     /// Parse the X/Y text fields into a world point (falls back to 0 for
@@ -3671,6 +3675,37 @@ impl CadApp {
                         self.light.calculate(&self.doc);
                     }
                     self.history.push(format!("  lux metric → {}", label));
+                }
+                self.clear_prompt();
+                return;
+            }
+        }
+        // ---- SIMLUX: `luxblock` — list luminaire blocks + their active IES ---
+        {
+            let lc = trimmed.to_ascii_lowercase();
+            if lc == "luxblock" || lc == "luxblocks" {
+                if self.light.lux_blocks.is_empty() {
+                    self.history.push(
+                        "  no luminaire blocks yet — tick ‘Luminaire (IES)’ in the Block dialog".into(),
+                    );
+                } else {
+                    let mut lines =
+                        vec![format!("  luminaire blocks ({}):", self.light.lux_blocks.len())];
+                    for (name, lux) in &self.light.lux_blocks {
+                        let active =
+                            lux.active_ies().cloned().unwrap_or_else(|| "(none)".to_string());
+                        lines.push(format!(
+                            "    {} — {} IES linked, active: {}",
+                            name,
+                            lux.ies_options.len(),
+                            active
+                        ));
+                    }
+                    let inst = self.light.derived_fixture_count(&self.doc);
+                    lines.push(format!("  {} fixture(s) derived from the drawing", inst));
+                    for l in lines {
+                        self.history.push(l);
+                    }
                 }
                 self.clear_prompt();
                 return;
@@ -14188,9 +14223,10 @@ impl CadApp {
         let mut do_compare  = false;   // diff the two chosen blocks
         let mut edit_id: Option<u32> = None;  // open Block Editor for this block
 
-        let existing: Vec<(u32, String, usize, bool)> = self.doc.blocks.blocks.iter()
+        let existing: Vec<(u32, String, usize, bool, bool)> = self.doc.blocks.blocks.iter()
             .enumerate()
-            .map(|(i, b)| (i as u32, b.name.clone(), b.dobjects.len(), b.smart))
+            .map(|(i, b)| (i as u32, b.name.clone(), b.dobjects.len(), b.smart,
+                           self.light.lux_blocks.contains_key(&b.name)))
             .collect();
         let sel_count = self.selection.len();
 
@@ -14329,6 +14365,12 @@ impl CadApp {
                     .on_hover_text("Mark this definition as a smart block \
                         (re-derive algorithm wired later).");
 
+                // ---- Luminaire (LUX) block ------------------------------
+                ui.checkbox(&mut dialog.luminaire, "Luminaire (IES) block")
+                    .on_hover_text("Mark this definition as a luminaire: link one \
+                        or more IES to it in the Light panel (one active at a time). \
+                        Placing this block IS placing a fixture for the lux calc.");
+
                 // ---- OK / Cancel ----------------------------------------
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
@@ -14345,11 +14387,12 @@ impl CadApp {
                     ui.label(egui::RichText::new("Existing blocks").strong());
                     egui::ScrollArea::vertical().max_height(120.0)
                         .show(ui, |ui| {
-                            for (id, name, n, smart) in &existing {
+                            for (id, name, n, smart, lux) in &existing {
                                 ui.horizontal(|ui| {
-                                    ui.label(format!("{}{}  ({} dobj)",
+                                    ui.label(format!("{}{}{}  ({} dobj)",
                                         name,
                                         if *smart { " ⚙" } else { "" },
+                                        if *lux { " 💡" } else { "" },
                                         n));
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
@@ -14411,8 +14454,8 @@ impl CadApp {
         }
         if let Some(id) = insert_id {
             let name = existing.iter()
-                .find(|(i, _, _, _)| *i == id)
-                .map(|(_, n, _, _)| n.clone())
+                .find(|(i, _, _, _, _)| *i == id)
+                .map(|(_, n, _, _, _)| n.clone())
                 .unwrap_or_default();
             self.insert_state = InsertState::WaitingForPoint { block: id };
             self.set_prompt(format!(
@@ -14464,7 +14507,15 @@ impl CadApp {
             } else {
                 let base = dialog.base_point();
                 let smart = dialog.smart;
+                let luminaire = dialog.luminaire;
                 self.apply_block_create(&name, base, dialog.color_aci, smart);
+                // Luminaire (LUX) block → register it in the SIMLUX sidecar so the
+                // Light panel can link IES to it; its instances then derive fixtures.
+                if luminaire {
+                    self.light.lux_blocks.entry(name.clone()).or_default();
+                    self.history.push(format!(
+                        "  💡 '{}' is a luminaire block — link IES in Light panel ▸ Luminaire blocks", name));
+                }
                 // Smart block → jump STRAIGHT into the isolated Block Editor to
                 // define the parametric modifier vectors (user request): ticking
                 // "Smart block" + OK opens the editor on the new definition.
