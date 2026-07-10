@@ -7,10 +7,16 @@ This is the strategic plan the coding agent works from. It records the product
 direction, the two **locked decisions**, the architecture that keeps those
 decisions from stalling the build, and the phased path. It is maintained by the
 supervisor as commits land — treat it as the source of truth for *what to build
-next and why*. The **scene / render / daylight** subsystem (import Blender
-objects, furniture, materials, render settings, sun path, daylight diagram) has
-its own companion: **`SIMLUX_SCENE_AND_DAYLIGHT_PLAN.md`** (expands §9 + the v0.4
-daylight frontier). Companion docs: `SIMLUX_LUX_WORKFLOW.md` (pipeline),
+next and why*. The **load-bearing crate/wiring architecture** — every DIALux section → the crate
+that owns it, the two 2D→3D paths, and the narrow-waist `cad_scene` model that
+stops future refactors — lives in **`SIMLUX_SYSTEM_ARCHITECTURE.md`** (read it
+before adding any producer/consumer). The **lux calculation engine** end-to-end
+(direct → radiosity → daylight → the full metric catalog: horizontal/vertical/
+cylindrical/UGR/glare/daylight-factor → EN 12464-1 verdict) is specified in
+**`SIMLUX_CALC_ENGINE_PLAN.md`**. The **scene / render / daylight** subsystem
+(import Blender objects, furniture, materials, render settings, sun path, daylight
+diagram) has its own companion: **`SIMLUX_SCENE_AND_DAYLIGHT_PLAN.md`** (expands §9
++ the v0.4 daylight frontier). Companion docs: `SIMLUX_LUX_WORKFLOW.md` (pipeline),
 `SIMLUX_STATUS.md` (what's done), `3D_LIBRARY.md` (csgrs), `Accuracy_Test_Plan.md`
 (validation), `AGENTS.md` (the 21 coding rules — still binding).
 
