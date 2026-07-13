@@ -13,10 +13,13 @@
 //! re-derives" contract). The eventual simLUX wire-in (S5) converts [`SolidMesh`]
 //! → `cad_light::Mesh` — the single coupling point.
 
+use cad_kernel::Vec2 as KVec2;
 use glam::{Mat4, Quat, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 
 mod csg;
+pub mod dbg_recorder; // copied VERBATIM from cad_app (identical to RUST_CAD's recorder)
+pub mod draw;
 pub mod modify;
 
 /// A flat triangle soup: `positions`/`normals` in lock-step, 3 consecutive
@@ -312,10 +315,227 @@ pub fn ray_aabb(orig: Vec3, dir: Vec3, min: Vec3, max: Vec3) -> Option<f32> {
     (exit >= enter.max(0.0)).then(|| enter.max(0.0))
 }
 
-/// The parametric solid: an ordered boolean feature history.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+/// Ray vs triangle (Möller–Trumbore). Returns the forward hit distance, or `None`.
+/// Used to pick a solid's **surface** (and its face normal) for sketch-on-face.
+pub fn ray_triangle(orig: Vec3, dir: Vec3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let (e1, e2) = (b - a, c - a);
+    let p = dir.cross(e2);
+    let det = e1.dot(p);
+    if det.abs() < 1e-7 {
+        return None;
+    }
+    let inv = 1.0 / det;
+    let tv = orig - a;
+    let u = tv.dot(p) * inv;
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = tv.cross(e1);
+    let v = dir.dot(q) * inv;
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let dist = e2.dot(q) * inv;
+    (dist > 1e-6).then_some(dist)
+}
+
+/// The **face** containing triangle `start`: all triangles reachable from it
+/// through shared edges whose normal matches (a maximal coplanar-connected
+/// region of the surface mesh). `positions` is the flat triangle soup (3 per
+/// tri). Returns the triangle indices of the face. Used for face selection.
+pub fn coplanar_face(positions: &[[f32; 3]], start: usize) -> Vec<usize> {
+    use std::collections::HashMap;
+    let ntri = positions.len() / 3;
+    if start >= ntri {
+        return Vec::new();
+    }
+    // Weld vertices onto a grid so shared edges match despite float noise.
+    let key = |p: [f32; 3]| -> (i64, i64, i64) {
+        let q = 1.0e4;
+        ((p[0] as f64 * q).round() as i64, (p[1] as f64 * q).round() as i64, (p[2] as f64 * q).round() as i64)
+    };
+    let edge = |t: usize, e: usize| {
+        let (mut a, mut b) = (key(positions[3 * t + e]), key(positions[3 * t + (e + 1) % 3]));
+        if a > b {
+            std::mem::swap(&mut a, &mut b);
+        }
+        (a, b)
+    };
+    let normal = |t: usize| -> Vec3 {
+        let a = Vec3::from(positions[3 * t]);
+        let b = Vec3::from(positions[3 * t + 1]);
+        let c = Vec3::from(positions[3 * t + 2]);
+        (b - a).cross(c - a).normalize_or_zero()
+    };
+    // Edge → adjacent triangles.
+    let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), Vec<usize>> = HashMap::new();
+    for t in 0..ntri {
+        for e in 0..3 {
+            edges.entry(edge(t, e)).or_default().push(t);
+        }
+    }
+    let n0 = normal(start);
+    let mut visited = vec![false; ntri];
+    let mut face = Vec::new();
+    let mut stack = vec![start];
+    visited[start] = true;
+    while let Some(t) = stack.pop() {
+        face.push(t);
+        for e in 0..3 {
+            if let Some(adj) = edges.get(&edge(t, e)) {
+                for &nt in adj {
+                    if !visited[nt] && normal(nt).dot(n0) > 0.999 {
+                        visited[nt] = true;
+                        stack.push(nt);
+                    }
+                }
+            }
+        }
+    }
+    face
+}
+
+/// A free (arbitrary) construction plane: an orthonormal `(u, v)` frame at an
+/// `origin` in world space. Unlike [`Plane`] (locked to XY/XZ/YZ), a `Frame` sits
+/// on any picked surface — the basis for **sketch-on-face**.
+#[derive(Clone, Copy, Debug)]
+pub struct Frame {
+    pub origin: Vec3,
+    pub u: Vec3,
+    pub v: Vec3,
+}
+
+impl Frame {
+    /// Build a right-handed frame (`u × v = normal`) at `origin` facing `normal`.
+    /// The in-plane axes are chosen deterministically from a world reference.
+    pub fn from_point_normal(origin: Vec3, normal: Vec3) -> Self {
+        let n = normal.normalize_or_zero();
+        let reference = if n.z.abs() < 0.9 { Vec3::Z } else { Vec3::X };
+        let u = reference.cross(n).normalize_or_zero();
+        let v = n.cross(u).normalize_or_zero();
+        Self { origin, u, v }
+    }
+    pub fn normal(&self) -> Vec3 {
+        self.u.cross(self.v).normalize_or_zero()
+    }
+    pub fn to_uv(&self, w: Vec3) -> Vec2 {
+        let d = w - self.origin;
+        Vec2::new(d.dot(self.u), d.dot(self.v))
+    }
+    pub fn from_uv(&self, uv: Vec2) -> Vec3 {
+        self.origin + self.u * uv.x + self.v * uv.y
+    }
+}
+
+/// A 2D sketch on a [`Frame`] (typically a picked solid face). It holds a real
+/// `cad_kernel::Document` — the SAME 2D document the main app edits — so the app's
+/// draw / modifier / osnap code operates on it unchanged (flat sketch mode).
+#[derive(Clone)]
+pub struct Sketch {
+    pub frame: Frame,
+    pub doc: cad_kernel::Document,
+    /// Reference geometry (the selected face's outline, in u,v) — shown faintly so
+    /// the user sees WHERE they're drawing, and offered as osnap targets. Not part
+    /// of the drawing itself.
+    pub reference: Vec<cad_kernel::Geom>,
+}
+
+impl Sketch {
+    pub fn new(frame: Frame) -> Self {
+        Self { frame, doc: cad_kernel::Document::default(), reference: Vec::new() }
+    }
+}
+
+/// Flatten a kernel geom into uv-space polyline paths (each inner `Vec` is one
+/// path; closed shapes include the wrap point). Reuses the kernel's own geometry
+/// (arc/ellipse samplers + DXF bulge). Point returns a small cross (two paths).
+pub fn geom_outlines(g: &cad_kernel::Geom) -> Vec<Vec<Vec2>> {
+    use cad_kernel::Geom as G;
+    match g {
+        G::Line(l) => vec![vec![gvec(l.a), gvec(l.b)]],
+        G::Circle(c) => vec![circle_path(c.center, c.radius, 64)],
+        G::Arc(a) => vec![arc_path(a.center, a.radius, a.start_angle, a.sweep_angle, 48)],
+        G::Ellipse(e) => {
+            let n = 72;
+            vec![(0..=n).map(|i| gvec(e.point_at(std::f64::consts::TAU * i as f64 / n as f64))).collect()]
+        }
+        G::EllipseArc(ea) => {
+            let n = 48;
+            vec![(0..=n)
+                .map(|i| gvec(ea.ellipse.point_at(ea.start_param + ea.sweep_param * i as f64 / n as f64)))
+                .collect()]
+        }
+        G::Polyline(p) => vec![polyline_path(p)],
+        G::Point(pt) => {
+            let c = gvec(pt.location);
+            let s = 0.15;
+            vec![
+                vec![c - Vec2::new(s, 0.0), c + Vec2::new(s, 0.0)],
+                vec![c - Vec2::new(0.0, s), c + Vec2::new(0.0, s)],
+            ]
+        }
+        _ => Vec::new(),
+    }
+}
+
+#[inline]
+fn gvec(p: KVec2) -> Vec2 {
+    Vec2::new(p.x as f32, p.y as f32)
+}
+
+fn circle_path(c: KVec2, r: f64, n: usize) -> Vec<Vec2> {
+    (0..=n)
+        .map(|i| {
+            let t = std::f64::consts::TAU * i as f64 / n as f64;
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+        })
+        .collect()
+}
+
+fn arc_path(c: KVec2, r: f64, start: f64, sweep: f64, n: usize) -> Vec<Vec2> {
+    (0..=n)
+        .map(|i| {
+            let t = start + sweep * i as f64 / n as f64;
+            gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin()))
+        })
+        .collect()
+}
+
+/// Flatten a (possibly bulged / closed) polyline into a single uv path.
+fn polyline_path(p: &cad_kernel::Polyline) -> Vec<Vec2> {
+    let n = p.vertices.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let mut path = Vec::new();
+    let segs = if p.closed { n } else { n - 1 };
+    for i in 0..segs {
+        let a = p.vertices[i];
+        let b = p.vertices[(i + 1) % n];
+        if a.bulge.abs() < 1e-9 {
+            path.push(gvec(a.pos));
+        } else if let Some((c, r, sa, sw)) = cad_kernel::bulge_arc(a.pos, b.pos, a.bulge) {
+            let steps = 16;
+            for k in 0..steps {
+                let t = sa + sw * k as f64 / steps as f64;
+                path.push(gvec(KVec2::new(c.x + r * t.cos(), c.y + r * t.sin())));
+            }
+        } else {
+            path.push(gvec(a.pos));
+        }
+    }
+    path.push(gvec(p.vertices[if p.closed { 0 } else { n - 1 }].pos));
+    path
+}
+
+/// The parametric solid: an ordered boolean feature history, plus any 2D sketches
+/// drawn on faces (not yet persisted — sketch serialization arrives with S5).
+/// (No `Debug` derive — `cad_kernel::Document` on `Sketch` isn't `Debug`.)
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Model {
     pub features: Vec<Feature>,
+    #[serde(skip)]
+    pub sketches: Vec<Sketch>,
 }
 
 impl Model {
@@ -422,5 +642,52 @@ mod tests {
             Primitive::Box { w, d, h } => assert!((w - 2.0).abs() < 1e-4 && (d - 2.0).abs() < 1e-4 && (h - 2.0).abs() < 1e-4),
             _ => panic!("still a box"),
         }
+    }
+
+    #[test]
+    fn ray_triangle_hits_and_misses() {
+        // Triangle in the z=1 plane; ray from below straight up hits at t=1.
+        let (a, b, c) = (Vec3::new(-1.0, -1.0, 1.0), Vec3::new(1.0, -1.0, 1.0), Vec3::new(0.0, 1.0, 1.0));
+        let t = ray_triangle(Vec3::ZERO, Vec3::Z, a, b, c);
+        assert!(t.map_or(false, |t| (t - 1.0).abs() < 1e-4));
+        // A ray off to the side misses.
+        assert!(ray_triangle(Vec3::new(5.0, 5.0, 0.0), Vec3::Z, a, b, c).is_none());
+    }
+
+    #[test]
+    fn frame_uv_round_trips_on_a_tilted_face() {
+        let f = Frame::from_point_normal(Vec3::new(1.0, 2.0, 3.0), Vec3::new(1.0, 1.0, 0.0));
+        let uv = Vec2::new(0.7, -1.3);
+        let back = f.to_uv(f.from_uv(uv));
+        assert!((back - uv).length() < 1e-4, "uv→world→uv is identity");
+        // The reconstructed world point lies in the plane (normal component ~0).
+        let w = f.from_uv(uv);
+        assert!((w - f.origin).dot(f.normal()).abs() < 1e-4);
+    }
+
+    #[test]
+    fn coplanar_face_groups_only_the_same_plane() {
+        // Two coplanar tris (z=0 quad) + one tri on the x=0 plane sharing an edge.
+        let positions = vec![
+            [0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [1.0, 1.0, 0.0], // tri 0 (z=0)
+            [0.0, 0.0, 0.0], [1.0, 1.0, 0.0], [0.0, 1.0, 0.0], // tri 1 (z=0, adjacent)
+            [0.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0], // tri 2 (x=0)
+        ];
+        let face = coplanar_face(&positions, 0);
+        assert_eq!(face.len(), 2, "the z=0 face is the two coplanar tris");
+        assert!(face.contains(&0) && face.contains(&1));
+        assert!(!face.contains(&2), "the perpendicular tri is a different face");
+    }
+
+    #[test]
+    fn circle_geom_outlines_to_a_closed_loop() {
+        let g = cad_kernel::Geom::Circle(cad_kernel::Circle { center: KVec2::new(0.0, 0.0), radius: 2.0 });
+        let paths = geom_outlines(&g);
+        assert_eq!(paths.len(), 1);
+        let p = &paths[0];
+        assert!(p.len() > 8);
+        // first ≈ last (closed) and every point is ~radius from centre.
+        assert!((p[0] - p[p.len() - 1]).length() < 1e-3);
+        assert!(p.iter().all(|q| (q.length() - 2.0).abs() < 1e-3));
     }
 }

@@ -5,6 +5,7 @@ edition = "2021"
 description = "SIMLUX free-3D solid modeler — parametric CSG (csgrs) sandbox, wired into the app later"
 
 [dependencies]
+cad_kernel = { path = "../cad_kernel" }   # reuse the 2D geometry + draw constructors + tessellation
 # crates.io csgrs 0.16–0.20 are all unbuildable: they hard-pin `core2 ^0.4`, whose
 # only release (0.4.0) is YANKED. The maintainer's main (→ 0.21.0) fixes it, so pin
 # that commit. Minimal features: `mesh` (BSP Mesh + booleans) + `f64` (the Real

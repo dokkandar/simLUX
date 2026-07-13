@@ -13,10 +13,19 @@ use std::sync::{Arc, Mutex};
 
 use eframe::glow;
 use eframe::glow::HasContext;
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 
-use cad_solid::modify::{Feed, Modify, ModifyOp};
-use cad_solid::{BoolOp, Model, Placement, Plane, PlaneKind, Primitive, SolidMesh};
+use cad_kernel::{find_snap, DObject, SnapKind, SnapSet};
+use cad_solid::dbg_recorder::{DbgEvent, DbgRecorder};
+use cad_solid::draw::{Draw, DrawTool};
+use cad_solid::modify::{rot_about, scale_about, Feed, Modify, ModifyOp};
+use cad_solid::{BoolOp, Frame, Model, Placement, Plane, PlaneKind, Primitive, Sketch, SolidMesh};
+
+/// An in-progress sketch-on-face session: which sketch + the live draw command.
+struct SketchMode {
+    idx: usize, // index into model.sketches
+    draw: Draw,
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Design tokens — copied from cad_app/src/theme.rs so the sandbox reads like the
@@ -101,6 +110,48 @@ impl ViewPreset {
     }
 }
 
+/// A command that has been RUN but still needs a selection — the 2D app's
+/// `QueuedOp`. Run the command → gather a selection → Enter → execute.
+#[derive(Clone, Copy)]
+enum Queued {
+    Modify(ModifyOp),
+    Erase,
+}
+
+impl Queued {
+    fn label(self) -> String {
+        match self {
+            Queued::Modify(op) => op.label().to_lowercase(),
+            Queued::Erase => "erase".to_string(),
+        }
+    }
+}
+
+// Session recorder is `cad_solid::dbg_recorder::DbgRecorder` — copied VERBATIM
+// from the app (byte-identical to RUST_CAD). Events are pushed via `self.note`.
+
+/// A 2D modifier in progress on the flat sketch (base → destination), applied to
+/// the sketch's selected dobjects via the kernel's own `DObject::translated`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlatOp {
+    Move,
+    Copy,
+}
+
+impl FlatOp {
+    fn label(self) -> &'static str {
+        match self {
+            FlatOp::Move => "move",
+            FlatOp::Copy => "copy",
+        }
+    }
+}
+
+struct FlatMod {
+    op: FlatOp,
+    base: Option<Vec2>, // in sketch (u,v)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // App state
 // ─────────────────────────────────────────────────────────────────────────────
@@ -117,9 +168,27 @@ struct Sandbox {
     // interaction
     card: bool,
     selection: Vec<u32>,
+    selected_face: Vec<usize>, // triangle indices of the highlighted face
+    selected_face_frame: Option<Frame>, // frame of the highlighted face (for "sketch on it")
     modify: Option<Modify>,
+    sketch: Option<SketchMode>,
+    // flat 2D sketch editor (a RIGHT split panel shown whenever a sketch is
+    // active). app w2s = center + (world + offset)*scale, Y-down.
+    sketch_scale: f32,
+    sketch_offset: egui::Vec2,
+    snap_enabled: SnapSet,      // osnap running set (END/MID/CEN/QUA by default)
+    sketch_sel: Vec<usize>,     // selected dobject indices in the active sketch's doc
+    flat_mod: Option<FlatMod>,  // in-flight 2D move/copy on the sketch
+    // command-driven select-first: a queued command gathering its selection
+    cmd: String,
+    selecting: bool,
+    queued: Option<Queued>,
     status: String,
     hover_plane_pt: Option<Vec3>,
+    dbg: DbgRecorder,
+    dbg_window_open: bool,
+    dbg_note_buf: String,
+    solid_verts: Vec<V3>, // cached flat-shaded triangles (rebuilt only on re-eval)
 
     // authoring state for the NEXT primitive
     plane: Plane,
@@ -144,16 +213,34 @@ impl Sandbox {
             Primitive::Cylinder { r: 0.55, h: 1.6, sides: 32 },
         );
         let cached = model.eval();
+        let solid_verts = mesh_verts(&cached);
+        let mut dbg = DbgRecorder::default();
+        dbg.start("sandbox launch");
         Self {
             model,
             cached,
+            solid_verts,
+            dbg,
+            dbg_window_open: true,
+            dbg_note_buf: String::new(),
             dirty: false,
             yaw: 0.9,
             pitch: 0.62,
             dist: 6.5,
             card: false,
             selection: Vec::new(),
+            selected_face: Vec::new(),
+            selected_face_frame: None,
             modify: None,
+            sketch: None,
+            sketch_scale: 60.0,
+            sketch_offset: egui::Vec2::ZERO,
+            snap_enabled: SnapSet::defaults(),
+            sketch_sel: Vec::new(),
+            flat_mod: None,
+            cmd: String::new(),
+            selecting: false,
+            queued: None,
             status: String::new(),
             hover_plane_pt: None,
             plane: Plane::default(),
@@ -167,11 +254,20 @@ impl Sandbox {
         }
     }
 
-    fn recompute_if_dirty(&mut self) {
-        if self.dirty {
-            self.cached = self.model.eval();
-            self.dirty = false;
-        }
+    /// Re-evaluate the CSG and rebuild the cached triangle verts (records timing).
+    fn recompute(&mut self) {
+        let t = std::time::Instant::now();
+        self.cached = self.model.eval();
+        let ms = t.elapsed().as_secs_f32() * 1000.0;
+        self.solid_verts = mesh_verts(&self.cached);
+        self.selected_face.clear(); // triangle indices are stale after re-eval
+        self.dirty = false;
+        self.note(format!(
+            "eval: {} feats → {} tris in {:.1}ms",
+            self.model.features.len(),
+            self.cached.tri_count(),
+            ms
+        ));
     }
 
     fn next_primitive(&self) -> Primitive {
@@ -196,16 +292,356 @@ impl Sandbox {
         }
     }
 
-    /// Start a select-first modifier (mirrors the 2D `run_command` arm: empty
-    /// selection → prompt to select; else enter the base-point flow).
-    fn start_modify(&mut self, op: ModifyOp) {
-        if self.selection.is_empty() {
-            self.status = format!("{}: select objects first", op.label().to_lowercase());
+    /// Command-line dispatch — mirrors the 2D app's `run_command`. A verb (typed
+    /// or from a button) starts the select-first flow.
+    fn run_command(&mut self, raw: &str) {
+        let v = raw.trim().to_lowercase();
+        if v.is_empty() {
             return;
         }
-        let m = Modify::new(op, self.selection.clone());
-        self.status = m.prompt();
-        self.modify = Some(m);
+        // If a 3D modifier is mid-pick, typed input is its value/keyword (degrees,
+        // factor, R=reference, C=copy) — feed it there. Only if it's NOT consumed do
+        // we fall through to parse `v` as a new command (which then overrides).
+        if let Some(mut md) = self.modify.take() {
+            if let Some(f) = md.type_value(&v, &self.plane, &mut self.model) {
+                self.note(format!("  {} typed '{v}' [{}] → {:?}", md.op.label(), md.pick_name(), f));
+                match f {
+                    Feed::NeedMore => {
+                        self.status = md.prompt();
+                        self.modify = Some(md);
+                    }
+                    Feed::AppliedContinue => {
+                        self.dirty = true;
+                        self.status = md.prompt();
+                        self.modify = Some(md);
+                    }
+                    Feed::Applied => {
+                        self.dirty = true;
+                        if let Some(s) = &md.last_summary {
+                            self.note(format!("  {} ✓ {s}", md.op.label()));
+                        }
+                        self.status.clear();
+                    }
+                }
+                return;
+            }
+            self.modify = Some(md); // not a modifier value → treat as a new command
+        }
+        self.note(format!("cmd '{v}'"));
+        if v == "dump" {
+            self.dump_session();
+            return;
+        }
+        if matches!(v.as_str(), "recorder" | "rec" | "dbg") {
+            self.dbg_window_open = !self.dbg_window_open;
+            return;
+        }
+        let op = match v.as_str() {
+            "move" | "m" => Some(ModifyOp::Move),
+            "copy" | "c" | "co" | "cp" => Some(ModifyOp::Copy),
+            "rotate" | "ro" => Some(ModifyOp::Rotate),
+            "scale" | "sc" => Some(ModifyOp::Scale),
+            "mirror" | "mi" => Some(ModifyOp::Mirror),
+            _ => None,
+        };
+        if let Some(op) = op {
+            self.run_modifier(op);
+        } else if matches!(v.as_str(), "erase" | "delete" | "e") {
+            self.abort_3d();
+            self.run_queued(Queued::Erase);
+        } else {
+            self.status = format!("unknown command: {v}");
+        }
+    }
+
+    /// 3D-view modifier (MODIFY panel + command line) — ALWAYS operates on 3D
+    /// features, entirely INDEPENDENT of the 2D sketch view.
+    fn run_modifier(&mut self, op: ModifyOp) {
+        self.abort_3d(); // new 3D command overrides the old 3D command
+        self.run_queued(Queued::Modify(op));
+    }
+
+    /// Abort the 3D-view command state only (does not touch the 2D sketch view).
+    fn abort_3d(&mut self) {
+        self.modify = None;
+        self.selecting = false;
+        self.queued = None;
+    }
+
+    /// Abort the 2D flat-sketch command state only (does not touch the 3D view).
+    fn abort_2d(&mut self) {
+        if let Some(sm) = self.sketch.as_mut() {
+            sm.draw.set_tool(DrawTool::None);
+        }
+        self.flat_mod = None;
+    }
+
+    /// Erase the selected 2D sketch dobjects (flat view only).
+    fn flat_erase(&mut self) {
+        if let Some(idx) = self.sketch.as_ref().map(|s| s.idx) {
+            let mut sel = std::mem::take(&mut self.sketch_sel);
+            sel.sort_unstable();
+            sel.dedup();
+            let doc = &mut self.model.sketches[idx].doc;
+            for &i in sel.iter().rev() {
+                if i < doc.dobjects.len() {
+                    doc.dobjects.remove(i);
+                }
+            }
+            self.status.clear();
+        }
+    }
+
+    /// Start a 2D move/copy on the sketch (select-first, like the app).
+    fn start_flat_mod(&mut self, op: FlatOp) {
+        if self.sketch_sel.is_empty() {
+            self.status = format!("{}: click object(s) to select, then run {} again", op.label(), op.label());
+        } else {
+            self.flat_mod = Some(FlatMod { op, base: None });
+            self.status = format!("{}: pick BASE point", op.label());
+        }
+    }
+
+    /// Feed a base/destination pick to the in-flight 2D modifier. Applies via the
+    /// kernel's own `DObject::translated` (Move mutates, Copy pushes duplicates).
+    fn flat_mod_feed(&mut self, uv: Vec2) {
+        let idx = match self.sketch.as_ref() {
+            Some(s) => s.idx,
+            None => return,
+        };
+        let (op, base) = match &self.flat_mod {
+            Some(fm) => (fm.op, fm.base),
+            None => return,
+        };
+        match base {
+            None => {
+                if let Some(fm) = self.flat_mod.as_mut() {
+                    fm.base = Some(uv);
+                }
+                self.status = format!("{}: pick DESTINATION", op.label());
+            }
+            Some(b) => {
+                let v = cad_kernel::Vec2::new((uv.x - b.x) as f64, (uv.y - b.y) as f64);
+                let sel = self.sketch_sel.clone();
+                self.flat_mod = None;
+                let doc = &mut self.model.sketches[idx].doc;
+                match op {
+                    FlatOp::Move => {
+                        for &i in &sel {
+                            if let Some(d) = doc.dobjects.get(i).cloned() {
+                                doc.dobjects[i] = d.translated(v);
+                            }
+                        }
+                    }
+                    FlatOp::Copy => {
+                        let copies: Vec<DObject> =
+                            sel.iter().filter_map(|&i| doc.dobjects.get(i).cloned()).map(|d| d.translated(v)).collect();
+                        for c in copies {
+                            doc.push(c);
+                        }
+                    }
+                }
+                self.note(format!("{} applied v=({:.3},{:.3})", op.label(), v.x, v.y));
+                self.status.clear();
+            }
+        }
+    }
+
+    /// Pick the nearest sketch dobject to `uv` (replace, or shift-toggle).
+    fn flat_select(&mut self, uv: Vec2, add: bool) {
+        let idx = match self.sketch.as_ref() {
+            Some(s) => s.idx,
+            None => return,
+        };
+        let tol = 10.0 / self.sketch_scale;
+        let mut best: Option<(f32, usize)> = None;
+        for (i, d) in self.model.sketches[idx].doc.dobjects.iter().enumerate() {
+            let dist = dist_to_geom(&d.geom, uv);
+            if dist < tol && best.map_or(true, |(bd, _)| dist < bd) {
+                best = Some((dist, i));
+            }
+        }
+        match best {
+            Some((_, i)) => {
+                if add {
+                    if let Some(p) = self.sketch_sel.iter().position(|x| *x == i) {
+                        self.sketch_sel.remove(p);
+                    } else {
+                        self.sketch_sel.push(i);
+                    }
+                } else {
+                    self.sketch_sel = vec![i];
+                }
+            }
+            None => {
+                if !add {
+                    self.sketch_sel.clear();
+                }
+            }
+        }
+        self.note(format!("flat select → {} object(s)", self.sketch_sel.len()));
+    }
+
+    /// Push a Note event with the caller's source location, in the recorder's own
+    /// format. `#[track_caller]` so `Location::caller()` points at the call site.
+    #[track_caller]
+    fn note(&mut self, message: String) {
+        self.dbg.push(DbgEvent::Note { message }, std::panic::Location::caller());
+    }
+
+    /// Print the session recorder to STDERR (identical format to RUST_CAD; also
+    /// mirrored live to /tmp/rust_cad_session.log). Paste it into chat to debug.
+    fn dump_session(&mut self) {
+        eprint!("{}", self.dbg.dump_text());
+        self.status = format!("dumped {} events to the terminal (stderr)", self.dbg.events.len());
+    }
+
+    #[track_caller]
+    fn dbg_snap(&mut self, reason: &str) {
+        let loc = std::panic::Location::caller();
+        if let Some(idx) = self.sketch.as_ref().map(|s| s.idx) {
+            self.dbg.take_snapshot(&self.model.sketches[idx].doc, reason, 0, 0, loc);
+        } else {
+            let doc = cad_kernel::Document::default();
+            self.dbg.take_snapshot(&doc, reason, 0, 0, loc);
+        }
+    }
+
+    fn dbg_start(&mut self) {
+        self.dbg.start("user pressed Start");
+        self.dbg_snap("session start");
+    }
+
+    fn dbg_stop(&mut self) {
+        self.dbg.stop("user pressed Stop");
+    }
+
+    /// Floating Session Recorder window — the app's `render_dbg_recorder_window`
+    /// (identical controls: Start/Stop/Clear/Snap · status · Note · Copy timeline
+    /// · backtrace · auto-snap). The two app-only capture sections (smart-block,
+    /// menu-layout) are dropped — they depend on app-specific state.
+    fn render_dbg_recorder_window(&mut self, ctx: &egui::Context) {
+        if !self.dbg_window_open {
+            return;
+        }
+        let mut open = self.dbg_window_open;
+        egui::Window::new("🛰 Session Recorder")
+            .open(&mut open)
+            .default_pos(egui::pos2(40.0, 40.0))
+            .default_size(egui::vec2(380.0, 200.0))
+            .resizable(true)
+            .collapsible(true)
+            .show(ctx, |ui| {
+                let is_recording = self.dbg.recording;
+                ui.horizontal(|ui| {
+                    let start_btn = egui::Button::new(egui::RichText::new("▶ Start").strong().color(egui::Color32::WHITE))
+                        .fill(if is_recording {
+                            egui::Color32::from_rgb(50, 90, 50)
+                        } else {
+                            egui::Color32::from_rgb(40, 130, 50)
+                        });
+                    if ui.add_enabled(!is_recording, start_btn).clicked() {
+                        self.dbg_start();
+                    }
+                    let stop_btn = egui::Button::new(egui::RichText::new("■ Stop").strong().color(egui::Color32::WHITE))
+                        .fill(if is_recording {
+                            egui::Color32::from_rgb(160, 50, 50)
+                        } else {
+                            egui::Color32::from_rgb(80, 50, 50)
+                        });
+                    if ui.add_enabled(is_recording, stop_btn).clicked() {
+                        self.dbg_stop();
+                    }
+                    ui.separator();
+                    if ui.button("🗑 Clear").clicked() {
+                        self.dbg.clear();
+                    }
+                    if ui.button("📷 Snap").clicked() {
+                        self.dbg_snap("manual snap");
+                    }
+                });
+                ui.add_space(4.0);
+                ui.label(format!(
+                    "Status: {}  ·  {} events  ·  {} snapshots",
+                    if is_recording { "🔴 RECORDING" } else { "⚪ idle" },
+                    self.dbg.events.len(),
+                    self.dbg.snapshots.len()
+                ));
+                ui.add_space(6.0);
+                ui.separator();
+                ui.label("Annotate (📝 added with current ms):");
+                ui.horizontal(|ui| {
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.dbg_note_buf)
+                            .desired_width(240.0)
+                            .hint_text("bug fired here / picked the wrong dobject / etc."),
+                    );
+                    if (ui.button("Drop note").clicked()
+                        || (resp.lost_focus() && ctx.input(|i| i.key_pressed(egui::Key::Enter))))
+                        && !self.dbg_note_buf.is_empty()
+                    {
+                        let msg = std::mem::take(&mut self.dbg_note_buf);
+                        self.note(msg);
+                    }
+                });
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("📋 Copy timeline").clicked() {
+                        let dump = self.dbg.dump_text();
+                        ctx.copy_text(dump);
+                    }
+                    if ui.button("⤓ Dump → stderr").clicked() {
+                        self.dump_session();
+                    }
+                    ui.checkbox(&mut self.dbg.capture_backtrace, "Capture backtrace (slow)");
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Auto-snap every:");
+                    ui.add(
+                        egui::DragValue::new(&mut self.dbg.auto_snap_every)
+                            .speed(1.0)
+                            .range(0..=10_000)
+                            .suffix(" events"),
+                    );
+                });
+            });
+        self.dbg_window_open = open;
+    }
+
+    /// Run a command: with a live selection, execute immediately; otherwise enter
+    /// the selection-gathering phase and remember what to do (the 2D `QueuedOp` +
+    /// `begin_selection`). Enter later finalises → `begin_queued`.
+    fn run_queued(&mut self, q: Queued) {
+        self.note(format!("run {} (selection={})", q.label(), self.selection.len()));
+        if self.selection.is_empty() {
+            self.selecting = true;
+            self.queued = Some(q);
+            self.status = format!("{}: select objects, Enter to continue [Esc cancels]", q.label());
+        } else {
+            self.begin_queued(q);
+        }
+    }
+
+    /// Execute a queued command against the current selection.
+    fn begin_queued(&mut self, q: Queued) {
+        // §8: record WHAT is highlighted (the actual handles), not just a count, so a
+        // dump alone reconstructs the run.
+        self.note(format!("begin {} on {} object(s) — sel={:?}", q.label(), self.selection.len(), self.selection));
+        match q {
+            Queued::Erase => {
+                for id in std::mem::take(&mut self.selection) {
+                    self.model.remove(id);
+                }
+                self.dirty = true;
+                self.status.clear();
+            }
+            Queued::Modify(op) => {
+                let m = Modify::new(op, self.selection.clone());
+                self.status = m.prompt();
+                self.modify = Some(m);
+            }
+        }
     }
 
     /// Unproject `cursor` (in `rect`) to a ray, intersect the active construction
@@ -245,29 +681,184 @@ impl Sandbox {
         let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
         (near, (far - near).normalize_or_zero())
     }
+
+    fn is_drawing(&self) -> bool {
+        self.sketch.as_ref().map_or(false, |s| s.draw.active())
+    }
+
+    /// Ray-pick the front-most solid SURFACE under the cursor → (hit point, face
+    /// normal), testing every triangle of the evaluated mesh.
+    fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<(Vec3, Vec3)> {
+        let (orig, dir) = self.ray(cursor, rect, mvp);
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for tri in self.cached.positions.chunks_exact(3) {
+            let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
+            if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                if best.map_or(true, |(bt, _, _)| t < bt) {
+                    let n = (b - a).cross(c - a).normalize_or_zero();
+                    best = Some((t, orig + dir * t, n));
+                }
+            }
+        }
+        best.map(|(_, p, n)| (p, n))
+    }
+
+    /// Ray-pick the front-most surface triangle index (for face selection).
+    fn pick_triangle(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<usize> {
+        let (orig, dir) = self.ray(cursor, rect, mvp);
+        let mut best: Option<(f32, usize)> = None;
+        for (i, tri) in self.cached.positions.chunks_exact(3).enumerate() {
+            let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
+            if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, i));
+                }
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// 3D vertex osnap for modifier base/destination picks — the nearest solid
+    /// mesh vertex whose screen projection is within the aperture. Returns its
+    /// world position (so copy/move snap to the solid's corners).
+    fn snap_3d(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<(Vec3, egui::Pos2)> {
+        let m = Mat4::from_cols_array(mvp);
+        let aperture = 12.0f32;
+        let mut best: Option<(f32, Vec3, egui::Pos2)> = None;
+        for p in &self.cached.positions {
+            let w = Vec3::from(*p);
+            let ndc = m.project_point3(w);
+            if !(-1.0..=1.0).contains(&ndc.z) {
+                continue; // behind the camera / clipped
+            }
+            let sx = rect.left() + (ndc.x * 0.5 + 0.5) * rect.width();
+            let sy = rect.top() + (0.5 - ndc.y * 0.5) * rect.height();
+            let d = ((sx - cursor.x).powi(2) + (sy - cursor.y).powi(2)).sqrt();
+            if d < aperture && best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, w, egui::pos2(sx, sy)));
+            }
+        }
+        best.map(|(_, w, s)| (w, s))
+    }
+
+    /// Cursor → point on the ACTIVE SKETCH frame's plane.
+    fn cursor_on_sketch(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+        let sm = self.sketch.as_ref()?;
+        let fr = self.model.sketches.get(sm.idx)?.frame;
+        let (near, dir) = self.ray(cursor, rect, mvp);
+        let n = fr.normal();
+        let denom = dir.dot(n);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        let t = (fr.origin - near).dot(n) / denom;
+        (t >= 0.0).then(|| near + dir * t)
+    }
+
+    /// Feed a pick (in sketch-plane u,v) to the active draw command; commit any
+    /// completed geom as a real `DObject` in the sketch's document.
+    fn draw_click(&mut self, uv: Vec2) {
+        let idx = match &self.sketch {
+            Some(s) => s.idx,
+            None => return,
+        };
+        let (geom, prompt) = {
+            let sm = self.sketch.as_mut().unwrap();
+            (sm.draw.feed(uv), sm.draw.prompt())
+        };
+        if let Some(g) = geom {
+            self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+        }
+        self.status = prompt;
+    }
+
+    /// Enter: commit an in-progress polyline / end a line chain.
+    fn finish_draw(&mut self) {
+        let idx = match &self.sketch {
+            Some(s) => s.idx,
+            None => return,
+        };
+        let geom = self.sketch.as_mut().unwrap().draw.finish();
+        if let Some(g) = geom {
+            self.model.sketches[idx].doc.push(cad_kernel::DObject::new(g));
+        }
+    }
 }
 
 impl eframe::App for Sandbox {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         theme::apply(ctx);
-        // Esc cancels an in-flight modifier; Del removes the selection.
-        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
-            self.modify = None;
-            self.status.clear();
-        }
-        if self.modify.is_none()
-            && !self.selection.is_empty()
-            && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
-        {
-            for id in std::mem::take(&mut self.selection) {
-                self.model.remove(id);
+        // Keyboard drives the command loop — but not while the command box has
+        // focus (so typing "move"+Enter runs the command, not the finalisers).
+        if !ctx.wants_keyboard_input() {
+            // Esc: cancel selection-gather → running op → sketch entity → sketch.
+            if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+                if self.selecting {
+                    self.selecting = false;
+                    self.queued = None;
+                    self.status.clear();
+                } else if self.modify.is_some() {
+                    self.modify = None;
+                    self.status.clear();
+                } else if self.flat_mod.is_some() {
+                    self.flat_mod = None;
+                    self.status.clear();
+                } else if let Some(sm) = &mut self.sketch {
+                    // cancel the in-progress draw entity, else end the sketch
+                    if !sm.draw.cancel() {
+                        self.sketch = None;
+                    }
+                    self.status.clear();
+                }
             }
-            self.dirty = true;
+            // Enter: finalise the selection → end a running op → finish a draw.
+            if ctx.input(|i| i.key_pressed(egui::Key::Enter)) {
+                if self.selecting {
+                    self.selecting = false;
+                    let q = self.queued.take();
+                    if self.selection.is_empty() {
+                        self.status = "operation cancelled — nothing selected".to_string();
+                    } else if let Some(q) = q {
+                        self.begin_queued(q);
+                    }
+                } else if self.modify.is_some() {
+                    self.modify = None; // ends a running op (e.g. the Copy loop)
+                    self.status.clear();
+                } else {
+                    self.finish_draw();
+                }
+            }
+            // Del erases the selection directly (only when idle).
+            if self.modify.is_none()
+                && self.sketch.is_none()
+                && !self.selecting
+                && !self.selection.is_empty()
+                && ctx.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace))
+            {
+                for id in std::mem::take(&mut self.selection) {
+                    self.model.remove(id);
+                }
+                self.dirty = true;
+            }
+        }
+        // Re-evaluate the CSG only when idle — never mid-drag — so dragging a
+        // value in the panel doesn't re-run csgrs every frame (the lag source).
+        if self.dirty && !ctx.is_using_pointer() {
+            self.recompute();
         }
         self.controls_panel(ctx);
+        self.cmd_bar(ctx);
+        // Split view: the 3D viewport is always shown; when a sketch is active its
+        // plane also "pops flat" into a right-side 2D panel — draw in both.
+        if self.sketch.is_some() {
+            self.flat_sketch_panel(ctx);
+        }
         self.viewport_panel(ctx);
         self.navigator(ctx);
-        self.recompute_if_dirty();
+        self.render_dbg_recorder_window(ctx);
+        if self.dbg.want_auto_snap() {
+            self.dbg_snap("auto-snap cadence");
+        }
     }
 }
 
@@ -287,8 +878,11 @@ impl Sandbox {
                     ui.horizontal_wrapped(|ui| {
                         for op in ModifyOp::ALL {
                             if ui.button(op.label()).clicked() {
-                                self.start_modify(op);
+                                self.run_modifier(op);
                             }
+                        }
+                        if ui.button("Erase").clicked() {
+                            self.run_queued(Queued::Erase);
                         }
                     });
                     ui.horizontal(|ui| {
@@ -307,6 +901,39 @@ impl Sandbox {
                     } else {
                         ui.label(
                             egui::RichText::new(format!("{} selected", self.selection.len()))
+                                .color(theme::TEXT_MUTED)
+                                .size(11.0),
+                        );
+                    }
+                    ui.add_space(12.0);
+
+                    // ── Sketch on face ──────────────────────────────────────
+                    section(ui, "SKETCH");
+                    if self.sketch.is_some() {
+                        ui.label(egui::RichText::new("editing in the flat panel →").color(theme::TEXT_MUTED).size(11.0));
+                        if ui.button("Finish sketch").clicked() {
+                            self.sketch = None;
+                            self.status.clear();
+                        }
+                    } else {
+                        let has_face = self.selected_face_frame.is_some() && !self.selected_face.is_empty();
+                        if ui
+                            .add_enabled(has_face, egui::Button::new("▸ Sketch on SELECTED face").fill(theme::SURFACE_3))
+                            .clicked()
+                        {
+                            if let Some(frame) = self.selected_face_frame {
+                                let face_tris = self.selected_face.clone();
+                                let reference = self.face_boundary_uv(&face_tris, &frame);
+                                self.enter_sketch(frame, reference);
+                            }
+                        }
+                        if ui.button("＋ Sketch on construction plane").clicked() {
+                            let (u, v) = self.plane.axes();
+                            let fr = Frame { origin: self.plane.origin(), u, v };
+                            self.enter_sketch(fr, Vec::new());
+                        }
+                        ui.label(
+                            egui::RichText::new("click a face to select → ▸ Sketch on it  ·  or right-click a face")
                                 .color(theme::TEXT_MUTED)
                                 .size(11.0),
                         );
@@ -404,10 +1031,27 @@ impl Sandbox {
                     });
                     ui.add_space(6.0);
                     ui.label(
-                        egui::RichText::new("click=select · shift=add · Del=delete · drag=orbit · scroll=zoom")
+                        egui::RichText::new("click=select object+face · shift=add · middle-drag=orbit · scroll=zoom · Del=erase")
                             .color(theme::TEXT_MUTED)
                             .size(11.0),
                     );
+
+                    ui.add_space(12.0);
+                    section(ui, "DEBUG");
+                    ui.horizontal(|ui| {
+                        if ui.selectable_label(self.dbg_window_open, "🛰 Recorder").clicked() {
+                            self.dbg_window_open = !self.dbg_window_open;
+                        }
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} · {} events",
+                                if self.dbg.recording { "🔴 rec" } else { "idle" },
+                                self.dbg.events.len()
+                            ))
+                            .color(theme::TEXT_MUTED)
+                            .size(11.0),
+                        );
+                    });
                 });
             });
     }
@@ -480,6 +1124,32 @@ impl Sandbox {
         }
     }
 
+    /// The command line — type a modifier verb (move/copy/rotate/scale/mirror/
+    /// erase) + Enter; the live prompt echoes beside it. This is the primary
+    /// trigger, identical to the app: run command → it asks for selection.
+    fn cmd_bar(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("cmdline")
+            .frame(egui::Frame::none().fill(theme::SURFACE_2).inner_margin(8.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("⌘").color(theme::TEXT_MUTED));
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut self.cmd)
+                            .desired_width(240.0)
+                            .hint_text("move · copy · rotate · scale · mirror · erase"),
+                    );
+                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        let c = std::mem::take(&mut self.cmd);
+                        self.run_command(&c);
+                        r.request_focus();
+                    }
+                    if !self.status.is_empty() {
+                        ui.label(egui::RichText::new(&self.status).color(theme::ACCENT).size(13.0));
+                    }
+                });
+            });
+    }
+
     fn viewport_panel(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(theme::SURFACE_0))
@@ -492,33 +1162,97 @@ impl Sandbox {
 
                 self.hover_plane_pt = resp.hover_pos().and_then(|p| self.cursor_on_plane(p, rect, &mvp));
 
-                // A click either feeds an in-flight modifier or (re)selects.
+                // Right-click a solid FACE → start a sketch plane on that face.
+                if resp.secondary_clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        if let (Some((p, n)), Some(tri)) =
+                            (self.pick_face(pos, rect, &mvp), self.pick_triangle(pos, rect, &mvp))
+                        {
+                            let frame = Frame::from_point_normal(p, n);
+                            let face_tris = cad_solid::coplanar_face(&self.cached.positions, tri);
+                            let reference = self.face_boundary_uv(&face_tris, &frame);
+                            self.note(format!("right-click FACE → sketch, {} boundary edges", reference.len()));
+                            self.enter_sketch(frame, reference);
+                        } else {
+                            self.note("right-click missed any face".to_string());
+                        }
+                    }
+                }
+                // A left click: gather selection, feed a modifier, place a sketch
+                // point, or (re)select.
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        if let Some(mut md) = self.modify.take() {
-                            if let Some(w) = self.cursor_on_plane(pos, rect, &mvp) {
+                        let mode = if self.selecting {
+                            "gather"
+                        } else if self.modify.is_some() {
+                            "modify"
+                        } else if self.is_drawing() {
+                            "draw"
+                        } else {
+                            "idle"
+                        };
+                        self.note(format!("click @({:.0},{:.0}) mode={mode}", pos.x, pos.y));
+                        if self.selecting {
+                            if let Some(id) = self.pick(pos, rect, &mvp) {
+                                toggle_select(&mut self.selection, id, true);
+                            }
+                            self.note(format!("  gather → {} selected", self.selection.len()));
+                            if let Some(q) = self.queued {
+                                self.status = format!("{}: {} selected, Enter to continue", q.label(), self.selection.len());
+                            }
+                        } else if let Some(mut md) = self.modify.take() {
+                            // OSNAP: prefer a snapped solid vertex, else the construction plane.
+                            let snapped = self.snap_3d(pos, rect, &mvp).map(|(w, _)| w);
+                            let w = snapped.or_else(|| self.cursor_on_plane(pos, rect, &mvp));
+                            if let Some(w) = w {
                                 let plane = self.plane;
-                                match md.feed(w, &plane, &mut self.model, self.card) {
+                                // §8: name the pick + snap kind BEFORE feed mutates state.
+                                let pick = md.pick_name();
+                                let snaptag = if snapped.is_some() { "END" } else { "none" };
+                                let f = md.feed(w, &plane, &mut self.model, self.card);
+                                self.note(format!(
+                                    "  {} {pick} = ({:.2},{:.2}) [snap={snaptag}] → {:?}",
+                                    md.op.label(), w.x, w.y, f
+                                ));
+                                match f {
                                     Feed::NeedMore => {
                                         self.status = md.prompt();
                                         self.modify = Some(md);
                                     }
                                     Feed::Applied => {
                                         self.dirty = true;
+                                        if let Some(s) = &md.last_summary {
+                                            self.note(format!("  {} ✓ {s}", md.op.label()));
+                                        }
                                         self.status.clear();
                                     }
                                     Feed::AppliedContinue => {
                                         self.dirty = true;
+                                        if let Some(s) = &md.last_summary {
+                                            self.note(format!("  {} ✓ {s}", md.op.label()));
+                                        }
                                         self.status = md.prompt();
                                         self.modify = Some(md);
                                     }
                                 }
                             } else {
-                                self.modify = Some(md); // click missed the plane; stay armed
+                                self.note("  modify: click missed the plane".to_string());
+                                self.modify = Some(md); // stay armed
+                            }
+                        } else if self.is_drawing() {
+                            if let Some(w) = self.cursor_on_sketch(pos, rect, &mvp) {
+                                if let Some(uv) = self.sketch.as_ref().map(|s| self.model.sketches[s.idx].frame.to_uv(w)) {
+                                    self.draw_click(uv);
+                                }
+                                let ng = self.sketch.as_ref().map_or(0, |s| self.model.sketches[s.idx].doc.dobjects.len());
+                                self.note(format!("  draw pt → {ng} dobjects in sketch"));
+                            } else {
+                                self.note("  draw: click missed the sketch plane".to_string());
                             }
                         } else {
                             let add = ui.input(|i| i.modifiers.shift);
-                            match self.pick(pos, rect, &mvp) {
+                            let feat = self.pick(pos, rect, &mvp);
+                            match feat {
                                 Some(id) => toggle_select(&mut self.selection, id, add),
                                 None => {
                                     if !add {
@@ -526,11 +1260,21 @@ impl Sandbox {
                                     }
                                 }
                             }
+                            // also highlight the exact FACE under the cursor + its
+                            // frame, so it can be "popped flat" via the panel button
+                            self.selected_face = self
+                                .pick_triangle(pos, rect, &mvp)
+                                .map(|t| cad_solid::coplanar_face(&self.cached.positions, t))
+                                .unwrap_or_default();
+                            self.selected_face_frame = self.pick_face(pos, rect, &mvp).map(|(p, n)| Frame::from_point_normal(p, n));
+                            self.note(format!("  idle select: feat={feat:?} face={} tris", self.selected_face.len()));
                         }
                     }
                 }
-                // Drag orbits (even mid-command, so you can reorient before a pick).
-                if resp.dragged() {
+                // Orbit ONLY with the middle mouse button (or the corner
+                // navigator). Left-drag stays free for picks, so moving a solid
+                // never sends the camera flying.
+                if resp.dragged_by(egui::PointerButton::Middle) {
                     let d = resp.drag_delta();
                     self.yaw -= d.x * 0.01;
                     self.pitch = (self.pitch + d.y * 0.01).clamp(-FRAC_PI_2 + 0.01, FRAC_PI_2 - 0.01);
@@ -542,20 +1286,82 @@ impl Sandbox {
                     }
                 }
 
-                self.recompute_if_dirty();
-                let tris = mesh_verts(&self.cached);
+                let tris = self.solid_verts.clone();
                 let mut lines = plane_grid(&self.plane);
-                // selection highlights
+                // selection highlights (whole-object AABB)
                 for id in &self.selection {
                     if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
                         let (mn, mx) = f.world_aabb();
                         aabb_lines(&mut lines, mn, mx, [0.0, 0.9, 1.0]);
                     }
                 }
-                // rubber-band from a gathered base/pivot to the cursor
+                // selected FACE highlight (warm outline over its triangles)
+                for &t in &self.selected_face {
+                    if 3 * t + 2 < self.cached.positions.len() {
+                        let a = Vec3::from(self.cached.positions[3 * t]);
+                        let b = Vec3::from(self.cached.positions[3 * t + 1]);
+                        let c = Vec3::from(self.cached.positions[3 * t + 2]);
+                        let col = [1.0, 0.62, 0.12];
+                        seg(&mut lines, a, b, col);
+                        seg(&mut lines, b, c, col);
+                        seg(&mut lines, c, a, col);
+                    }
+                }
+                // MODIFIER PREVIEW: baseline + pivot cross + live rotate/scale ghost.
+                // The ghost is each target's world-AABB transformed by the LIVE value,
+                // so the rotation/scale is visible before the click commits (the app's
+                // translucent-ghost behaviour, spec §0.6). The numeric label is drawn
+                // as a 2D overlay after the paint callback.
+                let mut modify_label: Option<String> = None;
                 if let Some(md) = &self.modify {
-                    if let (Some(a), Some(h)) = (md.anchor_world(&self.plane), self.hover_plane_pt) {
-                        seg(&mut lines, a, h, [0.95, 0.71, 0.24]);
+                    let plane = self.plane;
+                    if let (Some(a), Some(h)) = (md.anchor_world(&plane), self.hover_plane_pt) {
+                        seg(&mut lines, a, h, [0.95, 0.71, 0.24]); // baseline pivot→cursor
+                        if matches!(md.op, ModifyOp::Rotate | ModifyOp::Scale) {
+                            let ud = (plane.from_uv(Vec2::X) - plane.origin()).normalize_or_zero() * 0.5;
+                            let vd = (plane.from_uv(Vec2::Y) - plane.origin()).normalize_or_zero() * 0.5;
+                            seg(&mut lines, a - ud, a + ud, [1.0, 0.78, 0.31]);
+                            seg(&mut lines, a - vd, a + vd, [1.0, 0.78, 0.31]);
+                        }
+                        let cuv = plane.to_uv(h);
+                        if let Some(ang) = md.preview_angle(cuv, self.card) {
+                            let axis = plane.normal();
+                            for id in &md.targets {
+                                if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
+                                    let (mn, mx) = f.world_aabb();
+                                    let c8 = corners_of(mn, mx).map(|p| rot_about(p, a, axis, ang));
+                                    ghost_box(&mut lines, c8, [0.92, 0.92, 0.98]);
+                                }
+                            }
+                            modify_label = Some(format!("{:.1}°{}", ang.to_degrees(), if md.copy { "  (copy)" } else { "" }));
+                        }
+                        if let Some(k) = md.preview_factor(cuv) {
+                            for id in &md.targets {
+                                if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
+                                    let (mn, mx) = f.world_aabb();
+                                    let c8 = corners_of(mn, mx).map(|p| scale_about(p, a, k));
+                                    ghost_box(&mut lines, c8, [0.80, 0.95, 0.82]);
+                                }
+                            }
+                            modify_label = Some(format!("×{:.3}{}", k, if md.copy { "  (copy)" } else { "" }));
+                        }
+                    }
+                }
+                // all sketches, then the active sketch's frame grid + in-progress preview
+                for sk in &self.model.sketches {
+                    sketch_lines(&mut lines, sk);
+                }
+                if let Some(sm) = &self.sketch {
+                    let sk = &self.model.sketches[sm.idx];
+                    frame_grid(&mut lines, &sk.frame);
+                    if !sm.draw.pending.is_empty() {
+                        let mut chain: Vec<Vec3> = sm.draw.pending.iter().map(|uv| sk.frame.from_uv(*uv)).collect();
+                        if let Some(h) = resp.hover_pos().and_then(|p| self.cursor_on_sketch(p, rect, &mvp)) {
+                            chain.push(h);
+                        }
+                        for w in chain.windows(2) {
+                            seg(&mut lines, w[0], w[1], [0.95, 0.71, 0.24]);
+                        }
                     }
                 }
 
@@ -573,12 +1379,33 @@ impl Sandbox {
                     }
                 });
                 ui.painter().add(egui::PaintCallback { rect, callback: Arc::new(cb) });
+
+                // 3D osnap marker (END square) at the hovered solid vertex during a
+                // modifier base/destination pick — same glyph as the 2D view.
+                if self.modify.is_some() {
+                    if let Some(hp) = resp.hover_pos() {
+                        if let Some((_, sp)) = self.snap_3d(hp, rect, &mvp) {
+                            draw_snap_glyph(&ui.painter_at(rect), sp, SnapKind::End, theme::ACCENT);
+                        }
+                    }
+                }
+                // Live rotate-degree / scale-factor readout at the cursor (the app's
+                // "{deg}°" / "×{factor}" label).
+                if let (Some(txt), Some(hp)) = (modify_label, resp.hover_pos()) {
+                    ui.painter_at(rect).text(
+                        hp + egui::vec2(14.0, -14.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        txt,
+                        egui::FontId::proportional(14.0),
+                        theme::ACCENT,
+                    );
+                }
             });
     }
 
     fn navigator(&mut self, ctx: &egui::Context) {
         egui::Area::new(egui::Id::new("viewcube"))
-            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-16.0, 16.0))
+            .anchor(egui::Align2::LEFT_TOP, egui::vec2(316.0, 16.0))
             .show(ctx, |ui| {
                 let (rect, resp) = ui.allocate_exact_size(egui::vec2(112.0, 150.0), egui::Sense::click());
                 let p = ui.painter();
@@ -628,6 +1455,299 @@ impl Sandbox {
                     }
                 }
                 let _ = theme::WARNING;
+            });
+    }
+
+    /// Start a sketch on `frame`, with `reference` face-outline geometry (u,v).
+    fn enter_sketch(&mut self, frame: Frame, reference: Vec<cad_kernel::Geom>) {
+        let idx = self.model.sketches.len();
+        let mut sk = Sketch::new(frame);
+        sk.reference = reference;
+        self.model.sketches.push(sk);
+        self.modify = None;
+        self.sketch_sel.clear();
+        self.flat_mod = None;
+        self.sketch = Some(SketchMode { idx, draw: Draw::new() });
+        self.sketch_offset = egui::Vec2::ZERO;
+        self.sketch_scale = 60.0;
+        self.status = "sketch active — pick a draw tool (Esc = finish)".to_string();
+    }
+
+    /// Boundary edges of a face (its triangle set), projected into the sketch
+    /// frame's (u,v) as reference `Line` geoms — the outline the user sees + snaps to.
+    fn face_boundary_uv(&self, face_tris: &[usize], frame: &Frame) -> Vec<cad_kernel::Geom> {
+        use std::collections::HashMap;
+        let pos = &self.cached.positions;
+        let key = |p: [f32; 3]| -> (i64, i64, i64) {
+            ((p[0] as f64 * 1e4).round() as i64, (p[1] as f64 * 1e4).round() as i64, (p[2] as f64 * 1e4).round() as i64)
+        };
+        // undirected edge → (count, world endpoints); boundary edges appear once
+        let mut edges: HashMap<((i64, i64, i64), (i64, i64, i64)), (u32, [Vec3; 2])> = HashMap::new();
+        for &t in face_tris {
+            for e in 0..3 {
+                let (pa, pb) = (pos[3 * t + e], pos[3 * t + (e + 1) % 3]);
+                let (mut ka, mut kb) = (key(pa), key(pb));
+                let (mut wa, mut wb) = (Vec3::from(pa), Vec3::from(pb));
+                if ka > kb {
+                    std::mem::swap(&mut ka, &mut kb);
+                    std::mem::swap(&mut wa, &mut wb);
+                }
+                edges.entry((ka, kb)).or_insert((0, [wa, wb])).0 += 1;
+            }
+        }
+        edges
+            .values()
+            .filter(|(c, _)| *c == 1)
+            .map(|(_, [a, b])| {
+                let (ua, ub) = (frame.to_uv(*a), frame.to_uv(*b));
+                cad_kernel::Geom::Line(cad_kernel::Line {
+                    a: cad_kernel::Vec2::new(ua.x as f64, ua.y as f64),
+                    b: cad_kernel::Vec2::new(ub.x as f64, ub.y as f64),
+                })
+            })
+            .collect()
+    }
+
+    /// Run the SHARED osnap engine (`cad_kernel::find_snap`) over the flat sketch —
+    /// its drawn geometry + the face reference — at the cursor. Identical to the app.
+    fn compute_flat_snap(&self, resp: &egui::Response, rect: egui::Rect) -> Option<cad_kernel::SnapHit> {
+        let sm = self.sketch.as_ref()?;
+        let hp = resp.hover_pos()?;
+        let cursor = self.s2w_flat(hp, rect);
+        let sk = &self.model.sketches[sm.idx];
+        let mut objs: Vec<DObject> = sk.doc.dobjects.clone();
+        for g in &sk.reference {
+            objs.push(DObject::new(g.clone()));
+        }
+        if objs.is_empty() {
+            return None;
+        }
+        let world_radius = (12.0 / self.sketch_scale) as f64;
+        find_snap(
+            cad_kernel::Vec2::new(cursor.x as f64, cursor.y as f64),
+            world_radius,
+            self.snap_enabled,
+            None,
+            None,
+            &objs,
+            None,
+        )
+    }
+
+    /// Flat-view world→screen (the app's `w2s`): centre + (world+offset)·scale, Y-down.
+    fn w2s_flat(&self, uv: Vec2, rect: egui::Rect) -> egui::Pos2 {
+        let c = rect.center();
+        egui::pos2(
+            c.x + (uv.x + self.sketch_offset.x) * self.sketch_scale,
+            c.y - (uv.y + self.sketch_offset.y) * self.sketch_scale,
+        )
+    }
+
+    /// Flat-view screen→world (inverse of `w2s_flat`).
+    fn s2w_flat(&self, p: egui::Pos2, rect: egui::Rect) -> Vec2 {
+        let c = rect.center();
+        Vec2::new(
+            (p.x - c.x) / self.sketch_scale - self.sketch_offset.x,
+            -((p.y - c.y) / self.sketch_scale) - self.sketch_offset.y,
+        )
+    }
+
+    fn draw_flat_grid(&self, painter: &egui::Painter, rect: egui::Rect) {
+        let col = egui::Color32::from_rgb(0x22, 0x2c, 0x36);
+        let axis = egui::Color32::from_rgb(0x3a, 0x4a, 0x54);
+        let tl = self.s2w_flat(rect.left_top(), rect);
+        let br = self.s2w_flat(rect.right_bottom(), rect);
+        let x0 = tl.x.min(br.x).floor() as i32;
+        let x1 = tl.x.max(br.x).ceil() as i32;
+        let y0 = tl.y.min(br.y).floor() as i32;
+        let y1 = tl.y.max(br.y).ceil() as i32;
+        if (x1 - x0) > 500 || (y1 - y0) > 500 {
+            return; // too zoomed out — skip the grid to avoid overdraw
+        }
+        for x in x0..=x1 {
+            let a = self.w2s_flat(Vec2::new(x as f32, y0 as f32), rect);
+            let b = self.w2s_flat(Vec2::new(x as f32, y1 as f32), rect);
+            painter.line_segment([a, b], egui::Stroke::new(1.0, if x == 0 { axis } else { col }));
+        }
+        for y in y0..=y1 {
+            let a = self.w2s_flat(Vec2::new(x0 as f32, y as f32), rect);
+            let b = self.w2s_flat(Vec2::new(x1 as f32, y as f32), rect);
+            painter.line_segment([a, b], egui::Stroke::new(1.0, if y == 0 { axis } else { col }));
+        }
+    }
+
+    /// The flat 2D sketch editor — the plane "popped flat to screen". Renders the
+    /// sketch's `Document` in 2D (app w2s) with pan/zoom; draw tools place picks.
+    fn flat_sketch_panel(&mut self, ctx: &egui::Context) {
+        egui::SidePanel::right("flat_sketch")
+            .default_width(560.0)
+            .resizable(true)
+            .frame(egui::Frame::none().fill(theme::SURFACE_0).inner_margin(6.0))
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("✓ Done").clicked() {
+                        self.sketch = None;
+                    }
+                    ui.label(egui::RichText::new("FLAT SKETCH").color(theme::ACCENT).size(12.0).strong());
+                    let n = self.sketch.as_ref().map_or(0, |s| self.model.sketches[s.idx].doc.dobjects.len());
+                    ui.label(egui::RichText::new(format!("{n} obj · {} sel", self.sketch_sel.len())).color(theme::TEXT_MUTED).size(11.0));
+                });
+                // 2D toolbar — this view's OWN tools, independent of the 3D panel.
+                ui.horizontal_wrapped(|ui| {
+                    let cur = self.sketch.as_ref().map(|s| s.draw.tool);
+                    for t in DrawTool::ALL {
+                        if ui.selectable_label(cur == Some(t), t.label()).clicked() {
+                            self.abort_2d();
+                            if let Some(sm) = self.sketch.as_mut() {
+                                sm.draw.set_tool(t);
+                            }
+                            self.status = self.sketch.as_ref().map(|s| s.draw.prompt()).unwrap_or_default();
+                        }
+                    }
+                    ui.separator();
+                    let mod_op = self.flat_mod.as_ref().map(|m| m.op);
+                    if ui.selectable_label(mod_op == Some(FlatOp::Move), "Move").clicked() {
+                        self.abort_2d();
+                        self.start_flat_mod(FlatOp::Move);
+                    }
+                    if ui.selectable_label(mod_op == Some(FlatOp::Copy), "Copy").clicked() {
+                        self.abort_2d();
+                        self.start_flat_mod(FlatOp::Copy);
+                    }
+                    if ui.button("Erase").clicked() {
+                        self.abort_2d();
+                        self.flat_erase();
+                    }
+                });
+                if !self.status.is_empty() {
+                    ui.label(egui::RichText::new(&self.status).color(theme::WARNING).size(11.0));
+                }
+                ui.separator();
+
+                let size = ui.available_size();
+                let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+
+                // pan (middle drag, or left drag when not drawing) + zoom (scroll)
+                if resp.dragged_by(egui::PointerButton::Middle)
+                    || (resp.dragged_by(egui::PointerButton::Primary) && !self.is_drawing())
+                {
+                    let d = resp.drag_delta();
+                    self.sketch_offset.x += d.x / self.sketch_scale;
+                    self.sketch_offset.y -= d.y / self.sketch_scale;
+                }
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.raw_scroll_delta.y);
+                    if scroll != 0.0 {
+                        let f = (1.0 + scroll * 0.0015).clamp(0.5, 2.0);
+                        self.sketch_scale = (self.sketch_scale * f).clamp(2.0, 4000.0);
+                    }
+                }
+
+                // OSNAP — the SHARED cad_kernel engine over the sketch + face reference
+                let snap = self.compute_flat_snap(&resp, rect);
+                let snap_uv = snap.as_ref().map(|h| Vec2::new(h.point.x as f32, h.point.y as f32));
+
+                // Click routing: DRAW (press = point) → flat MODIFIER (base/dest) → SELECT.
+                // Press = click OR drag-start, so a small wobble never drops the pick.
+                let pressed = resp.clicked() || resp.drag_started_by(egui::PointerButton::Primary);
+                if self.is_drawing() {
+                    if pressed {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let uv = snap_uv.unwrap_or_else(|| self.s2w_flat(pos, rect));
+                            self.draw_click(uv);
+                            self.note(format!("flat draw uv=({:.3},{:.3}) snap={:?}", uv.x, uv.y, snap.as_ref().map(|h| h.kind)));
+                        }
+                    }
+                } else if self.flat_mod.is_some() {
+                    if pressed {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let uv = snap_uv.unwrap_or_else(|| self.s2w_flat(pos, rect));
+                            self.flat_mod_feed(uv);
+                        }
+                    }
+                } else if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let uv = self.s2w_flat(pos, rect);
+                        let add = ui.input(|i| i.modifiers.shift);
+                        self.flat_select(uv, add);
+                    }
+                }
+
+                let painter = ui.painter_at(rect);
+                self.draw_flat_grid(&painter, rect);
+                if let Some(sm) = &self.sketch {
+                    let sk = &self.model.sketches[sm.idx];
+                    // face reference outline (faint) — shows WHERE you're drawing
+                    let ref_stroke = egui::Stroke::new(1.5, egui::Color32::from_rgb(0x36, 0x6c, 0x7e));
+                    for g in &sk.reference {
+                        for path in cad_solid::geom_outlines(g) {
+                            let pts: Vec<egui::Pos2> = path.iter().map(|uv| self.w2s_flat(*uv, rect)).collect();
+                            for w in pts.windows(2) {
+                                painter.line_segment([w[0], w[1]], ref_stroke);
+                            }
+                        }
+                    }
+                    // drawn geometry
+                    let stroke = egui::Stroke::new(1.4, egui::Color32::from_rgb(0x9a, 0xdc, 0xa0));
+                    for d in &sk.doc.dobjects {
+                        for path in cad_solid::geom_outlines(&d.geom) {
+                            let pts: Vec<egui::Pos2> = path.iter().map(|uv| self.w2s_flat(*uv, rect)).collect();
+                            for w in pts.windows(2) {
+                                painter.line_segment([w[0], w[1]], stroke);
+                            }
+                        }
+                    }
+                    // selected dobjects (accent)
+                    let sel_stroke = egui::Stroke::new(2.0, theme::ACCENT);
+                    for &i in &self.sketch_sel {
+                        if let Some(d) = sk.doc.dobjects.get(i) {
+                            for path in cad_solid::geom_outlines(&d.geom) {
+                                let pts: Vec<egui::Pos2> = path.iter().map(|uv| self.w2s_flat(*uv, rect)).collect();
+                                for w in pts.windows(2) {
+                                    painter.line_segment([w[0], w[1]], sel_stroke);
+                                }
+                            }
+                        }
+                    }
+                    // COPY/MOVE shadow — ghost the selection at the cursor (app's approach:
+                    // draw d.geom.translated(cursor − base) translucent + a base→cursor line)
+                    if let (Some(fm), Some(hp)) = (self.flat_mod.as_ref(), resp.hover_pos()) {
+                        if let Some(b) = fm.base {
+                            let cur = snap_uv.unwrap_or_else(|| self.s2w_flat(hp, rect));
+                            let v = cad_kernel::Vec2::new((cur.x - b.x) as f64, (cur.y - b.y) as f64);
+                            let ghost = egui::Stroke::new(1.4, egui::Color32::from_rgba_unmultiplied(255, 200, 100, 200));
+                            for &i in &self.sketch_sel {
+                                if let Some(d) = sk.doc.dobjects.get(i) {
+                                    let moved = d.geom.translated(v);
+                                    for path in cad_solid::geom_outlines(&moved) {
+                                        let pts: Vec<egui::Pos2> = path.iter().map(|uv| self.w2s_flat(*uv, rect)).collect();
+                                        for w in pts.windows(2) {
+                                            painter.line_segment([w[0], w[1]], ghost);
+                                        }
+                                    }
+                                }
+                            }
+                            let (bs, cs) = (self.w2s_flat(b, rect), self.w2s_flat(cur, rect));
+                            painter.line_segment([bs, cs], egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 200, 100)));
+                        }
+                    }
+                    // pending rubber-band → the snapped point (or the cursor)
+                    if !sm.draw.pending.is_empty() {
+                        let mut chain: Vec<egui::Pos2> = sm.draw.pending.iter().map(|uv| self.w2s_flat(*uv, rect)).collect();
+                        let tip = snap_uv.map(|uv| self.w2s_flat(uv, rect)).or_else(|| resp.hover_pos());
+                        if let Some(hp) = tip {
+                            chain.push(hp);
+                        }
+                        for w in chain.windows(2) {
+                            painter.line_segment([w[0], w[1]], egui::Stroke::new(1.2, theme::WARNING));
+                        }
+                    }
+                }
+                // osnap marker on top (identical glyphs to the app)
+                if let Some(hit) = &snap {
+                    let sp = self.w2s_flat(Vec2::new(hit.point.x as f32, hit.point.y as f32), rect);
+                    draw_snap_glyph(&painter, sp, hit.kind, theme::ACCENT);
+                }
             });
     }
 }
@@ -710,6 +1830,35 @@ fn plane_grid(plane: &Plane) -> Vec<V3> {
     out
 }
 
+/// A sketch's dobjects, flattened (kernel tessellation) and projected frame→world.
+fn sketch_lines(out: &mut Vec<V3>, sk: &Sketch) {
+    let col = [0.45, 0.85, 0.55];
+    for d in &sk.doc.dobjects {
+        for path in cad_solid::geom_outlines(&d.geom) {
+            let w: Vec<Vec3> = path.iter().map(|uv| sk.frame.from_uv(*uv)).collect();
+            for i in 0..w.len().saturating_sub(1) {
+                seg(out, w[i], w[i + 1], col);
+            }
+        }
+    }
+}
+
+/// A small grid on a sketch frame so the active sketch plane is visible.
+fn frame_grid(out: &mut Vec<V3>, fr: &Frame) {
+    let (u, v, o) = (fr.u, fr.v, fr.origin);
+    // A small patch centred on the pick, so the sketch plane reads as sitting ON
+    // the face instead of a huge grid sprawling past it.
+    let h = 1.0f32;
+    let n = 4i32;
+    let step = 2.0 * h / n as f32;
+    let col = [0.20, 0.60, 0.72];
+    for i in 0..=n {
+        let t = -h + i as f32 * step;
+        seg(out, o + u * t - v * h, o + u * t + v * h, col);
+        seg(out, o + v * t - u * h, o + v * t + u * h, col);
+    }
+}
+
 fn aabb_lines(out: &mut Vec<V3>, mn: Vec3, mx: Vec3, c: [f32; 3]) {
     let corner = |i: usize| {
         Vec3::new(
@@ -731,6 +1880,110 @@ fn aabb_lines(out: &mut Vec<V3>, mn: Vec3, mx: Vec3, c: [f32; 3]) {
 fn seg(out: &mut Vec<V3>, a: Vec3, b: Vec3, c: [f32; 3]) {
     out.push(V3 { x: a.x, y: a.y, z: a.z, r: c[0], g: c[1], b: c[2] });
     out.push(V3 { x: b.x, y: b.y, z: b.z, r: c[0], g: c[1], b: c[2] });
+}
+
+/// The 8 corners of an axis-aligned box (min/max) — for a transformed ghost.
+fn corners_of(mn: Vec3, mx: Vec3) -> [Vec3; 8] {
+    let mut c = [Vec3::ZERO; 8];
+    for (i, slot) in c.iter_mut().enumerate() {
+        *slot = Vec3::new(
+            if i & 1 == 0 { mn.x } else { mx.x },
+            if i & 2 == 0 { mn.y } else { mx.y },
+            if i & 4 == 0 { mn.z } else { mx.z },
+        );
+    }
+    c
+}
+
+/// Draw the 12 edges of a box given its 8 (already-transformed) corners.
+fn ghost_box(out: &mut Vec<V3>, c8: [Vec3; 8], col: [f32; 3]) {
+    for a in 0..8usize {
+        for bit in [1usize, 2, 4] {
+            let b = a ^ bit;
+            if a < b {
+                seg(out, c8[a], c8[b], col);
+            }
+        }
+    }
+}
+
+/// Min distance (in u,v units) from a point to a geom's tessellated outline.
+fn dist_to_geom(g: &cad_kernel::Geom, p: Vec2) -> f32 {
+    let mut best = f32::INFINITY;
+    for path in cad_solid::geom_outlines(g) {
+        for w in path.windows(2) {
+            best = best.min(dist_point_segment(p, w[0], w[1]));
+        }
+    }
+    best
+}
+
+fn dist_point_segment(p: Vec2, a: Vec2, b: Vec2) -> f32 {
+    let ab = b - a;
+    let t = if ab.length_squared() > 1e-12 {
+        ((p - a).dot(ab) / ab.length_squared()).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (p - (a + ab * t)).length()
+}
+
+/// AutoCAD-style osnap marker glyphs — copied VERBATIM from cad_app::draw_snap_glyph.
+fn draw_snap_glyph(p: &egui::Painter, c: egui::Pos2, k: SnapKind, col: egui::Color32) {
+    let s = 6.0; // half-extent
+    let stroke = egui::Stroke::new(1.6, col);
+    match k {
+        SnapKind::End => {
+            let r = egui::Rect::from_min_max(egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s));
+            p.rect_stroke(r, 0.0, stroke);
+        }
+        SnapKind::Mid => {
+            let pts = vec![
+                egui::pos2(c.x, c.y - s),
+                egui::pos2(c.x + s, c.y + s),
+                egui::pos2(c.x - s, c.y + s),
+                egui::pos2(c.x, c.y - s),
+            ];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        SnapKind::Cen => {
+            p.circle_stroke(c, s, stroke);
+            p.circle_filled(c, 1.5, col);
+        }
+        SnapKind::Qua => {
+            let pts = vec![
+                egui::pos2(c.x, c.y - s),
+                egui::pos2(c.x + s, c.y),
+                egui::pos2(c.x, c.y + s),
+                egui::pos2(c.x - s, c.y),
+                egui::pos2(c.x, c.y - s),
+            ];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+        SnapKind::Int => {
+            p.line_segment([egui::pos2(c.x - s, c.y - s), egui::pos2(c.x + s, c.y + s)], stroke);
+            p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y - s)], stroke);
+        }
+        SnapKind::Per => {
+            p.line_segment([egui::pos2(c.x, c.y - s), egui::pos2(c.x, c.y + s)], stroke);
+            p.line_segment([egui::pos2(c.x - s, c.y + s), egui::pos2(c.x + s, c.y + s)], stroke);
+        }
+        SnapKind::Tan => {
+            p.circle_stroke(c, s * 0.75, stroke);
+            let y = c.y - s * 0.75;
+            p.line_segment([egui::pos2(c.x - s, y), egui::pos2(c.x + s, y)], stroke);
+        }
+        SnapKind::Nea => {
+            let pts = vec![
+                egui::pos2(c.x - s, c.y - s),
+                egui::pos2(c.x + s, c.y - s),
+                egui::pos2(c.x - s, c.y + s),
+                egui::pos2(c.x + s, c.y + s),
+                egui::pos2(c.x - s, c.y - s),
+            ];
+            p.add(egui::Shape::line(pts, stroke));
+        }
+    }
 }
 
 fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32) -> [f32; 16] {

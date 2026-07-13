@@ -338,6 +338,7 @@ dependencies = [
 name = "cad_solid"
 version = "0.1.0"
 dependencies = [
+ "cad_kernel",
  "csgrs",
  "eframe",
  "egui",
