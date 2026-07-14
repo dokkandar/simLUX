@@ -84,8 +84,10 @@ pub struct Modify {
     pub copy: bool,
     /// Human-readable summary of the last apply, for the session recorder (§8).
     pub last_summary: Option<String>,
-    /// base / pivot / mirror-A, in active-plane `(u, v)`; `None` until first pick.
-    first: Option<Vec2>,
+    /// base / pivot / mirror-A as a FULL 3D world point (`None` until first pick).
+    /// Stored in world space — NOT pre-flattened to `(u,v)` — so a pick snapped to a
+    /// solid vertex keeps its true Z; Move/Copy translate by the full 3D delta.
+    first: Option<Vec3>,
     /// Reference sub-flow state (rotate/scale only).
     refm: Ref,
 }
@@ -134,7 +136,7 @@ impl Modify {
         let cp = if self.copy { "ON" } else { "off" };
         match (self.op, self.refm) {
             (ModifyOp::Move, _) => "move: pick DESTINATION".into(),
-            (ModifyOp::Copy, _) => "copy: pick destination (repeats · Esc ends)".into(),
+            (ModifyOp::Copy, _) => "copy: pick DESTINATION".into(),
             (ModifyOp::Mirror, _) => "mirror: pick AXIS-2 point".into(),
             (ModifyOp::Rotate, Ref::None) => {
                 format!("rotate: pick ANGLE, or type degrees (CCW+) · R=reference · C=copy {cp}")
@@ -153,36 +155,38 @@ impl Modify {
     }
 
     /// The gathered base/pivot in world space, if any (for a rubber-band preview).
-    pub fn anchor_world(&self, plane: &Plane) -> Option<Vec3> {
-        self.first.map(|uv| plane.from_uv(uv))
+    pub fn anchor_world(&self, _plane: &Plane) -> Option<Vec3> {
+        self.first
     }
 
-    /// Live ROTATE angle (rad) for the cursor at `cursor_uv`, for the ghost + degree
-    /// label. `None` unless we're actually waiting on a rotate angle.
-    pub fn preview_angle(&self, cursor_uv: Vec2, card: bool) -> Option<f32> {
+    /// Live ROTATE angle (rad) for the cursor at `cursor_world`, for the ghost +
+    /// degree label. `None` unless we're actually waiting on a rotate angle.
+    pub fn preview_angle(&self, plane: &Plane, cursor_world: Vec3, card: bool) -> Option<f32> {
         if self.op != ModifyOp::Rotate {
             return None;
         }
-        let first = self.first?;
+        let first_uv = plane.to_uv(self.first?);
+        let cursor_uv = plane.to_uv(cursor_world);
         match self.refm {
-            Ref::None => Some(angle_from(first, cursor_uv, card)),
+            Ref::None => Some(angle_from(first_uv, cursor_uv, card)),
             Ref::RotTgt(src) => {
-                let d = cursor_uv - first;
+                let d = cursor_uv - first_uv;
                 Some(norm_pi(d.y.atan2(d.x) - src))
             }
             _ => None,
         }
     }
 
-    /// Live SCALE factor for the cursor at `cursor_uv`, for the ghost + `×f` label.
-    pub fn preview_factor(&self, cursor_uv: Vec2) -> Option<f32> {
+    /// Live SCALE factor for the cursor at `cursor_world`, for the ghost + `×f` label.
+    pub fn preview_factor(&self, plane: &Plane, cursor_world: Vec3) -> Option<f32> {
         if self.op != ModifyOp::Scale {
             return None;
         }
-        let first = self.first?;
+        let first_uv = plane.to_uv(self.first?);
+        let cursor_uv = plane.to_uv(cursor_world);
         match self.refm {
-            Ref::None => Some((cursor_uv - first).length().max(1e-4)),
-            Ref::ScaNew(ref_d) => Some(((cursor_uv - first).length() / ref_d).max(1e-4)),
+            Ref::None => Some((cursor_uv - first_uv).length().max(1e-4)),
+            Ref::ScaNew(ref_d) => Some(((cursor_uv - first_uv).length() / ref_d).max(1e-4)),
             _ => None,
         }
     }
@@ -190,31 +194,35 @@ impl Modify {
     /// Feed a pick — a world point on `plane`. First call stores the base/pivot;
     /// later calls advance the reference sub-flow or apply the op.
     pub fn feed(&mut self, world: Vec3, plane: &Plane, model: &mut Model, card: bool) -> Feed {
-        let uv = plane.to_uv(world);
-        let Some(first) = self.first else {
-            self.first = Some(uv);
+        let Some(first_w) = self.first else {
+            self.first = Some(world); // keep the FULL 3D pick (snapped vertices carry Z)
             return Feed::NeedMore;
         };
+        // In-plane `(u,v)` coordinates for the planar ops (rotate/scale/mirror).
+        let uv = plane.to_uv(world);
+        let first_uv = plane.to_uv(first_w);
 
         match self.op {
             ModifyOp::Move => {
-                let wd = plane_delta(plane, card_lock(uv - first, card));
+                // FULL 3D delta: snapping base=top-corner, dest=bottom-corner must move
+                // by the height too. CARD locks only the in-plane part; Z is preserved.
+                let wd = world_delta_carded(plane, first_w, world, card);
                 self.apply_translate(model, wd, false);
-                self.last_summary = Some(format!("move ({:.2},{:.2})", wd.x, wd.y));
+                self.last_summary = Some(format!("move Δ({:.2},{:.2},{:.2})", wd.x, wd.y, wd.z));
                 Feed::Applied
             }
             ModifyOp::Copy => {
-                // Each drop duplicates the ORIGINAL targets at (pick − base); base
-                // stays fixed so repeated clicks drop repeated copies (AutoCAD COPY).
-                let wd = plane_delta(plane, card_lock(uv - first, card));
+                // SINGLE-DROP, like RUST_CAD `apply_copy` (spec §2): base → destination
+                // → done. Full 3D delta (see Move) so snapped picks lift by their Z.
+                let wd = world_delta_carded(plane, first_w, world, card);
                 self.apply_translate(model, wd, true);
-                self.last_summary = Some(format!("copy +1 at ({:.2},{:.2})", wd.x, wd.y));
-                Feed::AppliedContinue
+                self.last_summary = Some(format!("copy Δ({:.2},{:.2},{:.2})", wd.x, wd.y, wd.z));
+                Feed::Applied
             }
             ModifyOp::Rotate => match self.refm {
                 Ref::None => {
-                    let ang = angle_from(first, uv, card);
-                    self.apply_rotate(plane, model, first, ang);
+                    let ang = angle_from(first_uv, uv, card);
+                    self.apply_rotate(plane, model, first_w, ang);
                     Feed::Applied
                 }
                 Ref::RotSrc1 => {
@@ -227,17 +235,17 @@ impl Modify {
                     Feed::NeedMore
                 }
                 Ref::RotTgt(src) => {
-                    let d = uv - first;
+                    let d = uv - first_uv;
                     let dtheta = norm_pi(d.y.atan2(d.x) - src);
-                    self.apply_rotate(plane, model, first, dtheta);
+                    self.apply_rotate(plane, model, first_w, dtheta);
                     Feed::Applied
                 }
                 _ => Feed::NeedMore,
             },
             ModifyOp::Scale => match self.refm {
                 Ref::None => {
-                    let k = (uv - first).length().max(1e-4);
-                    self.apply_scale(plane, model, first, k);
+                    let k = (uv - first_uv).length().max(1e-4);
+                    self.apply_scale(plane, model, first_w, k);
                     Feed::Applied
                 }
                 Ref::ScaStart => {
@@ -250,16 +258,16 @@ impl Modify {
                     Feed::NeedMore
                 }
                 Ref::ScaNew(ref_d) => {
-                    let k = ((uv - first).length() / ref_d).max(1e-4);
-                    self.apply_scale(plane, model, first, k);
+                    let k = ((uv - first_uv).length() / ref_d).max(1e-4);
+                    self.apply_scale(plane, model, first_w, k);
                     Feed::Applied
                 }
                 _ => Feed::NeedMore,
             },
             ModifyOp::Mirror => {
-                let b = if card { first + card_lock(uv - first, true) } else { uv };
-                let a_w = plane.from_uv(first);
-                let b_w = plane.from_uv(b);
+                let b_uv = if card { first_uv + card_lock(uv - first_uv, true) } else { uv };
+                let a_w = plane.from_uv(first_uv);
+                let b_w = plane.from_uv(b_uv);
                 let line = (b_w - a_w).normalize_or_zero();
                 let mirror_n = plane.normal().cross(line).normalize_or_zero();
                 for id in &self.targets {
@@ -342,8 +350,7 @@ impl Modify {
         }
     }
 
-    fn apply_rotate(&mut self, plane: &Plane, model: &mut Model, pivot_uv: Vec2, ang: f32) {
-        let pivot = plane.from_uv(pivot_uv);
+    fn apply_rotate(&mut self, plane: &Plane, model: &mut Model, pivot: Vec3, ang: f32) {
         let axis = plane.normal();
         if self.copy {
             let dupes: Vec<_> = self
@@ -368,8 +375,7 @@ impl Modify {
         }
     }
 
-    fn apply_scale(&mut self, plane: &Plane, model: &mut Model, pivot_uv: Vec2, k: f32) {
-        let pivot = plane.from_uv(pivot_uv);
+    fn apply_scale(&mut self, _plane: &Plane, model: &mut Model, pivot: Vec3, k: f32) {
         if self.copy {
             let dupes: Vec<_> = self
                 .targets
@@ -429,6 +435,22 @@ fn plane_delta(plane: &Plane, d: Vec2) -> Vec3 {
     plane.from_uv(d) - plane.origin()
 }
 
+/// The FULL 3D world delta `to − from`, with CARD applied only to the in-plane
+/// component (the out-of-plane / normal component is always preserved). With `card`
+/// off this returns exactly `to − from`, so a Move/Copy between two snapped solid
+/// vertices carries their real height difference (the fix for "copy went 2D").
+fn world_delta_carded(plane: &Plane, from: Vec3, to: Vec3, card: bool) -> Vec3 {
+    let d = to - from;
+    if !card {
+        return d;
+    }
+    // Decompose into plane basis: in-plane (u,v) + normal, lock the in-plane part.
+    let n = plane.normal();
+    let normal_comp = d.dot(n);
+    let uv_delta = plane.to_uv(to) - plane.to_uv(from);
+    plane_delta(plane, card_lock(uv_delta, true)) + n * normal_comp
+}
+
 /// CARD cardinal lock: collapse a delta to its dominant axis (the 2D
 /// `apply_constraints` H/V snap).
 fn card_lock(d: Vec2, card: bool) -> Vec2 {
@@ -482,13 +504,41 @@ mod tests {
     }
 
     #[test]
-    fn copy_adds_a_feature_and_continues() {
+    fn copy_carries_full_3d_delta_when_snapped() {
+        // base snapped to a top corner (z=1), dest to a bottom corner (z=0) → the
+        // duplicate must drop by the height, not stay flat (the "copy went 2D" bug).
+        let (mut m, id) = model_with_box(0.0, 0.0);
+        let mut op = Modify::new(ModifyOp::Copy, vec![id]);
+        let plane = Plane::default(); // XY plane, normal +Z
+        op.feed(Vec3::new(1.0, 1.0, 1.0), &plane, &mut m, false);
+        let r = op.feed(Vec3::new(1.0, 1.0, 0.0), &plane, &mut m, false);
+        assert_eq!(r, Feed::Applied);
+        assert_eq!(m.features.len(), 2);
+        let orig = m.features[0].world_origin();
+        let dup = m.features[1].world_origin();
+        assert!((dup - (orig + Vec3::new(0.0, 0.0, -1.0))).length() < 1e-4, "copy carried Δz, got {dup:?}");
+    }
+
+    #[test]
+    fn move_card_locks_in_plane_but_keeps_z() {
+        let (mut m, id) = model_with_box(0.0, 0.0);
+        let mut op = Modify::new(ModifyOp::Move, vec![id]);
+        let plane = Plane::default();
+        op.feed(Vec3::ZERO, &plane, &mut m, true);
+        // in-plane mostly +x (locks out the small +y) but +2 in Z must survive.
+        op.feed(Vec3::new(3.0, 0.4, 2.0), &plane, &mut m, true);
+        let o = m.get_mut(id).unwrap().world_origin();
+        assert!((o - Vec3::new(3.0, 0.0, 2.0)).length() < 1e-4, "x locked, y dropped, z kept, got {o:?}");
+    }
+
+    #[test]
+    fn copy_adds_one_feature_then_finishes() {
         let (mut m, id) = model_with_box(0.0, 0.0);
         let mut op = Modify::new(ModifyOp::Copy, vec![id]);
         let plane = Plane::default();
         op.feed(Vec3::ZERO, &plane, &mut m, false);
         let r = op.feed(Vec3::new(4.0, 0.0, 0.0), &plane, &mut m, false);
-        assert_eq!(r, Feed::AppliedContinue);
+        assert_eq!(r, Feed::Applied, "single-drop: base → dest → done");
         assert_eq!(m.features.len(), 2, "copy adds one feature");
         assert!((m.features[0].world_origin() - Vec3::ZERO).length() < 1e-4);
         assert!((m.features[1].world_origin() - Vec3::new(4.0, 0.0, 0.0)).length() < 1e-4);
