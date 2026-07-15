@@ -3247,6 +3247,28 @@ impl CadApp {
         self.cmd_flow = None;
         self.zoom_state = ZoomState::Off;
         self.var_set_pending = None;
+
+        // --- DERIVED CACHES KEYED TO THE OLD DOCUMENT ---
+        // This is the group that actually caused the "Draw on this face" crash, and it
+        // is NOT about selection at all: `index` (the UniformGrid) stores dobject
+        // indices. The canvas culls through it (`candidates` → `doc.dobjects[i]`), so a
+        // grid built from the model-space doc fed index 0 into an empty sketch doc:
+        //   app.rs — `let e = &self.doc.dobjects[i];`
+        //   panic: index out of bounds: the len is 0 but the index is 0
+        //
+        // The field list below mirrors the app's own `clear_all()` ("one-stop wipe
+        // everything geometry-related") MINUS its `doc.dobjects.clear()` — we are
+        // swapping a document in, not erasing one. **Keep these two in sync.**
+        self.index = None;
+        self.index_dirty = true;
+        self.index_label.clear();
+        self.intersections.clear();
+        self.last_intersect_label.clear();
+        self.snap_override = None;
+        self.blockdiff_overlay = None;
+        self.param_name_dialog = None;
+        self.block_task_rec = None;
+        self.gpu_dirty = true; // the GPU renderer caches vertex data per dobject
     }
 
     /// Enter a sketch on `frame`: create the sketch and **swap the app's active document
@@ -22485,6 +22507,7 @@ fn paint_arc_method_icon(
 
 impl eframe::App for CadApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+
         // ensure continuous repaint, never frozen
         ctx.request_repaint();
         self.trim_debug_frame = self.trim_debug_frame.wrapping_add(1);
@@ -32372,6 +32395,7 @@ mod factory_sketch_tests {
         app.dbg_press_hit = Some(0);
         app.dbg_press_sel = vec![0];
         app.pending = vec![Vec2::new(1.0, 1.0)];
+        app.index_dirty = false;
         app.factory_reset_doc_state();
         assert!(app.selection.is_empty());
         assert!(app.pre_op_selection.is_empty());
@@ -32385,5 +32409,11 @@ mod factory_sketch_tests {
         assert_eq!(app.select_mode, SelectMode::Off);
         assert_eq!(app.fillet_state, FilletState::Off);
         assert!(matches!(app.trim_state, TrimState::Off)); // TrimState is not PartialEq
+        // THE ACTUAL CRASH: the spatial index stores dobject indices and the canvas
+        // culls through it into `doc.dobjects[i]`. A grid built from the old document
+        // fed index 0 into an empty sketch doc = guaranteed panic.
+        assert!(app.index.is_none(), "stale spatial index MUST be dropped on a doc swap");
+        assert!(app.index_dirty, "spatial index must be marked for rebuild");
+        assert!(app.gpu_dirty, "GPU vertex cache is keyed to the old doc");
     }
 }
