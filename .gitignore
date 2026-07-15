@@ -12,3 +12,7 @@ target-docker/
 *.log
 
 .git_commit_msg.txt
+
+# 3D_Factory is its OWN repo (a full workspace fork where 3D is built inside the
+# real 2D app). It merges back as one big merge — simLUX must not track it.
+/3D_Factory/

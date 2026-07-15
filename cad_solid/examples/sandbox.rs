@@ -177,6 +177,19 @@ struct FlatMod {
     base: Option<Vec2>, // in sketch (u,v)
 }
 
+/// An in-flight 2D EDIT command — the pick-based modify tools, all backed by
+/// `cad_kernel` (`Geom::offset`/`trim_at`/`extend_to`/`split_at`, `fillet_geoms`,
+/// `chamfer_geoms`). Values (distance/radius) come from the command line; objects and
+/// points come from clicks.
+enum FlatEdit {
+    Offset { dist: Option<f64>, obj: Option<usize> },
+    Trim,
+    Extend,
+    Fillet { radius: Option<f64>, first: Option<(usize, Vec2)> },
+    Chamfer { dist: Option<f64>, first: Option<(usize, Vec2)> },
+    Break { obj: Option<usize>, p1: Option<Vec2> },
+}
+
 /// 3D viewport display mode — the standard CAD wireframe / shaded / shaded-with-edges
 /// toggle (the mesh/face/render "regulate the display" control).
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -231,6 +244,7 @@ struct Sandbox {
     snap_override: Option<SnapKind>, // one-shot inline snap override (typed END/MID/…)
     sketch_sel: Vec<usize>,     // selected dobject indices in the active sketch's doc
     flat_mod: Option<FlatMod>,  // in-flight 2D move/copy on the sketch
+    flat_edit: Option<FlatEdit>, // in-flight 2D edit (offset/trim/extend/fillet/…)
     // command-driven select-first: a queued command gathering its selection
     cmd: String,
     flat_cmd: String, // the flat-sketch command line (drives 2D drafting)
@@ -299,6 +313,7 @@ impl Sandbox {
             snap_override: None,
             sketch_sel: Vec::new(),
             flat_mod: None,
+            flat_edit: None,
             cmd: String::new(),
             flat_cmd: String::new(),
             selecting: false,
@@ -534,6 +549,9 @@ impl Sandbox {
         } else if self.flat_mod.is_some() {
             self.flat_mod = None;
             self.note("esc: cancelled 2D modifier".into());
+        } else if self.flat_edit.is_some() {
+            self.flat_edit = None;
+            self.note("esc: cancelled 2D edit".into());
         } else if let Some(sm) = &mut self.sketch {
             if sm.draw.cancel() {
                 self.note("esc: cancelled in-progress draw".into());
@@ -565,6 +583,7 @@ impl Sandbox {
             sm.draw.set_tool(DrawTool::None);
         }
         self.flat_mod = None;
+        self.flat_edit = None;
     }
 
     /// Erase the selected 2D sketch dobjects (flat view only).
@@ -697,6 +716,252 @@ impl Sandbox {
             }
         }
         self.note(format!("flat select → {} object(s)", self.sketch_sel.len()));
+    }
+
+    /// Index of the nearest sketch dobject to `uv` within the pick tolerance.
+    fn flat_nearest_obj(&self, uv: Vec2) -> Option<usize> {
+        let idx = self.sketch.as_ref()?.idx;
+        let tol = 10.0 / self.sketch_scale;
+        let mut best: Option<(f32, usize)> = None;
+        for (i, d) in self.model.sketches[idx].doc.dobjects.iter().enumerate() {
+            let dist = dist_to_geom(&d.geom, uv);
+            if dist < tol && best.map_or(true, |(bd, _)| dist < bd) {
+                best = Some((dist, i));
+            }
+        }
+        best.map(|(_, i)| i)
+    }
+
+    /// Start a pick-based 2D edit command (offset/trim/extend/fillet/chamfer/break).
+    fn start_flat_edit(&mut self, e: FlatEdit) {
+        self.status = match &e {
+            FlatEdit::Offset { .. } => "offset: type distance".into(),
+            FlatEdit::Fillet { .. } => "fillet: type radius".into(),
+            FlatEdit::Chamfer { .. } => "chamfer: type distance".into(),
+            FlatEdit::Trim => "trim: click the part of an object to cut (others = cutters) · Esc ends".into(),
+            FlatEdit::Extend => "extend: click an object end (others = boundaries) · Esc ends".into(),
+            FlatEdit::Break { .. } => "break: pick the object".into(),
+        };
+        self.flat_edit = Some(e);
+    }
+
+    /// A typed number for the active edit's value step (offset dist / fillet radius /
+    /// chamfer dist). Returns true if consumed.
+    fn flat_edit_value(&mut self, n: f64) -> bool {
+        match self.flat_edit.as_mut() {
+            Some(FlatEdit::Offset { dist, .. }) if dist.is_none() => {
+                *dist = Some(n);
+                self.status = "offset: pick object to offset".into();
+                true
+            }
+            Some(FlatEdit::Fillet { radius, .. }) if radius.is_none() => {
+                *radius = Some(n.max(0.0));
+                self.status = "fillet: pick FIRST object".into();
+                true
+            }
+            Some(FlatEdit::Chamfer { dist, .. }) if dist.is_none() => {
+                *dist = Some(n.max(0.0));
+                self.status = "chamfer: pick FIRST object".into();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Feed a click (sketch `u,v`) to the active pick-based edit.
+    fn flat_edit_pick(&mut self, uv: Vec2) {
+        let idx = match self.sketch.as_ref() {
+            Some(s) => s.idx,
+            None => return,
+        };
+        let ku = cad_kernel::Vec2::new(uv.x as f64, uv.y as f64);
+        let hit = self.flat_nearest_obj(uv);
+        let edit = match self.flat_edit.take() {
+            Some(e) => e,
+            None => return,
+        };
+        match edit {
+            FlatEdit::Offset { dist: Some(d), obj: None } => match hit {
+                Some(oi) => {
+                    self.flat_edit = Some(FlatEdit::Offset { dist: Some(d), obj: Some(oi) });
+                    self.status = "offset: pick side".into();
+                }
+                None => self.flat_edit = Some(FlatEdit::Offset { dist: Some(d), obj: None }),
+            },
+            FlatEdit::Offset { dist: Some(d), obj: Some(oi) } => {
+                let doc = &mut self.model.sketches[idx].doc;
+                if let Some(dobj) = doc.dobjects.get(oi).cloned() {
+                    match dobj.geom.offset(d, ku) {
+                        Ok(g) => {
+                            doc.push(DObject::new(g));
+                            self.note("flat offset ✓".into());
+                        }
+                        Err(e) => self.status = format!("offset: {e}"),
+                    }
+                }
+                self.flat_edit = None;
+            }
+            FlatEdit::Trim => {
+                if let Some(oi) = hit {
+                    let doc = &mut self.model.sketches[idx].doc;
+                    let cutters: Vec<cad_kernel::Geom> =
+                        doc.dobjects.iter().enumerate().filter(|(i, _)| *i != oi).map(|(_, d)| d.geom.clone()).collect();
+                    let target = doc.dobjects[oi].clone();
+                    match target.geom.trim_at(&cutters, ku, false) {
+                        Ok(survivors) => {
+                            doc.dobjects.remove(oi);
+                            for g in survivors {
+                                doc.push(DObject::with_style(g, target.style.clone()));
+                            }
+                            self.note("flat trim ✓".into());
+                        }
+                        Err(e) => self.status = format!("trim: {e}"),
+                    }
+                }
+                self.flat_edit = Some(FlatEdit::Trim); // stay active (repeat)
+            }
+            FlatEdit::Extend => {
+                if let Some(oi) = hit {
+                    let doc = &mut self.model.sketches[idx].doc;
+                    let boundaries: Vec<cad_kernel::Geom> =
+                        doc.dobjects.iter().enumerate().filter(|(i, _)| *i != oi).map(|(_, d)| d.geom.clone()).collect();
+                    let target = doc.dobjects[oi].geom.clone();
+                    match target.extend_to(&boundaries, ku, false) {
+                        Ok(g) => {
+                            doc.dobjects[oi].geom = g;
+                            self.note("flat extend ✓".into());
+                        }
+                        Err(e) => self.status = format!("extend: {e}"),
+                    }
+                }
+                self.flat_edit = Some(FlatEdit::Extend);
+            }
+            FlatEdit::Fillet { radius: Some(r), first: None } => match hit {
+                Some(i1) => {
+                    self.flat_edit = Some(FlatEdit::Fillet { radius: Some(r), first: Some((i1, uv)) });
+                    self.status = "fillet: pick SECOND object".into();
+                }
+                None => self.flat_edit = Some(FlatEdit::Fillet { radius: Some(r), first: None }),
+            },
+            FlatEdit::Fillet { radius: Some(r), first: Some((i1, p1)) } => {
+                if let Some(i2) = hit {
+                    self.apply_fillet_chamfer(idx, i1, p1, i2, uv, Some(r), None);
+                }
+                self.flat_edit = None;
+            }
+            FlatEdit::Chamfer { dist: Some(d), first: None } => match hit {
+                Some(i1) => {
+                    self.flat_edit = Some(FlatEdit::Chamfer { dist: Some(d), first: Some((i1, uv)) });
+                    self.status = "chamfer: pick SECOND object".into();
+                }
+                None => self.flat_edit = Some(FlatEdit::Chamfer { dist: Some(d), first: None }),
+            },
+            FlatEdit::Chamfer { dist: Some(d), first: Some((i1, p1)) } => {
+                if let Some(i2) = hit {
+                    self.apply_fillet_chamfer(idx, i1, p1, i2, uv, None, Some(d));
+                }
+                self.flat_edit = None;
+            }
+            FlatEdit::Break { obj: None, .. } => match hit {
+                Some(oi) => {
+                    self.flat_edit = Some(FlatEdit::Break { obj: Some(oi), p1: None });
+                    self.status = "break: pick FIRST break point".into();
+                }
+                None => self.flat_edit = Some(FlatEdit::Break { obj: None, p1: None }),
+            },
+            FlatEdit::Break { obj: Some(oi), p1: None } => {
+                self.flat_edit = Some(FlatEdit::Break { obj: Some(oi), p1: Some(uv) });
+                self.status = "break: pick SECOND break point".into();
+            }
+            FlatEdit::Break { obj: Some(oi), p1: Some(p1) } => {
+                let doc = &mut self.model.sketches[idx].doc;
+                if let Some(dobj) = doc.dobjects.get(oi).cloned() {
+                    let kp1 = cad_kernel::Vec2::new(p1.x as f64, p1.y as f64);
+                    // split at p1 → keep the far piece; split that at p2 → drop the middle
+                    if let Ok((a, _mid0)) = dobj.geom.split_at(kp1) {
+                        if let Ok((_mid1, b)) = dobj.geom.split_at(ku) {
+                            doc.dobjects.remove(oi);
+                            doc.push(DObject::with_style(a, dobj.style.clone()));
+                            doc.push(DObject::with_style(b, dobj.style.clone()));
+                            self.note("flat break ✓".into());
+                        }
+                    }
+                }
+                self.flat_edit = None;
+            }
+            other => self.flat_edit = Some(other),
+        }
+    }
+
+    /// Apply a fillet (radius) or chamfer (distance) between two picked objects.
+    fn apply_fillet_chamfer(&mut self, idx: usize, i1: usize, p1: Vec2, i2: usize, p2: Vec2, radius: Option<f64>, cham: Option<f64>) {
+        let kp1 = cad_kernel::Vec2::new(p1.x as f64, p1.y as f64);
+        let kp2 = cad_kernel::Vec2::new(p2.x as f64, p2.y as f64);
+        let doc = &mut self.model.sketches[idx].doc;
+        let (g1, g2) = match (doc.dobjects.get(i1), doc.dobjects.get(i2)) {
+            (Some(a), Some(b)) => (a.geom.clone(), b.geom.clone()),
+            _ => return,
+        };
+        if let Some(r) = radius {
+            match cad_kernel::fillet_geoms(&g1, kp1, &g2, kp2, r) {
+                Ok(out) => {
+                    doc.dobjects[i1].geom = out.g1_new;
+                    doc.dobjects[i2].geom = out.g2_new;
+                    if let Some(arc) = out.arc {
+                        doc.push(DObject::new(arc));
+                    }
+                    self.note("flat fillet ✓".into());
+                }
+                Err(e) => self.status = format!("fillet: {e}"),
+            }
+        } else if let Some(d) = cham {
+            match cad_kernel::chamfer_geoms(&g1, kp1, &g2, kp2, d, d) {
+                Ok(out) => {
+                    doc.dobjects[i1].geom = out.g1_new;
+                    doc.dobjects[i2].geom = out.g2_new;
+                    doc.push(DObject::new(out.bridge));
+                    self.note("flat chamfer ✓".into());
+                }
+                Err(e) => self.status = format!("chamfer: {e}"),
+            }
+        }
+    }
+
+    /// JOIN the selected sketch dobjects into merged polylines (select-first).
+    fn flat_join(&mut self) {
+        let idx = match self.sketch.as_ref() {
+            Some(s) => s.idx,
+            None => return,
+        };
+        if self.sketch_sel.len() < 2 {
+            self.status = "join: select 2+ touching objects first".into();
+            return;
+        }
+        let mut sel = self.sketch_sel.clone();
+        sel.sort_unstable();
+        sel.dedup();
+        let doc = &mut self.model.sketches[idx].doc;
+        let input: Vec<(usize, cad_kernel::Geom)> =
+            sel.iter().filter_map(|&i| doc.dobjects.get(i).map(|d| (i, d.geom.clone()))).collect();
+        let out = cad_kernel::join_geoms(&input);
+        if out.merged.is_empty() {
+            self.status = "join: nothing merged (objects must touch end-to-end)".into();
+            return;
+        }
+        let mut consumed = out.consumed_indices.clone();
+        consumed.sort_unstable();
+        consumed.dedup();
+        for &i in consumed.iter().rev() {
+            if i < doc.dobjects.len() {
+                doc.dobjects.remove(i);
+            }
+        }
+        for g in out.merged {
+            doc.push(DObject::new(g));
+        }
+        self.sketch_sel.clear();
+        self.note("flat join ✓".into());
+        self.status.clear();
     }
 
     /// Push a Note event with the caller's source location, in the recorder's own
@@ -1073,6 +1338,14 @@ impl Sandbox {
         if !t.is_empty() {
             self.note(format!("flat cmd '{t}'")); // §recorder: every submitted line
         }
+        // active EDIT value step (offset dist / fillet radius / chamfer dist)
+        if self.flat_edit.is_some() {
+            if let Ok(n) = t.parse::<f64>() {
+                if self.flat_edit_value(n) {
+                    return;
+                }
+            }
+        }
         let drawing = self.sketch.as_ref().map_or(false, |s| s.draw.active());
 
         // ── intercept: the active draw tool consumes the line ──
@@ -1130,13 +1403,20 @@ impl Sandbox {
             self.sync_flat_prompt();
             return;
         }
-        // flat modifiers (2D transforms on the sketch) + erase
+        // flat modifiers (2D transforms) + editing tools (offset/trim/…) + erase
         match t.to_lowercase().as_str() {
             "move" | "m" => self.start_flat_mod(FlatOp::Move),
             "copy" | "co" | "cp" => self.start_flat_mod(FlatOp::Copy),
             "rotate" | "ro" => self.start_flat_mod(FlatOp::Rotate),
             "scale" | "sc" => self.start_flat_mod(FlatOp::Scale),
             "mirror" | "mi" => self.start_flat_mod(FlatOp::Mirror),
+            "offset" | "o" => self.start_flat_edit(FlatEdit::Offset { dist: None, obj: None }),
+            "trim" | "tr" => self.start_flat_edit(FlatEdit::Trim),
+            "extend" | "ex" => self.start_flat_edit(FlatEdit::Extend),
+            "fillet" | "f" => self.start_flat_edit(FlatEdit::Fillet { radius: None, first: None }),
+            "chamfer" | "cha" => self.start_flat_edit(FlatEdit::Chamfer { dist: None, first: None }),
+            "break" | "br" => self.start_flat_edit(FlatEdit::Break { obj: None, p1: None }),
+            "join" | "j" => self.flat_join(),
             "erase" | "e" | "delete" => self.flat_erase(),
             other => self.status = format!("unknown: {other}"),
         }
@@ -1494,6 +1774,48 @@ impl Sandbox {
     /// The command line — type a modifier verb (move/copy/rotate/scale/mirror/
     /// erase) + Enter; the live prompt echoes beside it. This is the primary
     /// trigger, identical to the app: run command → it asks for selection.
+    /// While a literal TEXT body / text height is being typed, SPACE must stay a
+    /// LITERAL space and never submit — else the first space in `"Hello world"` fires
+    /// the command line. Spec `COMMAND_LINE_RULES.md` §4.3; RUST_CAD gates the same way
+    /// on `TextDraftState::WaitingForString | text_waiting_height` (`app.rs:12707`).
+    ///
+    /// The sandbox has no text entry yet, so this is vacuously false. It exists as the
+    /// SINGLE hook to extend when the flat sketch gains TEXT — one place to change, and
+    /// nobody has to rediscover why `"Hello world"` broke.
+    fn in_text_body(&self) -> bool {
+        false
+    }
+
+    /// SPACE = ENTER — does this frame's input submit `buf`?
+    /// Spec `COMMAND_LINE_RULES.md` §4; mirrors RUST_CAD `app.rs:12703-12712`.
+    ///
+    /// * **Enter** fires on `has_focus` OR `lost_focus` (egui surrenders focus on Enter).
+    /// * **Space** fires ONLY when the box is FOCUSED — a canvas Space must never run a
+    ///   command — and never inside a text body (§4.3).
+    ///
+    /// egui has ALREADY inserted the space into `buf` by the time we read the key event,
+    /// so trailing spaces are stripped first: `"move "` → `"move"` (submits the command),
+    /// `" "` → `""` (empty ⇒ the caller routes to `confirm()`). Both halves of §4 run
+    /// through this ONE path, so a single space can never both submit a command and fire
+    /// the empty-confirm in the same frame (the double-fire RUST_CAD works around with
+    /// `if space_now { self.cmd.clear(); }` repeated at ~10 cascade arms).
+    ///
+    /// ⚠️ Consequence (§7): Space=Enter forecloses TYPED multi-token commands — after
+    /// this, `circle 3p` submits at `circle`. Reach the method via the verb→option flow
+    /// (`circle` ⏎ `3p`), which `Draw::option` already supports. Every 3D verb is
+    /// single-token, so the 3D line is unaffected.
+    fn cmd_submit(ui: &egui::Ui, r: &egui::Response, buf: &mut String, in_text_body: bool) -> bool {
+        let enter =
+            (r.lost_focus() || r.has_focus()) && ui.input(|i| i.key_pressed(egui::Key::Enter));
+        let space = r.has_focus()
+            && !in_text_body
+            && ui.input(|i| i.key_pressed(egui::Key::Space));
+        if space {
+            *buf = buf.trim_end_matches(' ').to_string();
+        }
+        enter || space
+    }
+
     fn cmd_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::bottom("cmdline")
             .frame(egui::Frame::none().fill(theme::SURFACE_2).inner_margin(8.0))
@@ -1503,12 +1825,13 @@ impl Sandbox {
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut self.cmd)
                             .desired_width(300.0)
-                            .hint_text("3D: move·copy·rotate·scale·mirror·erase  |  in a sketch: line·pline·circle 3p·arc·rect·x,y·C/U"),
+                            .hint_text("3D: move·copy·rotate·scale·mirror·erase  (Space or ⏎ submits)"),
                     );
-                    if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                    let itb = self.in_text_body();
+                    if Self::cmd_submit(ui, &r, &mut self.cmd, itb) {
                         let c = std::mem::take(&mut self.cmd);
-                        // Empty Enter in the box = confirm (finalise gather / end op),
-                        // so a focused command line never traps the selection step.
+                        // Empty Enter/Space in the box = confirm (finalise gather / end
+                        // op), so a focused command line never traps the selection step.
                         if c.trim().is_empty() {
                             self.confirm();
                         } else {
@@ -2076,6 +2399,42 @@ impl Sandbox {
                         self.flat_erase();
                     }
                 });
+                // EDIT tools (kernel-backed: offset/trim/extend/fillet/chamfer/break/join)
+                ui.horizontal_wrapped(|ui| {
+                    let active = self.flat_edit.is_some();
+                    let btn = |ui: &mut egui::Ui, on: bool, cap: &str| {
+                        ui.selectable_label(on, cap).clicked()
+                    };
+                    if btn(ui, false, "Offset") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Offset { dist: None, obj: None });
+                    }
+                    if btn(ui, false, "Trim") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Trim);
+                    }
+                    if btn(ui, false, "Extend") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Extend);
+                    }
+                    if btn(ui, false, "Fillet") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Fillet { radius: None, first: None });
+                    }
+                    if btn(ui, false, "Chamfer") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Chamfer { dist: None, first: None });
+                    }
+                    if btn(ui, false, "Break") {
+                        self.abort_2d();
+                        self.start_flat_edit(FlatEdit::Break { obj: None, p1: None });
+                    }
+                    if btn(ui, false, "Join") {
+                        self.abort_2d();
+                        self.flat_join();
+                    }
+                    let _ = active;
+                });
                 // Per-tool construction METHOD + polyline controls (the app's Circle
                 // 2P/3P/Ttr, Arc modes, pline Close/Undo — the "not limited" part).
                 let tool = self.sketch.as_ref().map(|s| s.draw.tool);
@@ -2171,9 +2530,14 @@ impl Sandbox {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut self.flat_cmd)
                                     .desired_width(f32::INFINITY)
-                                    .hint_text("pline ⏎ → 0,0 ⏎ 4,0 ⏎ 4,3 ⏎ C ⏎   ·   or circle 3p / arc sce / rect / x,y"),
+                                    .hint_text("pline ␣ 0,0 ␣ 4,0 ␣ 4,3 ␣ C   ·   circle ␣ 3p   ·   arc ␣ sce   ·   rect · x,y"),
                             );
-                            if r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                            // Space=Enter (§4). The method is a SEPARATE submission now
+                            // (`circle` ␣ `3p`) — `circle 3p` on one line submits at
+                            // `circle`, so the hint above teaches the verb→option flow
+                            // that `Draw::option` already supports (§7).
+                            let itb = self.in_text_body();
+                            if Self::cmd_submit(ui, &r, &mut self.flat_cmd, itb) {
                                 let c = std::mem::take(&mut self.flat_cmd);
                                 self.flat_command(&c);
                                 r.request_focus();
@@ -2188,9 +2552,9 @@ impl Sandbox {
                 let size = ui.available_size();
                 let (rect, resp) = ui.allocate_exact_size(size, egui::Sense::click_and_drag());
 
-                // A point-pick phase (drawing OR a flat modifier) is "click-only":
-                // press fires the pick, drag never pans. Only the bare pointer pans.
-                let point_pick = self.is_drawing() || self.flat_mod.is_some();
+                // A point-pick phase (drawing / flat modifier / flat edit) is
+                // "click-only": press fires the pick, drag never pans.
+                let point_pick = self.is_drawing() || self.flat_mod.is_some() || self.flat_edit.is_some();
 
                 // pan (middle drag always; left drag ONLY when not in a point-pick) + zoom
                 if resp.dragged_by(egui::PointerButton::Middle)
@@ -2230,6 +2594,13 @@ impl Sandbox {
                         if let Some(pos) = resp.interact_pointer_pos() {
                             let uv = snap_uv.unwrap_or_else(|| self.s2w_flat(pos, rect));
                             self.flat_mod_feed(uv);
+                        }
+                    }
+                } else if self.flat_edit.is_some() {
+                    if press_now {
+                        if let Some(pos) = resp.interact_pointer_pos() {
+                            let uv = snap_uv.unwrap_or_else(|| self.s2w_flat(pos, rect));
+                            self.flat_edit_pick(uv);
                         }
                     }
                 } else if resp.clicked() {

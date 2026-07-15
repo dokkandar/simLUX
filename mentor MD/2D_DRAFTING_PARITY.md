@@ -32,14 +32,14 @@ Canonical specs: `mentor MD/BASIC_MODIFIERS_RULES.md` (modifiers), `PLINE_GUIDE.
 | Rotate / Scale | `DObject::rotated` / `scaled` | ✅ done |
 | Mirror (keep original) | `DObject::mirrored` | ✅ done |
 | Erase | `Document` remove | ✅ done |
-| **Offset** | `Geom::offset(dist, side)` (`modify.rs:20`) | ⬜ NEXT — pick object + side/distance |
-| **Trim** | `Geom::trim_at` (`trim.rs:156`) + `split_at` | ⬜ NEXT — cutters + click piece |
-| **Extend** | `Geom::extend_to` (`trim.rs:448`) | ⬜ NEXT — boundary + click end |
-| **Fillet** | `fillet_geoms` (`fillet.rs:426`), `fillet_polyline_corner/all` | ⬜ NEXT — 2 picks + radius |
-| **Chamfer** | `chamfer_geoms` (`fillet.rs:466`) | ⬜ NEXT — 2 picks + dists |
-| **Join** | `join_geoms` (`join.rs:112`) | ⬜ TODO |
-| **Break** | `Geom::split_at` (`trim.rs:586`) | ⬜ TODO |
-| Array (rect/polar) | transforms in a loop | ⬜ TODO |
+| **Offset** | `Geom::offset(dist, side)` | ✅ done — `offset` → dist → pick obj → pick side |
+| **Trim** | `Geom::trim_at` | ✅ done — `trim` → click piece (all others = cutters), repeats |
+| **Extend** | `Geom::extend_to` | ✅ done — `extend` → click end (all others = boundaries) |
+| **Fillet** | `fillet_geoms` | ✅ done — `fillet` → radius → pick 2 objects |
+| **Chamfer** | `chamfer_geoms` | ✅ done — `chamfer` → dist → pick 2 objects |
+| **Join** | `join_geoms` | ✅ done — select 2+ → `join` |
+| **Break** | `Geom::split_at` | ✅ done — `break` → pick obj → 2 points |
+| Array (rect/polar) | transforms in a loop | ⬜ TODO (needs count/spacing UI) |
 
 ## SNAP / INPUT  (precision)
 | Feature | Kernel | Status |
