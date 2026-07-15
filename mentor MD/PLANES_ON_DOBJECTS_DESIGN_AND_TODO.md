@@ -12,7 +12,7 @@ our in-file datastructure … make a comprehensive todo list"* + 3 UI asks (§6)
 |---|---|
 | Is "plane on the dobject" the right call? | **Yes — and it is FORCED, not a preference.** `Geom` is `Vec2`. A dobject on a tilted plane *cannot* store world coords. §1 |
 | Does it conflict with existing plans? | **Yes — head-on with `UCS_Roadmap.md`**, which says UCS is "not 3D" and "not per-dobject". That spec assumed a 2D-only project. §2 |
-| What shape? | **Mirror the LAYER pattern exactly**: `Document.planes: PlaneTable` + `DObject.plane: PlaneId`, id 0 = World. §3 |
+| What shape? | **Mirror the LAYER pattern**: `Document.planes` + `DObject.plane: PlaneId`. A plane = **ID + 3 GLOBAL points** (owner's refinement) — the identifier anchors it in world space; the frame is derived, never stored. **Plane 0 = STANDARD, fixed, never rotated** ⇒ 2D is byte-identical to today. §3.0 |
 | On-disk? | **RSM v7 → v8**: a `planes` table + a per-dobject id. `#[serde(default)]` ⇒ v7 files still load. §4 |
 | Bonus | It **deletes the doc-swap** and the entire crash class we just fixed. §5 |
 | Cost | **None to the kernel — use the SIDECAR** (decision D5, the pattern simLUX already uses for all of SIMLUX). Promote to kernel fields later only if cross-plane ops need it. §8.1a/b |
@@ -101,27 +101,73 @@ The kernel already has this exact shape and the app already has the machinery. *
 | lock / freeze / visible | **other planes = reference (greyed, snappable, not editable)** — identical semantics to a locked layer |
 | serialised as a table in RSM | same |
 
+### 3.0 The plane record = **ID + 3 global points** (owner's refinement, 2026-07-15)
+
+> *"each plane will have an ID and 3 points from global as identifier … if it is standard 2D
+> drafting, the plane id is 0 and identifier is standard for this."*
+
+**Adopted.** A plane is identified by **3 world points** — not by stored `u`/`v` vectors. The 3
+points are the *authoritative, serialized* form; the orthonormal frame is **derived**.
+
 ```rust
-// cad_kernel::plane (new)
-pub struct PlaneId(pub u16);                 // 0 = World XY, always present
+pub struct PlaneId(pub u16);                 // 0 = STANDARD (world XY), always present
 
 pub struct DPlane {
-    pub id:     PlaneId,
-    pub name:   String,      // "Top of box", "Wall A"
-    pub origin: [f32; 3],    // world
-    pub u:      [f32; 3],    // unit, in-plane +U
-    pub v:      [f32; 3],    // unit, in-plane +V  (normal = u × v)
-    pub color:  u8,          // ACI — for the plane list + 3D outline
+    pub id:   PlaneId,
+    pub name: String,        // "Top of box", "Wall A"
+    /// The IDENTIFIER: 3 non-collinear GLOBAL points that anchor this plane in world space.
+    /// p[0] = origin · p[1] = a point on +U · p[2] = a point on the +V side.
+    pub p: [[f64; 3]; 3],
+    pub color: u8,           // ACI — plane list + 3D outline
 }
 
-pub struct PlaneTable { planes: Vec<DPlane> }   // planes[0] == World XY
+pub struct PlaneTable { planes: Vec<DPlane> }   // planes[0] == STANDARD
 
 // cad_kernel::Document
 pub planes: PlaneTable,
-
 // cad_kernel::DObject
-pub plane: PlaneId,          // #[serde(default)] → 0 = World
+pub plane: PlaneId,          // #[serde(default)] → 0 = STANDARD
 ```
+
+**Plane 0 is fixed and standard — it is never rotated:**
+```
+p = [ (0,0,0), (1,0,0), (0,1,0) ]   ⇒  u = (1,0,0)   v = (0,1,0)   n = (0,0,1)
+```
+i.e. **exactly the world axes**. That is what makes §1.1 true: for plane 0, `(u,v) ≡ world (x,y)`,
+so **standard 2D drafting is byte-identical to today**. Plane 0's identifier is a **constant**;
+it is not user-editable and not derived from anything.
+
+**Why 3 points beat storing `u`/`v` (same 9 floats either way):**
+- **Illegal states become unrepresentable.** A stored `u`/`v` pair can drift non-orthonormal or be
+  corrupted → geometry silently **skews**. 3 points always re-derive a clean orthonormal frame —
+  a skewed frame cannot be expressed.
+- **It matches how a plane is created** (3 picks) *and* the existing `UCS_Roadmap.md` flow:
+  *"click ORIGIN → click point on +X axis → click point on +Y axis … the system locks Y = +90°
+  from X to stay orthogonal"* — that "lock" **is** the Gram-Schmidt below. Same convention, already
+  the project's.
+- **Globally anchored provenance**, which is the owner's point: the plane's identity is 3 world
+  coordinates, so a dobject's `(u,v)` can always be resolved back to world — nothing is "lost in
+  the global system".
+
+**Derivation (fix this convention once — planes 1..N depend on it):**
+```
+u = normalize(p1 - p0)
+w = p2 - p0
+v = normalize(w - u * dot(w, u))        // Gram-Schmidt = "lock V +90° from U"
+n = u × v
+reject if |u| ≈ 0, |v| ≈ 0  (collinear ⇒ degenerate, not a plane)
+```
+⚠️ **The point ROLES are load-bearing** — `p1` is the +U point, `p2` only picks the +V *side*.
+Swapping p1/p2 rotates that plane's frame. Verified numerically: with p1=(1,0,0), p2=(0,1,0) *or*
+p2=(1,1,0), the frame is identically `u=(1,0,0), v=(0,1,0)` (Gram-Schmidt absorbs the non-
+perpendicular p2) — but feeding `(1,1,0)` as **p1** yields a 45°-rotated frame. So: document the
+roles at the field, and **validate on load**.
+
+**Derive ONCE, never per-dobject.** The 3 points are the on-disk truth; cache the derived `Frame`
+(`origin,u,v`) in the `PlaneTable` when it loads or changes. Re-deriving per dobject per frame
+(normalize + dot + cross) would be exactly the overhead §9 exists to avoid. Plane count is tiny and
+changes rarely, so this cache is cheap and — unlike the doc-keyed caches of §9.5 — is keyed to the
+plane table, not to `doc.dobjects`.
 
 **Why `DObject.plane` and not `DObject.style.plane`:** `Style` is presentation (colour, linetype,
 visible). A plane changes what the coordinates **mean** — that is geometry, not style. Keep it a
@@ -154,8 +200,10 @@ Today: `cad_io/src/rsm.rs` → `const VERSION: u16 = 7`.
 ```
 RSM v8 adds:
   TABLE  planes:
-      id, name, origin[3], u[3], v[3], color
-      (id 0 = World XY — written explicitly so the file is self-describing)
+      id, name, p[3][3] (the 3 GLOBAL identifier points), color
+      (id 0 = STANDARD, written explicitly as [(0,0,0),(1,0,0),(0,1,0)] so the
+       file is self-describing; u/v are DERIVED on load, never stored — a stored
+       u/v could arrive non-orthonormal and silently skew geometry)
   DOBJECT record gains:
       plane: u16          #[serde(default)] → 0
 ```
