@@ -3181,6 +3181,59 @@ impl CadApp {
     /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
     /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
     /// be added BEFORE the CentralPanel so it reserves the right edge.
+    /// Enter a sketch on `frame`: create the sketch and **swap the app's active document
+    /// to it**. From this moment every 2D tool — draw, fillet (R/T/M/P), trim, extend,
+    /// offset, chamfer, break, the command line, snaps, layers — operates ON THE PLANE,
+    /// complete and unchanged, because they all only know `self.doc`. Nothing is
+    /// reimplemented. This is the point of 3D_Factory.
+    ///
+    /// `undo_stack`/`redo_stack` are `Vec<Document>` snapshots, so they are parked with
+    /// the model-space doc and the sketch starts with a clean undo history — otherwise an
+    /// undo in the sketch would restore a model-space document over it.
+    fn factory_enter_sketch(&mut self, frame: cad_solid::Frame) {
+        if self.factory.session.is_some() {
+            self.factory_exit_sketch();
+        }
+        self.factory.model.sketches.push(cad_solid::Sketch::new(frame));
+        let idx = self.factory.model.sketches.len() - 1;
+
+        let sketch_doc = std::mem::take(&mut self.factory.model.sketches[idx].doc);
+        let saved_doc = std::mem::replace(&mut self.doc, sketch_doc);
+        let saved_undo = std::mem::take(&mut self.undo_stack);
+        let saved_redo = std::mem::take(&mut self.redo_stack);
+        self.factory.session = Some(crate::factory::SketchSession {
+            idx,
+            saved_doc,
+            saved_undo,
+            saved_redo,
+        });
+        // land in a clean drafting state on the new plane
+        self.selection.clear();
+        self.tool = Tool::None;
+        self.zoom_extents();
+        self.set_prompt(
+            "3D Factory — drafting on the picked plane. FULL 2D toolset (try: f → r → 10). \
+             Finish in the 3D Factory panel.",
+        );
+    }
+
+    /// Close the sketch: put the drawn document back into the model and restore the
+    /// model-space document + its undo history.
+    fn factory_exit_sketch(&mut self) {
+        if let Some(s) = self.factory.session.take() {
+            let sketch_doc = std::mem::replace(&mut self.doc, s.saved_doc);
+            if let Some(sk) = self.factory.model.sketches.get_mut(s.idx) {
+                sk.doc = sketch_doc;
+            }
+            self.undo_stack = s.saved_undo;
+            self.redo_stack = s.saved_redo;
+            self.selection.clear();
+            self.tool = Tool::None;
+            self.clear_prompt();
+            self.zoom_extents();
+        }
+    }
+
     /// 3D FACTORY viewport — the sandbox's 3D view, now a panel in the real app.
     /// Reuses `light3d::{mvp, Scene3dRenderer}` (the sandbox had duplicated both) and
     /// renders a `cad_solid::Model`. Docked right, mirroring the SIMLUX 3D panel.
@@ -3210,6 +3263,35 @@ impl CadApp {
                     });
                 });
                 ui.separator();
+                // SKETCH BANNER — while a sketch is open the app's whole 2D canvas IS
+                // this plane, so say so loudly and give a way out.
+                if self.factory.session.is_some() {
+                    egui::Frame::none()
+                        .fill(egui::Color32::from_rgb(52, 38, 12))
+                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(255, 158, 30)))
+                        .inner_margin(egui::Margin::symmetric(8.0, 5.0))
+                        .rounding(4.0)
+                        .show(ui, |ui| {
+                            ui.horizontal(|ui| {
+                                ui.label(
+                                    egui::RichText::new("✎ drafting on plane")
+                                        .color(egui::Color32::from_rgb(255, 178, 60))
+                                        .strong(),
+                                );
+                                if ui.button("✔ Finish sketch").clicked() {
+                                    self.factory_exit_sketch();
+                                }
+                            });
+                            ui.label(
+                                egui::RichText::new(
+                                    "the 2D canvas is this plane — full toolset (try: f → r → 10)",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        });
+                    ui.separator();
+                }
                 ui.horizontal(|ui| {
                     if ui.button("⬛ Box").clicked() {
                         self.factory.add_box();
@@ -3282,14 +3364,68 @@ impl CadApp {
                     self.factory.cam_target,
                     aspect,
                 );
-                let verts = self.factory.scene_verts();
-                let lines = self.factory.overlay_lines();
+                // ---- RIGHT-CLICK → pick a face → sketch on it ----------------
+                // The face under the cursor becomes a `Frame`; the context menu then
+                // hands that plane to the app's real 2D drafting.
+                if resp.secondary_clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        self.factory.pending_face = self.factory.pick_face(pos, rect, &mvp);
+                    }
+                }
+                let pending = self.factory.pending_face;
+                let sketching = self.factory.session.is_some();
+                let mut want_sketch: Option<cad_solid::Frame> = None;
+                let mut want_finish = false;
+                resp.context_menu(|ui| {
+                    ui.set_min_width(210.0);
+                    if sketching {
+                        if ui.button("✔  Finish sketch").clicked() {
+                            want_finish = true;
+                            ui.close_menu();
+                        }
+                        return;
+                    }
+                    match pending {
+                        Some(f) => {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "face @ ({:.2}, {:.2}, {:.2})",
+                                    f.origin.x, f.origin.y, f.origin.z
+                                ))
+                                .small()
+                                .weak(),
+                            );
+                            if ui
+                                .button("✎  Draw on this face")
+                                .on_hover_text("Sketch here with the FULL 2D toolset")
+                                .clicked()
+                            {
+                                want_sketch = Some(f);
+                                ui.close_menu();
+                            }
+                        }
+                        None => {
+                            ui.label(
+                                egui::RichText::new("no face under the cursor").small().weak(),
+                            );
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("▦  Draw on ground plane").clicked() {
+                        want_sketch = Some(crate::factory::FactoryState::ground_frame());
+                        ui.close_menu();
+                    }
+                });
 
-                if verts.is_empty() {
+                let verts = self.factory.scene_verts();
+                let mut lines = self.factory.overlay_lines();
+                lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
+
+                if verts.is_empty() && lines.is_empty() {
                     painter.text(
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
-                        "Add a Box or Cylinder to start",
+                        "Add a Box or Cylinder — then right-click a face to draw on it",
                         egui::FontId::proportional(13.0),
                         egui::Color32::from_gray(150),
                     );
@@ -3315,6 +3451,13 @@ impl CadApp {
                     || (resp.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0))
                 {
                     ui.ctx().request_repaint();
+                }
+                // applied outside the context-menu closure (it can't borrow self mutably)
+                if let Some(f) = want_sketch {
+                    self.factory_enter_sketch(f);
+                }
+                if want_finish {
+                    self.factory_exit_sketch();
                 }
             });
         self.factory.open = open;

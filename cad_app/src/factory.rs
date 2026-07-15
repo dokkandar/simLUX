@@ -8,10 +8,29 @@
 //! The app already has all of those. We reuse [`crate::light3d`]'s `Scene3dRenderer` + `mvp`
 //! (the sandbox had duplicated both) and drive them with a `cad_solid::Model`.
 
-use cad_solid::{BoolOp, Model, Placement, Plane, Primitive, SolidMesh};
-use glam::Vec3;
+use cad_solid::{BoolOp, Frame, Model, Placement, Plane, Primitive, SolidMesh};
+use glam::{Mat4, Vec2, Vec3};
 
 use crate::light3d::V3;
+
+/// An open sketch-on-plane session.
+///
+/// **The core trick of 3D_Factory:** while this is live, the app's active `doc` IS the
+/// sketch's `Document`. Every 2D tool in `cad_app` only ever knows `self.doc` — so draw,
+/// fillet (with its R/T/M/P options), trim, extend, offset, chamfer, break, the command
+/// line, snaps and layers ALL operate on the plane, **unchanged and complete**, with
+/// nothing reimplemented. That is the whole thesis of this fork.
+///
+/// `undo_stack`/`redo_stack` are `Vec<Document>` (full snapshots), so they must be parked
+/// alongside the model-space doc — otherwise an undo inside the sketch would restore a
+/// model-space document over the sketch. The sketch gets a fresh, empty undo history.
+pub struct SketchSession {
+    /// Index into `Model::sketches`.
+    pub idx: usize,
+    pub saved_doc: cad_kernel::Document,
+    pub saved_undo: Vec<cad_kernel::Document>,
+    pub saved_redo: Vec<cad_kernel::Document>,
+}
 
 /// Fixed key light, matching `light3d`'s shading so the two 3D views look alike.
 fn shade(base: [f32; 3], n: Vec3) -> [f32; 3] {
@@ -72,6 +91,11 @@ pub struct FactoryState {
     pub cam_dist: f32,
     pub cam_target: [f32; 3],
 
+    /// Live sketch-on-plane session (the app's `doc` is swapped while `Some`).
+    pub session: Option<SketchSession>,
+    /// Face picked by the last right-click — what the context menu acts on.
+    pub pending_face: Option<Frame>,
+
     /// Boolean op applied when the NEXT primitive is added.
     pub next_op: BoolOp,
     pub box_w: f32,
@@ -94,6 +118,8 @@ impl Default for FactoryState {
             cam_pitch: 0.5,
             cam_dist: 12.0,
             cam_target: [0.0, 0.0, 0.0],
+            session: None,
+            pending_face: None,
             next_op: BoolOp::Union,
             box_w: 2.0,
             box_d: 2.0,
@@ -185,6 +211,69 @@ impl FactoryState {
             if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
                 let (mn, mx) = f.world_aabb();
                 aabb_lines(&mut out, mn, mx, [0.0, 0.9, 1.0]);
+            }
+        }
+        out
+    }
+
+    /// Screen cursor → world ray (origin, unit dir), by inverting the MVP.
+    fn ray(cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> (Vec3, Vec3) {
+        let ndc_x = 2.0 * (cursor.x - rect.left()) / rect.width().max(1.0) - 1.0;
+        let ndc_y = 1.0 - 2.0 * (cursor.y - rect.top()) / rect.height().max(1.0);
+        let inv = Mat4::from_cols_array(mvp).inverse();
+        let near = inv.project_point3(Vec3::new(ndc_x, ndc_y, -1.0));
+        let far = inv.project_point3(Vec3::new(ndc_x, ndc_y, 1.0));
+        (near, (far - near).normalize_or_zero())
+    }
+
+    /// Ray-pick the front-most solid FACE under `cursor` and return a sketch [`Frame`]
+    /// sitting on it — the basis for sketch-on-face. `None` if the ray misses.
+    pub fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Frame> {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let mut best: Option<(f32, Vec3, Vec3)> = None;
+        for tri in self.cached.positions.chunks_exact(3) {
+            let (a, b, c) = (Vec3::from(tri[0]), Vec3::from(tri[1]), Vec3::from(tri[2]));
+            if let Some(t) = cad_solid::ray_triangle(orig, dir, a, b, c) {
+                if best.map_or(true, |(bt, _, _)| t < bt) {
+                    let n = (b - a).cross(c - a).normalize_or_zero();
+                    best = Some((t, orig + dir * t, n));
+                }
+            }
+        }
+        best.map(|(_, p, n)| Frame::from_point_normal(p, n))
+    }
+
+    /// The ground (XY) plane at the origin — the fallback sketch surface when the
+    /// right-click misses a solid, so you can always start drawing.
+    pub fn ground_frame() -> Frame {
+        Frame::from_point_normal(Vec3::ZERO, Vec3::Z)
+    }
+
+    /// Every sketch's geometry, lifted from its frame's `(u,v)` back into world space,
+    /// as GL_LINES. This is what makes 2D work drawn on a plane visible in 3D.
+    pub fn sketch_lines(&self) -> Vec<V3> {
+        let mut out = Vec::new();
+        for (i, sk) in self.model.sketches.iter().enumerate() {
+            // the sketch being edited right now is drawn hot, the others cool
+            let active = self.session.as_ref().is_some_and(|s| s.idx == i);
+            let c = if active { [1.0, 0.62, 0.12] } else { [0.55, 0.62, 0.72] };
+            for d in &sk.doc.dobjects {
+                for poly in cad_solid::geom_outlines(&d.geom) {
+                    for w in poly.windows(2) {
+                        seg(
+                            &mut out,
+                            sk.frame.from_uv(Vec2::new(w[0].x, w[0].y)),
+                            sk.frame.from_uv(Vec2::new(w[1].x, w[1].y)),
+                            c,
+                        );
+                    }
+                }
+            }
+            // frame axes, so an empty sketch plane is still visible
+            if active {
+                let o = sk.frame.origin;
+                seg(&mut out, o, o + sk.frame.u * 1.5, [1.0, 0.3, 0.3]);
+                seg(&mut out, o, o + sk.frame.v * 1.5, [0.3, 1.0, 0.3]);
             }
         }
         out
