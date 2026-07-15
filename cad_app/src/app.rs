@@ -3181,6 +3181,74 @@ impl CadApp {
     /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
     /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
     /// be added BEFORE the CentralPanel so it reserves the right edge.
+    /// Reset every piece of **doc-relative** interactive state.
+    ///
+    /// Swapping `self.doc` (enter/leave a sketch) instantly invalidates anything holding
+    /// an INDEX into the old document — `selection`, `pre_op_selection`, `selection_prev`,
+    /// a half-finished fillet's first pick, a trim basket, a grip drag. The app has ~20
+    /// unguarded `self.doc.dobjects[i]` sites, so a stale index is a **panic**, not a
+    /// glitch. That was the "Draw on this face" crash: the swap left the seeded drawing's
+    /// selection pointing into a document that was no longer there.
+    ///
+    /// The app has no File>New reset to reuse, so this is the single place that knows the
+    /// full list. **If you add a `*_state` field to `CadApp`, add it here too.**
+    fn factory_reset_doc_state(&mut self) {
+        // --- baskets / caches holding dobject INDICES ---
+        // This list is the EXHAUSTIVE set of `Option<usize>` / `Vec<usize>` fields on
+        // CadApp that index `doc.dobjects`. `selected` is the easy one to miss: it is
+        // chained with `selection` when drawing (`selection.iter().chain(self.selected)`),
+        // so a stale `selected` panics the canvas on its own.
+        self.selection.clear();
+        self.selection_prev.clear();
+        self.pre_op_selection.clear();
+        self.aci_pick_many.clear();
+        self.selected = None;
+        self.hatch_last_idx = None;
+        self.grip_drag = None;
+        // command-internal-undo baselines (depth/count, not indices — but they describe
+        // the parked document, so they are meaningless against the new one)
+        self.cmd_undo_base = None;
+        self.cmd_base_objs = None;
+        // recorder press-state (holds a hit index + a selection snapshot)
+        self.dbg_press_hit = None;
+        self.dbg_press_sel.clear();
+        // --- in-progress draw buffers ---
+        self.tool = Tool::None;
+        self.pending.clear();
+        self.pending_bulges.clear();
+        self.pending_widths.clear();
+        // --- selection session ---
+        self.select_mode = SelectMode::Off;
+        self.select_remove_mode = false;
+        // --- every modify / inquiry state machine ---
+        self.move_state = MoveState::Off;
+        self.copy_state = CopyState::Off;
+        self.rotate_state = RotateState::Off;
+        self.scale_state = ScaleState::Off;
+        self.mirror_state = MirrorState::Off;
+        self.matchprops_state = MatchPropsState::Off;
+        self.paste_state = PasteState::Off;
+        self.pedit_state = PeditState::Off;
+        self.offset_state = OffsetState::Off;
+        self.dist_state = DistState::Off;
+        self.lengthen_state = LengthenState::Off;
+        self.break_state = BreakState::Off;
+        self.align_state = AlignState::Off;
+        self.stretch_state = StretchState::Off;
+        self.fillet_state = FilletState::Off;
+        self.chamfer_state = ChamferState::Off;
+        self.trim_state = TrimState::Off;
+        self.extend_state = ExtendState::Off;
+        self.insert_state = InsertState::Off;
+        self.block_def_state = BlockDefState::Off;
+        // --- drafts + flows ---
+        self.text_draft = TextDraftState::Off;
+        self.dim_draft = DimDraftState::Off;
+        self.cmd_flow = None;
+        self.zoom_state = ZoomState::Off;
+        self.var_set_pending = None;
+    }
+
     /// Enter a sketch on `frame`: create the sketch and **swap the app's active document
     /// to it**. From this moment every 2D tool — draw, fillet (R/T/M/P), trim, extend,
     /// offset, chamfer, break, the command line, snaps, layers — operates ON THE PLANE,
@@ -3207,9 +3275,10 @@ impl CadApp {
             saved_undo,
             saved_redo,
         });
-        // land in a clean drafting state on the new plane
-        self.selection.clear();
-        self.tool = Tool::None;
+        // land in a clean drafting state on the new plane. MUST run after the swap:
+        // every index-holding field still points into the model-space doc we just
+        // parked, and the app panics on a stale `doc.dobjects[i]`.
+        self.factory_reset_doc_state();
         self.zoom_extents();
         self.set_prompt(
             "3D Factory — drafting on the picked plane. FULL 2D toolset (try: f → r → 10). \
@@ -3227,8 +3296,9 @@ impl CadApp {
             }
             self.undo_stack = s.saved_undo;
             self.redo_stack = s.saved_redo;
-            self.selection.clear();
-            self.tool = Tool::None;
+            // same hazard in reverse: sketch-relative indices must not survive into
+            // the model-space document.
+            self.factory_reset_doc_state();
             self.clear_prompt();
             self.zoom_extents();
         }
@@ -32199,4 +32269,121 @@ impl CadApp {
         }).collect()
     }
 
+}
+
+#[cfg(test)]
+mod factory_sketch_tests {
+    use super::*;
+
+    /// Regression: entering a sketch swaps `self.doc` to the sketch's Document.
+    /// Anything still holding indices into the OLD doc goes stale — this test drives
+    /// the real path headlessly so a panic shows up in CI, not in the user's hands.
+    #[test]
+    fn enter_sketch_on_ground_plane_does_not_panic() {
+        let mut app = CadApp::default();
+        app.factory.add_box();
+        app.factory.recompute();
+        let f = crate::factory::FactoryState::ground_frame();
+        app.factory_enter_sketch(f);
+        assert!(app.factory.session.is_some(), "session opened");
+        assert!(app.doc.dobjects.is_empty(), "the sketch doc is the active doc");
+    }
+
+    /// Enter → draw something → exit must put the geometry back in the sketch and
+    /// restore the model-space doc.
+    #[test]
+    fn enter_draw_exit_round_trips_the_document() {
+        let mut app = CadApp::default();
+        // CadApp::default() SEEDS a drawing, so count from whatever it starts with.
+        let before = app.doc.dobjects.len();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+        let f = crate::factory::FactoryState::ground_frame();
+        app.factory_enter_sketch(f);
+        assert!(app.doc.dobjects.is_empty(), "sketch starts empty");
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(5.0, 5.0),
+        })));
+        app.factory_exit_sketch();
+        assert_eq!(app.doc.dobjects.len(), before + 1, "model-space doc restored intact");
+        assert_eq!(app.factory.model.sketches[0].doc.dobjects.len(), 1, "sketch kept its geometry");
+    }
+
+    /// A stale selection index from model space must not survive into the sketch.
+    #[test]
+    fn stale_selection_is_cleared_on_enter() {
+        let mut app = CadApp::default();
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+        app.selection = vec![0];
+        app.pre_op_selection = vec![0];
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        assert!(app.selection.is_empty(), "selection cleared");
+        assert!(app.pre_op_selection.is_empty(), "pre_op_selection must not strand an index");
+        assert!(app.selection_prev.is_empty(), "selection_prev must not strand an index");
+        assert!(app.selected.is_none(), "`selected` must not strand an index");
+    }
+
+    /// The ACTUAL crash repro: entering a sketch swaps the doc, then the app RENDERS.
+    /// A stale index surviving into that render is what killed "Draw on this face".
+    /// Drives a real egui frame headlessly (the PaintCallback is only queued, so no GL
+    /// context is needed).
+    #[test]
+    fn render_after_enter_sketch_does_not_panic() {
+        let mut app = CadApp::default();
+        app.factory.open = true;
+        app.factory.add_box();
+        app.factory.recompute();
+        // stale model-space indices, exactly as a real session would have
+        app.selection = vec![0];
+        app.pre_op_selection = vec![0];
+        app.selection_prev = vec![0];
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+
+        let ctx = egui::Context::default();
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input, |ctx| {
+            app.render_factory_panel(ctx);
+        });
+    }
+
+    /// The reset must leave NO index-holding field populated — that is the invariant
+    /// that makes a doc swap safe.
+    #[test]
+    fn reset_leaves_no_stale_indices() {
+        let mut app = CadApp::default();
+        app.selection = vec![0];
+        app.pre_op_selection = vec![0];
+        app.selection_prev = vec![0];
+        app.aci_pick_many = vec![0];
+        app.hatch_last_idx = Some(0);
+        app.selected = Some(0);
+        app.dbg_press_hit = Some(0);
+        app.dbg_press_sel = vec![0];
+        app.pending = vec![Vec2::new(1.0, 1.0)];
+        app.factory_reset_doc_state();
+        assert!(app.selection.is_empty());
+        assert!(app.pre_op_selection.is_empty());
+        assert!(app.selection_prev.is_empty());
+        assert!(app.aci_pick_many.is_empty());
+        assert!(app.hatch_last_idx.is_none());
+        assert!(app.selected.is_none(), "`selected` is chained with `selection` when drawing");
+        assert!(app.dbg_press_hit.is_none());
+        assert!(app.dbg_press_sel.is_empty());
+        assert!(app.pending.is_empty());
+        assert_eq!(app.select_mode, SelectMode::Off);
+        assert_eq!(app.fillet_state, FilletState::Off);
+        assert!(matches!(app.trim_state, TrimState::Off)); // TrimState is not PartialEq
+    }
 }
