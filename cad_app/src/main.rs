@@ -3,6 +3,7 @@ mod app;
 mod command;
 mod dbg_recorder;
 mod dock;
+mod factory;   // 3D Factory — cad_solid wired into the app
 mod gpu;
 mod hatch_trace;
 mod light;

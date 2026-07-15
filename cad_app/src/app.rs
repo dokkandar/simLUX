@@ -1361,6 +1361,8 @@ pub struct CadApp {
     /// SIMLUX 3D viewport renderer (offscreen-FBO glow), shared into the egui
     /// PaintCallback like `gpu_renderer`.
     light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
+    /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
+    factory: crate::factory::FactoryState,
     gpu_dirty:    bool,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
@@ -2884,6 +2886,7 @@ impl Default for CadApp {
             gpu_renderer: StdArc::new(Mutex::new(GpuShapeRenderer::default())),
             light:               crate::light::LightState::new(),
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
+            factory:             crate::factory::FactoryState::default(),
             gpu_dirty:    true,
             layer_panel_open:   true,
             layer_rename:       None,
@@ -3178,6 +3181,145 @@ impl CadApp {
     /// SIMLUX 3D viewport — a docked right panel that renders the extruded room
     /// via the offscreen-FBO glow renderer. Drag to orbit, scroll to zoom. Must
     /// be added BEFORE the CentralPanel so it reserves the right edge.
+    /// 3D FACTORY viewport — the sandbox's 3D view, now a panel in the real app.
+    /// Reuses `light3d::{mvp, Scene3dRenderer}` (the sandbox had duplicated both) and
+    /// renders a `cad_solid::Model`. Docked right, mirroring the SIMLUX 3D panel.
+    fn render_factory_panel(&mut self, ctx: &egui::Context) {
+        if !self.factory.open {
+            return;
+        }
+        // csgrs is expensive — only re-evaluate when idle, never mid-drag.
+        if self.factory.dirty && !ctx.is_using_pointer() {
+            self.factory.recompute();
+        }
+        let mut open = self.factory.open;
+        egui::SidePanel::right("factory_3d_panel")
+            .min_width(240.0)
+            .resizable(true)
+            .default_width(420.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.strong("3D Factory");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("✕").on_hover_text("Close 3D Factory view").clicked() {
+                            open = false;
+                        }
+                        ui.label(
+                            egui::RichText::new("drag: orbit · scroll: zoom").small().weak(),
+                        );
+                    });
+                });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("⬛ Box").clicked() {
+                        self.factory.add_box();
+                    }
+                    if ui.button("⬤ Cylinder").clicked() {
+                        self.factory.add_cylinder();
+                    }
+                    ui.separator();
+                    if ui.button("⌖ Frame").clicked() {
+                        if self.factory.dirty {
+                            self.factory.recompute();
+                        }
+                        self.factory.fit();
+                    }
+                    if ui.button("🗑 Clear").clicked() {
+                        self.factory.clear();
+                    }
+                });
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("next op:").small().weak());
+                    for (op, name) in [
+                        (cad_solid::BoolOp::Union, "Union"),
+                        (cad_solid::BoolOp::Difference, "Difference"),
+                        (cad_solid::BoolOp::Intersection, "Intersect"),
+                    ] {
+                        if ui
+                            .selectable_label(self.factory.next_op == op, name)
+                            .clicked()
+                        {
+                            self.factory.next_op = op;
+                        }
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} feature(s) · {} tris",
+                        self.factory.feature_count(),
+                        self.factory.tri_count()
+                    ))
+                    .small()
+                    .weak(),
+                );
+                ui.separator();
+
+                let size = ui.available_size();
+                let (rect, resp) =
+                    ui.allocate_exact_size(size, egui::Sense::click_and_drag());
+                let painter = ui.painter_at(rect);
+
+                // ---- orbit + zoom (same feel as the SIMLUX 3D view) ----------
+                if resp.dragged() {
+                    let d = resp.drag_delta();
+                    self.factory.cam_yaw -= d.x * 0.01;
+                    self.factory.cam_pitch =
+                        (self.factory.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
+                }
+                if resp.hovered() {
+                    let scroll = ui.input(|i| i.smooth_scroll_delta.y);
+                    if scroll.abs() > 0.0 {
+                        self.factory.cam_dist =
+                            (self.factory.cam_dist * (1.0 - scroll * 0.0015)).clamp(0.4, 400.0);
+                    }
+                }
+
+                let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.0 };
+                let mvp = crate::light3d::mvp(
+                    self.factory.cam_yaw,
+                    self.factory.cam_pitch,
+                    self.factory.cam_dist,
+                    self.factory.cam_target,
+                    aspect,
+                );
+                let verts = self.factory.scene_verts();
+                let lines = self.factory.overlay_lines();
+
+                if verts.is_empty() {
+                    painter.text(
+                        rect.center(),
+                        egui::Align2::CENTER_CENTER,
+                        "Add a Box or Cylinder to start",
+                        egui::FontId::proportional(13.0),
+                        egui::Color32::from_gray(150),
+                    );
+                } else {
+                    let renderer = self.light3d_renderer.clone();
+                    painter.add(egui::Shape::Callback(egui::PaintCallback {
+                        rect,
+                        callback: StdArc::new(egui_glow::CallbackFn::new(move |info, gp| {
+                            let gl = gp.gl();
+                            let vp = info.viewport_in_pixels();
+                            let s = info.screen_size_px;
+                            if let Ok(mut r) = renderer.lock() {
+                                r.render(
+                                    gl, &verts, &lines, &mvp,
+                                    vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
+                                    s[0] as i32, s[1] as i32,
+                                );
+                            }
+                        })),
+                    }));
+                }
+                if resp.dragged()
+                    || (resp.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0))
+                {
+                    ui.ctx().request_repaint();
+                }
+            });
+        self.factory.open = open;
+    }
+
     fn render_light_3d_panel(&mut self, ctx: &egui::Context) {
         // SIMLUX workspace mode force-shows this as the right HALF of the window
         // and keeps it in sync with the 2D drawing; else it's the toggled panel.
@@ -3269,7 +3411,7 @@ impl CadApp {
                             let s = info.screen_size_px;
                             if let Ok(mut r) = renderer.lock() {
                                 r.render(
-                                    gl, &verts, &mvp,
+                                    gl, &verts, &[], &mvp,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -23298,6 +23440,68 @@ impl eframe::App for CadApp {
                 // yet → both reserve the empty 20px slot (§1).
                 // SIMLUX — independent lighting (lux) section. Plain egui widgets
                 // inside the custom dropdown chrome; opens the grafted Light panels.
+                // ---- 3D FACTORY -------------------------------------------
+                // The cad_solid 3D solid layer, wired into the real app. Sits between
+                // Tools and SIMLUX. Everything here drives `self.factory`
+                // (crate::factory::FactoryState) and reuses light3d's renderer.
+                custom_menu(ui, "3D Factory", |ui| {
+                    ui.set_min_width(248.0);
+                    ui.add_space(4.0);
+                    if ui
+                        .checkbox(&mut self.factory.open, "  ◧  3D Factory view")
+                        .on_hover_text("Parametric CSG solids (csgrs) — docked right")
+                        .changed()
+                        && self.factory.open
+                        && self.factory.dirty
+                    {
+                        self.factory.recompute();
+                    }
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("  Add solid")
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 165, 185)),
+                    );
+                    if ui.button("  ⬛  Box").clicked() {
+                        self.factory.open = true;
+                        self.factory.add_box();
+                        ui.close_menu();
+                    }
+                    if ui.button("  ⬤  Cylinder").clicked() {
+                        self.factory.open = true;
+                        self.factory.add_cylinder();
+                        ui.close_menu();
+                    }
+                    ui.separator();
+                    ui.label(
+                        egui::RichText::new("  Boolean for the next solid")
+                            .small()
+                            .color(egui::Color32::from_rgb(150, 165, 185)),
+                    );
+                    for (op, name) in [
+                        (cad_solid::BoolOp::Union, "  ∪  Union"),
+                        (cad_solid::BoolOp::Difference, "  ∖  Difference"),
+                        (cad_solid::BoolOp::Intersection, "  ∩  Intersection"),
+                    ] {
+                        if ui.radio(self.factory.next_op == op, name).clicked() {
+                            self.factory.next_op = op;
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("  ⌖  Frame (zoom extents)").clicked() {
+                        if self.factory.dirty {
+                            self.factory.recompute();
+                        }
+                        self.factory.fit();
+                        ui.close_menu();
+                    }
+                    if ui.button("  🗑  Clear solids").clicked() {
+                        self.factory.clear();
+                        ui.close_menu();
+                    }
+                    ui.add_space(4.0);
+                    pp_cap_ui(ui, "menu: 3D Factory");
+                });
                 custom_menu(ui, "SIMLUX", |ui| {
                     ui.set_min_width(232.0);
                     ui.add_space(4.0);
@@ -23946,6 +24150,8 @@ impl eframe::App for CadApp {
         self.render_light_panel(ctx);
         // SIMLUX 3D viewport (docked right; reserves the right edge before Central).
         self.render_light_3d_panel(ctx);
+        // 3D FACTORY viewport (docked right, like the SIMLUX 3D view).
+        self.render_factory_panel(ctx);
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)

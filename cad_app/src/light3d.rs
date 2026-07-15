@@ -303,10 +303,17 @@ impl Scene3dRenderer {
     /// `vp_*` describe the panel rect in default-framebuffer pixels (bottom-left
     /// origin); `screen_*` is the full framebuffer size in pixels.
     #[allow(clippy::too_many_arguments)]
+    /// `verts` = shaded TRIANGLES; `lines` = GL_LINES pairs (grid, selection boxes,
+    /// preview ghosts). Pass `&[]` for `lines` to draw solids only — that is what the
+    /// SIMLUX lighting view does, so its behaviour is unchanged. The 3D Factory view
+    /// uses the lines pass for its grid + selection + ghosts.
+    /// Both passes share one program/VAO/VBO: `V3` (pos+colour) is the same vertex
+    /// format either way, so lines just re-upload the buffer and draw with `LINES`.
     pub fn render(
         &mut self,
         gl: &glow::Context,
         verts: &[V3],
+        lines: &[V3],
         mvp: &[f32; 16],
         vp_left: i32,
         vp_from_bottom: i32,
@@ -342,6 +349,26 @@ impl Scene3dRenderer {
                     }
                     gl.bind_vertex_array(Some(vao));
                     gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
+                    gl.bind_vertex_array(None);
+                }
+            }
+
+            // ---- line pass (grid / selection / ghosts) -------------------
+            // Same program + VAO/VBO as above: identical `V3` vertex layout, so we
+            // only re-upload and switch the primitive mode. Depth-tested with the
+            // solids so lines are correctly occluded by them.
+            if !lines.is_empty() {
+                if let (Some(prog), Some(vao), Some(vbo)) =
+                    (self.scene_prog, self.scene_vao, self.scene_vbo)
+                {
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(lines), glow::DYNAMIC_DRAW);
+                    gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_mvp {
+                        gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+                    }
+                    gl.bind_vertex_array(Some(vao));
+                    gl.draw_arrays(glow::LINES, 0, lines.len() as i32);
                     gl.bind_vertex_array(None);
                 }
             }
