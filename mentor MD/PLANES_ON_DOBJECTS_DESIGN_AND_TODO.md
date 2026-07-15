@@ -16,6 +16,7 @@ our in-file datastructure … make a comprehensive todo list"* + 3 UI asks (§6)
 | On-disk? | **RSM v7 → v8**: a `planes` table + a per-dobject id. `#[serde(default)]` ⇒ v7 files still load. §4 |
 | Bonus | It **deletes the doc-swap** and the entire crash class we just fixed. §5 |
 | Cost | **None to the kernel — use the SIDECAR** (decision D5, the pattern simLUX already uses for all of SIMLUX). Promote to kernel fields later only if cross-plane ops need it. §8.1a/b |
+| Overhead for 2D users? | **ZERO — and it's a correctness win.** The spatial index is 2D and buckets on `bbox()`, so ONE grid cannot hold two planes. Partition per plane ⇒ 2D = one grid = today's exact code path; multi-plane = smaller grids = *faster*. §9 |
 | ⛔ Blocker | `HANDLE_COUNTER` is never bumped on load → new objects collide with loaded handles. **Proven.** Also corrupts hatch boundaries. Fix first. §8.1c |
 
 ---
@@ -246,7 +247,7 @@ Ordered so each slice is independently mergeable and independently *provable*.
 | # | Task | Done when |
 |---|---|---|
 | D1 | `active_plane: PlaneId` on `CadApp` (peer of the current layer) | — |
-| D2 | **Filter the candidate iteration by active plane** (the culling loop) | other planes don't render as if flat |
+| D2 | **PARTITION the spatial index per plane** (§9) — one grid each; query the active plane's. NOT a per-dobject filter: one grid can't hold two planes (`bbox()` is `Vec2`), and a per-dobject check would tax 2D users | 2D path unchanged; `planes.len()==1` ⇒ today's exact code |
 | D3 | Filter **pick + window-select** | can't select through a plane |
 | D4 | Filter **osnap targets** | can't snap to a non-coplanar point |
 | D5 | Filter **trim/extend/fillet/chamfer** cutters + boundaries | ⚠️ the correctness-critical one |
@@ -279,6 +280,72 @@ f → r → 10                      (the app's own fillet, on that plane)
 save → reopen                   → the plane + its filleted profile are back, in 3D
 switch to World                 → the 2D drawing is untouched
 ```
+
+---
+
+## 9. Overhead — can 2D ignore it? **Yes: literally zero.**
+
+> *"if user uses 2D it means the standard plane … the plane only gets important once we have 3D
+> dobjects. Can the overhead be ignored? What's the plan to reduce it if it occurs?"*
+
+### 9.1 The finding that decides it: the index is 2D and buckets on `bbox()`
+
+```rust
+pub struct UniformGrid { cell_size: f64, origin: Vec2, cols, rows, cells: Vec<Vec<u32>> }
+pub fn build(dobjects: &[DObject], cell_size: f64) -> Self { … let (emin, emax) = e.bbox(); … }
+```
+
+`bbox()` is the dobject's own **`Vec2`** bounds. If dobjects hold plane-local `(u,v)`, then two lines
+on **perpendicular walls**, each spanning `(0,0)–(10,10)`, bucket into the **same cells** — metres
+apart in 3D, identical to the index.
+
+> **One grid cannot hold two planes.** This is **correctness**, not performance.
+> ⇒ **The index MUST be partitioned per plane.** And that partition is exactly what makes the
+> overhead vanish.
+
+### 9.2 The answer: partition the index by plane → "pay only when you use it"
+
+| Situation | Index | Hot loop cost |
+|---|---|---|
+| **Pure 2D** (`planes.len() == 1`) | **one** grid = the one that exists today | **ZERO — byte-identical code path.** No filter, no branch, no lookup. |
+| **Multi-plane** | one grid **per plane**; query only the **active** plane's | **FASTER than today** — each grid is smaller, so `query_bbox` returns *fewer* candidates than a combined grid would |
+
+The key consequence: **the render loop never asks a dobject which plane it's on.** The grid already
+guarantees every candidate is same-plane, so there is no per-dobject check to pay for. The filter
+in §3.1 stops being a per-dobject predicate and becomes *"which grid do I query"* — decided **once
+per frame**.
+
+### 9.3 Cost table (be concrete)
+
+| Cost | Kernel field | Sidecar (§8.1a) |
+|---|---|---|
+| Storage / dobject | **+2 bytes** (`u16`), likely absorbed by existing padding — `Geom` already dominates `DObject`'s size. 100k dobjects ⇒ **~200 KB** | **0** |
+| Render hot loop (per frame) | **0** — grid partition (§9.2) | **0** — same reason |
+| Index build (per **edit**, not per frame) | **0** | **+1 map lookup per dobject** on an already-`O(n)` build |
+| Can it go stale? | **No** — travels with the dobject | Only at index build; the reconcile rule covers it |
+
+### 9.4 Why this rescues the sidecar
+The sidecar's obvious perf worry — a `BTreeMap<handle, String>` lookup **per dobject per frame** —
+would be fatal in the render loop. The partition **moves that lookup out of the frame entirely**:
+it happens once per dobject when the index is rebuilt (already gated on `index_dirty`). So the
+sidecar costs nothing where it matters. **§8.1a stands.**
+
+### 9.5 If overhead ever *does* show up — the escalation ladder
+1. **Hoist, don't filter.** Never write `if d.plane != active` inside a per-dobject loop; decide
+   *which grid* once per frame (§9.2). If a per-dobject check ever appears in a hot loop, that's
+   the bug.
+2. **Single-plane fast path.** `planes.len() == 1` ⇒ skip every plane code path. This is the
+   guarantee that 2D users pay literally nothing, forever.
+3. **Materialise `Vec<PlaneId>`** parallel to `doc.dobjects` (rebuilt on `index_dirty`) *only if*
+   profiling shows the sidecar's build-time lookups matter. ⚠️ This adds a derived cache keyed to
+   the document — **the exact class that caused the `07120ac` crash**. Don't do it on a hunch;
+   measure first.
+4. **Promote to the kernel field** (§8.1b). If step 3 is ever needed, the field is strictly better:
+   it *is* the materialised view, and it cannot desync.
+
+> **The rule:** overhead is only ignorable **because** of the partition. The moment someone
+> "simplifies" it to one grid + a per-dobject filter, 2D users start paying for a 3D feature they
+> don't use — and the index becomes wrong across planes anyway (§9.1).
 
 ---
 
