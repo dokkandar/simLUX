@@ -1244,3 +1244,35 @@ mod tests {
         assert!(bytes.len() < 100_000, "1000 lines → {} bytes (expected < 100k)", bytes.len());
     }
 }
+
+
+#[cfg(test)]
+mod handle_collision_probe {
+    use super::*;
+    use cad_kernel::{DObject, Document, Geom, Line, Vec2};
+
+    fn rt(doc: &Document) -> Document {
+        read_rsm(&write_rsm(doc)).expect("rsm round-trip")
+    }
+
+    /// PROBE: RSM preserves handles on load, but nothing bumps `HANDLE_COUNTER` past
+    /// the loaded maximum — so the next dobject drawn after opening a file can be
+    /// handed a handle a loaded dobject already owns.
+    /// Beyond planes this matters because `Hatch.boundary_handles` resolves its
+    /// boundary BY HANDLE: a collision binds a hatch to the wrong geometry.
+    #[test]
+    #[ignore = "KNOWN BUG (documented, not yet fixed): HANDLE_COUNTER is not bumped on load. \
+                Run with `cargo test -p cad_io -- --ignored` to see it. Fix = an additive \
+                `cad_kernel::reserve_handles_above(max)` called at the end of read_rsm."]
+    fn known_bug_next_handle_collides_with_a_loaded_handle() {
+        let mut doc = Document::default();
+        let i = doc.push(DObject::new(Geom::Line(Line { a: Vec2::ZERO, b: Vec2::new(1.0, 1.0) })));
+        doc.dobjects[i].handle = 1_000_000; // a file saved in an earlier, long session
+        let back = rt(&doc);
+        assert_eq!(back.dobjects[0].handle, 1_000_000, "handle preserved on load");
+
+        let fresh = cad_kernel::next_handle();
+        println!("PROBE: loaded handle = 1000000, next_handle() = {fresh}");
+        assert!(fresh > 1_000_000, "BUG CONFIRMED: next_handle() = {fresh} collides with loaded handles");
+    }
+}

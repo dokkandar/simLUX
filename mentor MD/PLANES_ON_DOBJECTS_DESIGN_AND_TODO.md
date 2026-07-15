@@ -15,7 +15,8 @@ our in-file datastructure … make a comprehensive todo list"* + 3 UI asks (§6)
 | What shape? | **Mirror the LAYER pattern exactly**: `Document.planes: PlaneTable` + `DObject.plane: PlaneId`, id 0 = World. §3 |
 | On-disk? | **RSM v7 → v8**: a `planes` table + a per-dobject id. `#[serde(default)]` ⇒ v7 files still load. §4 |
 | Bonus | It **deletes the doc-swap** and the entire crash class we just fixed. §5 |
-| Cost | **Diverges `cad_kernel` from RUST_CAD** (byte-identical today). The one real price. §8 |
+| Cost | **None to the kernel — use the SIDECAR** (decision D5, the pattern simLUX already uses for all of SIMLUX). Promote to kernel fields later only if cross-plane ops need it. §8.1a/b |
+| ⛔ Blocker | `HANDLE_COUNTER` is never bumped on load → new objects collide with loaded handles. **Proven.** Also corrupts hatch boundaries. Fix first. §8.1c |
 
 ---
 
@@ -218,7 +219,8 @@ Ordered so each slice is independently mergeable and independently *provable*.
 ### Phase A — decide + document (before any code)
 | # | Task | Done when |
 |---|---|---|
-| A1 | **Decide §8.1**: accept `cad_kernel` divergence from RUST_CAD | written down in the memo |
+| A0 | **⛔ Fix the handle-collision bug** (§8.1c) — additive `reserve_handles_above()` + call in `read_rsm`. Blocks everything handle-keyed, and fixes hatch-boundary corruption today | the `--ignored` known-bug test passes |
+| A1 | **Decide §8.1**: sidecar now (recommended, per D5) vs kernel fields now | written down in the memo |
 | A2 | **Decide §8.2**: v7 readers refuse v8, or flatten | written down |
 | A3 | Add a "**superseded for 3D**" note to `UCS_Roadmap.md` pointing here — Plane ≠ UCS (§2) | the next agent can't mis-implement |
 | A4 | Decide the workspace-mode enum (3D Factory vs SIMLUX split are exclusive, §6.1) | one enum, not two bools |
@@ -282,14 +284,99 @@ switch to World                 → the 2D drawing is untouched
 
 ## 8. Decisions I need from you
 
-**8.1 — `cad_kernel` divergence (the real cost).**
-`cad_kernel` is **byte-identical to RUST_CAD** today; adding `DObject.plane` + `Document.planes`
-breaks that, so the merge spreads to a second repo. Options:
-- **(a) Accept it** ← my recommendation. This feature has to go upstream eventually; §1.1 makes it
-  additive and a no-op for 2D, so it's the cheapest it will ever be.
-- (b) Side-table (`HashMap<Handle, PlaneId>` in `cad_solid`). Kernel untouched — but it **desyncs**
-  the moment any of the 31.8k lines of tools creates a dobject without telling the side-table.
-  **Reject: it reintroduces exactly the "two sources of truth" bug class this fork exists to kill.**
+> ### ⚠️ §8.1 REVISED 2026-07-15 — I was wrong; the owner's instinct was right.
+> My original §8.1 recommended accepting kernel divergence and **rejected** the side-table. That
+> recommendation **contradicted an existing, documented project decision** I had not read:
+>
+> > **D5 — Persistence = sidecar.** `drawing.simlux.json` beside `drawing.rsm`
+> > *(`SIMLUX_LUX_WORKFLOW.md`)*
+>
+> and `cad_app/src/simlux_io.rs` states it outright:
+> > *"All SIMLUX-specific state … lives here, **NOT in the (2D) `cad_kernel` document**. Keyed by
+> > **STABLE NAMES** … `cad_kernel` / `cad_io` stay **UNTOUCHED** (decision D5)."*
+>
+> simLUX has **already solved "isolate the engine, add alongside" once** — for the entire lighting
+> feature. Planes should follow the same precedent. See §8.1a/§8.1b below.
+
+### 8.1 — In what sense does `cad_kernel` change? (the precise answer)
+
+My §3 proposal is **exactly two field additions**, plus additive types:
+
+| Change | Kind | Blast radius |
+|---|---|---|
+| `DObject.plane: PlaneId` | **struct change** | breaks every struct-literal site: **26** (23 `dobject.rs`, 1 each `blockdiff.rs`, `spatial.rs`, `rsm.rs`) |
+| `Document.planes: PlaneTable` | **struct change** | ditto, small |
+| `PlaneId` / `DPlane` / `PlaneTable` (new module) | **purely additive** | none |
+| `Frame` shared into the kernel | additive | none |
+
+So "the kernel changes" = **2 fields**. Everything else is new files. But those 2 fields are what
+break byte-identity with RUST_CAD.
+
+### 8.1a — How to isolate: the SIDECAR (recommended, follows D5)
+
+**Zero kernel change. Zero `cad_io` change. Zero RSM version bump.**
+
+```rust
+// cad_app/src/factory_io.rs — a NEW sidecar, or extend SimluxConfig (D5 pattern)
+pub struct FactoryConfig {
+    /// plane NAME → definition (name-keyed, per D5: ids are positional, names are stable)
+    pub planes: BTreeMap<String, PlaneDef>,      // origin[3], u[3], v[3], color
+    /// dobject HANDLE → plane name. Handles ARE stable: they round-trip through RSM
+    /// (`write_u64(w, d.handle)` / `r.u64()`), unlike positional layer/block ids.
+    pub dobject_plane: BTreeMap<u64, String>,
+}
+```
+Reconcile rule: **a dobject whose handle is absent from the map belongs to the active plane.**
+
+**Why this is CORRECT (and why my "two sources of truth" objection was wrong):** it holds under the
+invariant the design already enforces — *tools only ever see the active plane* (§3.1, D2–D5). If
+every dobject a tool can touch is on the active plane, then every dobject it creates belongs there
+too. The rule isn't a guess; it's implied by the filter.
+
+**The two honest limits:**
+1. **Cross-plane copy breaks it.** A copy gets a **new handle** (`copy.handle = next_handle()`,
+   `app.rs:18137/18183`) → absent from the map → lands on the **active** plane, not the source's.
+   Fine while selection is plane-filtered; wrong the moment cross-plane ops exist.
+2. **⛔ BLOCKED by a real handle-collision bug — see §8.1c.** Handle-keyed attribution is unsafe
+   until it's fixed.
+
+### 8.1b — The staged answer to "isolate now, add later"
+
+| Stage | Where planes live | Kernel | When |
+|---|---|---|---|
+| **Now** | **Sidecar** (`FactoryConfig`, D5) | **untouched** | prove the design in 3D_Factory |
+| **Later** | Promote to `DObject.plane` + `Document.planes` (§3) | 2 fields | **only if** cross-plane ops are needed, and as part of the one big merge |
+
+The sidecar is not a hack — it is **this project's established answer** to exactly this question,
+and it makes the whole plane feature revertible by deleting one file.
+
+### 8.1c — ⛔ BLOCKER: `HANDLE_COUNTER` is never bumped on load (real, proven bug)
+
+`cad_kernel/src/dobject.rs`:
+```rust
+static HANDLE_COUNTER: AtomicU64 = AtomicU64::new(1);   // starts at 1 EVERY session
+pub fn next_handle() -> Handle { HANDLE_COUNTER.fetch_add(1, Ordering::Relaxed) }
+```
+Nothing raises it after a load, but RSM **preserves** handles. Proven by
+`cad_io/src/rsm.rs → known_bug_next_handle_collides_with_a_loaded_handle` (`--ignored`):
+```
+PROBE: loaded handle = 1000000, next_handle() = 2
+```
+Open a drawing → the next object drawn is handed a handle a loaded object already owns.
+
+**This is bigger than planes.** `Hatch.boundary_handles` resolves its boundary **by handle**
+(`rsm.rs:433-435`), so a collision can bind a hatch to the wrong geometry. It exists in **RUST_CAD
+too** (byte-identical kernel).
+
+**Fix — additive, ~5 lines, no struct change:**
+```rust
+// cad_kernel/src/dobject.rs
+pub fn reserve_handles_above(max: Handle) {
+    HANDLE_COUNTER.fetch_max(max.saturating_add(1), Ordering::Relaxed);
+}
+```
+called at the end of `read_rsm` with the max loaded handle. A **pure bug fix** that upstream wants
+anyway → the easiest possible merge, and it unblocks the sidecar.
 
 **8.2 — v7 readers meeting a v8 file:** refuse (my recommendation — silent geometry corruption is
 worse than an error), or flatten to World?
