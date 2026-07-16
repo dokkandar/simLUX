@@ -1363,6 +1363,8 @@ pub struct CadApp {
     light3d_renderer: StdArc<Mutex<crate::light3d::Scene3dRenderer>>,
     /// 3D FACTORY: the cad_solid model + its view. Reuses `light3d_renderer`.
     factory: crate::factory::FactoryState,
+    /// Which viewport is ACTIVE (last interacted with) — the modifier dispatch signal.
+    active_view: ActiveView,
     gpu_dirty:    bool,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
@@ -2739,6 +2741,35 @@ pub enum AciPickRequest {
     BlockForm,
 }
 
+/// Which viewport the user is currently working in.
+///
+/// **This is the signal the modifiers dispatch on** — `move` is ONE command; the
+/// active view decides which algorithm runs behind it (owner's rule: "knowing the
+/// active one, you get move command, check 2d or 3d, take the right move in the
+/// background").
+///
+/// ⚠️ It is deliberately NOT "which panel is open". A panel can be OPEN while you
+/// work in the other view — gating on `factory.open` is precisely what hijacked `m`
+/// out of the 2D drawing. ACTIVE means *last interacted with*: it only changes when
+/// you actually click/drag inside a viewport.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ActiveView {
+    /// The 2D plan — the default, and where every established command lives.
+    #[default]
+    TwoD,
+    /// The 3D Factory viewport.
+    ThreeD,
+}
+
+impl ActiveView {
+    pub fn label(self) -> &'static str {
+        match self {
+            ActiveView::TwoD => "2D",
+            ActiveView::ThreeD => "3D",
+        }
+    }
+}
+
 impl Default for CadApp {
     fn default() -> Self {
         // Build the command registry from the seed arrays FIRST, then derive the
@@ -2887,6 +2918,7 @@ impl Default for CadApp {
             light:               crate::light::LightState::new(),
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             factory:             crate::factory::FactoryState::default(),
+            active_view:         ActiveView::TwoD,
             gpu_dirty:    true,
             layer_panel_open:   true,
             layer_rename:       None,
@@ -3608,6 +3640,11 @@ impl CadApp {
                 // selection and NEVER moves the camera — otherwise dragging a solid
                 // sends the view flying. Only the middle button (or Alt+Right, for
                 // mice without one) orbits.
+                // ACTIVE VIEW — a press INSIDE the 3D viewport makes 3D active
+                // (orbiting counts: you are working in this view).
+                if resp.is_pointer_button_down_on() || resp.clicked() || resp.dragged() {
+                    self.active_view = ActiveView::ThreeD;
+                }
                 let alt = ui.input(|i| i.modifiers.alt);
                 let orbiting = resp.dragged_by(egui::PointerButton::Middle)
                     || (alt && resp.dragged_by(egui::PointerButton::Secondary));
@@ -3790,6 +3827,9 @@ impl CadApp {
                     self.factory_exit_sketch();
                 }
             });
+        if !open && self.factory.open {
+            self.active_view = ActiveView::TwoD; // the 3D view is gone → 2D is active
+        }
         self.factory.open = open;
     }
 
@@ -9637,8 +9677,14 @@ impl CadApp {
     fn dbg_watched_now(&self) -> crate::dbg_recorder::WatchedState {
         use crate::dbg_recorder::{WatchedState, WindowFlags};
         WatchedState {
+            active_view:        format!("{:?}", self.active_view),
             tool:               format!("{:?}", self.tool),
             select_mode:        format!("{:?}", self.select_mode),
+            move_state:         format!("{:?}", self.move_state),
+            copy_state:         format!("{:?}", self.copy_state),
+            rotate_state:       format!("{:?}", self.rotate_state),
+            scale_state:        format!("{:?}", self.scale_state),
+            mirror_state:       format!("{:?}", self.mirror_state),
             trim_state:         format!("{:?}", self.trim_state),
             extend_state:       format!("{:?}", self.extend_state),
             fillet_state:       format!("{:?}", self.fillet_state),
@@ -23466,6 +23512,39 @@ impl eframe::App for CadApp {
             ui.horizontal_top(|ui| {
                 self.draw_logo_column(ui);
                 ui.add_space(8.0);
+                // ---- ACTIVE VIEW pill -------------------------------------
+                // Which viewport owns the next command. MOVE/COPY/… dispatch on
+                // this, so it must be visible at a glance — you should never have to
+                // guess whether `m` is about to move a dobject or a solid. Only shown
+                // once the 3D view exists; with 2D alone there is nothing to choose.
+                if self.factory.open {
+                    let three_d = self.active_view == ActiveView::ThreeD;
+                    let (bg, fg) = if three_d {
+                        (egui::Color32::from_rgb(52, 38, 12), egui::Color32::from_rgb(255, 178, 60))
+                    } else {
+                        (egui::Color32::from_rgb(12, 38, 46), egui::Color32::from_rgb(0, 200, 235))
+                    };
+                    egui::Frame::none()
+                        .fill(bg)
+                        .stroke(egui::Stroke::new(1.0, fg))
+                        .inner_margin(egui::Margin::symmetric(7.0, 3.0))
+                        .rounding(4.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                egui::RichText::new(format!("◧ {} active", self.active_view.label()))
+                                    .color(fg)
+                                    .size(11.0)
+                                    .strong(),
+                            );
+                        })
+                        .response
+                        .on_hover_text(
+                            "The viewport that owns the next command.\n\
+                             move/copy/rotate/scale/mirror act on THIS view's objects.\n\
+                             Click inside a viewport to make it active.",
+                        );
+                    ui.add_space(8.0);
+                }
                 ui.vertical(|ui| {
                     ui.add_space(2.0);
                     // --- line 1: customizable Quick Access shortcuts ---
@@ -24663,6 +24742,12 @@ impl eframe::App for CadApp {
             let (resp, painter) =
                 ui.allocate_painter(avail, egui::Sense::click_and_drag());
             let rect = resp.rect;
+            // ACTIVE VIEW — a press INSIDE the 2D canvas makes 2D active. Only real
+            // interaction flips it; merely having the 3D panel open never does (that
+            // was the bug that hijacked `m`). See `ActiveView`.
+            if resp.is_pointer_button_down_on() || resp.clicked() || resp.dragged() {
+                self.active_view = ActiveView::TwoD;
+            }
             // Stash the canvas rect for the dock helpers — they need
             // the canvas area (below toolbar, above status bar) not
             // the full window rect.
@@ -32776,19 +32861,19 @@ mod established_commands_are_untouchable {
     ///
     /// If 3D solids ever need these verbs, dispatch by object type at APPLY time —
     /// never by intercepting the command.
+    /// The dispatch signal must be the ACTIVE view, never "is the 3D panel open".
+    /// `factory.open` is what hijacked `m` out of the 2D drawing; `active_view` only
+    /// changes when you actually work inside a viewport.
     #[test]
-    fn run_command_never_consults_the_3d_factory() {
+    fn dispatch_keys_on_active_view_never_on_panel_open() {
         let src = include_str!("app.rs");
         let start = src.find("fn run_command").expect("run_command exists");
-        let end = src[start..]
-            .find("\n    fn ")
-            .map(|e| start + e)
-            .unwrap_or(src.len());
+        let end = src[start..].find("\n    fn ").map(|e| start + e).unwrap_or(src.len());
         let body = &src[start..end];
         assert!(
-            !body.contains("factory"),
-            "run_command must not touch the 3D factory — the established commands are \
-             not to be intercepted (see memory: move-is-move)"
+            !body.contains("factory.open"),
+            "run_command must NEVER gate on `factory.open` — a panel being visible says \
+             nothing about what you are editing (this is the bug that stole `m`)"
         );
     }
 

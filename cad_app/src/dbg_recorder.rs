@@ -592,8 +592,19 @@ fn format_event_oneline(e: &DbgEvent) -> String {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WatchedState {
+    /// Which viewport the user is working in (2D plan / 3D Factory). This is the
+    /// signal the modifiers dispatch on, so a dump must show it.
+    pub active_view:         String,
     pub tool:                String,
     pub select_mode:         String,
+    // The five core modifiers. They were MISSING from the watched set, which is why a
+    // dump of a MOVE showed the command being typed and then nothing — the one state
+    // that was live was the one state never printed.
+    pub move_state:          String,
+    pub copy_state:          String,
+    pub rotate_state:        String,
+    pub scale_state:         String,
+    pub mirror_state:        String,
     pub trim_state:          String,
     pub extend_state:        String,
     pub fillet_state:        String,
@@ -719,7 +730,13 @@ pub fn diff_watched(
         }, loc);
         n += 1;
     }
+    diff_field!("active_view",       active_view);
     diff_field!("select_mode",       select_mode);
+    diff_field!("move_state",        move_state);
+    diff_field!("copy_state",        copy_state);
+    diff_field!("rotate_state",      rotate_state);
+    diff_field!("scale_state",       scale_state);
+    diff_field!("mirror_state",      mirror_state);
     diff_field!("trim_state",        trim_state);
     diff_field!("extend_state",      extend_state);
     diff_field!("fillet_state",      fillet_state);
