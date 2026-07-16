@@ -1753,6 +1753,20 @@ impl Sandbox {
                         changed |= ui.add(egui::DragValue::new(sides).range(3..=128)).changed();
                     });
                 }
+                // The Draw3D primitives (Sphere/Frustum/Torus/Capsule/Tube/Ellipsoid)
+                // are authored in the APP — `3D Factory ▸ Draw3D` — which is where the
+                // per-shape controllers live. This sandbox is superseded by that panel
+                // and is scheduled for retirement (README slice 5); it is left here
+                // read-only rather than growing a second editor for them.
+                other => {
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "{} — edit in the app: 3D Factory ▸ Draw3D",
+                            other.kind_label()
+                        ))
+                        .weak(),
+                    );
+                }
             }
         }
         if ui

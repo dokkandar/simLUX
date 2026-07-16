@@ -104,6 +104,209 @@ pub struct FactoryState {
     pub cyl_r: f32,
     pub cyl_h: f32,
     pub cyl_sides: u32,
+
+    /// DRAW3D: the open primitive dialog (`None` = closed). The dialog OWNS the
+    /// live parameters, so tweaking them costs nothing until Create is pressed —
+    /// csgrs walks a BSP per boolean, so we never re-evaluate per keystroke.
+    pub draw3d: Option<Draw3dDialog>,
+}
+
+/// Which primitive the Draw3D dialog is editing. One entry per menu item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Draw3dKind {
+    Box,
+    Sphere,
+    Cylinder,
+    Cone,
+    Prism,
+    Pyramid,
+    Capsule,
+    Torus,
+    Tube,
+    Ellipsoid,
+}
+
+impl Draw3dKind {
+    /// Menu order — the owner's "basic 3D objects" list, minus the two that are
+    /// NOT solids (Plane/Quad and Disk/Circle are 2D: that is what the sketch +
+    /// plane system is for, not a CSG primitive).
+    pub const ALL: [Draw3dKind; 10] = [
+        Draw3dKind::Box,
+        Draw3dKind::Sphere,
+        Draw3dKind::Cylinder,
+        Draw3dKind::Cone,
+        Draw3dKind::Prism,
+        Draw3dKind::Pyramid,
+        Draw3dKind::Capsule,
+        Draw3dKind::Torus,
+        Draw3dKind::Tube,
+        Draw3dKind::Ellipsoid,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Draw3dKind::Box => "Box / Cuboid",
+            Draw3dKind::Sphere => "Sphere",
+            Draw3dKind::Cylinder => "Cylinder",
+            Draw3dKind::Cone => "Cone / Frustum",
+            Draw3dKind::Prism => "Prism",
+            Draw3dKind::Pyramid => "Pyramid",
+            Draw3dKind::Capsule => "Capsule",
+            Draw3dKind::Torus => "Torus",
+            Draw3dKind::Tube => "Tube (hollow)",
+            Draw3dKind::Ellipsoid => "Ellipsoid",
+        }
+    }
+
+    pub fn icon(self) -> &'static str {
+        match self {
+            Draw3dKind::Box => "⬛",
+            Draw3dKind::Sphere => "⬤",
+            Draw3dKind::Cylinder => "⬮",
+            Draw3dKind::Cone => "▲",
+            Draw3dKind::Prism => "⬡",
+            Draw3dKind::Pyramid => "◭",
+            Draw3dKind::Capsule => "⬭",
+            Draw3dKind::Torus => "◎",
+            Draw3dKind::Tube => "◯",
+            Draw3dKind::Ellipsoid => "⬯",
+        }
+    }
+}
+
+/// The live parameter set for the Draw3D dialog.
+///
+/// ONE struct holds every primitive's controllers (rather than one per shape) so
+/// switching kinds keeps what you already typed — set a radius on Cylinder, switch
+/// to Cone, and the radius carries over. Fields are named for the CONTROLLER, and
+/// several are deliberately shared across shapes (`r`, `h`, `segments`).
+#[derive(Clone, Debug)]
+pub struct Draw3dDialog {
+    pub kind: Draw3dKind,
+    // lengths
+    pub w: f32,
+    pub d: f32,
+    pub h: f32,
+    pub r: f32,
+    pub r_top: f32,
+    pub r_inner: f32,
+    pub major_r: f32,
+    pub minor_r: f32,
+    pub rx: f32,
+    pub ry: f32,
+    pub rz: f32,
+    // tessellation (accuracy controllers)
+    pub segments: u32,
+    pub stacks: u32,
+    pub sides: u32,
+    pub seg_major: u32,
+    pub seg_minor: u32,
+}
+
+impl Default for Draw3dDialog {
+    fn default() -> Self {
+        Self {
+            kind: Draw3dKind::Box,
+            w: 2.0,
+            d: 2.0,
+            h: 1.0,
+            r: 1.0,
+            r_top: 0.0,
+            r_inner: 0.6,
+            major_r: 2.0,
+            minor_r: 0.5,
+            rx: 1.0,
+            ry: 1.5,
+            rz: 0.75,
+            segments: 32,
+            stacks: 16,
+            sides: 6,
+            seg_major: 32,
+            seg_minor: 16,
+        }
+    }
+}
+
+impl Draw3dDialog {
+    pub fn new(kind: Draw3dKind) -> Self {
+        Self { kind, ..Default::default() }
+    }
+
+    /// Build the primitive from the current controllers.
+    ///
+    /// Cone / Prism / Pyramid all map onto ONE `Primitive::Frustum` — they are the
+    /// same solid with different controllers (`r_top = 0` → cone; `r_top = r` →
+    /// prism; 4 sides + `r_top = 0` → pyramid). Keeping them as separate MENU items
+    /// but one primitive is why there is no duplicated meshing code.
+    pub fn build(&self) -> Primitive {
+        match self.kind {
+            Draw3dKind::Box => Primitive::Box { w: self.w, d: self.d, h: self.h },
+            Draw3dKind::Sphere => {
+                Primitive::Sphere { r: self.r, segments: self.segments, stacks: self.stacks }
+            }
+            Draw3dKind::Cylinder => {
+                Primitive::Cylinder { r: self.r, h: self.h, sides: self.segments }
+            }
+            Draw3dKind::Cone => Primitive::Frustum {
+                r_bottom: self.r,
+                r_top: self.r_top,
+                h: self.h,
+                sides: self.segments,
+            },
+            Draw3dKind::Prism => Primitive::Frustum {
+                r_bottom: self.r,
+                r_top: self.r, // equal radii ⇒ a prism
+                h: self.h,
+                sides: self.sides,
+            },
+            Draw3dKind::Pyramid => Primitive::Frustum {
+                r_bottom: self.r,
+                r_top: 0.0, // apex
+                h: self.h,
+                sides: self.sides,
+            },
+            Draw3dKind::Capsule => Primitive::Capsule {
+                r: self.r,
+                h: self.h,
+                segments: self.segments,
+                stacks: self.stacks,
+            },
+            Draw3dKind::Torus => Primitive::Torus {
+                major_r: self.major_r,
+                minor_r: self.minor_r,
+                seg_major: self.seg_major,
+                seg_minor: self.seg_minor,
+            },
+            Draw3dKind::Tube => Primitive::Tube {
+                r_outer: self.r,
+                r_inner: self.r_inner,
+                h: self.h,
+                sides: self.segments,
+            },
+            Draw3dKind::Ellipsoid => Primitive::Ellipsoid {
+                rx: self.rx,
+                ry: self.ry,
+                rz: self.rz,
+                segments: self.segments,
+                stacks: self.stacks,
+            },
+        }
+    }
+
+    /// Validity + the reason, shown live in the dialog so Create is never a
+    /// guess (e.g. a tube whose bore is wider than its wall isn't a tube).
+    pub fn problem(&self) -> Option<&'static str> {
+        match self.kind {
+            Draw3dKind::Tube if self.r_inner >= self.r => {
+                Some("inner radius must be smaller than outer")
+            }
+            Draw3dKind::Torus if self.minor_r >= self.major_r => {
+                Some("minor radius must be smaller than major (else it self-intersects)")
+            }
+            Draw3dKind::Cone if self.r_top >= self.r => Some("top radius must be < bottom (0 = cone)"),
+            _ => None,
+        }
+    }
 }
 
 impl Default for FactoryState {
@@ -127,6 +330,7 @@ impl Default for FactoryState {
             cyl_r: 0.5,
             cyl_h: 2.0,
             cyl_sides: 24,
+            draw3d: None,
         }
     }
 }
@@ -134,6 +338,13 @@ impl Default for FactoryState {
 impl FactoryState {
     pub fn add_box(&mut self) {
         let p = Primitive::Box { w: self.box_w, d: self.box_d, h: self.box_h };
+        let id = self.model.push(self.next_op, Plane::default(), Placement::default(), p);
+        self.selection = vec![id];
+        self.dirty = true;
+    }
+
+    /// DRAW3D: commit the dialog's primitive into the model.
+    pub fn add_primitive(&mut self, p: Primitive) {
         let id = self.model.push(self.next_op, Plane::default(), Placement::default(), p);
         self.selection = vec![id];
         self.dirty = true;

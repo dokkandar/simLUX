@@ -152,6 +152,24 @@ pub enum Primitive {
     Box { w: f32, d: f32, h: f32 },
     /// Cylinder radius `r`, `h` tall, `sides` facets.
     Cylinder { r: f32, h: f32, sides: u32 },
+    /// Sphere. `segments` = longitude slices, `stacks` = latitude rings.
+    /// Rests ON the plane (lifted by `r`), per this module's convention.
+    Sphere { r: f32, segments: u32, stacks: u32 },
+    /// Cone / frustum / prism / pyramid — one primitive, four shapes:
+    /// `r_top = 0` → **cone** · `r_top = r_bottom` → **prism** ·
+    /// `sides = 4, r_top = 0` → **pyramid** · else → **frustum**.
+    /// (This is why there is no separate Cone/Prism/Pyramid variant.)
+    Frustum { r_bottom: f32, r_top: f32, h: f32, sides: u32 },
+    /// Torus — `major_r` = ring radius, `minor_r` = tube thickness.
+    Torus { major_r: f32, minor_r: f32, seg_major: u32, seg_minor: u32 },
+    /// Capsule — a cylinder of length `h` with hemispherical caps of radius `r`.
+    /// **COMPOSED** (csgrs has no capsule): cylinder ∪ sphere ∪ sphere.
+    /// Total height = `h + 2r`.
+    Capsule { r: f32, h: f32, segments: u32, stacks: u32 },
+    /// Hollow tube — **COMPOSED** (csgrs has no tube): outer cylinder ∖ inner.
+    Tube { r_outer: f32, r_inner: f32, h: f32, sides: u32 },
+    /// Ellipsoid with independent radii. Rests on the plane (lifted by `rz`).
+    Ellipsoid { rx: f32, ry: f32, rz: f32, segments: u32, stacks: u32 },
 }
 
 impl Primitive {
@@ -159,6 +177,21 @@ impl Primitive {
         match self {
             Primitive::Box { .. } => "Box",
             Primitive::Cylinder { .. } => "Cylinder",
+            Primitive::Sphere { .. } => "Sphere",
+            Primitive::Frustum { r_top, sides, r_bottom, .. } => {
+                // one variant, four shapes — name it by what it actually is
+                if *r_top <= 1e-6 {
+                    if *sides == 4 { "Pyramid" } else { "Cone" }
+                } else if (*r_top - *r_bottom).abs() <= 1e-6 {
+                    "Prism"
+                } else {
+                    "Frustum"
+                }
+            }
+            Primitive::Torus { .. } => "Torus",
+            Primitive::Capsule { .. } => "Capsule",
+            Primitive::Tube { .. } => "Tube",
+            Primitive::Ellipsoid { .. } => "Ellipsoid",
         }
     }
 
@@ -168,6 +201,25 @@ impl Primitive {
         match *self {
             Primitive::Box { w, d, h } => (Vec3::new(-w / 2.0, -d / 2.0, 0.0), Vec3::new(w / 2.0, d / 2.0, h)),
             Primitive::Cylinder { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h)),
+            // sphere/ellipsoid are lifted so they REST on the plane
+            Primitive::Sphere { r, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, 2.0 * r)),
+            Primitive::Ellipsoid { rx, ry, rz, .. } => {
+                (Vec3::new(-rx, -ry, 0.0), Vec3::new(rx, ry, 2.0 * rz))
+            }
+            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+                let r = r_bottom.max(r_top);
+                (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h))
+            }
+            // torus lies flat, lifted by minor_r → rests on the plane
+            Primitive::Torus { major_r, minor_r, .. } => {
+                let o = major_r + minor_r;
+                (Vec3::new(-o, -o, 0.0), Vec3::new(o, o, 2.0 * minor_r))
+            }
+            // capsule: caps of r at each end of an h-long barrel → total h + 2r
+            Primitive::Capsule { r, h, .. } => (Vec3::new(-r, -r, 0.0), Vec3::new(r, r, h + 2.0 * r)),
+            Primitive::Tube { r_outer, h, .. } => {
+                (Vec3::new(-r_outer, -r_outer, 0.0), Vec3::new(r_outer, r_outer, h))
+            }
         }
     }
 }
@@ -288,6 +340,31 @@ impl Feature {
             Primitive::Cylinder { r, h, .. } => {
                 *r = (*r * k).max(0.001);
                 *h = (*h * k).max(0.001);
+            }
+            // Uniform scale: every LENGTH scales, every SEGMENT COUNT does not.
+            Primitive::Sphere { r, .. } => *r = (*r * k).max(0.001),
+            Primitive::Frustum { r_bottom, r_top, h, .. } => {
+                *r_bottom = (*r_bottom * k).max(0.0); // 0 is legal — that IS a cone
+                *r_top = (*r_top * k).max(0.0);
+                *h = (*h * k).max(0.001);
+            }
+            Primitive::Torus { major_r, minor_r, .. } => {
+                *major_r = (*major_r * k).max(0.001);
+                *minor_r = (*minor_r * k).max(0.001);
+            }
+            Primitive::Capsule { r, h, .. } => {
+                *r = (*r * k).max(0.001);
+                *h = (*h * k).max(0.0); // 0 is legal — that IS a sphere
+            }
+            Primitive::Tube { r_outer, r_inner, h, .. } => {
+                *r_outer = (*r_outer * k).max(0.001);
+                *r_inner = (*r_inner * k).max(0.0);
+                *h = (*h * k).max(0.001);
+            }
+            Primitive::Ellipsoid { rx, ry, rz, .. } => {
+                *rx = (*rx * k).max(0.001);
+                *ry = (*ry * k).max(0.001);
+                *rz = (*rz * k).max(0.001);
             }
         }
         f

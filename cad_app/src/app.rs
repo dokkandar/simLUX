@@ -3326,6 +3326,161 @@ impl CadApp {
         }
     }
 
+    /// DRAW3D dialog — the controllers for the primitive being created.
+    ///
+    /// The dialog OWNS its parameters (`factory.draw3d`) and nothing touches the model
+    /// until **Create** is pressed: csgrs walks a BSP per boolean, so re-evaluating on
+    /// every keystroke is the known lag source. Segment/stack counts are surfaced as
+    /// first-class "accuracy" controllers, not hidden constants.
+    fn render_draw3d_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dlg) = self.factory.draw3d.clone() else { return };
+        let mut open = true;      // the window's own ✕
+        let mut close_btn = false; // our Close button (separate: egui holds `open`)
+        let mut create = false;
+        egui::Window::new(format!("{}  {}", dlg.kind.icon(), dlg.kind.label()))
+            .open(&mut open)
+            .resizable(false)
+            .default_width(320.0)
+            .show(ctx, |ui| {
+                // ── the shape's own controllers ─────────────────────────────
+                egui::Grid::new("draw3d_params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    let mut len = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(v).speed(0.05).range(min..=1e4).suffix(" m"));
+                        ui.end_row();
+                    };
+                    match dlg.kind {
+                        crate::factory::Draw3dKind::Box => {
+                            len(ui, "width", &mut dlg.w, 0.001);
+                            len(ui, "depth", &mut dlg.d, 0.001);
+                            len(ui, "height", &mut dlg.h, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Sphere => len(ui, "radius", &mut dlg.r, 0.001),
+                        crate::factory::Draw3dKind::Cylinder => {
+                            len(ui, "radius", &mut dlg.r, 0.001);
+                            len(ui, "height", &mut dlg.h, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Cone => {
+                            len(ui, "bottom radius", &mut dlg.r, 0.001);
+                            len(ui, "top radius", &mut dlg.r_top, 0.0);
+                            len(ui, "height", &mut dlg.h, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Prism | crate::factory::Draw3dKind::Pyramid => {
+                            len(ui, "radius", &mut dlg.r, 0.001);
+                            len(ui, "height", &mut dlg.h, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Capsule => {
+                            len(ui, "radius", &mut dlg.r, 0.001);
+                            len(ui, "length (barrel)", &mut dlg.h, 0.0);
+                        }
+                        crate::factory::Draw3dKind::Torus => {
+                            len(ui, "major radius (ring)", &mut dlg.major_r, 0.001);
+                            len(ui, "minor radius (tube)", &mut dlg.minor_r, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Tube => {
+                            len(ui, "outer radius", &mut dlg.r, 0.001);
+                            len(ui, "inner radius", &mut dlg.r_inner, 0.0);
+                            len(ui, "height", &mut dlg.h, 0.001);
+                        }
+                        crate::factory::Draw3dKind::Ellipsoid => {
+                            len(ui, "radius X", &mut dlg.rx, 0.001);
+                            len(ui, "radius Y", &mut dlg.ry, 0.001);
+                            len(ui, "radius Z", &mut dlg.rz, 0.001);
+                        }
+                    }
+                });
+
+                // ── accuracy controllers (tessellation) ─────────────────────
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new("Accuracy — tessellation")
+                        .small()
+                        .color(egui::Color32::from_rgb(150, 165, 185)),
+                );
+                egui::Grid::new("draw3d_tess").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    let mut cnt = |ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32| {
+                        ui.label(label);
+                        ui.add(egui::DragValue::new(v).speed(1.0).range(min..=512));
+                        ui.end_row();
+                    };
+                    use crate::factory::Draw3dKind as K;
+                    match dlg.kind {
+                        K::Box => {
+                            ui.label(egui::RichText::new("(flat faces — none)").small().weak());
+                            ui.end_row();
+                        }
+                        K::Sphere | K::Capsule | K::Ellipsoid => {
+                            cnt(ui, "segments (longitude)", &mut dlg.segments, 3);
+                            cnt(ui, "stacks (latitude)", &mut dlg.stacks, 2);
+                        }
+                        K::Cylinder | K::Cone | K::Tube => {
+                            cnt(ui, "radial segments", &mut dlg.segments, 3);
+                        }
+                        K::Prism | K::Pyramid => {
+                            cnt(ui, "sides", &mut dlg.sides, 3);
+                        }
+                        K::Torus => {
+                            cnt(ui, "major segments", &mut dlg.seg_major, 3);
+                            cnt(ui, "minor segments", &mut dlg.seg_minor, 3);
+                        }
+                    }
+                });
+
+                // ── boolean for this solid ──────────────────────────────────
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("boolean:").small().weak());
+                    for (op, name) in [
+                        (cad_solid::BoolOp::Union, "∪ Union"),
+                        (cad_solid::BoolOp::Difference, "∖ Difference"),
+                        (cad_solid::BoolOp::Intersection, "∩ Intersect"),
+                    ] {
+                        if ui.selectable_label(self.factory.next_op == op, name).clicked() {
+                            self.factory.next_op = op;
+                        }
+                    }
+                });
+
+                ui.separator();
+                let problem = dlg.problem();
+                if let Some(p) = problem {
+                    ui.label(egui::RichText::new(format!("⚠ {p}")).color(egui::Color32::from_rgb(255, 158, 30)));
+                }
+                ui.horizontal(|ui| {
+                    if ui
+                        .add_enabled(problem.is_none(), egui::Button::new("✚  Create"))
+                        .clicked()
+                    {
+                        create = true;
+                    }
+                    if ui.button("Close").clicked() {
+                        close_btn = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} feature(s)",
+                                self.factory.feature_count()
+                            ))
+                            .small()
+                            .weak(),
+                        );
+                    });
+                });
+            });
+
+        if create {
+            let p = dlg.build();
+            self.factory.open = true;
+            self.factory.add_primitive(p);
+            if self.factory.dirty {
+                self.factory.recompute();
+            }
+            self.factory.fit();
+        }
+        self.factory.draw3d = if open && !close_btn { Some(dlg) } else { None };
+    }
+
     /// 3D FACTORY viewport — the sandbox's 3D view, now a panel in the real app.
     /// Reuses `light3d::{mvp, Scene3dRenderer}` (the sandbox had duplicated both) and
     /// renders a `cad_solid::Model`. Docked right, mirroring the SIMLUX 3D panel.
@@ -23693,20 +23848,21 @@ impl eframe::App for CadApp {
                         self.factory.recompute();
                     }
                     ui.separator();
+                    // ---- DRAW3D ------------------------------------------
+                    // Every basic 3D primitive. Each opens the Draw3D dialog with
+                    // that shape's standard controllers; nothing is built until
+                    // Create is pressed (csgrs walks a BSP per boolean).
                     ui.label(
-                        egui::RichText::new("  Add solid")
+                        egui::RichText::new("  Draw3D — basic solids")
                             .small()
                             .color(egui::Color32::from_rgb(150, 165, 185)),
                     );
-                    if ui.button("  ⬛  Box").clicked() {
-                        self.factory.open = true;
-                        self.factory.add_box();
-                        ui.close_menu();
-                    }
-                    if ui.button("  ⬤  Cylinder").clicked() {
-                        self.factory.open = true;
-                        self.factory.add_cylinder();
-                        ui.close_menu();
+                    for k in crate::factory::Draw3dKind::ALL {
+                        if ui.button(format!("  {}  {}", k.icon(), k.label())).clicked() {
+                            self.factory.open = true;
+                            self.factory.draw3d = Some(crate::factory::Draw3dDialog::new(k));
+                            ui.close_menu();
+                        }
                     }
                     ui.separator();
                     ui.label(
@@ -24388,6 +24544,7 @@ impl eframe::App for CadApp {
         self.render_light_3d_panel(ctx);
         // 3D FACTORY viewport (docked right, like the SIMLUX 3D view).
         self.render_factory_panel(ctx);
+        self.render_draw3d_dialog(ctx);
         // Command palette (Phase 7) — registry-driven; also handles Ctrl+Shift+P.
         self.render_command_palette(ctx);
         self.render_menu_flyouts(ctx);  // generalized top-level dropdown flyouts (§9)
