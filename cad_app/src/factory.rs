@@ -109,6 +109,14 @@ pub struct FactoryState {
     /// live parameters, so tweaking them costs nothing until Create is pressed —
     /// csgrs walks a BSP per boolean, so we never re-evaluate per keystroke.
     pub draw3d: Option<Draw3dDialog>,
+
+    /// An in-flight 3D modifier (move/copy/rotate/scale/mirror) over `selection`.
+    /// `cad_solid::modify` has been spec-conformant and unit-tested since day one —
+    /// it was simply never INVOKED, because the command line only ever drove the 2D
+    /// app. This field is the missing link.
+    pub modify: Option<cad_solid::modify::Modify>,
+    /// Prompt for the running 3D op, echoed in the panel.
+    pub status: String,
 }
 
 /// Which primitive the Draw3D dialog is editing. One entry per menu item.
@@ -331,6 +339,8 @@ impl Default for FactoryState {
             cyl_h: 2.0,
             cyl_sides: 24,
             draw3d: None,
+            modify: None,
+            status: String::new(),
         }
     }
 }
@@ -470,6 +480,48 @@ impl FactoryState {
         best.map(|(_, p, n)| Frame::from_point_normal(p, n))
     }
 
+    /// Unproject `cursor` onto the active construction plane (XY at z=0) — the 3D
+    /// analog of the 2D canvas's screen→world. `None` if the ray is parallel to it.
+    pub fn cursor_on_plane(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Vec3> {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let n = Vec3::Z;
+        let denom = dir.dot(n);
+        if denom.abs() < 1e-6 {
+            return None;
+        }
+        let t = -orig.dot(n) / denom;
+        (t >= 0.0).then(|| orig + dir * t)
+    }
+
+    /// OSNAP for 3D picks — the nearest solid mesh VERTEX whose screen projection is
+    /// within the aperture. Mirrors the 2D pickbox: snapping to a real corner is what
+    /// makes "move this corner to that corner" exact instead of eyeballed.
+    pub fn snap_vertex(
+        &self,
+        cursor: egui::Pos2,
+        rect: egui::Rect,
+        mvp: &[f32; 16],
+    ) -> Option<(Vec3, egui::Pos2)> {
+        let m = Mat4::from_cols_array(mvp);
+        let aperture = 12.0f32;
+        let mut best: Option<(f32, Vec3, egui::Pos2)> = None;
+        for p in &self.cached.positions {
+            let w = Vec3::from(*p);
+            let ndc = m.project_point3(w);
+            if !(-1.0..=1.0).contains(&ndc.z) {
+                continue;
+            }
+            let sx = rect.left() + (ndc.x * 0.5 + 0.5) * rect.width();
+            let sy = rect.top() + (0.5 - ndc.y * 0.5) * rect.height();
+            let sp = egui::pos2(sx, sy);
+            let d = sp.distance(cursor);
+            if d <= aperture && best.map_or(true, |(bd, _, _)| d < bd) {
+                best = Some((d, w, sp));
+            }
+        }
+        best.map(|(_, w, sp)| (w, sp))
+    }
+
     /// The ground (XY) plane at the origin — the fallback sketch surface when the
     /// right-click misses a solid, so you can always start drawing.
     pub fn ground_frame() -> Frame {
@@ -512,5 +564,58 @@ impl FactoryState {
 
     pub fn feature_count(&self) -> usize {
         self.model.features.len()
+    }
+}
+
+#[cfg(test)]
+mod pick_tests {
+    use super::*;
+
+    fn view(st: &FactoryState, rect: egui::Rect) -> [f32; 16] {
+        let aspect = rect.width() / rect.height();
+        crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, aspect)
+    }
+
+    /// The user reports "3D dobject not selecting". Picking is pure math (screen →
+    /// ray → AABB), so it CAN be tested headlessly even though the click itself
+    /// needs a live egui pointer. If this passes, selection math is sound and the
+    /// fault is in reachability/routing, not geometry.
+    #[test]
+    fn clicking_the_centre_of_the_view_picks_the_solid_there() {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+        st.fit(); // aim the camera at the solid, as ⌖ Frame does
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = view(&st, rect);
+        let hit = st.pick_feature(rect.center(), rect, &mvp);
+        assert!(hit.is_some(), "a ray through the centre must hit the centred solid");
+        assert_eq!(hit.unwrap(), st.model.features[0].id);
+    }
+
+    /// …and a ray into empty space must MISS (else everything is always selected).
+    #[test]
+    fn clicking_far_from_the_solid_misses() {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+        st.fit();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = view(&st, rect);
+        let corner = egui::pos2(rect.left() + 2.0, rect.top() + 2.0);
+        assert!(st.pick_feature(corner, rect, &mvp).is_none(), "corner ray must miss");
+    }
+
+    /// Face-pick (the right-click → "Draw on this face" path) must land ON the solid.
+    #[test]
+    fn face_pick_returns_a_frame_on_the_solid() {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+        st.fit();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let mvp = view(&st, rect);
+        let f = st.pick_face(rect.center(), rect, &mvp);
+        assert!(f.is_some(), "centre ray must hit a face of the centred solid");
     }
 }
