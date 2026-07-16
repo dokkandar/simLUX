@@ -3191,37 +3191,6 @@ impl CadApp {
         crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: msg });
     }
 
-    /// Common tail for a 3D modifier `feed`/`type_value`: apply the outcome, log the
-    /// committed parameters (recorder §8), and keep or drop the op.
-    fn factory_after_feed(
-        &mut self,
-        md: cad_solid::modify::Modify,
-        f: cad_solid::modify::Feed,
-    ) {
-        use cad_solid::modify::Feed;
-        match f {
-            Feed::NeedMore => {
-                self.factory.status = md.prompt();
-                self.factory.modify = Some(md);
-            }
-            Feed::AppliedContinue => {
-                self.factory.dirty = true;
-                self.factory.status = md.prompt();
-                self.factory.modify = Some(md);
-            }
-            Feed::Applied => {
-                self.factory.dirty = true;
-                if let Some(s) = &md.last_summary {
-                    let line = format!("3D {} ✓ {s}", md.op.label());
-                    self.factory_note(line.clone());
-                    self.history.push(format!("  {line}"));
-                }
-                self.factory.status.clear();
-                self.factory.modify = None;
-            }
-        }
-    }
-
     /// Reset every piece of **doc-relative** interactive state.
     ///
     /// Swapping `self.doc` (enter/leave a sketch) instantly invalidates anything holding
@@ -3625,19 +3594,7 @@ impl CadApp {
                 );
                 // Live prompt for a running 3D op — the same feedback the 2D command
                 // line gives, so a 3D op is never silently waiting for a pick.
-                if !self.factory.status.is_empty() {
-                    ui.label(
-                        egui::RichText::new(&self.factory.status)
-                            .color(egui::Color32::from_rgb(255, 178, 60))
-                            .size(12.0),
-                    );
-                } else if !self.factory.selection.is_empty() {
-                    ui.label(
-                        egui::RichText::new("type: move · copy · rotate · scale · mirror · erase")
-                            .small()
-                            .weak(),
-                    );
-                }
+
                 ui.separator();
 
                 let size = ui.available_size();
@@ -3652,7 +3609,6 @@ impl CadApp {
                 // sends the view flying. Only the middle button (or Alt+Right, for
                 // mice without one) orbits.
                 let alt = ui.input(|i| i.modifiers.alt);
-                let mut return_after_click = false; // a 3D op consumed the click
                 let orbiting = resp.dragged_by(egui::PointerButton::Middle)
                     || (alt && resp.dragged_by(egui::PointerButton::Secondary));
                 if orbiting {
@@ -3682,35 +3638,9 @@ impl CadApp {
                 // adds, a click on empty space clears. The camera is untouched.
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        // A 3D op mid-pick OWNS the click — it's a point, not a
-                        // selection (mirrors the 2D cascade: an active state consumes
-                        // the input first).
-                        if let Some(mut md) = self.factory.modify.take() {
-                            let snapped = self.factory.snap_vertex(pos, rect, &mvp).map(|(w, _)| w);
-                            let w = snapped.or_else(|| self.factory.cursor_on_plane(pos, rect, &mvp));
-                            if let Some(w) = w {
-                                let plane = cad_solid::Plane::default();
-                                // §8: name the pick + snap kind BEFORE feed mutates state
-                                let pick = md.pick_name();
-                                let snaptag = if snapped.is_some() { "END" } else { "none" };
-                                // CARD (the project's name for the H/V lock — SYSVAR CrdEnb) applies to the
-                                // 2nd+ pick, exactly as in 2D; the modifier engine gates it internally.
-                                let card = self.env.CrdEnb;
-                                let f = md.feed(w, &plane, &mut self.factory.model, card);
-                                self.factory_note(format!(
-                                    "3D {} {pick} = ({:.2},{:.2},{:.2}) [snap={snaptag}] → {f:?}",
-                                    md.op.label(), w.x, w.y, w.z
-                                ));
-                                self.factory_after_feed(md, f);
-                            } else {
-                                self.factory_note("3D modify: click missed the plane".into());
-                                self.factory.modify = Some(md); // stay armed
-                            }
-                            return_after_click = true;
-                        }
                     }
                 }
-                if resp.clicked() && !return_after_click {
+                if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         let add = ui.input(|i| i.modifiers.shift);
                         match self.factory.pick_feature(pos, rect, &mvp) {
@@ -3802,51 +3732,6 @@ impl CadApp {
                 // (osnap → CARD → raw), so what you see is exactly where it lands.
                 self.factory.sync_selection_mesh();
                 let mut overlay = self.factory.shade_verts();
-                let mut ants: Option<(egui::Pos2, egui::Pos2, egui::Color32)> = None;
-                let mut ghost_label: Option<(String, egui::Color32)> = None;
-                if let Some(md) = &self.factory.modify {
-                    let hover = resp.hover_pos();
-                    // the SAME resolution the click uses: osnap first, then the plane
-                    let cw = hover.and_then(|hp| {
-                        self.factory
-                            .snap_vertex(hp, rect, &mvp)
-                            .map(|(w, _)| w)
-                            .or_else(|| self.factory.cursor_on_plane(hp, rect, &mvp))
-                    });
-                    if let (Some(cw), Some(base)) =
-                        (cw, md.anchor_world(&cad_solid::Plane::default()))
-                    {
-                        let card = self.env.CrdEnb;
-                        overlay.extend(self.factory.modify_ghost(cw, card));
-                        // project base + cursor back to screen for the 2D overlay bits
-                        let m = glam::Mat4::from_cols_array(&mvp);
-                        let to_s = |w: glam::Vec3| {
-                            let n = m.project_point3(w);
-                            egui::pos2(
-                                rect.left() + (n.x * 0.5 + 0.5) * rect.width(),
-                                rect.top() + (0.5 - n.y * 0.5) * rect.height(),
-                            )
-                        };
-                        use cad_solid::modify::ModifyOp as MO;
-                        let accent = match md.op {
-                            MO::Move => egui::Color32::from_rgb(255, 200, 100),
-                            MO::Copy => egui::Color32::from_rgb(150, 230, 170),
-                            MO::Mirror => egui::Color32::from_rgb(200, 160, 255),
-                            _ => egui::Color32::from_rgb(235, 235, 245),
-                        };
-                        ants = Some((to_s(base), to_s(cw), accent));
-                        // numeric readout — degrees / ×factor, as in 2D
-                        let plane = cad_solid::Plane::default();
-                        if let Some(a) = md.preview_angle(&plane, cw, card) {
-                            ghost_label =
-                                Some((format!("{:.1}°{}", a.to_degrees(), if md.copy { " (copy)" } else { "" }), accent));
-                        } else if let Some(k) = md.preview_factor(&plane, cw) {
-                            ghost_label =
-                                Some((format!("×{k:.3}{}", if md.copy { " (copy)" } else { "" }), accent));
-                        }
-                    }
-                }
-
                 if verts.is_empty() && lines.is_empty() {
                     painter.text(
                         rect.center(),
@@ -3873,53 +3758,6 @@ impl CadApp {
                         })),
                     }));
                 }
-                // ---- marching-ants path + base blip + readout ----------------
-                // Drawn AFTER the 3D callback so they sit on top of the solids, and
-                // with the SAME helpers the 2D move uses (`draw_base_blip`,
-                // `draw_dashed_line`, phase = time*60) — one implementation, so the
-                // 3D path animates identically to the 2D one.
-                if let Some((base_s, dest_s, accent)) = ants {
-                    draw_base_blip(&painter, base_s, accent);
-                    let phase = ctx.input(|i| i.time) as f32 * 60.0;
-                    draw_dashed_line(
-                        &painter,
-                        base_s,
-                        dest_s,
-                        6.0,
-                        4.0,
-                        phase,
-                        egui::Stroke::new(1.2, accent),
-                    );
-                    ctx.request_repaint(); // keep the ants marching
-                }
-                if let (Some((txt, col)), Some(hp)) = (ghost_label, resp.hover_pos()) {
-                    painter.text(
-                        hp + egui::vec2(14.0, -14.0),
-                        egui::Align2::LEFT_BOTTOM,
-                        txt,
-                        egui::FontId::proportional(13.0),
-                        col,
-                    );
-                }
-                // Hint line — mirrors the 2D move's top-left prompt.
-                if let Some(md) = &self.factory.modify {
-                    painter.text(
-                        rect.left_top() + egui::vec2(10.0, 10.0),
-                        egui::Align2::LEFT_TOP,
-                        format!(
-                            "{}: {}",
-                            md.op.label().to_uppercase(),
-                            if md.has_base() {
-                                format!("click {} ({} solid(s) following)", md.pick_name(), md.targets.len())
-                            } else {
-                                format!("click {} for {} solid(s)    [Esc cancels]", md.pick_name(), md.targets.len())
-                            }
-                        ),
-                        egui::FontId::monospace(12.0),
-                        egui::Color32::from_rgb(255, 200, 100),
-                    );
-                }
-
                 // ---- CURSOR — the SAME glyphs as the 2D canvas ---------------
                 // Reused via `draw_select_cursor` / `draw_draft_cursor`, so the two
                 // views can never drift. Which one is showing tells you what the LEFT
@@ -3931,7 +3769,7 @@ impl CadApp {
                     if let Some(p) = resp.hover_pos() {
                         // a running 3D op is a POINT-PICK phase → drafting glyph,
                         // exactly as `in_click_only_phase` gates it in 2D
-                        if self.factory.session.is_some() || self.factory.modify.is_some() {
+                        if self.factory.session.is_some() {
                             draw_draft_cursor(&painter, p);
                         } else {
                             draw_select_cursor(&painter, p);
@@ -4286,91 +4124,6 @@ impl CadApp {
             },
             source:        crate::dbg_recorder::CmdSource::Typed,
         });
-
-        // ---- 3D FACTORY modifier intercept ------------------------------
-        // THE FIX for "3D solid not moving": `move`/`copy`/… used to fall through
-        // to the 2D dispatcher, which starts a 2D selection session over
-        // `self.doc` — a document that knows nothing about `factory.model`. On an
-        // empty drawing that meant `select_mode → ForSelect` with 0 dobjects and a
-        // command that could never complete. The 3D modifier engine
-        // (`cad_solid::modify`, spec-conformant + unit-tested) existed all along;
-        // nothing ever CALLED it.
-        //
-        // Placed here — first, before every 2D intercept — per the cascade rule
-        // ("am I in a live state that should consume this input?"). Two live states
-        // claim the line:
-        //   1. a 3D op is mid-pick   → the text is its value/keyword (deg/factor/R/C)
-        //   2. the 3D view owns a selection → a modifier verb starts a 3D op
-        // Both `return`, so the 2D dispatcher never sees them. Anything else falls
-        // through untouched, so 2D behaviour is unchanged.
-        // ---- 3D FACTORY modifier routing --------------------------------
-        // ONE command, TWO algorithms — the owner's rule: "if dobject is 3d you use
-        // 3d algorithm, if 2d use the normal one. don't mess up with established
-        // command."
-        //
-        // ⚠️ REGRESSION THIS FIXES: the first cut gated on `factory.open` — a UI
-        // state — so with the 3D panel open and a STALE 3D selection, typing `m` in
-        // the 2D drawing was hijacked into a 3D move (and with no 3D selection it
-        // printed an error and BLOCKED `m` outright). That destroyed an established
-        // command. The panel being open says nothing about what you're editing.
-        //
-        // THE RULE — route by WHAT IS SELECTED:
-        //   · a 2D selection      → the established 2D command. Untouched. Always.
-        //   · only a 3D selection → the 3D algorithm.
-        //   · both/neither        → 2D. The established command is never stolen;
-        //                            the new path must earn the route unambiguously.
-        let route_3d = self.selection.is_empty()          // no 2D selection …
-            && !self.factory.selection.is_empty()          // … and a real 3D one
-            && self.factory.session.is_none();             // (in a sketch, 2D owns it)
-        if self.factory.modify.is_some() || route_3d {
-            // (1) an in-flight 3D op consumes typed values first (deg/factor/R/C)
-            if let Some(mut md) = self.factory.modify.take() {
-                let plane = cad_solid::Plane::default();
-                if let Some(f) = md.type_value(trimmed, &plane, &mut self.factory.model) {
-                    self.factory_note(format!(
-                        "3D {} typed '{trimmed}' [{}] → {f:?}",
-                        md.op.label(),
-                        md.pick_name()
-                    ));
-                    self.factory_after_feed(md, f);
-                    return;
-                }
-                self.factory.modify = Some(md); // not a value → maybe a new command
-            }
-            // (2) a modifier verb + a 3D-only selection starts the 3D algorithm
-            if route_3d {
-                use cad_solid::modify::ModifyOp as MO;
-                let op3d = match trimmed.to_ascii_lowercase().as_str() {
-                    "move" | "m" => Some(MO::Move),
-                    "copy" | "c" | "co" | "cp" => Some(MO::Copy),
-                    "rotate" | "ro" => Some(MO::Rotate),
-                    "scale" | "sc" => Some(MO::Scale),
-                    "mirror" | "mi" => Some(MO::Mirror),
-                    _ => None,
-                };
-                if let Some(op) = op3d {
-                    let m = cad_solid::modify::Modify::new(op, self.factory.selection.clone());
-                    self.factory.status = m.prompt();
-                    self.factory_note(format!(
-                        "3D begin {} on {} solid(s) — sel={:?}",
-                        op.label(),
-                        self.factory.selection.len(),
-                        self.factory.selection
-                    ));
-                    self.factory.modify = Some(m);
-                    self.history.push(format!("  3D {}: {}", op.label(), self.factory.status));
-                    return;
-                }
-                if matches!(trimmed.to_ascii_lowercase().as_str(), "erase" | "delete" | "e") {
-                    let n = self.factory.selection.len();
-                    self.factory.erase_selection();
-                    self.factory_note(format!("3D erase ✓ {n} solid(s)"));
-                    self.history.push(format!("  - erased {n} solid(s)"));
-                    return;
-                }
-            }
-            // anything else falls through to the 2D dispatcher, untouched
-        }
 
         // ---- SYSVAR value entry (after `setvar NAME` or a bare var name) ----
         // The next input is the new value; empty keeps current; bad input
@@ -33003,123 +32756,60 @@ mod mouse_rule_tests {
     }
 }
 
+
 #[cfg(test)]
-mod factory_command_routing_tests {
+mod established_commands_are_untouchable {
     use super::*;
 
-    fn app_with_a_solid() -> CadApp {
-        let mut app = CadApp::default();
-        app.factory.open = true;
-        app.factory.add_box();
-        app.factory.recompute();
-        let id = app.factory.model.features[0].id;
-        app.factory.selection = vec![id];
-        app.selection.clear(); // CadApp::default() seeds a drawing; start 2D-clean
-        app
-    }
-
-    /// THE REPORTED BUG. From the user's dump:
-    ///   CMD "move" → Move  [Typed]
-    ///   select_mode "Off" → "ForSelect"      ← the 2D session, on 0 dobjects
-    /// `move` fell through to the 2D dispatcher, which knows nothing about
-    /// factory.model, so the command could never complete. With the 3D view open and
-    /// a solid selected, `move` must start a 3D op and NEVER touch select_mode.
+    /// MOVE IS MOVE. The established modifiers are ONE command each — there is no
+    /// "3D Move". A previous change added a command-line intercept that hijacked `m`
+    /// out of the 2D drawing into an invented 3D op (and, with no 3D selection, even
+    /// BLOCKED it). This test exists so that can never come back.
+    ///
+    /// The canonical flow (owner, verbatim):
+    ///   1. move is an established command
+    ///   2. Move
+    ///   3. select what is going to move     ← selection comes AFTER the verb, which
+    ///   4. first point                        is why any "route by what's selected
+    ///   5. second Point                       when the verb is typed" rule is wrong
+    ///   6. and done
+    ///
+    /// If 3D solids ever need these verbs, dispatch by object type at APPLY time —
+    /// never by intercepting the command.
     #[test]
-    fn move_with_a_3d_selection_starts_a_3d_op_not_a_2d_selection_session() {
-        let mut app = app_with_a_solid();
-        app.selection.clear(); // a 3D-ONLY selection is what routes to 3D
-        app.run_command("move");
-        assert!(app.factory.modify.is_some(), "a 3D move must be in flight");
-        assert_eq!(
-            app.select_mode,
-            SelectMode::Off,
-            "the 2D selection session must NOT start — that was the bug"
-        );
-        assert_eq!(app.move_state, MoveState::Off, "the 2D move must not start either");
-    }
-
-    /// Two picks must actually MOVE the solid — proving the op runs end to end.
-    #[test]
-    fn base_then_destination_moves_the_solid() {
-        let mut app = app_with_a_solid();
-        app.selection.clear();
-        let id = app.factory.model.features[0].id;
-        let before = app.factory.model.get_mut(id).unwrap().world_origin();
-        app.run_command("move");
-
-        let plane = cad_solid::Plane::default();
-        let mut md = app.factory.modify.take().unwrap();
-        let f1 = md.feed(glam::Vec3::ZERO, &plane, &mut app.factory.model, false);
-        assert_eq!(f1, cad_solid::modify::Feed::NeedMore, "1st pick = BASE");
-        app.factory_after_feed(md, f1);
-
-        let mut md = app.factory.modify.take().unwrap();
-        let f2 = md.feed(glam::Vec3::new(5.0, 0.0, 0.0), &plane, &mut app.factory.model, false);
-        assert_eq!(f2, cad_solid::modify::Feed::Applied, "2nd pick = DEST, applies");
-        app.factory_after_feed(md, f2);
-
-        let after = app.factory.model.get_mut(id).unwrap().world_origin();
-        assert!((after.x - before.x - 5.0).abs() < 1e-3, "moved +5 in x: {before:?} → {after:?}");
-        assert!(app.factory.modify.is_none(), "single op: finished, not left armed");
-        assert!(app.factory.dirty, "the CSG must be marked for re-eval");
-    }
-
-    /// Typed degrees must reach the 3D rotate (the value-consuming half of the cascade).
-    #[test]
-    fn typed_degrees_drive_the_3d_rotate() {
-        let mut app = app_with_a_solid();
-        app.selection.clear();
-        app.run_command("rotate");
-        // pivot first
-        let plane = cad_solid::Plane::default();
-        let mut md = app.factory.modify.take().unwrap();
-        let f = md.feed(glam::Vec3::ZERO, &plane, &mut app.factory.model, false);
-        app.factory_after_feed(md, f);
-        assert!(app.factory.modify.is_some(), "waiting on the ANGLE");
-        app.run_command("90"); // typed value → consumed by the 3D op
-        assert!(app.factory.modify.is_none(), "typed 90° applied and finished the op");
-    }
-
-    /// ⚠️ THE REGRESSION, from the user's dump:
-    ///   SNAP[0] 6 dobj                              ← working in the 2D drawing
-    ///   CMD "m" → Move  [Typed]
-    ///   NOTE: 3D begin Move on 1 solid(s) — sel=[1] ← hijacked by a STALE 3D selection
-    /// With the 3D panel open but a 2D selection live, `m` MUST run the established
-    /// 2D move. The panel being open says nothing about what you're editing.
-    #[test]
-    fn a_2d_selection_always_wins_even_with_the_3d_panel_open_and_selected() {
-        let mut app = app_with_a_solid(); // 3D view open, a solid selected
-        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
-            a: Vec2::new(0.0, 0.0),
-            b: Vec2::new(1.0, 0.0),
-        })));
-        app.selection = vec![app.doc.dobjects.len() - 1]; // …and a 2D selection
-        app.run_command("m");
-        assert!(app.factory.modify.is_none(), "the 3D op must NOT steal an established 2D move");
-        assert_eq!(app.move_state, MoveState::WaitingForBase, "the 2D move runs, as always");
-    }
-
-    /// …and with NO 3D selection, a modifier must fall THROUGH to 2D — never be
-    /// blocked. The first cut printed an error and returned, killing `m` outright.
-    #[test]
-    fn no_3d_selection_falls_through_to_the_established_2d_command() {
-        let mut app = CadApp::default();
-        app.factory.open = true; // panel open, nothing picked in 3D
-        app.run_command("move");
-        assert!(app.factory.modify.is_none());
-        assert_eq!(
-            app.select_mode,
-            SelectMode::ForSelect,
-            "2D select-first must run — the 3D path must not block it"
+    fn run_command_never_consults_the_3d_factory() {
+        let src = include_str!("app.rs");
+        let start = src.find("fn run_command").expect("run_command exists");
+        let end = src[start..]
+            .find("\n    fn ")
+            .map(|e| start + e)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(
+            !body.contains("factory"),
+            "run_command must not touch the 3D factory — the established commands are \
+             not to be intercepted (see memory: move-is-move)"
         );
     }
 
-    /// 2D must be untouched when the 3D view is CLOSED — `move` still drives 2D.
+    /// The 2D modifiers must run their normal select-first flow, with the 3D panel
+    /// open, closed, or holding a stale selection — the panel is irrelevant to them.
     #[test]
-    fn with_the_3d_view_closed_move_still_drives_2d() {
-        let mut app = CadApp::default();
-        app.factory.open = false;
-        app.run_command("move");
-        assert_eq!(app.select_mode, SelectMode::ForSelect, "2D behaviour preserved");
+    fn modifiers_run_the_established_2d_flow_regardless_of_the_3d_panel() {
+        for (open, sel3d) in [(false, vec![]), (true, vec![]), (true, vec![1u32])] {
+            for verb in ["move", "m", "copy", "rotate", "scale", "mirror"] {
+                let mut app = CadApp::default();
+                app.factory.open = open;
+                app.factory.selection = sel3d.clone();
+                app.selection.clear();
+                app.run_command(verb);
+                assert_eq!(
+                    app.select_mode,
+                    SelectMode::ForSelect,
+                    "`{verb}` must start the established 2D select-first flow \
+                     (3d panel open={open}, stale 3d sel={sel3d:?})"
+                );
+            }
+        }
     }
 }
