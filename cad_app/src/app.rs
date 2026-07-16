@@ -3795,6 +3795,10 @@ impl CadApp {
                         })),
                     }));
                 }
+                // ---- ACTIVE-VIEWPORT frame ----------------------------------
+                // yellow = this view owns the next command · gray = idle
+                draw_viewport_active_frame(&painter, rect, self.active_view == ActiveView::ThreeD);
+
                 // ---- CURSOR — the SAME glyphs as the 2D canvas ---------------
                 // Reused via `draw_select_cursor` / `draw_draft_cursor`, so the two
                 // views can never drift. Which one is showing tells you what the LEFT
@@ -28819,6 +28823,13 @@ impl eframe::App for CadApp {
             // ortho / grid-snap) so the user sees exactly where the
             // click will land, not where their raw cursor is. Drawn
             // last so it sits on top of dobjects and previews.
+            // ---- ACTIVE-VIEWPORT frame (drawn last → above the drawing) -----
+            // Only when the 3D view is also up: with 2D alone there is no choice to
+            // make, and a permanently-yellow frame would just be noise.
+            if self.factory.open {
+                draw_viewport_active_frame(&painter, rect, self.active_view == ActiveView::TwoD);
+            }
+
             if in_click_only_phase {
                 if let Some(raw_p) = resp.hover_pos() {
                     let constrained_world = snap_hit.map(|h| h.point)
@@ -32823,6 +32834,30 @@ mod mouse_rule_tests {
         assert!(body.contains("pick_feature"), "left click selects a feature");
     }
 
+    /// BOTH viewports must show the active-viewport frame, from ONE implementation —
+    /// the indicator is useless if only one view has it, or if the two drift apart.
+    /// The 3D panel's frame must also be drawn AFTER its paint callback, or the GL
+    /// render covers it.
+    #[test]
+    fn both_viewports_show_the_active_frame() {
+        let src = include_str!("app.rs");
+        assert!(src.contains("pub fn draw_viewport_active_frame"), "one shared impl");
+        // 3D panel
+        let start = src.find("fn render_factory_panel").unwrap();
+        let end = src[start..].find("\n    fn ").map(|e| start + e).unwrap_or(src.len());
+        let panel = &src[start..end];
+        let cb = panel.find("Shape::Callback").expect("the 3D paint callback");
+        let frame = panel.find("draw_viewport_active_frame").expect("3D shows the frame");
+        assert!(frame > cb, "the frame must be painted AFTER the GL callback, else it is hidden");
+        // 2D canvas
+        let c2d = src.find("egui::CentralPanel::default().show(ctx").unwrap();
+        let e2d = src[c2d..].find("\n        egui::TopBottomPanel").map(|e| c2d + e).unwrap_or(src.len());
+        assert!(
+            src[c2d..e2d].contains("draw_viewport_active_frame"),
+            "the 2D canvas must show the frame too"
+        );
+    }
+
     /// Both canvases must use the SAME cursor glyphs — one implementation, so 2D and
     /// 3D can't drift apart.
     #[test]
@@ -32896,5 +32931,30 @@ mod established_commands_are_untouchable {
                 );
             }
         }
+    }
+}
+
+/// ACTIVE-VIEWPORT indicator — drawn ON the viewport, where the eyes already are.
+///
+/// A 1px border plus a dot in the top-right corner: **yellow = active, gray = idle**.
+/// The active viewport is the one that owns the next command (move/copy/rotate/… act on
+/// ITS objects), so this must be readable without looking away from what you're drawing —
+/// a pill up in the header is too far from the work.
+///
+/// Only drawn when there is genuinely a choice (both viewports visible). With 2D alone
+/// there is nothing to disambiguate and a permanently-yellow frame would be noise.
+pub fn draw_viewport_active_frame(painter: &egui::Painter, rect: egui::Rect, active: bool) {
+    let col = if active {
+        egui::Color32::from_rgb(0xf2, 0xb5, 0x3d) // yellow — this view owns the command
+    } else {
+        egui::Color32::from_rgb(0x5a, 0x63, 0x6d) // gray — idle
+    };
+    // shrink by half a pixel so the 1px stroke lands ON the boundary, not straddling it
+    painter.rect_stroke(rect.shrink(0.5), 0.0, egui::Stroke::new(1.0, col));
+    let c = egui::pos2(rect.right() - 11.0, rect.top() + 11.0);
+    painter.circle_filled(c, 4.0, col);
+    if active {
+        // a soft ring so the live one reads at a glance in peripheral vision
+        painter.circle_stroke(c, 6.5, egui::Stroke::new(1.0, col.gamma_multiply(0.5)));
     }
 }
