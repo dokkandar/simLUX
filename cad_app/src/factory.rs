@@ -437,6 +437,22 @@ impl FactoryState {
         (near, (far - near).normalize_or_zero())
     }
 
+    /// Ray-pick the front-most FEATURE (solid) under `cursor`, by world AABB.
+    /// This is what the LEFT button does in the 3D view — selection, never camera.
+    pub fn pick_feature(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<u32> {
+        let (orig, dir) = Self::ray(cursor, rect, mvp);
+        let mut best: Option<(f32, u32)> = None;
+        for f in &self.model.features {
+            let (mn, mx) = f.world_aabb();
+            if let Some(t) = cad_solid::ray_aabb(orig, dir, mn, mx) {
+                if best.map_or(true, |(bt, _)| t < bt) {
+                    best = Some((t, f.id));
+                }
+            }
+        }
+        best.map(|(_, id)| id)
+    }
+
     /// Ray-pick the front-most solid FACE under `cursor` and return a sketch [`Frame`]
     /// sitting on it — the basis for sketch-on-face. `None` if the ray misses.
     pub fn pick_face(&self, cursor: egui::Pos2, rect: egui::Rect, mvp: &[f32; 16]) -> Option<Frame> {

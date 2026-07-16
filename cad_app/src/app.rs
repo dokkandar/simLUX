@@ -3588,8 +3588,16 @@ impl CadApp {
                     ui.allocate_exact_size(size, egui::Sense::click_and_drag());
                 let painter = ui.painter_at(rect);
 
-                // ---- orbit + zoom (same feel as the SIMLUX 3D view) ----------
-                if resp.dragged() {
+                // ---- VIEWPOINT CHANGE — MIDDLE drag, or ALT + RIGHT drag -----
+                // The project's long-standing mouse rule (COMMAND_LINE_AND_MOUSE_RULES
+                // Part B), now applied to 3D: the LEFT button is reserved for picks and
+                // selection and NEVER moves the camera — otherwise dragging a solid
+                // sends the view flying. Only the middle button (or Alt+Right, for
+                // mice without one) orbits.
+                let alt = ui.input(|i| i.modifiers.alt);
+                let orbiting = resp.dragged_by(egui::PointerButton::Middle)
+                    || (alt && resp.dragged_by(egui::PointerButton::Secondary));
+                if orbiting {
                     let d = resp.drag_delta();
                     self.factory.cam_yaw -= d.x * 0.01;
                     self.factory.cam_pitch =
@@ -3611,10 +3619,36 @@ impl CadApp {
                     self.factory.cam_target,
                     aspect,
                 );
+                // ---- LEFT CLICK = SELECT (never camera) ----------------------
+                // Part B of the mouse rule: the left button is the selector. Shift
+                // adds, a click on empty space clears. The camera is untouched.
+                if resp.clicked() {
+                    if let Some(pos) = resp.interact_pointer_pos() {
+                        let add = ui.input(|i| i.modifiers.shift);
+                        match self.factory.pick_feature(pos, rect, &mvp) {
+                            Some(id) => {
+                                if add {
+                                    if !self.factory.selection.contains(&id) {
+                                        self.factory.selection.push(id);
+                                    }
+                                } else {
+                                    self.factory.selection = vec![id];
+                                }
+                            }
+                            None => {
+                                if !add {
+                                    self.factory.selection.clear();
+                                }
+                            }
+                        }
+                    }
+                }
                 // ---- RIGHT-CLICK → pick a face → sketch on it ----------------
                 // The face under the cursor becomes a `Frame`; the context menu then
                 // hands that plane to the app's real 2D drafting.
-                if resp.secondary_clicked() {
+                // Skipped while ALT is held — that combination is the orbit gesture,
+                // so it must not also open a menu.
+                if resp.secondary_clicked() && !alt {
                     if let Some(pos) = resp.interact_pointer_pos() {
                         self.factory.pending_face = self.factory.pick_face(pos, rect, &mvp);
                     }
@@ -3693,6 +3727,23 @@ impl CadApp {
                             }
                         })),
                     }));
+                }
+                // ---- CURSOR — the SAME glyphs as the 2D canvas ---------------
+                // Reused via `draw_select_cursor` / `draw_draft_cursor`, so the two
+                // views can never drift. Which one is showing tells you what the LEFT
+                // button will do, exactly as in 2D:
+                //   orbiting            → nothing (the OS arrow; you're moving the view)
+                //   drafting on a plane → square + cross (a click places a POINT)
+                //   otherwise           → "^" pickbox   (a click selects an OBJECT)
+                if !orbiting {
+                    if let Some(p) = resp.hover_pos() {
+                        if self.factory.session.is_some() {
+                            draw_draft_cursor(&painter, p);
+                        } else {
+                            draw_select_cursor(&painter, p);
+                        }
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::None); // ours replaces it
+                    }
                 }
                 if resp.dragged()
                     || (resp.hovered() && ui.input(|i| i.smooth_scroll_delta.y != 0.0))
@@ -28656,16 +28707,13 @@ impl eframe::App for CadApp {
                     let constrained_world = snap_hit.map(|h| h.point)
                         .unwrap_or_else(|| self.apply_constraints(self.s2w(raw_p, rect)));
                     let p = self.w2s(constrained_world, rect);
-                    let half  = 7.0_f32;     // pickbox half-edge in px
-                    let arm   = 14.0_f32;    // crosshair arm half-length
-                    let col   = egui::Color32::from_rgb(235, 235, 245);
-                    let stroke= egui::Stroke::new(1.0, col);
-                    let sq = egui::Rect::from_center_size(p, egui::vec2(half*2.0, half*2.0));
-                    painter.rect_stroke(sq, 0.0, stroke);
-                    painter.line_segment(
-                        [egui::pos2(p.x - arm, p.y), egui::pos2(p.x + arm, p.y)], stroke);
-                    painter.line_segment(
-                        [egui::pos2(p.x, p.y - arm), egui::pos2(p.x, p.y + arm)], stroke);
+                    draw_draft_cursor(&painter, p);
+                }
+            } else if self.select_mode != SelectMode::Off {
+                // SELECTION phase — a visually DIFFERENT cursor (pickbox + ^ arrow),
+                // so "I'm picking objects" never looks like "I'm placing a point".
+                if let Some(p) = resp.hover_pos() {
+                    draw_select_cursor(&painter, p);
                 }
             }
 
@@ -32572,5 +32620,106 @@ mod factory_sketch_tests {
         assert!(app.index.is_none(), "stale spatial index MUST be dropped on a doc swap");
         assert!(app.index_dirty, "spatial index must be marked for rebuild");
         assert!(app.gpu_dirty, "GPU vertex cache is keyed to the old doc");
+    }
+}
+
+// ===================================================================
+// Shared canvas cursors — ONE implementation, used by the 2D canvas AND the
+// 3D Factory viewport, so the two views can never drift apart.
+//
+// The rule (COMMAND_LINE_AND_MOUSE_RULES.md Part B):
+//   · drafting / point-pick phase → square (pickbox) + crosshair, and PRESS
+//     fires the click (a small drift never becomes a drag)
+//   · selection phase            → pickbox + "^" arrow — visually distinct, so
+//     "picking objects" never looks like "placing a point"
+//   · idle pointer               → the OS arrow (we draw nothing)
+// ===================================================================
+
+/// Pickbox half-edge, px. (`PkBxSz` is the user-facing SYSVAR for the 2D pick
+/// tolerance; these are the on-screen glyph dimensions.)
+const CUR_PICK_HALF: f32 = 7.0;
+/// Crosshair arm half-length, px.
+const CUR_ARM: f32 = 14.0;
+const CUR_COL: egui::Color32 = egui::Color32::from_rgb(235, 235, 245);
+
+/// DRAFTING cursor — square + cross. Drawn iff `in_click_only_phase`; it is the
+/// visual cue that press-fires-click is in effect ("I'm in a command, click to
+/// place a point"), exactly as AutoCAD does.
+pub fn draw_draft_cursor(painter: &egui::Painter, p: egui::Pos2) {
+    let stroke = egui::Stroke::new(1.0, CUR_COL);
+    let sq = egui::Rect::from_center_size(p, egui::vec2(CUR_PICK_HALF * 2.0, CUR_PICK_HALF * 2.0));
+    painter.rect_stroke(sq, 0.0, stroke);
+    painter.line_segment([egui::pos2(p.x - CUR_ARM, p.y), egui::pos2(p.x + CUR_ARM, p.y)], stroke);
+    painter.line_segment([egui::pos2(p.x, p.y - CUR_ARM), egui::pos2(p.x, p.y + CUR_ARM)], stroke);
+}
+
+/// SELECTION cursor — pickbox + a "^" arrow pointing up-left out of it.
+/// Deliberately NOT a crosshair: selection picks an OBJECT, drafting places a
+/// POINT, and the two must be distinguishable at a glance.
+pub fn draw_select_cursor(painter: &egui::Painter, p: egui::Pos2) {
+    let stroke = egui::Stroke::new(1.0, CUR_COL);
+    let sq = egui::Rect::from_center_size(p, egui::vec2(CUR_PICK_HALF * 2.0, CUR_PICK_HALF * 2.0));
+    painter.rect_stroke(sq, 0.0, stroke);
+    // "^" — an arrowhead above-left of the box, its tip AT the hot spot side so
+    // the box still reads as the pick aperture.
+    let tip = egui::pos2(p.x - CUR_PICK_HALF - 2.0, p.y - CUR_PICK_HALF - 2.0);
+    let len = 9.0_f32;
+    painter.line_segment([tip, egui::pos2(tip.x + len, tip.y)], stroke);
+    painter.line_segment([tip, egui::pos2(tip.x, tip.y + len)], stroke);
+    painter.line_segment([tip, egui::pos2(tip.x + len * 0.75, tip.y + len * 0.75)], stroke);
+}
+
+#[cfg(test)]
+mod mouse_rule_tests {
+
+    /// MOUSE RULE (COMMAND_LINE_AND_MOUSE_RULES Part B), enforced as a test rather
+    /// than a comment: the 3D viewport must orbit ONLY on middle-drag or Alt+Right,
+    /// never on a bare `resp.dragged()` — the left button belongs to picking, and a
+    /// left-drag that moved the camera is exactly the "view flies away while I drag a
+    /// solid" bug. This greps the real source because the gesture itself needs a live
+    /// egui pointer, which a unit test has no way to supply.
+    #[test]
+    fn factory_viewport_orbits_only_on_middle_or_alt_right() {
+        let src = include_str!("app.rs");
+        let start = src.find("fn render_factory_panel").expect("panel exists");
+        let end = src[start..].find("\n    fn ").map(|e| start + e).unwrap_or(src.len());
+        let body = &src[start..end];
+
+        assert!(
+            body.contains("dragged_by(egui::PointerButton::Middle)"),
+            "middle-drag must orbit"
+        );
+        assert!(
+            body.contains("modifiers.alt") && body.contains("PointerButton::Secondary"),
+            "Alt+Right must orbit (for mice without a middle button)"
+        );
+        // the regression this guards: a bare dragged() orbits on ANY button
+        for line in body.lines() {
+            let l = line.trim();
+            if l.starts_with("//") { continue; }
+            assert!(
+                !l.contains("resp.dragged()") || !l.contains("cam_yaw"),
+                "bare resp.dragged() must not drive the camera: {l}"
+            );
+        }
+        // and the left button must be wired to SELECTION, not the view
+        assert!(body.contains("pick_feature"), "left click selects a feature");
+    }
+
+    /// Both canvases must use the SAME cursor glyphs — one implementation, so 2D and
+    /// 3D can't drift apart.
+    #[test]
+    fn both_views_share_the_cursor_glyphs() {
+        let src = include_str!("app.rs");
+        assert!(src.contains("pub fn draw_draft_cursor"), "shared drafting cursor exists");
+        assert!(src.contains("pub fn draw_select_cursor"), "shared selection cursor exists");
+        // 2D canvas uses them
+        assert!(src.contains("draw_draft_cursor(&painter, p);"), "2D uses the shared draft cursor");
+        // 3D panel uses them
+        let start = src.find("fn render_factory_panel").unwrap();
+        let end = src[start..].find("\n    fn ").map(|e| start + e).unwrap_or(src.len());
+        let body = &src[start..end];
+        assert!(body.contains("draw_select_cursor"), "3D uses the shared selection cursor");
+        assert!(body.contains("draw_draft_cursor"), "3D uses the shared drafting cursor");
     }
 }
