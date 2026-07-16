@@ -110,6 +110,15 @@ pub struct FactoryState {
     /// csgrs walks a BSP per boolean, so we never re-evaluate per keystroke.
     pub draw3d: Option<Draw3dDialog>,
 
+    /// An in-flight 3D modifier over `selection`. This is the SAME `move` command as
+    /// 2D — only the objects and the algorithm differ ("check 2d or 3d, take the right
+    /// move in the background"). `cad_solid::modify` is spec-conformant + unit-tested.
+    pub modify: Option<cad_solid::modify::Modify>,
+    /// A 3D op waiting on its selection — the 3D twin of the app's `queued_op`.
+    /// `move` with nothing picked → queue it, gather, Enter dispatches into the picks.
+    pub queued: Option<cad_solid::modify::ModifyOp>,
+    /// Live prompt for the running/queued 3D op.
+    pub status: String,
     /// The selected features' own mesh + the selection it was built from (the cache
     /// key). Rebuilt only when the selection changes — never per frame.
     sel_mesh: SolidMesh,
@@ -347,6 +356,9 @@ impl Default for FactoryState {
             cyl_h: 2.0,
             cyl_sides: 24,
             draw3d: None,
+            modify: None,
+            queued: None,
+            status: String::new(),
             sel_mesh: SolidMesh::default(),
             sel_key: Vec::new(),
         }
@@ -446,11 +458,55 @@ impl FactoryState {
     /// dobjects get a shade"). Drawn in the translucent overlay pass, which uses
     /// `depth_func(LEQUAL)` so coincident geometry tints instead of z-fighting.
     pub fn shade_verts(&self) -> Vec<V3> {
-        if self.selection.is_empty() {
-            return Vec::new();
+        if self.selection.is_empty() || self.modify.as_ref().is_some_and(|m| m.has_base()) {
+            return Vec::new(); // once the base is picked the GHOST is the feedback
         }
         let c = [0.0, 0.75, 0.95];
         self.sel_mesh.positions.iter().map(|p| v(Vec3::from(*p), c)).collect()
+    }
+
+    /// GHOST — the selected solids under the op's LIVE transform, at the constrained
+    /// cursor (spec §0.6: "while moving it shows the path").
+    fn ghost_verts(&self, c: [f32; 3], xf: impl Fn(Vec3) -> Vec3) -> Vec<V3> {
+        self.sel_mesh.positions.iter().map(|p| v(xf(Vec3::from(*p)), c)).collect()
+    }
+
+    /// The live ghost for the running op. Colours per §0.6: Move accent(255,200,100) ·
+    /// Copy green(150,230,170) · Rotate/Scale white · Mirror violet(200,160,255).
+    pub fn modify_ghost(&self, cursor_world: Vec3, card: bool) -> Vec<V3> {
+        use cad_solid::modify::{rot_about, scale_about, ModifyOp};
+        let Some(md) = &self.modify else { return Vec::new() };
+        let plane = Plane::default();
+        let Some(base) = md.anchor_world(&plane) else { return Vec::new() };
+        match md.op {
+            ModifyOp::Move | ModifyOp::Copy => {
+                let d = cursor_world - base;
+                let d = if card { card_lock_world(d) } else { d };
+                let c = if md.op == ModifyOp::Move { [1.0, 0.78, 0.39] } else { [0.59, 0.90, 0.67] };
+                self.ghost_verts(c, |p| p + d)
+            }
+            ModifyOp::Rotate => {
+                let a = md.preview_angle(&plane, cursor_world, card).unwrap_or(0.0);
+                self.ghost_verts([0.92, 0.92, 0.98], |p| rot_about(p, base, Vec3::Z, a))
+            }
+            ModifyOp::Scale => {
+                let k = md.preview_factor(&plane, cursor_world).unwrap_or(1.0);
+                self.ghost_verts([0.80, 0.95, 0.82], |p| scale_about(p, base, k))
+            }
+            ModifyOp::Mirror => {
+                let line = (cursor_world - base).normalize_or_zero();
+                let n = Vec3::Z.cross(line).normalize_or_zero();
+                if n.length_squared() < 1e-9 { return Vec::new(); }
+                self.ghost_verts([0.78, 0.63, 1.0], |p| p - n * (2.0 * (p - base).dot(n)))
+            }
+        }
+    }
+
+    /// Cancel any queued/running 3D op.
+    pub fn abort_op(&mut self) {
+        self.modify = None;
+        self.queued = None;
+        self.status.clear();
     }
 
     /// Flat-shaded triangle soup for the evaluated solid.
