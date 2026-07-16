@@ -4303,8 +4303,27 @@ impl CadApp {
         //   2. the 3D view owns a selection → a modifier verb starts a 3D op
         // Both `return`, so the 2D dispatcher never sees them. Anything else falls
         // through untouched, so 2D behaviour is unchanged.
-        if self.factory.open && self.factory.session.is_none() {
-            // (1) an in-flight 3D op consumes typed values first
+        // ---- 3D FACTORY modifier routing --------------------------------
+        // ONE command, TWO algorithms — the owner's rule: "if dobject is 3d you use
+        // 3d algorithm, if 2d use the normal one. don't mess up with established
+        // command."
+        //
+        // ⚠️ REGRESSION THIS FIXES: the first cut gated on `factory.open` — a UI
+        // state — so with the 3D panel open and a STALE 3D selection, typing `m` in
+        // the 2D drawing was hijacked into a 3D move (and with no 3D selection it
+        // printed an error and BLOCKED `m` outright). That destroyed an established
+        // command. The panel being open says nothing about what you're editing.
+        //
+        // THE RULE — route by WHAT IS SELECTED:
+        //   · a 2D selection      → the established 2D command. Untouched. Always.
+        //   · only a 3D selection → the 3D algorithm.
+        //   · both/neither        → 2D. The established command is never stolen;
+        //                            the new path must earn the route unambiguously.
+        let route_3d = self.selection.is_empty()          // no 2D selection …
+            && !self.factory.selection.is_empty()          // … and a real 3D one
+            && self.factory.session.is_none();             // (in a sketch, 2D owns it)
+        if self.factory.modify.is_some() || route_3d {
+            // (1) an in-flight 3D op consumes typed values first (deg/factor/R/C)
             if let Some(mut md) = self.factory.modify.take() {
                 let plane = cad_solid::Plane::default();
                 if let Some(f) = md.type_value(trimmed, &plane, &mut self.factory.model) {
@@ -4318,18 +4337,18 @@ impl CadApp {
                 }
                 self.factory.modify = Some(md); // not a value → maybe a new command
             }
-            // (2) a modifier verb + a 3D selection starts a 3D op
-            use cad_solid::modify::ModifyOp as MO;
-            let op3d = match trimmed.to_ascii_lowercase().as_str() {
-                "move" | "m" => Some(MO::Move),
-                "copy" | "c" | "co" | "cp" => Some(MO::Copy),
-                "rotate" | "ro" => Some(MO::Rotate),
-                "scale" | "sc" => Some(MO::Scale),
-                "mirror" | "mi" => Some(MO::Mirror),
-                _ => None,
-            };
-            if let Some(op) = op3d {
-                if !self.factory.selection.is_empty() {
+            // (2) a modifier verb + a 3D-only selection starts the 3D algorithm
+            if route_3d {
+                use cad_solid::modify::ModifyOp as MO;
+                let op3d = match trimmed.to_ascii_lowercase().as_str() {
+                    "move" | "m" => Some(MO::Move),
+                    "copy" | "c" | "co" | "cp" => Some(MO::Copy),
+                    "rotate" | "ro" => Some(MO::Rotate),
+                    "scale" | "sc" => Some(MO::Scale),
+                    "mirror" | "mi" => Some(MO::Mirror),
+                    _ => None,
+                };
+                if let Some(op) = op3d {
                     let m = cad_solid::modify::Modify::new(op, self.factory.selection.clone());
                     self.factory.status = m.prompt();
                     self.factory_note(format!(
@@ -4342,23 +4361,15 @@ impl CadApp {
                     self.history.push(format!("  3D {}: {}", op.label(), self.factory.status));
                     return;
                 }
-                // Open 3D view, modifier verb, but nothing picked — say so instead of
-                // silently starting a 2D session the user never asked for.
-                self.history.push(format!(
-                    "  ! 3D {}: select a solid in the 3D Factory view first (click it)",
-                    op.label()
-                ));
-                return;
+                if matches!(trimmed.to_ascii_lowercase().as_str(), "erase" | "delete" | "e") {
+                    let n = self.factory.selection.len();
+                    self.factory.erase_selection();
+                    self.factory_note(format!("3D erase ✓ {n} solid(s)"));
+                    self.history.push(format!("  - erased {n} solid(s)"));
+                    return;
+                }
             }
-            if matches!(trimmed.to_ascii_lowercase().as_str(), "erase" | "delete" | "e")
-                && !self.factory.selection.is_empty()
-            {
-                let n = self.factory.selection.len();
-                self.factory.erase_selection();
-                self.factory_note(format!("3D erase ✓ {n} solid(s)"));
-                self.history.push(format!("  - erased {n} solid(s)"));
-                return;
-            }
+            // anything else falls through to the 2D dispatcher, untouched
         }
 
         // ---- SYSVAR value entry (after `setvar NAME` or a bare var name) ----
@@ -33003,6 +33014,7 @@ mod factory_command_routing_tests {
         app.factory.recompute();
         let id = app.factory.model.features[0].id;
         app.factory.selection = vec![id];
+        app.selection.clear(); // CadApp::default() seeds a drawing; start 2D-clean
         app
     }
 
@@ -33015,6 +33027,7 @@ mod factory_command_routing_tests {
     #[test]
     fn move_with_a_3d_selection_starts_a_3d_op_not_a_2d_selection_session() {
         let mut app = app_with_a_solid();
+        app.selection.clear(); // a 3D-ONLY selection is what routes to 3D
         app.run_command("move");
         assert!(app.factory.modify.is_some(), "a 3D move must be in flight");
         assert_eq!(
@@ -33029,6 +33042,7 @@ mod factory_command_routing_tests {
     #[test]
     fn base_then_destination_moves_the_solid() {
         let mut app = app_with_a_solid();
+        app.selection.clear();
         let id = app.factory.model.features[0].id;
         let before = app.factory.model.get_mut(id).unwrap().world_origin();
         app.run_command("move");
@@ -33054,6 +33068,7 @@ mod factory_command_routing_tests {
     #[test]
     fn typed_degrees_drive_the_3d_rotate() {
         let mut app = app_with_a_solid();
+        app.selection.clear();
         app.run_command("rotate");
         // pivot first
         let plane = cad_solid::Plane::default();
@@ -33065,19 +33080,37 @@ mod factory_command_routing_tests {
         assert!(app.factory.modify.is_none(), "typed 90° applied and finished the op");
     }
 
-    /// With NO 3D selection, a modifier verb must NOT silently start a 2D session —
-    /// it must say what to do. (The 2D app is unaffected when the 3D view is closed.)
+    /// ⚠️ THE REGRESSION, from the user's dump:
+    ///   SNAP[0] 6 dobj                              ← working in the 2D drawing
+    ///   CMD "m" → Move  [Typed]
+    ///   NOTE: 3D begin Move on 1 solid(s) — sel=[1] ← hijacked by a STALE 3D selection
+    /// With the 3D panel open but a 2D selection live, `m` MUST run the established
+    /// 2D move. The panel being open says nothing about what you're editing.
     #[test]
-    fn modifier_without_a_3d_selection_explains_instead_of_starting_2d() {
+    fn a_2d_selection_always_wins_even_with_the_3d_panel_open_and_selected() {
+        let mut app = app_with_a_solid(); // 3D view open, a solid selected
+        app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+            a: Vec2::new(0.0, 0.0),
+            b: Vec2::new(1.0, 0.0),
+        })));
+        app.selection = vec![app.doc.dobjects.len() - 1]; // …and a 2D selection
+        app.run_command("m");
+        assert!(app.factory.modify.is_none(), "the 3D op must NOT steal an established 2D move");
+        assert_eq!(app.move_state, MoveState::WaitingForBase, "the 2D move runs, as always");
+    }
+
+    /// …and with NO 3D selection, a modifier must fall THROUGH to 2D — never be
+    /// blocked. The first cut printed an error and returned, killing `m` outright.
+    #[test]
+    fn no_3d_selection_falls_through_to_the_established_2d_command() {
         let mut app = CadApp::default();
-        app.factory.open = true;
+        app.factory.open = true; // panel open, nothing picked in 3D
         app.run_command("move");
         assert!(app.factory.modify.is_none());
-        assert_eq!(app.select_mode, SelectMode::Off, "no stray 2D session");
-        assert!(
-            app.history.iter().any(|h| h.contains("select a solid")),
-            "must tell the user what to do, got: {:?}",
-            app.history.last()
+        assert_eq!(
+            app.select_mode,
+            SelectMode::ForSelect,
+            "2D select-first must run — the 3D path must not block it"
         );
     }
 
