@@ -146,7 +146,11 @@ const SCENE_FS: &str = r#"
     #version 330 core
     in vec3 v_col;
     out vec4 frag;
-    void main() { frag = vec4(v_col, 1.0); }
+    // Per-PASS alpha: V3 carries no alpha channel, so translucency for the overlay
+    // pass (selection shade / modifier ghosts) rides on this uniform. 1.0 for the
+    // opaque solid + line passes.
+    uniform float u_alpha;
+    void main() { frag = vec4(v_col, u_alpha); }
 "#;
 
 // Composite: draw the FBO colour texture over an NDC rect (the panel viewport).
@@ -170,6 +174,7 @@ pub struct Scene3dRenderer {
     inited: bool,
     scene_prog: Option<glow::Program>,
     u_mvp: Option<glow::UniformLocation>,
+    u_alpha: Option<glow::UniformLocation>,
     scene_vao: Option<glow::VertexArray>,
     scene_vbo: Option<glow::Buffer>,
     blit_prog: Option<glow::Program>,
@@ -193,6 +198,7 @@ impl Default for Scene3dRenderer {
             inited: false,
             scene_prog: None,
             u_mvp: None,
+            u_alpha: None,
             scene_vao: None,
             scene_vbo: None,
             blit_prog: None,
@@ -217,6 +223,7 @@ impl Scene3dRenderer {
             // --- scene program + VAO (position + colour, interleaved) ---
             let scene_prog = compile(gl, SCENE_VS, SCENE_FS);
             self.u_mvp = gl.get_uniform_location(scene_prog, "u_mvp");
+            self.u_alpha = gl.get_uniform_location(scene_prog, "u_alpha");
             let svbo = gl.create_buffer().unwrap();
             let svao = gl.create_vertex_array().unwrap();
             gl.bind_vertex_array(Some(svao));
@@ -303,16 +310,24 @@ impl Scene3dRenderer {
     /// `vp_*` describe the panel rect in default-framebuffer pixels (bottom-left
     /// origin); `screen_*` is the full framebuffer size in pixels.
     #[allow(clippy::too_many_arguments)]
-    /// `verts` = shaded TRIANGLES; `lines` = GL_LINES pairs (grid, selection boxes,
-    /// preview ghosts). Pass `&[]` for `lines` to draw solids only — that is what the
-    /// SIMLUX lighting view does, so its behaviour is unchanged. The 3D Factory view
-    /// uses the lines pass for its grid + selection + ghosts.
-    /// Both passes share one program/VAO/VBO: `V3` (pos+colour) is the same vertex
-    /// format either way, so lines just re-upload the buffer and draw with `LINES`.
+    /// `verts` = shaded TRIANGLES · `overlay` = TRANSLUCENT triangles (selection
+    /// shade + modifier ghosts) · `lines` = GL_LINES pairs (grid, boxes, axes).
+    /// Pass `&[]` for `overlay`/`lines` to draw solids only — that is what the SIMLUX
+    /// lighting view does, so its behaviour is unchanged.
+    ///
+    /// The overlay pass is separate because it needs **blending** (the main pass runs
+    /// with BLEND off) and **`depth_func(LEQUAL)`**: the selection shade is exactly
+    /// COINCIDENT with the solid it highlights, so under the default `LESS` it would
+    /// z-fight instead of tinting. Ghost geometry sits elsewhere and blends normally.
+    /// Depth WRITES are disabled so overlapping ghost faces don't occlude each other.
+    ///
+    /// All three passes share one program/VAO/VBO — `V3` (pos+colour) is the same
+    /// vertex format throughout, so each pass just re-uploads and switches mode.
     pub fn render(
         &mut self,
         gl: &glow::Context,
         verts: &[V3],
+        overlay: &[V3],
         lines: &[V3],
         mvp: &[f32; 16],
         vp_left: i32,
@@ -347,9 +362,42 @@ impl Scene3dRenderer {
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
                     }
+                    if let Some(loc) = &self.u_alpha {
+                        gl.uniform_1_f32(Some(loc), 1.0); // opaque
+                    }
                     gl.bind_vertex_array(Some(vao));
                     gl.draw_arrays(glow::TRIANGLES, 0, verts.len() as i32);
                     gl.bind_vertex_array(None);
+                }
+            }
+
+            // ---- overlay pass — selection shade + modifier ghosts --------
+            // LEQUAL (not LESS): the shade is coincident with the solid it tints, so
+            // LESS would z-fight. Depth-write off so ghost faces don't occlude each
+            // other. Alpha comes from the vertex colour's implied blend below.
+            if !overlay.is_empty() {
+                if let (Some(prog), Some(vao), Some(vbo)) =
+                    (self.scene_prog, self.scene_vao, self.scene_vbo)
+                {
+                    gl.enable(glow::BLEND);
+                    gl.blend_func(glow::SRC_ALPHA, glow::ONE_MINUS_SRC_ALPHA);
+                    gl.depth_func(glow::LEQUAL);
+                    gl.depth_mask(false);
+                    gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
+                    gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes(overlay), glow::DYNAMIC_DRAW);
+                    gl.use_program(Some(prog));
+                    if let Some(loc) = &self.u_mvp {
+                        gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+                    }
+                    if let Some(loc) = &self.u_alpha {
+                        gl.uniform_1_f32(Some(loc), 0.45); // translucent shade / ghost
+                    }
+                    gl.bind_vertex_array(Some(vao));
+                    gl.draw_arrays(glow::TRIANGLES, 0, overlay.len() as i32);
+                    gl.bind_vertex_array(None);
+                    gl.depth_mask(true);
+                    gl.depth_func(glow::LESS);
+                    gl.disable(glow::BLEND);
                 }
             }
 
@@ -366,6 +414,9 @@ impl Scene3dRenderer {
                     gl.use_program(Some(prog));
                     if let Some(loc) = &self.u_mvp {
                         gl.uniform_matrix_4_f32_slice(Some(loc), false, mvp);
+                    }
+                    if let Some(loc) = &self.u_alpha {
+                        gl.uniform_1_f32(Some(loc), 1.0); // opaque
                     }
                     gl.bind_vertex_array(Some(vao));
                     gl.draw_arrays(glow::LINES, 0, lines.len() as i32);

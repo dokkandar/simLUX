@@ -117,6 +117,21 @@ pub struct FactoryState {
     pub modify: Option<cad_solid::modify::Modify>,
     /// Prompt for the running 3D op, echoed in the panel.
     pub status: String,
+    /// The selected features' own mesh + the selection it was built from (the cache
+    /// key). Rebuilt only when the selection changes — never per frame.
+    sel_mesh: SolidMesh,
+    sel_key: Vec<u32>,
+}
+
+/// CARD cardinal lock on a WORLD delta: collapse the in-plane part to its dominant
+/// axis, preserving the out-of-plane component (the 3D reading of the 2D H/V lock —
+/// same rule `cad_solid::modify` applies internally).
+fn card_lock_world(d: Vec3) -> Vec3 {
+    if d.x.abs() >= d.y.abs() {
+        Vec3::new(d.x, 0.0, d.z)
+    } else {
+        Vec3::new(0.0, d.y, d.z)
+    }
 }
 
 /// Which primitive the Draw3D dialog is editing. One entry per menu item.
@@ -341,6 +356,8 @@ impl Default for FactoryState {
             draw3d: None,
             modify: None,
             status: String::new(),
+            sel_mesh: SolidMesh::default(),
+            sel_key: Vec::new(),
         }
     }
 }
@@ -383,7 +400,14 @@ impl FactoryState {
     /// Re-evaluate the CSG tree. Call ONLY when idle — csgrs walks a BSP per boolean.
     pub fn recompute(&mut self) {
         self.cached = self.model.eval();
+        self.sel_key.clear(); // the model changed → the selection's mesh is stale
+        self.ensure_sel_mesh();
         self.dirty = false;
+    }
+
+    /// Refresh the selection mesh if the selection moved on (cheap no-op otherwise).
+    pub fn sync_selection_mesh(&mut self) {
+        self.ensure_sel_mesh();
     }
 
     /// Zoom-extents: the ONLY thing that moves `cam_target`.
@@ -399,6 +423,82 @@ impl FactoryState {
         } else {
             self.cam_target = [0.0, 0.0, 0.0];
             self.cam_dist = 12.0;
+        }
+    }
+
+    /// The SELECTED features' own geometry, as a mesh.
+    ///
+    /// `cached` is the fused CSG result — after booleans, individual features have no
+    /// identity in it, so the selected solid's triangles cannot be picked back out.
+    /// This evaluates just the selection into its own mesh, which is what both the
+    /// selection SHADE and the modifier GHOST draw.
+    ///
+    /// **Cached on the selection**, because csgrs walks a BSP per boolean — doing this
+    /// per frame is precisely the lag source the whole panel is careful to avoid.
+    fn ensure_sel_mesh(&mut self) {
+        if self.sel_key == self.selection {
+            return;
+        }
+        let mut m = Model::default();
+        for id in &self.selection {
+            if let Some(f) = self.model.features.iter().find(|f| f.id == *id) {
+                let mut f = *f;
+                f.op = BoolOp::Union; // isolated: a lone Difference would erase itself
+                m.push_feature(f);
+            }
+        }
+        self.sel_mesh = m.eval();
+        self.sel_key = self.selection.clone();
+    }
+
+    /// Selection SHADE — the selected solids tinted in place (§0.6's "selected
+    /// dobjects get a shade"). Drawn in the translucent overlay pass, which uses
+    /// `depth_func(LEQUAL)` so coincident geometry tints instead of z-fighting.
+    pub fn shade_verts(&self) -> Vec<V3> {
+        if self.selection.is_empty() || self.modify.is_some() {
+            return Vec::new(); // during an op the GHOST is the feedback, not the shade
+        }
+        let c = [0.0, 0.75, 0.95];
+        self.sel_mesh.positions.iter().map(|p| v(Vec3::from(*p), c)).collect()
+    }
+
+    /// GHOST — the selected solids under the op's LIVE transform, redrawn every frame
+    /// at the constrained cursor (spec §0.6). `xf` is the per-point transform.
+    fn ghost_verts(&self, c: [f32; 3], xf: impl Fn(Vec3) -> Vec3) -> Vec<V3> {
+        self.sel_mesh.positions.iter().map(|p| v(xf(Vec3::from(*p)), c)).collect()
+    }
+
+    /// The live ghost for the running op, or empty. Colours per spec §0.6:
+    /// Move accent(255,200,100) · Copy green(150,230,170) · Rotate/Scale white ·
+    /// Mirror violet(200,160,255).
+    pub fn modify_ghost(&self, cursor_world: Vec3, card: bool) -> Vec<V3> {
+        use cad_solid::modify::{rot_about, scale_about, ModifyOp};
+        let Some(md) = &self.modify else { return Vec::new() };
+        let plane = Plane::default();
+        let Some(base) = md.anchor_world(&plane) else { return Vec::new() };
+        match md.op {
+            ModifyOp::Move | ModifyOp::Copy => {
+                let v3 = cursor_world - base;
+                let v3 = if card { card_lock_world(v3) } else { v3 };
+                let c = if md.op == ModifyOp::Move { [1.0, 0.78, 0.39] } else { [0.59, 0.90, 0.67] };
+                self.ghost_verts(c, |p| p + v3)
+            }
+            ModifyOp::Rotate => {
+                let ang = md.preview_angle(&plane, cursor_world, card).unwrap_or(0.0);
+                self.ghost_verts([0.92, 0.92, 0.98], |p| rot_about(p, base, Vec3::Z, ang))
+            }
+            ModifyOp::Scale => {
+                let k = md.preview_factor(&plane, cursor_world).unwrap_or(1.0);
+                self.ghost_verts([0.80, 0.95, 0.82], |p| scale_about(p, base, k))
+            }
+            ModifyOp::Mirror => {
+                let line = (cursor_world - base).normalize_or_zero();
+                let n = Vec3::Z.cross(line).normalize_or_zero();
+                if n.length_squared() < 1e-9 {
+                    return Vec::new();
+                }
+                self.ghost_verts([0.78, 0.63, 1.0], |p| p - n * (2.0 * (p - base).dot(n)))
+            }
         }
     }
 
@@ -617,5 +717,95 @@ mod pick_tests {
         let mvp = view(&st, rect);
         let f = st.pick_face(rect.center(), rect, &mvp);
         assert!(f.is_some(), "centre ray must hit a face of the centred solid");
+    }
+}
+
+#[cfg(test)]
+mod preview_tests {
+    use super::*;
+    use cad_solid::modify::{Modify, ModifyOp};
+
+    fn sel_box() -> FactoryState {
+        let mut st = FactoryState::default();
+        st.add_box();
+        st.recompute();
+        st.selection = vec![st.model.features[0].id];
+        st.sync_selection_mesh();
+        st
+    }
+
+    /// §0.6: selected solids get a SHADE. This is what the owner asked for and what
+    /// the first cut shipped without (only a wireframe AABB).
+    #[test]
+    fn selection_produces_a_shade() {
+        let st = sel_box();
+        assert!(!st.shade_verts().is_empty(), "a selected solid must be shaded");
+        // add_box() auto-selects what it creates (a newly drawn solid IS selected),
+        // so clear it explicitly to test the empty case.
+        let mut none = FactoryState::default();
+        none.add_box();
+        none.selection.clear();
+        none.recompute();
+        assert!(none.shade_verts().is_empty(), "nothing selected → no shade");
+    }
+
+    /// §0.6 MOVE: after the BASE pick, a live GHOST of the selection must follow the
+    /// cursor — translated by (cursor − base). Its absence was the owner's complaint:
+    /// the solid jumped from base to destination with no preview of the path.
+    #[test]
+    fn move_ghost_follows_the_cursor_after_the_base_pick() {
+        let mut st = sel_box();
+        let mut md = Modify::new(ModifyOp::Move, st.selection.clone());
+        let plane = Plane::default();
+        // no base yet → no ghost
+        st.modify = Some(md.clone());
+        assert!(st.modify_ghost(Vec3::new(5.0, 0.0, 0.0), false).is_empty(), "no ghost before BASE");
+        // pick BASE at origin
+        md.feed(Vec3::ZERO, &plane, &mut st.model, false);
+        st.modify = Some(md);
+
+        let g = st.modify_ghost(Vec3::new(5.0, 0.0, 0.0), false);
+        assert!(!g.is_empty(), "ghost must exist once the base is picked");
+        // and it must sit at +5 in x relative to the real mesh
+        let gx = g.iter().map(|v| v.x).fold(f32::NEG_INFINITY, f32::max);
+        let mx = st.sel_mesh.positions.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((gx - mx - 5.0).abs() < 1e-3, "ghost offset +5: real {mx} ghost {gx}");
+    }
+
+    /// The ghost must honour CARD — it previews the CONSTRAINED cursor, so what you
+    /// see is where the click actually lands (§0.5/§0.6).
+    #[test]
+    fn move_ghost_respects_card_lock() {
+        let mut st = sel_box();
+        let mut md = Modify::new(ModifyOp::Move, st.selection.clone());
+        md.feed(Vec3::ZERO, &Plane::default(), &mut st.model, false);
+        st.modify = Some(md);
+        // dominant axis is x → y must be locked out of the ghost
+        let g = st.modify_ghost(Vec3::new(5.0, 0.4, 0.0), true);
+        let gy = g.iter().map(|v| v.y).fold(f32::NEG_INFINITY, f32::max);
+        let my = st.sel_mesh.positions.iter().map(|p| p[1]).fold(f32::NEG_INFINITY, f32::max);
+        assert!((gy - my).abs() < 1e-3, "CARD locks y out: real {my} ghost {gy}");
+    }
+
+    /// Rotate/Scale/Mirror must ghost too (§0.6) — not just Move.
+    #[test]
+    fn every_modifier_has_a_ghost() {
+        for op in [ModifyOp::Move, ModifyOp::Copy, ModifyOp::Rotate, ModifyOp::Scale, ModifyOp::Mirror] {
+            let mut st = sel_box();
+            let mut md = Modify::new(op, st.selection.clone());
+            md.feed(Vec3::ZERO, &Plane::default(), &mut st.model, false); // base/pivot/axis-A
+            st.modify = Some(md);
+            let g = st.modify_ghost(Vec3::new(3.0, 2.0, 0.0), false);
+            assert!(!g.is_empty(), "{op:?} must draw a ghost");
+        }
+    }
+
+    /// During an op the GHOST is the feedback, so the static shade steps aside —
+    /// otherwise the solid reads as both "selected here" and "going there" at once.
+    #[test]
+    fn shade_yields_to_the_ghost_during_an_op() {
+        let mut st = sel_box();
+        st.modify = Some(Modify::new(ModifyOp::Move, st.selection.clone()));
+        assert!(st.shade_verts().is_empty(), "no static shade while an op is running");
     }
 }

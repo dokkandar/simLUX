@@ -3794,6 +3794,59 @@ impl CadApp {
                 let mut lines = self.factory.overlay_lines();
                 lines.extend(self.factory.sketch_lines()); // 2D work, lifted onto its plane
 
+                // ---- §0.6 PREVIEW — shade / ghost / marching-ants / blip -----
+                // The complete move, per BASIC_MODIFIERS_RULES §0.6 and §1:
+                //   select → the picked solids SHADE → click BASE → a live GHOST and
+                //   an animated path follow the constrained cursor → click DEST.
+                // Everything below is redrawn each frame at the CONSTRAINED cursor
+                // (osnap → CARD → raw), so what you see is exactly where it lands.
+                self.factory.sync_selection_mesh();
+                let mut overlay = self.factory.shade_verts();
+                let mut ants: Option<(egui::Pos2, egui::Pos2, egui::Color32)> = None;
+                let mut ghost_label: Option<(String, egui::Color32)> = None;
+                if let Some(md) = &self.factory.modify {
+                    let hover = resp.hover_pos();
+                    // the SAME resolution the click uses: osnap first, then the plane
+                    let cw = hover.and_then(|hp| {
+                        self.factory
+                            .snap_vertex(hp, rect, &mvp)
+                            .map(|(w, _)| w)
+                            .or_else(|| self.factory.cursor_on_plane(hp, rect, &mvp))
+                    });
+                    if let (Some(cw), Some(base)) =
+                        (cw, md.anchor_world(&cad_solid::Plane::default()))
+                    {
+                        let card = self.env.CrdEnb;
+                        overlay.extend(self.factory.modify_ghost(cw, card));
+                        // project base + cursor back to screen for the 2D overlay bits
+                        let m = glam::Mat4::from_cols_array(&mvp);
+                        let to_s = |w: glam::Vec3| {
+                            let n = m.project_point3(w);
+                            egui::pos2(
+                                rect.left() + (n.x * 0.5 + 0.5) * rect.width(),
+                                rect.top() + (0.5 - n.y * 0.5) * rect.height(),
+                            )
+                        };
+                        use cad_solid::modify::ModifyOp as MO;
+                        let accent = match md.op {
+                            MO::Move => egui::Color32::from_rgb(255, 200, 100),
+                            MO::Copy => egui::Color32::from_rgb(150, 230, 170),
+                            MO::Mirror => egui::Color32::from_rgb(200, 160, 255),
+                            _ => egui::Color32::from_rgb(235, 235, 245),
+                        };
+                        ants = Some((to_s(base), to_s(cw), accent));
+                        // numeric readout — degrees / ×factor, as in 2D
+                        let plane = cad_solid::Plane::default();
+                        if let Some(a) = md.preview_angle(&plane, cw, card) {
+                            ghost_label =
+                                Some((format!("{:.1}°{}", a.to_degrees(), if md.copy { " (copy)" } else { "" }), accent));
+                        } else if let Some(k) = md.preview_factor(&plane, cw) {
+                            ghost_label =
+                                Some((format!("×{k:.3}{}", if md.copy { " (copy)" } else { "" }), accent));
+                        }
+                    }
+                }
+
                 if verts.is_empty() && lines.is_empty() {
                     painter.text(
                         rect.center(),
@@ -3812,7 +3865,7 @@ impl CadApp {
                             let s = info.screen_size_px;
                             if let Ok(mut r) = renderer.lock() {
                                 r.render(
-                                    gl, &verts, &lines, &mvp,
+                                    gl, &verts, &overlay, &lines, &mvp,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
@@ -3820,6 +3873,53 @@ impl CadApp {
                         })),
                     }));
                 }
+                // ---- marching-ants path + base blip + readout ----------------
+                // Drawn AFTER the 3D callback so they sit on top of the solids, and
+                // with the SAME helpers the 2D move uses (`draw_base_blip`,
+                // `draw_dashed_line`, phase = time*60) — one implementation, so the
+                // 3D path animates identically to the 2D one.
+                if let Some((base_s, dest_s, accent)) = ants {
+                    draw_base_blip(&painter, base_s, accent);
+                    let phase = ctx.input(|i| i.time) as f32 * 60.0;
+                    draw_dashed_line(
+                        &painter,
+                        base_s,
+                        dest_s,
+                        6.0,
+                        4.0,
+                        phase,
+                        egui::Stroke::new(1.2, accent),
+                    );
+                    ctx.request_repaint(); // keep the ants marching
+                }
+                if let (Some((txt, col)), Some(hp)) = (ghost_label, resp.hover_pos()) {
+                    painter.text(
+                        hp + egui::vec2(14.0, -14.0),
+                        egui::Align2::LEFT_BOTTOM,
+                        txt,
+                        egui::FontId::proportional(13.0),
+                        col,
+                    );
+                }
+                // Hint line — mirrors the 2D move's top-left prompt.
+                if let Some(md) = &self.factory.modify {
+                    painter.text(
+                        rect.left_top() + egui::vec2(10.0, 10.0),
+                        egui::Align2::LEFT_TOP,
+                        format!(
+                            "{}: {}",
+                            md.op.label().to_uppercase(),
+                            if md.has_base() {
+                                format!("click {} ({} solid(s) following)", md.pick_name(), md.targets.len())
+                            } else {
+                                format!("click {} for {} solid(s)    [Esc cancels]", md.pick_name(), md.targets.len())
+                            }
+                        ),
+                        egui::FontId::monospace(12.0),
+                        egui::Color32::from_rgb(255, 200, 100),
+                    );
+                }
+
                 // ---- CURSOR — the SAME glyphs as the 2D canvas ---------------
                 // Reused via `draw_select_cursor` / `draw_draft_cursor`, so the two
                 // views can never drift. Which one is showing tells you what the LEFT
@@ -3829,7 +3929,9 @@ impl CadApp {
                 //   otherwise           → "^" pickbox   (a click selects an OBJECT)
                 if !orbiting {
                     if let Some(p) = resp.hover_pos() {
-                        if self.factory.session.is_some() {
+                        // a running 3D op is a POINT-PICK phase → drafting glyph,
+                        // exactly as `in_click_only_phase` gates it in 2D
+                        if self.factory.session.is_some() || self.factory.modify.is_some() {
                             draw_draft_cursor(&painter, p);
                         } else {
                             draw_select_cursor(&painter, p);
@@ -3944,7 +4046,7 @@ impl CadApp {
                             let s = info.screen_size_px;
                             if let Ok(mut r) = renderer.lock() {
                                 r.render(
-                                    gl, &verts, &[], &mvp,
+                                    gl, &verts, &[], &[], &mvp,
                                     vp.left_px, vp.from_bottom_px, vp.width_px, vp.height_px,
                                     s[0] as i32, s[1] as i32,
                                 );
