@@ -177,6 +177,25 @@ pub enum DbgEvent {
         detail:             String,    // free-form per-op summary
     },
 
+    /// A frame that BLEW THE BUDGET, with a breakdown of where it went.
+    ///
+    /// Emitted only when a frame exceeds one refresh (16.7 ms @ 60 Hz) — i.e. only
+    /// when the user can actually SEE the stall — so it costs nothing on a healthy
+    /// frame and cannot flood the dump.
+    ///
+    /// This exists because "zoom/pan got slow" was previously unfalsifiable: the dump
+    /// showed clicks seconds apart with no way to tell user think-time from frame
+    /// time. `candidates` is the key column — at 1.5M dobjects a zoomed-out query
+    /// returns EVERY dobject, and the render loop then walks all of them.
+    SlowFrame {
+        total_us:   u64,
+        query_us:   u64,
+        draw_us:    u64,
+        candidates: usize,
+        drawn:      usize,
+        capped:     bool,
+    },
+
     /// Spatial-index rebuild — O(n) over the WHOLE drawing, triggered by ~58 places
     /// marking `index_dirty` (i.e. essentially every edit).
     ///
@@ -612,6 +631,17 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             format!("◆ SESSION STOP — {} ({} events)", reason, event_count),
         DbgEvent::Note { message } =>
             format!("📝 NOTE: {}", message),
+        DbgEvent::SlowFrame { total_us, query_us, draw_us, candidates, drawn, capped } => {
+            format!(
+                "🐢 SLOW FRAME {:.1} ms  (query {:.1} · draw {:.1})  candidates={} drawn={}{}",
+                *total_us as f64 / 1000.0,
+                *query_us as f64 / 1000.0,
+                *draw_us as f64 / 1000.0,
+                candidates,
+                drawn,
+                if *capped { "  ⚠ DRAW CAPPED (frame truncated)" } else { "" },
+            )
+        }
         DbgEvent::IndexRebuild { dobjects, elapsed_us } => {
             let ms = *elapsed_us as f64 / 1000.0;
             // 16 ms = one frame @ 60 Hz — past that the stall is VISIBLE

@@ -26845,13 +26845,20 @@ impl eframe::App for CadApp {
             // (= `in_viewport` in the screen-stats panel) and iterate
             // them twice (CPU vs GPU branches consume the same set).
             let _ = self.ensure_index();
+            // FRAME INSTRUMENTATION — see DbgEvent::SlowFrame. Two Instants per frame
+            // (~40 ns) is free next to what we're measuring, and "is zoom/pan slow?"
+            // was otherwise unfalsifiable from a dump.
+            let t_frame = std::time::Instant::now();
+            let t_query = std::time::Instant::now();
             let candidates: Vec<usize> =
                 if let (Some(g), false) = (self.index.as_ref(), self.index_dirty) {
                     g.query_bbox(v_min, v_max).into_iter().map(|u| u as usize).collect()
                 } else {
                     (0..self.doc.dobjects.len()).collect()
                 };
+            let query_us = t_query.elapsed().as_micros() as u64;
             let in_viewport = candidates.len();
+            let t_draw = std::time::Instant::now();
 
             // ---- Hatch geometry cache (the perf fix) ---------------------
             // Hatch generation (pattern scanline-clip, solid ear-clip) is the
@@ -27689,6 +27696,25 @@ impl eframe::App for CadApp {
                 } else {
                     None
                 };
+            // ---- SLOW-FRAME report -------------------------------------
+            // Only when the frame blew one refresh (16.7 ms @ 60 Hz) — i.e. only when
+            // the stall is VISIBLE. Costs nothing on a healthy frame and cannot flood
+            // the dump. `candidates` is the column that matters: zoomed out at 1.5M it
+            // is EVERY dobject, and the draw loop then walks all of them.
+            {
+                let total_us = t_frame.elapsed().as_micros() as u64;
+                if total_us >= 16_700 {
+                    let draw_us = t_draw.elapsed().as_micros() as u64;
+                    crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::SlowFrame {
+                        total_us,
+                        query_us,
+                        draw_us,
+                        candidates: in_viewport,
+                        drawn,
+                        capped: cpu_capped,
+                    });
+                }
+            }
             if let Some((msg, col)) = notice {
                 let font = egui::FontId::monospace(12.0);
                 let ink  = egui::Color32::from_rgb(20, 20, 24);
@@ -33627,6 +33653,53 @@ mod perf_investigation {
         d
     }
 
+
+
+    /// ⭐ ZOOM/PAN slowness. `query_bbox` runs EVERY FRAME to decide what to render.
+    /// It allocates O(n) per call — so panning a 1.5M drawing allocates megabytes per
+    /// frame, before a single pixel is drawn.
+    #[test]
+    #[ignore = "benchmark: --ignored --nocapture"]
+    fn query_cost_per_frame() {
+        for n in [100_000usize, 1_500_000] {
+            let doc = doc_with(n);
+            let cs = cad_kernel::UniformGrid::auto_cell_size(&doc.dobjects, 10.0);
+            let g = cad_kernel::UniformGrid::build(&doc.dobjects, cs);
+            let (mn, mx) = {
+                let mut a = Vec2::new(f64::MAX, f64::MAX);
+                let mut b = Vec2::new(f64::MIN, f64::MIN);
+                for d in &doc.dobjects {
+                    let (p, q) = d.bbox();
+                    a.x = a.x.min(p.x); a.y = a.y.min(p.y);
+                    b.x = b.x.max(q.x); b.y = b.y.max(q.y);
+                }
+                (a, b)
+            };
+            println!("\n=== {n} dobjects ===");
+
+            // ZOOMED OUT (the whole drawing) — hits the "≥80% of the grid" fast path
+            let t = std::time::Instant::now();
+            let mut hits = 0usize;
+            for _ in 0..10 {
+                hits = g.query_bbox(mn, mx).len();
+            }
+            let out_ms = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+            println!("  query zoomed OUT (whole drawing) : {out_ms:7.2} ms/frame  → {hits} candidates");
+
+            // ZOOMED IN (a small window) — the normal cell scan
+            let w = (mx.x - mn.x) * 0.02;
+            let h = (mx.y - mn.y) * 0.02;
+            let c0 = Vec2::new(mn.x + (mx.x - mn.x) * 0.5, mn.y + (mx.y - mn.y) * 0.5);
+            let t = std::time::Instant::now();
+            let mut hits2 = 0usize;
+            for _ in 0..10 {
+                hits2 = g.query_bbox(c0, Vec2::new(c0.x + w, c0.y + h)).len();
+            }
+            let in_ms = t.elapsed().as_secs_f64() * 1000.0 / 10.0;
+            println!("  query zoomed IN  (2% window)     : {in_ms:7.2} ms/frame  → {hits2} candidates");
+            println!("  ↳ at 60 Hz a frame is 16.7 ms — anything above that IS the stall");
+        }
+    }
 
     /// ⭐ THE WIN, measured. A MOVE of a subset must re-bucket only that subset.
     #[test]
