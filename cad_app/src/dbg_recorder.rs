@@ -106,8 +106,12 @@ pub enum DbgEvent {
         hit_at_release:      Option<usize>,
         in_select_mode:      bool,
         active_tool:         String,
+        /// EMPTIED at capture when `counts_only` is on — see `n_before`/`n_after`.
         selection_before:    Vec<usize>,
         selection_after:     Vec<usize>,
+        /// True sizes, stamped by `push()` before any stripping. Always valid.
+        n_before:            usize,
+        n_after:             usize,
         app_action_taken:    String,    // "click_select(i=2)", "window_first=Some(...)", "add_window_selection", "NOOP — gesture had no effect"
         outcome_summary:     String,    // human-readable verdict
     },
@@ -121,8 +125,13 @@ pub enum DbgEvent {
 
     /// Selection mutated — what was the basket BEFORE vs AFTER.
     SelectChange {
+        /// The baskets. EMPTIED at capture when `counts_only` is on — read
+        /// `n_before`/`n_after` for the size, which is always populated.
         basket_before: Vec<usize>,
         basket_after:  Vec<usize>,
+        /// True basket sizes, stamped by `push()` before any stripping. Always valid.
+        n_before:      usize,
+        n_after:       usize,
         cause:         String,    // "click_select(i=5, shift=false)" etc.
     },
 
@@ -272,6 +281,16 @@ pub struct DbgSnapshot {
 /// production builds.
 pub struct DbgRecorder {
     pub recording:        bool,
+    /// **Count dobjects ONLY.** Keep the NUMBER of selected/affected dobjects and
+    /// nothing else — never the index lists themselves.
+    ///
+    /// Why it exists: `SelectChange`/`GestureClassification` carry `Vec<usize>`
+    /// baskets, and a gesture prints its selection TWICE (before → after). At 916
+    /// selected that is ~11 KB per event; at a million it is ~11 MB per event, and the
+    /// dump stops being pasteable at all. With this on, the lists are dropped AT
+    /// CAPTURE — not merely hidden at render — so the recorder's own memory stays O(1)
+    /// in the selection size.
+    pub counts_only:      bool,
     pub session_started:  Option<Instant>,
     pub events:           Vec<DbgRecord>,
     pub snapshots:        Vec<DbgSnapshot>,
@@ -299,6 +318,7 @@ impl Default for DbgRecorder {
     fn default() -> Self {
         Self {
             recording:        false,
+            counts_only:      false,
             session_started:  None,
             events:           Vec::new(),
             snapshots:        Vec::new(),
@@ -392,8 +412,33 @@ impl DbgRecorder {
         }
     }
 
-    pub fn push(&mut self, event: DbgEvent, loc: &'static Location<'static>) {
+    pub fn push(&mut self, mut event: DbgEvent, loc: &'static Location<'static>) {
         if !self.recording { return; }
+        // COUNT-ONLY — strip dobject index lists at CAPTURE. Done here, in the single
+        // choke point every event passes through, so no emission site can forget it
+        // and no future one can bypass it. The counts survive (see `n_before/n_after`).
+        // Counts are stamped ALWAYS (so the render never has to trust the vecs);
+        // the lists are dropped only in counts-only mode.
+        let strip = self.counts_only;
+        match &mut event {
+            DbgEvent::SelectChange { basket_before, basket_after, n_before, n_after, .. } => {
+                *n_before = basket_before.len();
+                *n_after = basket_after.len();
+                if strip {
+                    *basket_before = Vec::new();
+                    *basket_after = Vec::new();
+                }
+            }
+            DbgEvent::GestureClassification { selection_before, selection_after, n_before, n_after, .. } => {
+                *n_before = selection_before.len();
+                *n_after = selection_after.len();
+                if strip {
+                    *selection_before = Vec::new();
+                    *selection_after = Vec::new();
+                }
+            }
+            _ => {}
+        }
         if self.max_events > 0 && self.events.len() >= self.max_events {
             // Ring eviction — drop oldest 5% to amortise the move cost.
             let drop = self.max_events / 20;
@@ -581,26 +626,42 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             motion_px, motion_dir, egui_clicked, egui_drag_stopped,
             press_world, release_world, hit_at_press, hit_at_release,
             in_select_mode, active_tool, selection_before, selection_after,
-            app_action_taken, outcome_summary, ..
+            n_before, n_after, app_action_taken, outcome_summary, ..
         } => {
+            // The selection is printed TWICE here (before → after), so this line is
+            // the single biggest dump amplifier: ~11 KB at 916 selected. In
+            // counts-only mode print the SIZES instead.
+            let sel = if selection_before.is_empty() && selection_after.is_empty()
+                && (*n_before > 0 || *n_after > 0)
+            {
+                format!("{n_before} → {n_after} dobject(s)")
+            } else {
+                format!("{selection_before:?} → {selection_after:?}")
+            };
             // Multi-line so the timeline reader can SEE the whole story.
             format!(
                 "🔍 GESTURE press=({:.2},{:.2}) hit_press={:?}  →  release=({:.2},{:.2}) hit_release={:?}\n         \
                  motion={} px ({})  egui: clicked={} drag_stopped={}  select_mode={}  tool={}\n         \
-                 sel: {:?} → {:?}  | action: {}\n         \
+                 sel: {}  | action: {}\n         \
                  verdict: {}",
                 press_world.x, press_world.y, hit_at_press,
                 release_world.x, release_world.y, hit_at_release,
                 motion_px, motion_dir, egui_clicked, egui_drag_stopped,
                 in_select_mode, active_tool,
-                selection_before, selection_after,
+                sel,
                 app_action_taken, outcome_summary)
         }
         DbgEvent::CanvasDrag { from_world, to_world, button, .. } =>
             format!("🖱 DRAG {} ({:.3},{:.3})→({:.3},{:.3})",
                 button, from_world.x, from_world.y, to_world.x, to_world.y),
-        DbgEvent::SelectChange { basket_before, basket_after, cause } =>
-            format!("✓ SEL {:?} → {:?}  ({})", basket_before, basket_after, cause),
+        DbgEvent::SelectChange { basket_before, basket_after, n_before, n_after, cause } => {
+            if basket_before.is_empty() && basket_after.is_empty() && (*n_before > 0 || *n_after > 0) {
+                // counts-only: the lists were dropped at capture
+                format!("✓ SEL {} → {} dobject(s)  ({})", n_before, n_after, cause)
+            } else {
+                format!("✓ SEL {:?} → {:?}  ({})", basket_before, basket_after, cause)
+            }
+        }
         DbgEvent::ToolChange { from, to, cause } =>
             format!("🔧 TOOL {} → {}  ({})", from, to, cause),
         DbgEvent::StateChange { state_name, before, after, cause } =>

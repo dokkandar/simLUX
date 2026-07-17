@@ -8140,6 +8140,7 @@ impl CadApp {
         }
         crate::dbg_event!(self,
             crate::dbg_recorder::DbgEvent::SelectChange {
+                n_before: 0, n_after: 0, // stamped by push() from the real vec lens
                 basket_before,
                 basket_after: self.selection.clone(),
                 cause: format!("click_select(i={}, shift={}, alt={}, fresh={})",
@@ -8333,6 +8334,7 @@ impl CadApp {
         };
         crate::dbg_event!(self,
             crate::dbg_recorder::DbgEvent::SelectChange {
+                n_before: 0, n_after: 0, // stamped by push() from the real vec lens
                 basket_before,
                 basket_after: self.selection.clone(),
                 cause: format!(
@@ -10018,6 +10020,7 @@ impl CadApp {
         let egui_drag_stopped = p.motion_px > 5.0;
         crate::dbg_event!(self,
             crate::dbg_recorder::DbgEvent::GestureClassification {
+                n_before: 0, n_after: 0, // stamped by push() from the real vec lens
                 press_screen:     p.press_screen,
                 release_screen:   p.release_screen,
                 press_world:      p.press_world,
@@ -10282,6 +10285,26 @@ impl CadApp {
                     } else { egui::Color32::from_rgb(80, 50, 50) });
                 if ui.add_enabled(is_recording, stop_btn).clicked() {
                     self.dbg_stop();
+                }
+                ui.separator();
+                // COUNT DOBJECTS ONLY — keep the NUMBER of selected/affected
+                // dobjects, never the index lists. The lists are dropped at CAPTURE
+                // (in DbgRecorder::push), so this bounds the recorder's memory too,
+                // not just the dump's size.
+                let co = ui
+                    .selectable_label(self.dbg.counts_only, "# Count dobjects ONLY")
+                    .on_hover_text(
+                        "Record only HOW MANY dobjects were selected/affected — never \
+                         the index lists.\n\nA gesture prints its selection twice \
+                         (before → after): ~11 KB at 916 selected, ~11 MB at a million. \
+                         Turn this on for large-drawing work and dumps stay readable.",
+                    );
+                if co.clicked() {
+                    self.dbg.counts_only = !self.dbg.counts_only;
+                    self.history.push(format!(
+                        "  🛰 recorder: count dobjects only {}",
+                        if self.dbg.counts_only { "ON" } else { "off" }
+                    ));
                 }
                 ui.separator();
                 if ui.button("🗑 Clear").clicked() {
@@ -33456,6 +33479,102 @@ mod snapshot_scaling_tests {
             dump.len() < 8_000,
             "a 100k-dobject dump must stay readable, got {} bytes",
             dump.len()
+        );
+    }
+}
+
+#[cfg(test)]
+mod counts_only_tests {
+    use super::*;
+    use crate::dbg_recorder::DbgEvent;
+
+    fn rec() -> crate::dbg_recorder::DbgRecorder {
+        let mut r = crate::dbg_recorder::DbgRecorder::default();
+        r.recording = true;
+        r.session_started = Some(std::time::Instant::now());
+        r
+    }
+
+    /// Measures the win at the user's real numbers (916 selected, and 1M).
+    #[test]
+    #[ignore = "benchmark: --ignored --nocapture"]
+    fn measure_dump_size() {
+        for n in [916usize, 100_000, 1_000_000] {
+            let mut a = rec(); a.counts_only = false;
+            a.push(sel_change(n), std::panic::Location::caller());
+            let mut b = rec(); b.counts_only = true;
+            b.push(sel_change(n), std::panic::Location::caller());
+            println!("  {n:>9} selected → verbose {:>9} bytes · counts-only {:>4} bytes",
+                     a.dump_text().len(), b.dump_text().len());
+        }
+    }
+
+    fn sel_change(n: usize) -> DbgEvent {
+        DbgEvent::SelectChange {
+            basket_before: vec![],
+            basket_after: (0..n).collect(),
+            n_before: 0,
+            n_after: 0,
+            cause: "window".into(),
+        }
+    }
+
+    /// Count-only keeps the NUMBER and drops the list — at CAPTURE, so the recorder's
+    /// own memory is bounded too, not just the dump text.
+    #[test]
+    fn counts_only_drops_the_list_but_keeps_the_number() {
+        let mut r = rec();
+        r.counts_only = true;
+        r.push(sel_change(50_000), std::panic::Location::caller());
+        match &r.events[0].event {
+            DbgEvent::SelectChange { basket_after, n_after, .. } => {
+                assert!(basket_after.is_empty(), "the list must be dropped AT CAPTURE");
+                assert_eq!(*n_after, 50_000, "…but the count survives");
+            }
+            _ => panic!("wrong event"),
+        }
+        let dump = r.dump_text();
+        assert!(dump.contains("✓ SEL 0 → 50000 dobject(s)"), "counts, got: {dump}");
+        // (the dump's TIMESTAMPS use brackets — check the SEL line itself)
+        let sel_line = dump.lines().find(|l| l.contains("✓ SEL")).unwrap();
+        assert!(!sel_line.contains("[0,"), "no index list on the SEL line: {sel_line}");
+        assert!(dump.len() < 400, "and the whole dump stays tiny: {} bytes", dump.len());
+    }
+
+    /// Off by default → the full lists, exactly as before. This is a debugging aid;
+    /// it must not silently change what a normal session records.
+    #[test]
+    fn off_by_default_keeps_the_full_list() {
+        let mut r = rec();
+        assert!(!r.counts_only, "must default OFF");
+        r.push(sel_change(3), std::panic::Location::caller());
+        match &r.events[0].event {
+            DbgEvent::SelectChange { basket_after, n_after, .. } => {
+                assert_eq!(basket_after.len(), 3, "lists preserved when off");
+                assert_eq!(*n_after, 3, "count stamped either way");
+            }
+            _ => panic!("wrong event"),
+        }
+        assert!(r.dump_text().contains("[0, 1, 2]"));
+    }
+
+    /// ⭐ THE POINT. The user's 1.2M-dobject dump was too big to paste — the second
+    /// half was truncated away. A 916-selection gesture prints its list TWICE.
+    /// Count-only must make dump size independent of selection size.
+    #[test]
+    fn dump_size_stops_scaling_with_the_selection() {
+        let big = |counts_only: bool| {
+            let mut r = rec();
+            r.counts_only = counts_only;
+            r.push(sel_change(100_000), std::panic::Location::caller());
+            r.dump_text().len()
+        };
+        let verbose = big(false);
+        let counted = big(true);
+        assert!(counted < 400, "counts-only dump must stay tiny, got {counted} bytes");
+        assert!(
+            verbose > 100 * counted,
+            "the verbose dump should dwarf it ({verbose} vs {counted})"
         );
     }
 }
