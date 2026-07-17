@@ -202,6 +202,77 @@ impl UniformGrid {
         true
     }
 
+    /// Build the index computing every `bbox()` **exactly ONCE**.
+    ///
+    /// The `auto_cell_size` + `build` pair sweeps `bbox()` THREE times (cell-size pass,
+    /// world-bbox pass, bucketing pass). On real geometry that dominates: measured on a
+    /// 1.5M drawing of lines/circles/arcs/ellipses/polylines, one sweep is 106 ms and
+    /// the rebuild is 409 ms — **78% of it is bbox()**, because bbox() is O(verts) for
+    /// a polyline and trigonometric for an arc/ellipse. Flat-line benchmarks hide this.
+    ///
+    /// Caches the bboxes (32 B/dobject, freed when this returns) and derives the cell
+    /// size from the same pass. Same result as `build(d, auto_cell_size(d, t))`, which
+    /// `index_rebuild_matches_build_auto` asserts.
+    pub fn build_auto(dobjects: &[DObject], target_per_cell: f64) -> Self {
+        if dobjects.is_empty() { return Self::empty(); }
+
+        // ---- the ONE bbox sweep -------------------------------------------
+        let mut bbs: Vec<(Vec2, Vec2)> = Vec::with_capacity(dobjects.len());
+        let mut min = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut max = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        let mut view_independent: Vec<u32> = Vec::new();
+        let mut count_real = 0usize;
+        for (i, e) in dobjects.iter().enumerate() {
+            if e.geom.is_view_independent_bbox() {
+                view_independent.push(i as u32);
+                bbs.push((Vec2::ZERO, Vec2::ZERO));
+                continue;
+            }
+            let bb = e.bbox();
+            count_real += 1;
+            if bb.0.x < min.x { min.x = bb.0.x; }
+            if bb.0.y < min.y { min.y = bb.0.y; }
+            if bb.1.x > max.x { max.x = bb.1.x; }
+            if bb.1.y > max.y { max.y = bb.1.y; }
+            bbs.push(bb);
+        }
+        if count_real == 0 || !min.x.is_finite() {
+            return Self {
+                cell_size: 1.0, origin: Vec2::ZERO, cols: 0, rows: 0,
+                cells: Vec::new(), ranges: vec![SKIP; dobjects.len()],
+                view_independent, n_entities: dobjects.len(),
+            };
+        }
+
+        // ---- cell size, from the SAME pass (no second sweep) --------------
+        let w = (max.x - min.x).max(1.0);
+        let h = (max.y - min.y).max(1.0);
+        let cell_size = (w * h * target_per_cell / count_real as f64)
+            .sqrt().max(0.001).min(1.0e6);
+
+        // ---- bucket, reusing the cached bboxes (no third sweep) ----------
+        let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
+        let rows = (((max.y - min.y) / cell_size).floor() as isize + 1).max(1) as usize;
+        let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+        let mut ranges: Vec<[u32; 4]> = Vec::with_capacity(dobjects.len());
+        for (i, e) in dobjects.iter().enumerate() {
+            if e.geom.is_view_independent_bbox() {
+                ranges.push(SKIP);
+                continue;
+            }
+            let r = cell_range(&bbs[i], min, cell_size, cols, rows);
+            ranges.push(r);
+            for cy in r[2]..=r[3] {
+                let row = cy as usize * cols;
+                for cx in r[0]..=r[1] {
+                    cells[row + cx as usize].push(i as u32);
+                }
+            }
+        }
+        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
+               n_entities: dobjects.len() }
+    }
+
     /// Pick a cell size that targets `target_per_cell` dobjects per cell, on
     /// average, given the dobjects' overall bbox area.
     pub fn auto_cell_size(dobjects: &[DObject], target_per_cell: f64) -> f64 {
@@ -436,5 +507,41 @@ mod tests {
         assert!(!g.update(&ents, &[1, 2]));
         let after = sorted(g.query_bbox(Vec2::new(-1.0, -1.0), Vec2::new(200.0, 20.0)));
         assert_eq!(before, after, "a rejected update must not mutate the grid");
+    }
+
+    /// build_auto must produce an index INDISTINGUISHABLE from the two-call form. It
+    /// is a pure speed change; if the answers differ, picking/selection break.
+    #[test]
+    fn build_auto_matches_auto_cell_size_plus_build() {
+        let ents: Vec<DObject> = (0..500)
+            .map(|i| line((i % 25) as f64 * 11.0, (i / 25) as f64 * 9.0))
+            .collect();
+        let a = UniformGrid::build_auto(&ents, 10.0);
+        let b = UniformGrid::build(&ents, UniformGrid::auto_cell_size(&ents, 10.0));
+        assert!((a.cell_size - b.cell_size).abs() < 1e-9, "same cell size");
+        assert_eq!((a.cols, a.rows), (b.cols, b.rows), "same grid shape");
+        for gy in 0..14 {
+            for gx in 0..14 {
+                let q0 = Vec2::new(gx as f64 * 22.0 - 6.0, gy as f64 * 18.0 - 6.0);
+                let q1 = Vec2::new(q0.x + 30.0, q0.y + 30.0);
+                assert_eq!(
+                    sorted(a.query_bbox(q0, q1)),
+                    sorted(b.query_bbox(q0, q1)),
+                    "build_auto != build at probe ({gx},{gy})"
+                );
+            }
+        }
+    }
+
+    /// …and it must still support incremental update afterwards.
+    #[test]
+    fn build_auto_grid_can_still_absorb_updates() {
+        let mut ents: Vec<DObject> = (0..200).map(|i| line((i % 20) as f64 * 10.0, (i / 20) as f64 * 10.0)).collect();
+        let mut g = UniformGrid::build_auto(&ents, 10.0);
+        let changed: Vec<usize> = (0..200).step_by(5).collect();
+        for &i in &changed {
+            if let crate::geom::Geom::Line(l) = &mut ents[i].geom { l.a.x += 1.0; l.b.x += 1.0; }
+        }
+        assert!(g.update(&ents, &changed), "ranges are populated by build_auto too");
     }
 }

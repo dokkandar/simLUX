@@ -18952,8 +18952,11 @@ impl CadApp {
             return 0.0;
         }
         let t = std::time::Instant::now();
-        let cs = UniformGrid::auto_cell_size(&self.doc.dobjects, 10.0);
-        let g  = UniformGrid::build(&self.doc.dobjects, cs);
+        // ONE bbox() sweep, not three. On the owner's real 1.5M drawing the old
+        // `auto_cell_size(..) + build(..)` pair measured 417 ms, of which 71% was
+        // bbox() swept three times; build_auto is 233 ms (1.76×) for a provably
+        // identical grid (`build_auto_matches_auto_cell_size_plus_build`).
+        let g  = UniformGrid::build_auto(&self.doc.dobjects, 10.0);
         let (cells_total, idx_entries, cell_size) = g.stats();
         self.index = Some(g);
         self.index_dirty = false;
@@ -33679,6 +33682,70 @@ mod perf_investigation {
 
 
 
+
+
+    /// The owner's ACTUAL drawing: the 6-dobject seed arrayed ×250,000. My earlier
+    /// benchmarks used flat lines and reported 163 ms; the real dump says 386-397 ms.
+    /// bbox() is O(verts) for a polyline and non-trivial for arc/ellipse, and the
+    /// rebuild sweeps bbox THREE times (auto_cell_size + build's world sweep + build's
+    /// bucketing pass). Measure the real mix.
+    #[test]
+    #[ignore = "benchmark: --ignored --nocapture"]
+    fn real_geometry_rebuild_cost() {
+        use cad_kernel::{Arc as KArc, Circle, DObject, Ellipse, Geom, Line, Point, Polyline};
+        let mut doc = Document::default();
+        doc.dobjects.clear();
+        let n_sets = 250_000usize;
+        for k in 0..n_sets {
+            let ox = (k % 500) as f64 * 500.0;
+            let oy = (k / 500) as f64 * 500.0;
+            doc.push(DObject::new(Geom::Line(Line {
+                a: Vec2::new(ox - 40.0, oy - 20.0), b: Vec2::new(ox + 40.0, oy + 20.0) })));
+            doc.push(DObject::new(Geom::Circle(Circle {
+                center: Vec2::new(ox, oy), radius: 30.0 })));
+            doc.push(DObject::new(Geom::Arc(KArc {
+                center: Vec2::new(ox, oy), radius: 45.0,
+                start_angle: 0.0, sweep_angle: std::f64::consts::PI })));
+            doc.push(DObject::new(Geom::Ellipse(Ellipse {
+                center: Vec2::new(ox - 60.0, oy - 30.0),
+                major: Vec2::new(25.0, 12.0), ratio: 0.55 })));
+            doc.push(DObject::new(Geom::Point(Point {
+                location: Vec2::new(ox + 60.0, oy - 40.0), style: 0, size: 0.0 })));
+            let pv = |x: f64, y: f64| cad_kernel::PolyVertex { pos: Vec2::new(x, y), bulge: 0.0 };
+            doc.push(DObject::new(Geom::Polyline(Polyline {
+                vertices: vec![
+                    pv(ox + 50.0, oy + 40.0), pv(ox + 70.0, oy + 60.0),
+                    pv(ox + 90.0, oy + 40.0), pv(ox + 80.0, oy + 20.0),
+                    pv(ox + 55.0, oy + 25.0)],
+                closed: true, widths: vec![] })));
+        }
+        println!("\n=== {} dobjects (the owner's real 6-shape mix) ===", doc.dobjects.len());
+
+        let t = std::time::Instant::now();
+        let mut acc = 0.0f64;
+        for d in &doc.dobjects { let (a, b) = d.bbox(); acc += a.x + b.y; }
+        let sweep = t.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(acc);
+        println!("  ONE bbox() sweep            : {sweep:7.1} ms   (×3 per rebuild = {:.0} ms)", sweep * 3.0);
+
+        let t = std::time::Instant::now();
+        let cs = cad_kernel::UniformGrid::auto_cell_size(&doc.dobjects, 10.0);
+        let a_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = std::time::Instant::now();
+        let g = cad_kernel::UniformGrid::build(&doc.dobjects, cs);
+        let b_ms = t.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(&g);
+        println!("  auto_cell_size              : {a_ms:7.1} ms");
+        println!("  build                       : {b_ms:7.1} ms");
+        println!("  REBUILD TOTAL (3 sweeps)    : {:7.1} ms   ← the dump says 386-397 ms", a_ms + b_ms);
+        println!("  ↳ bbox() is {:.0}% of it", (sweep * 3.0) / (a_ms + b_ms) * 100.0);
+
+        let t = std::time::Instant::now();
+        let g2 = cad_kernel::UniformGrid::build_auto(&doc.dobjects, 10.0);
+        let one_ms = t.elapsed().as_secs_f64() * 1000.0;
+        std::hint::black_box(&g2);
+        println!("  build_auto (1 sweep)        : {one_ms:7.1} ms   → {:.2}× faster", (a_ms + b_ms) / one_ms);
+    }
 
     /// ⭐ THE FREEZE, from the owner's real 1.5M session:
     ///     🐢 SLOW FRAME    27.5 ms  (draw    25.2)  candidates=143856 drawn=141766
