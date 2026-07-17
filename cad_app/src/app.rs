@@ -8163,6 +8163,9 @@ impl CadApp {
                 *d = d.translated(v);
             }
         }
+        // Only the moved dobjects changed — re-bucket THOSE, not the whole drawing.
+        let moved = self.selection.clone();
+        self.index_absorb(&moved);
         // Save for `before`, then clear the live highlight.
         if !self.selection.is_empty() {
             self.selection_prev = self.selection.clone();
@@ -18910,6 +18913,27 @@ impl CadApp {
 
     /// Rebuild the spatial index if it's missing or stale. Returns the build
     /// duration in milliseconds.
+    /// Try to absorb an edit that changed exactly `changed` dobjects, WITHOUT the
+    /// O(n) rebuild. Falls back silently (leaves `index_dirty`) when the grid can't
+    /// take it — always correct, just slow.
+    ///
+    /// Why: a full rebuild is ~163 ms at 1.5M dobjects (auto_cell_size 23 ms + build
+    /// 140 ms) and fires from ~58 `index_dirty` sites. Moving 3,150 of 1.5M should
+    /// re-bucket 3,150 — not 1,500,000. Measured by
+    /// `perf_investigation::where_does_the_time_go`.
+    fn index_absorb(&mut self, changed: &[usize]) {
+        if self.index_dirty || changed.is_empty() {
+            return; // already stale for another reason → let the rebuild handle it
+        }
+        let ok = match self.index.as_mut() {
+            Some(g) => g.update(&self.doc.dobjects, changed),
+            None => false,
+        };
+        if !ok {
+            self.index_dirty = true; // grid can't absorb it → full rebuild next query
+        }
+    }
+
     fn ensure_index(&mut self) -> f64 {
         if !self.index_dirty && self.index.is_some() {
             return 0.0;
@@ -33601,6 +33625,41 @@ mod perf_investigation {
             })));
         }
         d
+    }
+
+
+    /// ⭐ THE WIN, measured. A MOVE of a subset must re-bucket only that subset.
+    #[test]
+    #[ignore = "benchmark: --ignored --nocapture"]
+    fn incremental_vs_rebuild() {
+        for n in [100_000usize, 1_500_000] {
+            let mut doc = doc_with(n);
+            let cs = cad_kernel::UniformGrid::auto_cell_size(&doc.dobjects, 10.0);
+            let mut g = cad_kernel::UniformGrid::build(&doc.dobjects, cs);
+
+            // the owner's shape: move a scattered ~3150 of them, a SMALL delta
+            let changed: Vec<usize> = (0..n).step_by(n / 3150).take(3150).collect();
+            for &i in &changed {
+                if let cad_kernel::Geom::Line(l) = &mut doc.dobjects[i].geom {
+                    l.a.x += 1.0; l.b.x += 1.0;
+                }
+            }
+
+            let t = std::time::Instant::now();
+            let ok = g.update(&doc.dobjects, &changed);
+            let inc = t.elapsed().as_secs_f64() * 1000.0;
+
+            let t = std::time::Instant::now();
+            let cs2 = cad_kernel::UniformGrid::auto_cell_size(&doc.dobjects, 10.0);
+            let g2 = cad_kernel::UniformGrid::build(&doc.dobjects, cs2);
+            let full = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(&g2);
+
+            println!(
+                "  {n:>9} dobj · moved {} → incremental {inc:7.2} ms (absorbed={ok}) vs rebuild {full:7.1} ms  → {:.0}× faster",
+                changed.len(), full / inc.max(0.0001)
+            );
+        }
     }
 
     /// WHERE DOES THE TIME GO at 1.5M dobjects? Measures the per-EDIT and per-FRAME

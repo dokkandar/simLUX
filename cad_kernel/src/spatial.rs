@@ -16,12 +16,44 @@
 use crate::dobject::DObject;
 use crate::math::Vec2;
 
+/// Marks a dobject that is not bucketed (view-independent bbox).
+const SKIP: [u32; 4] = [u32::MAX, 0, 0, 0];
+
+/// The cell range a bbox occupies, clamped to the grid.
+fn cell_range(bb: &(Vec2, Vec2), origin: Vec2, cs: f64, cols: usize, rows: usize) -> [u32; 4] {
+    let (emin, emax) = *bb;
+    let xmin = (((emin.x - origin.x) / cs).floor() as isize).max(0) as usize;
+    let xmax = ((((emax.x - origin.x) / cs).floor() as isize).max(0) as usize).min(cols - 1);
+    let ymin = (((emin.y - origin.y) / cs).floor() as isize).max(0) as usize;
+    let ymax = ((((emax.y - origin.y) / cs).floor() as isize).max(0) as usize).min(rows - 1);
+    [xmin as u32, xmax as u32, ymin as u32, ymax as u32]
+}
+
+/// Does this bbox lie INSIDE the grid? A clamped range would silently mis-bucket a
+/// dobject that has moved out of bounds, so `update` must reject it and rebuild.
+fn fits(emin: Vec2, emax: Vec2, origin: Vec2, cs: f64, cols: usize, rows: usize) -> bool {
+    emin.x >= origin.x
+        && emin.y >= origin.y
+        && emax.x < origin.x + cols as f64 * cs
+        && emax.y < origin.y + rows as f64 * cs
+}
+
 pub struct UniformGrid {
     pub cell_size: f64,
     pub origin:    Vec2,   // world coord of the grid's (0,0) corner
     pub cols:      usize,
     pub rows:      usize,
     cells: Vec<Vec<u32>>,  // row-major, cells[row * cols + col]
+    /// Per-dobject cell range `[xmin, xmax, ymin, ymax]` — the cells it currently
+    /// occupies. Exists so [`Self::update`] can REMOVE a changed dobject from its old
+    /// cells without scanning the grid; a moved dobject's old position is otherwise
+    /// unrecoverable (the geometry has already changed by the time we're told).
+    ///
+    /// `[u32::MAX, ..]` marks a view-independent dobject (never bucketed).
+    /// Costs 16 B/dobject (~24 MB at 1.5M) — 8% on top of a ~300 MB document, and it
+    /// buys O(changed) edits instead of O(n): moving 3,150 of 1.5M dobjects
+    /// re-buckets 3,150, not 1,500,000.
+    ranges: Vec<[u32; 4]>,
     /// Indices of dobjects whose `Geom::is_view_independent_bbox()`
     /// returned true (Hatch today). They're NOT bucketed into cells
     /// because their bbox is a degenerate placeholder; instead they
@@ -43,6 +75,7 @@ impl UniformGrid {
             origin:    Vec2::ZERO,
             cols: 0, rows: 0,
             cells: Vec::new(),
+            ranges: Vec::new(),
             view_independent: Vec::new(),
             n_entities: 0,
         }
@@ -78,6 +111,7 @@ impl UniformGrid {
             return Self {
                 cell_size, origin: Vec2::ZERO, cols: 0, rows: 0,
                 cells: Vec::new(),
+                ranges: vec![SKIP; dobjects.len()],
                 view_independent,
                 n_entities: dobjects.len(),
             };
@@ -86,28 +120,86 @@ impl UniformGrid {
         let cols = (((max.x - min.x) / cell_size).floor() as isize + 1).max(1) as usize;
         let rows = (((max.y - min.y) / cell_size).floor() as isize + 1).max(1) as usize;
         let mut cells: Vec<Vec<u32>> = vec![Vec::new(); cols * rows];
+        let mut ranges: Vec<[u32; 4]> = Vec::with_capacity(dobjects.len());
 
         for (i, e) in dobjects.iter().enumerate() {
             if e.geom.is_view_independent_bbox() {
+                ranges.push(SKIP);
                 continue;   // already in view_independent
             }
-            let (emin, emax) = e.bbox();
-            let xmin = (((emin.x - min.x) / cell_size).floor() as isize).max(0) as usize;
-            let xmax = (((emax.x - min.x) / cell_size).floor() as isize).max(0) as usize;
-            let ymin = (((emin.y - min.y) / cell_size).floor() as isize).max(0) as usize;
-            let ymax = (((emax.y - min.y) / cell_size).floor() as isize).max(0) as usize;
-            let xmax = xmax.min(cols - 1);
-            let ymax = ymax.min(rows - 1);
-            for cy in ymin..=ymax {
-                let row_start = cy * cols;
-                for cx in xmin..=xmax {
-                    cells[row_start + cx].push(i as u32);
+            let r = cell_range(&e.bbox(), min, cell_size, cols, rows);
+            ranges.push(r);
+            for cy in r[2]..=r[3] {
+                let row_start = cy as usize * cols;
+                for cx in r[0]..=r[1] {
+                    cells[row_start + cx as usize].push(i as u32);
                 }
             }
         }
 
-        Self { cell_size, origin: min, cols, rows, cells, view_independent,
+        Self { cell_size, origin: min, cols, rows, cells, ranges, view_independent,
                n_entities: dobjects.len() }
+    }
+
+    /// Incrementally re-bucket just the `changed` dobjects. **O(changed)**, not O(n).
+    ///
+    /// Returns `false` when the grid cannot absorb the change — the caller must then
+    /// do a full [`Self::build`]. That happens when:
+    ///   * the dobject COUNT changed (add/delete shifts every index — the whole
+    ///     bucket space is invalidated), or
+    ///   * a new bbox falls OUTSIDE the current grid (the grid would have to grow;
+    ///     `origin`/`cols`/`rows` are fixed at build time), or
+    ///   * a dobject changed to/from view-independent.
+    ///
+    /// Falling back is always CORRECT, just slow — so a caller can call this
+    /// unconditionally and rebuild on `false`.
+    pub fn update(&mut self, dobjects: &[DObject], changed: &[usize]) -> bool {
+        // Count change ⇒ indices shifted ⇒ every stored range is suspect.
+        if dobjects.len() != self.ranges.len() || self.cells.is_empty() {
+            return false;
+        }
+        // Pass 1 — verify EVERY changed dobject fits before mutating anything, so a
+        // rejected update leaves the grid untouched (no half-applied state).
+        let mut new_ranges: Vec<(usize, [u32; 4])> = Vec::with_capacity(changed.len());
+        for &i in changed {
+            let e = match dobjects.get(i) { Some(e) => e, None => return false };
+            if e.geom.is_view_independent_bbox() {
+                return false; // changed KIND — rebuild handles the bookkeeping
+            }
+            if self.ranges[i] == SKIP {
+                return false; // was view-independent, now isn't
+            }
+            let (emin, emax) = e.bbox();
+            if !fits(emin, emax, self.origin, self.cell_size, self.cols, self.rows) {
+                return false; // outside the grid → must grow → rebuild
+            }
+            new_ranges.push((i, cell_range(&(emin, emax), self.origin, self.cell_size, self.cols, self.rows)));
+        }
+        // Pass 2 — remove from old cells, insert into new.
+        for (i, new) in new_ranges {
+            let old = self.ranges[i];
+            if old == new {
+                continue; // same cells → nothing to do (a small move usually lands here)
+            }
+            let id = i as u32;
+            for cy in old[2]..=old[3] {
+                let row = cy as usize * self.cols;
+                for cx in old[0]..=old[1] {
+                    let c = &mut self.cells[row + cx as usize];
+                    if let Some(p) = c.iter().position(|&x| x == id) {
+                        c.swap_remove(p); // order within a cell is irrelevant
+                    }
+                }
+            }
+            for cy in new[2]..=new[3] {
+                let row = cy as usize * self.cols;
+                for cx in new[0]..=new[1] {
+                    self.cells[row + cx as usize].push(id);
+                }
+            }
+            self.ranges[i] = new;
+        }
+        true
     }
 
     /// Pick a cell size that targets `target_per_cell` dobjects per cell, on
@@ -257,5 +349,92 @@ mod tests {
         assert!(r.contains(&0));
         assert!(!r.contains(&1));
         assert!(!r.contains(&2));
+    }
+
+    // ---- incremental update (UniformGrid::update) --------------------------
+
+    fn line(x: f64, y: f64) -> DObject {
+        crate::geom::Line { a: Vec2::new(x, y), b: Vec2::new(x + 3.0, y + 2.0) }.into()
+    }
+
+    fn sorted(mut v: Vec<u32>) -> Vec<u32> { v.sort_unstable(); v }
+
+    /// ⭐ THE ACCEPTANCE TEST. An incrementally-updated grid must answer queries
+    /// IDENTICALLY to a full rebuild. A wrong index is a CORRECTNESS bug — you would
+    /// click a dobject you can see and not select it — so "faster" is worthless
+    /// unless the answers match exactly.
+    #[test]
+    fn update_matches_a_full_rebuild_everywhere() {
+        let mut ents: Vec<DObject> = (0..400)
+            .map(|i| line((i % 20) as f64 * 10.0, (i / 20) as f64 * 10.0))
+            .collect();
+        let cs = 12.0;
+        let mut g = UniformGrid::build(&ents, cs);
+
+        // Move a scattered subset — the real "move 3150 of 1.5M" shape. The delta is
+        // deliberately small enough to stay INSIDE the grid: build() fits the grid to
+        // the drawing's exact bbox, so an OUTWARD move leaves it and is rejected by
+        // design (covered by `update_rejects_a_move_outside_the_grid`).
+        let changed: Vec<usize> = (0..400).step_by(7).collect();
+        for &i in &changed {
+            if let crate::geom::Geom::Line(l) = &mut ents[i].geom {
+                l.a.x += 5.0; l.a.y += 5.0;
+                l.b.x += 5.0; l.b.y += 5.0;
+            }
+        }
+        assert!(g.update(&ents, &changed), "in-bounds move must be absorbed");
+
+        let fresh = UniformGrid::build(&ents, cs);
+        // sweep the whole grid with many probes, not one
+        for gy in 0..12 {
+            for gx in 0..12 {
+                let q0 = Vec2::new(gx as f64 * 18.0 - 5.0, gy as f64 * 18.0 - 5.0);
+                let q1 = Vec2::new(q0.x + 25.0, q0.y + 25.0);
+                assert_eq!(
+                    sorted(g.query_bbox(q0, q1)),
+                    sorted(fresh.query_bbox(q0, q1)),
+                    "incremental != rebuild at probe ({gx},{gy})"
+                );
+            }
+        }
+    }
+
+    /// Out-of-bounds must be REJECTED (not silently clamped): the grid's origin/cols/
+    /// rows are fixed at build, so a dobject moved outside would be mis-bucketed.
+    /// Rejecting is how the caller knows to rebuild.
+    #[test]
+    fn update_rejects_a_move_outside_the_grid() {
+        let mut ents: Vec<DObject> = (0..50).map(|i| line(i as f64 * 5.0, 0.0)).collect();
+        let mut g = UniformGrid::build(&ents, 8.0);
+        if let crate::geom::Geom::Line(l) = &mut ents[3].geom {
+            l.a.x += 100_000.0; l.b.x += 100_000.0; // far outside
+        }
+        assert!(!g.update(&ents, &[3]), "must reject → caller rebuilds");
+    }
+
+    /// A count change shifts every index, invalidating the stored ranges.
+    #[test]
+    fn update_rejects_add_or_delete() {
+        let ents: Vec<DObject> = (0..20).map(|i| line(i as f64 * 5.0, 0.0)).collect();
+        let mut g = UniformGrid::build(&ents, 8.0);
+        let mut more = ents.clone();
+        more.push(line(1.0, 1.0));
+        assert!(!g.update(&more, &[0]), "count change → rebuild");
+        let fewer = &ents[..19];
+        assert!(!g.update(fewer, &[0]), "count change → rebuild");
+    }
+
+    /// A rejected update must leave the grid UNTOUCHED — no half-applied state.
+    #[test]
+    fn a_rejected_update_does_not_corrupt_the_grid() {
+        let mut ents: Vec<DObject> = (0..30).map(|i| line(i as f64 * 5.0, 0.0)).collect();
+        let mut g = UniformGrid::build(&ents, 8.0);
+        let before = sorted(g.query_bbox(Vec2::new(-1.0, -1.0), Vec2::new(200.0, 20.0)));
+        // one legal move, one illegal — the batch must be rejected WHOLE
+        if let crate::geom::Geom::Line(l) = &mut ents[1].geom { l.a.x += 2.0; l.b.x += 2.0; }
+        if let crate::geom::Geom::Line(l) = &mut ents[2].geom { l.a.x += 99_999.0; l.b.x += 99_999.0; }
+        assert!(!g.update(&ents, &[1, 2]));
+        let after = sorted(g.query_bbox(Vec2::new(-1.0, -1.0), Vec2::new(200.0, 20.0)));
+        assert_eq!(before, after, "a rejected update must not mutate the grid");
     }
 }
