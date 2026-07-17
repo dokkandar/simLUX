@@ -1365,6 +1365,18 @@ pub struct CadApp {
     factory: crate::factory::FactoryState,
     /// Which viewport is ACTIVE (last interacted with) — the modifier dispatch signal.
     active_view: ActiveView,
+    /// O(1) "is dobject i selected?" lookup for the DRAW LOOP, rebuilt once per frame.
+    ///
+    /// ⚠️ This exists because `self.selection.contains(&i)` is a LINEAR SCAN of a Vec,
+    /// and the draw loop ran it PER DRAWN DOBJECT PER FRAME. Measured on a real 1.5M
+    /// session: 141,766 drawn × 52,650 selected = 7.46 BILLION comparisons → a
+    /// 21,815 ms frame. The same frame with nothing selected drew in 25.2 ms. Select a
+    /// big window and the app froze for 20 seconds.
+    ///
+    /// The Vec allocation is REUSED across frames (clear+resize, no realloc), so the
+    /// per-frame cost is an O(n) memset (~0.1 ms at 1.5M) plus O(selection) to fill —
+    /// instead of O(drawn × selection).
+    sel_mask: Vec<bool>,
     gpu_dirty:    bool,
     /// Cached per-hatch WORLD-space render geometry, keyed by dobject handle.
     /// Hatch generation (pattern scanline-clip, solid ear-clip) is EXPENSIVE;
@@ -2919,6 +2931,7 @@ impl Default for CadApp {
             light3d_renderer:    StdArc::new(Mutex::new(crate::light3d::Scene3dRenderer::default())),
             factory:             crate::factory::FactoryState::default(),
             active_view:         ActiveView::TwoD,
+            sel_mask:            Vec::new(),
             gpu_dirty:    true,
             layer_panel_open:   true,
             layer_rename:       None,
@@ -26858,6 +26871,17 @@ impl eframe::App for CadApp {
                 };
             let query_us = t_query.elapsed().as_micros() as u64;
             let in_viewport = candidates.len();
+
+            // SELECTION MASK — built ONCE per frame so the draw loop's "is this
+            // selected?" test is O(1) instead of a linear Vec scan per dobject.
+            // See `sel_mask`: this is the difference between a 25 ms frame and a
+            // 21,815 ms one.
+            self.sel_mask.clear();
+            self.sel_mask.resize(self.doc.dobjects.len(), false); // reuses the alloc
+            for &i in &self.selection {
+                if let Some(m) = self.sel_mask.get_mut(i) { *m = true; }
+            }
+
             let t_draw = std::time::Instant::now();
 
             // ---- Hatch geometry cache (the perf fix) ---------------------
@@ -27001,7 +27025,7 @@ impl eframe::App for CadApp {
                     };
                     // Selection / snap highlight wins over per-dobject
                     // color so the user can still pick out selected items.
-                    let in_selection = self.selection.contains(&i);
+                    let in_selection = self.sel_mask.get(i).copied().unwrap_or(false);
                     let color = if self.selected == Some(i) || in_selection {
                         egui::Color32::from_rgb(255, 200, 80)
                     } else if snap_source == Some(i) {
@@ -27079,7 +27103,7 @@ impl eframe::App for CadApp {
                         // none of that matters.
                         if let Geom::Hatch(_) = &e.geom {
                             let color = if self.selected == Some(i)
-                                || self.selection.contains(&i)
+                                || self.sel_mask.get(i).copied().unwrap_or(false)
                             {
                                 egui::Color32::from_rgb(255, 200, 80)
                             } else if snap_source == Some(i) {
@@ -27136,7 +27160,7 @@ impl eframe::App for CadApp {
                             continue;
                         }
                         let bbox_px = (emax.x - emin.x).max(emax.y - emin.y) as f32 * self.scale;
-                        let in_selection = self.selection.contains(&i);
+                        let in_selection = self.sel_mask.get(i).copied().unwrap_or(false);
                         if bbox_px < 1.0
                             && self.selected != Some(i)
                             && snap_source != Some(i)
@@ -27287,7 +27311,7 @@ impl eframe::App for CadApp {
                             skipped += 1;
                             continue;
                         }
-                        let in_selection = self.selection.contains(&i);
+                        let in_selection = self.sel_mask.get(i).copied().unwrap_or(false);
                         let color = if self.selected == Some(i) || in_selection {
                             sel_col
                         } else if snap_source == Some(i) {
@@ -33654,6 +33678,50 @@ mod perf_investigation {
     }
 
 
+
+
+    /// ⭐ THE FREEZE, from the owner's real 1.5M session:
+    ///     🐢 SLOW FRAME    27.5 ms  (draw    25.2)  candidates=143856 drawn=141766
+    ///     🐢 SLOW FRAME 21817.5 ms  (draw 21815.4)  candidates=143856 drawn=141766
+    /// Identical work, 800× slower — the only difference was 52,650 selected
+    /// dobjects. `selection.contains(&i)` is a LINEAR Vec scan and the draw loop ran
+    /// it per drawn dobject: 141,766 × 52,650 = 7.46 BILLION comparisons.
+    ///
+    /// This measures the mask (what the draw loop now does) against the old scan.
+    #[test]
+    #[ignore = "benchmark: --ignored --nocapture"]
+    fn selection_lookup_mask_vs_linear_scan() {
+        let drawn = 141_766usize;
+        let n = 1_500_000usize;
+        for sel_n in [0usize, 43_840, 52_650] {
+            let selection: Vec<usize> = (0..sel_n).map(|i| i * 7 % n).collect();
+
+            // OLD: linear Vec scan per drawn dobject
+            let t = std::time::Instant::now();
+            let mut hits = 0usize;
+            for i in 0..drawn {
+                if selection.contains(&i) { hits += 1; }
+            }
+            let scan_ms = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(hits);
+
+            // NEW: build the mask once, then O(1) per dobject
+            let t = std::time::Instant::now();
+            let mut mask = vec![false; n];
+            for &i in &selection { mask[i] = true; }
+            let mut hits2 = 0usize;
+            for i in 0..drawn {
+                if mask[i] { hits2 += 1; }
+            }
+            let mask_ms = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(hits2);
+
+            println!(
+                "  {drawn} drawn × {sel_n:>6} selected → linear scan {scan_ms:9.1} ms · mask {mask_ms:6.2} ms  ({:.0}× faster)",
+                scan_ms / mask_ms.max(0.0001)
+            );
+        }
+    }
 
     /// ⭐ ZOOM/PAN slowness. `query_bbox` runs EVERY FRAME to decide what to render.
     /// It allocates O(n) per call — so panning a 1.5M drawing allocates megabytes per
