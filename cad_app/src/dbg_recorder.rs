@@ -68,6 +68,11 @@ pub enum DbgEvent {
         raw:           String,
         parsed_debug:  String,
         source:        CmdSource,
+        /// Wall-clock the command took to EXECUTE, in µs. The event timestamp says
+        /// WHEN it ran; this says HOW LONG it took — so when the app stalls, the dump
+        /// names the command responsible instead of leaving you to guess.
+        /// `None` = not measured (the value came from an older capture).
+        elapsed_us:    Option<u64>,
     },
 
     /// Canvas mouse click — fully decoded.
@@ -355,6 +360,25 @@ impl DbgRecorder {
 
     /// Push one event. Cheap when `!recording`. The `loc` is the
     /// CALLER's location, threaded through by the `dbg_event!` macro.
+    /// Stamp a `CmdRun`'s execution time — the FIRST one at or after `from_idx`.
+    ///
+    /// Indexed, not "the last CmdRun", because `run_command` is RE-ENTRANT: a select
+    /// session rewrites `p`/`l`/`d` into `run_command("previous")` &co. Patching "the
+    /// last" would let a nested call steal the outer command's slot. Each caller
+    /// remembers the event count from before its own push and patches from there, so
+    /// an outer command's time correctly INCLUDES the inner one it spawned.
+    pub fn patch_cmd_elapsed_at(&mut self, from_idx: usize, us: u64) {
+        if !self.recording { return; }
+        for r in self.events.iter_mut().skip(from_idx) {
+            if let DbgEvent::CmdRun { elapsed_us, .. } = &mut r.event {
+                if elapsed_us.is_none() {
+                    *elapsed_us = Some(us);
+                    return;
+                }
+            }
+        }
+    }
+
     pub fn push(&mut self, event: DbgEvent, loc: &'static Location<'static>) {
         if !self.recording { return; }
         if self.max_events > 0 && self.events.len() >= self.max_events {
@@ -469,7 +493,7 @@ impl DbgRecorder {
 
 /// One-line summary of an event for the text dump. Verbose enough to
 /// read at a glance, terse enough that 1000 events fit on screen.
-fn format_event_oneline(e: &DbgEvent) -> String {
+pub fn format_event_oneline(e: &DbgEvent) -> String {
     match e {
         DbgEvent::SessionStart { reason } =>
             format!("◆ SESSION START — {}", reason),
@@ -480,8 +504,17 @@ fn format_event_oneline(e: &DbgEvent) -> String {
         DbgEvent::DocSnapshot { reason, dobject_count, undo_depth, redo_depth, index_in_dump, .. } =>
             format!("📷 SNAP[{}] {} dobj, undo={}, redo={}  ({})",
                 index_in_dump, dobject_count, undo_depth, redo_depth, reason),
-        DbgEvent::CmdRun { raw, parsed_debug, source } =>
-            format!("⌨ CMD \"{}\" → {}  [{:?}]", raw, parsed_debug, source),
+        DbgEvent::CmdRun { raw, parsed_debug, source, elapsed_us } => {
+            // Flag the slow ones so they stand out while skimming: 16 ms is one frame
+            // at 60 Hz — past that the user SEES the stall.
+            let t = match elapsed_us {
+                Some(us) if *us >= 16_000 => format!("  ⏱ {:.1} ms ⚠ SLOW", *us as f64 / 1000.0),
+                Some(us) if *us >= 1_000 => format!("  ⏱ {:.1} ms", *us as f64 / 1000.0),
+                Some(us) => format!("  ⏱ {us} µs"),
+                None => String::new(),
+            };
+            format!("⌨ CMD \"{}\" → {}  [{:?}]{}", raw, parsed_debug, source, t)
+        }
         DbgEvent::CanvasClick { world, hit_dobject, active_tool, active_state, .. } =>
             format!("🖱 CLICK world=({:.3},{:.3})  hit={:?}  tool={}  state={}",
                 world.x, world.y, hit_dobject, active_tool, active_state),

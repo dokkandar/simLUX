@@ -4270,7 +4270,23 @@ impl CadApp {
     }
 
     #[track_caller]
+    /// Timing wrapper — measures how long a command takes to EXECUTE and stamps it
+    /// onto the `CmdRun` event, so a dump answers "what made the app hang?" instead of
+    /// only "what was typed". Wrapping is required: `run_command_inner` has ~27
+    /// early-return intercepts, so there is no single tail to time.
+    ///
+    /// Re-entrancy safe: we remember the event index BEFORE the inner call pushes its
+    /// CmdRun, then patch from there. A nested `run_command("previous")` stamps its own
+    /// event; the outer stamps its own, whose time legitimately includes the nested one.
     fn run_command(&mut self, raw: &str) {
+        let t0 = std::time::Instant::now();
+        let from = self.dbg.events.len();
+        self.run_command_inner(raw);
+        let us = t0.elapsed().as_micros() as u64;
+        self.dbg.patch_cmd_elapsed_at(from, us);
+    }
+
+    fn run_command_inner(&mut self, raw: &str) {
         // Echo the line into the history. A TOP-LEVEL command (typed at the
         // idle "command:" prompt) reads "command: circle"; a reply to an
         // active prompt reads "> 50". Both then stack upward in the history.
@@ -4293,6 +4309,7 @@ impl CadApp {
                 Err(e) => format!("ParseErr({})", e),
             },
             source:        crate::dbg_recorder::CmdSource::Typed,
+            elapsed_us:    None, // stamped by the `run_command` wrapper once it returns
         });
 
         // ---- ACTIVE-VIEW dispatch — ONE command, two algorithms -----------
@@ -33104,7 +33121,9 @@ mod established_commands_are_untouchable {
     #[test]
     fn dispatch_keys_on_active_view_never_on_panel_open() {
         let src = include_str!("app.rs");
-        let start = src.find("fn run_command").expect("run_command exists");
+        // NOTE: `run_command` is now a thin timing wrapper — inspecting IT would make
+        // this test vacuous. The dispatcher is `run_command_inner`.
+        let start = src.find("fn run_command_inner").expect("the dispatcher exists");
         let end = src[start..].find("\n    fn ").map(|e| start + e).unwrap_or(src.len());
         // Check CODE, not prose — the dispatch block deliberately *documents* why it
         // does not gate on `factory.open`, and a naive string search trips on that.
@@ -33278,5 +33297,69 @@ mod active_view_dispatch_tests {
         app.active_view = ActiveView::ThreeD; // even with 3D "active"
         app.run_command("move");
         assert!(app.factory.modify.is_none(), "a sketch routes to the 2D move");
+    }
+}
+
+#[cfg(test)]
+mod cmd_timing_tests {
+    use super::*;
+    /// Every command must record HOW LONG it took, not just when it ran — "if
+    /// something [is slow], we know what is the reason".
+    #[test]
+    fn a_command_records_its_execution_time() {
+        let mut app = CadApp::default();
+        app.dbg.recording = true;
+        app.dbg.session_started = Some(std::time::Instant::now());
+        app.run_command("move");
+        let stamped = app.dbg.events.iter().any(|r| matches!(
+            &r.event,
+            crate::dbg_recorder::DbgEvent::CmdRun { elapsed_us: Some(_), .. }
+        ));
+        assert!(stamped, "the CmdRun must carry an execution time");
+    }
+
+    /// A command past one frame (16 ms @ 60 Hz) is flagged ⚠ SLOW — that is the
+    /// threshold where the user actually SEES the stall.
+    #[test]
+    fn slow_commands_are_flagged_in_the_dump() {
+        use crate::dbg_recorder::{format_event_oneline, CmdSource, DbgEvent};
+        let ev = |us: u64| {
+            format_event_oneline(&DbgEvent::CmdRun {
+                raw: "x".into(),
+                parsed_debug: "X".into(),
+                source: CmdSource::Typed,
+                elapsed_us: Some(us),
+            })
+        };
+        assert!(ev(500).contains("µs"), "sub-ms shows µs");
+        assert!(ev(5_000).contains("5.0 ms") && !ev(5_000).contains("SLOW"));
+        assert!(ev(20_000).contains("⚠ SLOW"), "past a frame → flagged");
+    }
+
+    /// RE-ENTRANCY: a select-session `p`/`l`/`d` re-enters run_command. Each CmdRun
+    /// must get its OWN time — patching "the last one" would let the nested call steal
+    /// the outer command's slot, and both would read wrong.
+    #[test]
+    fn nested_commands_each_get_their_own_time() {
+        let mut app = CadApp::default();
+        app.dbg.recording = true;
+        app.dbg.session_started = Some(std::time::Instant::now());
+        app.begin_selection(SelectMode::ForSelect);
+        app.run_command("p"); // → rewrites to run_command("previous"), re-entrant
+        let cmds: Vec<_> = app
+            .dbg
+            .events
+            .iter()
+            .filter_map(|r| match &r.event {
+                crate::dbg_recorder::DbgEvent::CmdRun { raw, elapsed_us, .. } => {
+                    Some((raw.clone(), *elapsed_us))
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(cmds.len() >= 2, "outer `p` + nested `previous`, got {cmds:?}");
+        for (raw, us) in &cmds {
+            assert!(us.is_some(), "`{raw}` was left unstamped — a nested call stole its slot");
+        }
     }
 }
