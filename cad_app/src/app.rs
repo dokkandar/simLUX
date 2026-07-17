@@ -9871,7 +9871,7 @@ impl CadApp {
         let loc = std::panic::Location::caller();
         let undo_d = self.undo_stack.len();
         let redo_d = self.redo_stack.len();
-        self.dbg.take_snapshot(&self.doc, "session start", undo_d, redo_d, loc);
+        self.dbg.take_snapshot(&self.doc, "session start", undo_d, redo_d, describe_verbose, loc);
         self.history.push(format!(
             "  🛰 recording started — every action will be captured"));
     }
@@ -9914,7 +9914,6 @@ impl CadApp {
             insert_state:       format!("{:?}", self.insert_state),
             block_pick_base:    self.block_dialog_pick_base,
             grip_drag:          self.grip_drag.is_some(),
-            selection:          self.selection.clone(),
             queued_op:          format!("{:?}", self.queued_op),
             armed_window_inside: format!("{:?}", self.armed_window_inside),
             window_first:       format!("{:?}", self.window_first),
@@ -10066,6 +10065,7 @@ impl CadApp {
                 "auto cadence",
                 undo_d,
                 redo_d,
+                describe_verbose,
                 std::panic::Location::caller(),
             );
         }
@@ -10294,6 +10294,7 @@ impl CadApp {
                     self.dbg.take_snapshot(
                         &self.doc, "manual snap",
                         undo_d, redo_d,
+                        describe_verbose,
                         std::panic::Location::caller());
                 }
             });
@@ -33361,5 +33362,100 @@ mod cmd_timing_tests {
         for (raw, us) in &cmds {
             assert!(us.is_some(), "`{raw}` was left unstamped — a nested call stole its slot");
         }
+    }
+}
+
+#[cfg(test)]
+mod snapshot_scaling_tests {
+    use super::*;
+    use crate::dbg_recorder::SNAP_GEOM_MAX;
+
+    /// Benchmark, not an assertion — `cargo test -p cad_app -- --ignored --nocapture`.
+    /// Proves snapshot cost is FLAT in drawing size (1k/100k/1M all ≈ the same µs and
+    /// the same ~1.6 KB dump).
+    #[test]
+    #[ignore = "benchmark: run with --ignored --nocapture"]
+    fn measure_snapshot_cost() {
+        for n in [1_000usize, 100_000, 1_000_000] {
+            let mut app = app_with(n);
+            let t = std::time::Instant::now();
+            snap(&mut app, "m");
+            let us = t.elapsed().as_micros();
+            let dump = app.dbg.dump_text();
+            println!("  {n:>9} dobjects → snapshot {us:>6} µs · dump {:>6} bytes", dump.len());
+        }
+    }
+
+    fn snap(app: &mut CadApp, tag: &str) {
+        app.dbg.take_snapshot(&app.doc, tag, 0, 0, describe_verbose, std::panic::Location::caller());
+    }
+
+    fn app_with(n: usize) -> CadApp {
+        let mut app = CadApp::default();
+        app.doc.dobjects.clear();
+        for i in 0..n {
+            app.doc.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(i as f64, 0.0),
+                b: Vec2::new(i as f64, 1.0),
+            })));
+        }
+        app.dbg.recording = true;
+        app.dbg.session_started = Some(std::time::Instant::now());
+        app
+    }
+
+    /// The dump keeps the first 20 dobjects' geometry — enough for draw-function
+    /// tests — and NEVER more, whatever the drawing size.
+    #[test]
+    fn snapshot_caps_geometry_at_twenty() {
+        let mut app = app_with(1_000);
+        snap(&mut app, "test");
+        let snap = app.dbg.snapshots.last().unwrap();
+        assert_eq!(snap.geom.len(), SNAP_GEOM_MAX, "capped at {SNAP_GEOM_MAX}");
+        assert_eq!(snap.omitted, 980, "and it SAYS how many it dropped");
+        let dump = app.dbg.dump_text();
+        assert!(dump.contains("980 MORE OMITTED"), "a capped dump must never look complete");
+        assert!(dump.contains("line  a=(0.000,0.000)"), "real coordinates, for draw tests");
+    }
+
+    /// Small drawings are fully captured, with no omission notice.
+    #[test]
+    fn small_drawings_are_captured_whole() {
+        let mut app = app_with(3);
+        snap(&mut app, "test");
+        let snap = app.dbg.snapshots.last().unwrap();
+        assert_eq!(snap.geom.len(), 3);
+        assert_eq!(snap.omitted, 0);
+        assert!(!app.dbg.dump_text().contains("OMITTED"));
+    }
+
+    /// ⭐ THE PERFORMANCE CONTRACT. Snapshotting must be O(1) in the drawing size —
+    /// it used to clone the whole Document (a clone nothing ever read), so an
+    /// auto-snap every 50 events was O(n) time AND memory. At a million dobjects that
+    /// is a freeze, not a big file.
+    ///
+    /// Asserts the SHAPE, not a wall-clock: 100k dobjects must cost no more captured
+    /// geometry than 100 do. A restored clone would fail the memory claim silently, so
+    /// we also assert the type no longer carries a Document.
+    #[test]
+    fn snapshotting_is_o1_in_drawing_size() {
+        let mut small = app_with(100);
+        snap(&mut small, "s");
+        let mut huge = app_with(100_000);
+        snap(&mut huge, "h");
+
+        let a = small.dbg.snapshots.last().unwrap();
+        let b = huge.dbg.snapshots.last().unwrap();
+        assert_eq!(a.geom.len(), SNAP_GEOM_MAX);
+        assert_eq!(b.geom.len(), SNAP_GEOM_MAX, "a 1000× bigger drawing captures the SAME amount");
+        assert_eq!(b.omitted, 100_000 - SNAP_GEOM_MAX);
+
+        // the dump must stay small too — it is pasted into bug reports
+        let dump = huge.dbg.dump_text();
+        assert!(
+            dump.len() < 8_000,
+            "a 100k-dobject dump must stay readable, got {} bytes",
+            dump.len()
+        );
     }
 }

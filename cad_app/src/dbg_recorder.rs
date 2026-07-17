@@ -246,12 +246,25 @@ pub struct DbgRecord {
     pub location:   &'static Location<'static>,
 }
 
-/// Snapshot of `Document` at a specific event index, plus a tag.
+/// How many dobjects' geometry a snapshot keeps. Enough to verify the draw
+/// functions (what the snapshots are actually FOR) and nothing more.
+///
+/// ⚠️ This cap is a PERFORMANCE contract, not a display preference. Snapshots used to
+/// hold a full `Document` **clone** — which nothing ever read — so an auto-snap every
+/// 50 events cloned the entire drawing. At a million dobjects that is not a large
+/// file, it is a freeze. Never restore the clone; if a future replay feature needs
+/// full state, snapshot a DELTA or write to disk, don't clone the document into RAM.
+pub const SNAP_GEOM_MAX: usize = 20;
+
 #[derive(Clone)]
 pub struct DbgSnapshot {
     pub event_index: usize,
     pub tag:         String,
-    pub doc:         Document,
+    /// Geometry (full coordinates) of the first [`SNAP_GEOM_MAX`] dobjects.
+    pub geom:        Vec<String>,
+    /// How many dobjects were NOT captured. Reported in the dump so a capped
+    /// snapshot can never be mistaken for a complete one.
+    pub omitted:     usize,
 }
 
 /// The recorder. One per `CadApp`. When `recording == false` every
@@ -421,20 +434,36 @@ impl DbgRecorder {
     /// Push a Document snapshot. Caller (CadApp) owns the Document and
     /// passes a clone. Records a `DocSnapshot` event referencing the
     /// snapshot's index into `self.snapshots`.
+    /// Snapshot the drawing. `describe` formats one dobject's geometry — passed in so
+    /// the recorder stays free of app formatting.
+    ///
+    /// Captures at most [`SNAP_GEOM_MAX`] dobjects: O(20), not O(n). Previously this
+    /// cloned the whole `Document` — a clone no code ever read — which made every
+    /// auto-snap O(n) in both time and memory.
     pub fn take_snapshot(
         &mut self,
         doc: &Document,
         reason: &str,
         undo_depth: usize,
         redo_depth: usize,
+        describe: impl Fn(&cad_kernel::Geom) -> String,
         loc: &'static Location<'static>,
     ) {
         if !self.recording { return; }
         let idx = self.snapshots.len();
+        let n = doc.dobjects.len();
+        let geom: Vec<String> = doc
+            .dobjects
+            .iter()
+            .take(SNAP_GEOM_MAX)
+            .enumerate()
+            .map(|(i, d)| format!("#{i:<4} h={:<6} {}", d.handle, describe(&d.geom)))
+            .collect();
         self.snapshots.push(DbgSnapshot {
             event_index: self.events.len(),
             tag:         reason.to_string(),
-            doc:         doc.clone(),
+            geom,
+            omitted:     n.saturating_sub(SNAP_GEOM_MAX),
         });
         let dobject_count = doc.dobjects.len();
         let layer_count   = doc.layers.len();
@@ -483,6 +512,32 @@ impl DbgRecorder {
                 r.location.line(),
                 format_event_oneline(&r.event),
             ));
+        }
+        // ---- GEOMETRY --------------------------------------------------
+        // The first SNAP_GEOM_MAX dobjects, with full coordinates — enough to verify
+        // the draw functions, which is what these snapshots are FOR. Deliberately
+        // capped: dumping a million dobjects would produce an unreadable, enormous
+        // file, and the interesting ones for a draw test are the ones you just drew.
+        // `omitted` is always reported, so a capped dump can never be misread as a
+        // complete one.
+        for (i, snap) in self.snapshots.iter().enumerate() {
+            out.push_str(&format!(
+                "\n--- SNAP[{}] geometry ({}) — {} shown{} ---\n",
+                i,
+                snap.tag,
+                snap.geom.len(),
+                if snap.omitted > 0 {
+                    format!(", {} MORE OMITTED (cap {})", snap.omitted, SNAP_GEOM_MAX)
+                } else {
+                    String::new()
+                },
+            ));
+            for g in &snap.geom {
+                out.push_str(&format!("  {g}\n"));
+            }
+            if snap.geom.is_empty() {
+                out.push_str("  (empty drawing)\n");
+            }
         }
         out.push_str(&format!(
             "=== END SESSION ({} snapshots in side-buffer) ===\n",
@@ -658,7 +713,16 @@ pub struct WatchedState {
     /// Block dialog "Pick ⊕" base-point capture in progress.
     pub block_pick_base:     bool,
     pub grip_drag:           bool,
-    pub selection:           Vec<usize>,
+    // NOTE: there is deliberately NO `selection` field here.
+    //
+    // It used to hold a `Vec<usize>` CLONE of the selection, rebuilt EVERY FRAME while
+    // recording — and no code ever diffed or read it. Selecting a million dobjects
+    // meant an 8 MB allocation per frame for a value nobody looked at.
+    //
+    // It is also redundant: selection changes are captured precisely AT THE SOURCE by
+    // `SelectChange { basket_before, basket_after, cause }` — the "✓ SEL [] → [5]"
+    // lines — which carry the cause too. Polling for them would be strictly worse
+    // information at O(n) cost. Do not add it back.
     /// Queued select-mode follow-up op (erase, move, hatch, …). When
     /// the basket is empty and the user types one of these, the cmd
     /// puts itself here and waits for the user to pick. If you see
