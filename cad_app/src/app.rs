@@ -18932,6 +18932,12 @@ impl CadApp {
             cell_size, avg, ms,
         );
         self.history.push(format!("  index: {}", self.index_label));
+        // Into the RECORDER too, not just the history — this is ~half the per-edit
+        // cost at scale and a dump could not see it.
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::IndexRebuild {
+            dobjects:   self.doc.dobjects.len(),
+            elapsed_us: (ms * 1000.0) as u64,
+        });
         ms
     }
 
@@ -33576,5 +33582,81 @@ mod counts_only_tests {
             verbose > 100 * counted,
             "the verbose dump should dwarf it ({verbose} vs {counted})"
         );
+    }
+}
+
+#[cfg(test)]
+mod perf_investigation {
+    use super::*;
+
+    fn doc_with(n: usize) -> Document {
+        let mut d = Document::default();
+        d.dobjects.clear();
+        for i in 0..n {
+            let x = (i % 2000) as f64 * 10.0;
+            let y = (i / 2000) as f64 * 10.0;
+            d.push(cad_kernel::DObject::new(cad_kernel::Geom::Line(cad_kernel::Line {
+                a: Vec2::new(x, y),
+                b: Vec2::new(x + 8.0, y + 4.0),
+            })));
+        }
+        d
+    }
+
+    /// WHERE DOES THE TIME GO at 1.5M dobjects? Measures the per-EDIT and per-FRAME
+    /// O(n) costs, so the answer to "why is it slow" is a number, not a hunch.
+    #[test]
+    #[ignore = "investigation: --ignored --nocapture"]
+    fn where_does_the_time_go() {
+        for n in [100_000usize, 1_500_000] {
+            println!("\n=== {n} dobjects ===");
+            let doc = doc_with(n);
+
+            let t = std::time::Instant::now();
+            let c = doc.clone();
+            let clone_ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("  undo snapshot_doc (Document clone) : {clone_ms:8.1} ms   ← PER EDIT");
+            std::hint::black_box(&c);
+
+            // ensure_index() calls BOTH — so the real per-edit cost is their sum.
+            let t = std::time::Instant::now();
+            let cs = cad_kernel::UniformGrid::auto_cell_size(&doc.dobjects, 10.0);
+            let auto_ms = t.elapsed().as_secs_f64() * 1000.0;
+            let t = std::time::Instant::now();
+            let g = cad_kernel::UniformGrid::build(&doc.dobjects, cs);
+            let build_ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("  index: auto_cell_size (bbox sweep)  : {auto_ms:8.1} ms");
+            println!("  index: build (bbox sweep + bucket)  : {build_ms:8.1} ms");
+            println!("  index TOTAL per edit                : {:8.1} ms   ← PER EDIT", auto_ms + build_ms);
+            std::hint::black_box(&g);
+
+            // How much of that is just bbox()? It is called THREE times per dobject
+            // per rebuild: once in auto_cell_size, once in build's world sweep, once
+            // in build's bucketing pass.
+            let t = std::time::Instant::now();
+            let mut acc = 0.0f64;
+            for d in &doc.dobjects {
+                let (a, b) = d.bbox();
+                acc += a.x + b.y;
+            }
+            let one_sweep = t.elapsed().as_secs_f64() * 1000.0;
+            std::hint::black_box(acc);
+            println!("  ↳ ONE bbox() sweep                  : {one_sweep:8.1} ms  (×3 per rebuild = {:.1} ms)", one_sweep * 3.0);
+
+            let t = std::time::Instant::now();
+            let mut mn = Vec2::new(f64::MAX, f64::MAX);
+            let mut mx = Vec2::new(f64::MIN, f64::MIN);
+            for d in &doc.dobjects {
+                let (a, b) = d.bbox();
+                mn.x = mn.x.min(a.x); mn.y = mn.y.min(a.y);
+                mx.x = mx.x.max(b.x); mx.y = mx.y.max(b.y);
+            }
+            let ext_ms = t.elapsed().as_secs_f64() * 1000.0;
+            println!("  full-doc bbox sweep (extents)      : {ext_ms:8.1} ms");
+            std::hint::black_box((mn, mx));
+
+            let bytes = n * 200; // rough per-dobject
+            println!("  ≈ resident per undo level          : {:8.1} MB", bytes as f64 / 1e6);
+        }
     }
 }

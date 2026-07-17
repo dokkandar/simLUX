@@ -177,6 +177,17 @@ pub enum DbgEvent {
         detail:             String,    // free-form per-op summary
     },
 
+    /// Spatial-index rebuild — O(n) over the WHOLE drawing, triggered by ~58 places
+    /// marking `index_dirty` (i.e. essentially every edit).
+    ///
+    /// It used to log only to the command history, so a dump could not see it: at 1.5M
+    /// dobjects it is ~119 ms PER EDIT — bigger than the 98 ms undo clone that IS
+    /// logged. Half the per-edit cost was invisible in the dump.
+    IndexRebuild {
+        dobjects:   usize,
+        elapsed_us: u64,
+    },
+
     /// Memory incident — Doc clone, grid rebuild, ACI table grow, etc.
     /// `bytes` is the BEST-EFFORT size estimate; `name` describes WHAT.
     MemoryEvent {
@@ -601,6 +612,12 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
             format!("◆ SESSION STOP — {} ({} events)", reason, event_count),
         DbgEvent::Note { message } =>
             format!("📝 NOTE: {}", message),
+        DbgEvent::IndexRebuild { dobjects, elapsed_us } => {
+            let ms = *elapsed_us as f64 / 1000.0;
+            // 16 ms = one frame @ 60 Hz — past that the stall is VISIBLE
+            let flag = if *elapsed_us >= 16_000 { "  ⚠ SLOW" } else { "" };
+            format!("🗂 INDEX REBUILD {dobjects} dobj  ⏱ {ms:.1} ms{flag}")
+        }
         DbgEvent::DocSnapshot { reason, dobject_count, undo_depth, redo_depth, index_in_dump, .. } =>
             format!("📷 SNAP[{}] {} dobj, undo={}, redo={}  ({})",
                 index_in_dump, dobject_count, undo_depth, redo_depth, reason),
