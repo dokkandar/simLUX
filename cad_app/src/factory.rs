@@ -96,8 +96,6 @@ pub struct FactoryState {
     /// Face picked by the last right-click — what the context menu acts on.
     pub pending_face: Option<Frame>,
 
-    /// Boolean op applied when the NEXT primitive is added.
-    pub next_op: BoolOp,
     pub box_w: f32,
     pub box_d: f32,
     pub box_h: f32,
@@ -109,6 +107,17 @@ pub struct FactoryState {
     /// live parameters, so tweaking them costs nothing until Create is pressed —
     /// csgrs walks a BSP per boolean, so we never re-evaluate per keystroke.
     pub draw3d: Option<Draw3dDialog>,
+
+    /// DRAW3D edit-binding: when exactly one solid is selected, the dialog's
+    /// controllers edit THAT feature live. This holds the id currently bound, so the
+    /// dialog reloads its fields only when the selection changes — not every frame,
+    /// which would stomp the user's edits mid-drag.
+    pub draw3d_edit: Option<u32>,
+
+    /// 3D wall extrusion height — the ONE thing a 2D wall lacks. A promoted wall keeps
+    /// its own (per-wall) thickness and rises to this height. Kept in the 3D layer, NOT
+    /// cad_kernel's `WallStyle` (that's CORE, shared with the 2D app / RUST_CAD).
+    pub wall_height: f32,
 
     /// An in-flight 3D modifier over `selection`. This is the SAME `move` command as
     /// 2D — only the objects and the algorithm differ ("check 2d or 3d, take the right
@@ -257,6 +266,58 @@ impl Draw3dDialog {
         Self { kind, ..Default::default() }
     }
 
+    /// Load the controllers FROM an existing primitive — the inverse of `build()` — so
+    /// selecting a solid shows its real dimensions. The Frustum family (cone / prism /
+    /// pyramid / frustum) is disambiguated the same way `Primitive::kind_label` does,
+    /// by `r_top` and `sides`. Fields are set to match how `build()` reads them (e.g.
+    /// cone/cylinder/tube take their facet count from `segments`, prism/pyramid from
+    /// `sides`), so a load→build round-trip is stable.
+    pub fn load_from(&mut self, p: &Primitive) {
+        match *p {
+            Primitive::Box { w, d, h } => {
+                self.kind = Draw3dKind::Box;
+                self.w = w; self.d = d; self.h = h;
+            }
+            Primitive::Sphere { r, segments, stacks } => {
+                self.kind = Draw3dKind::Sphere;
+                self.r = r; self.segments = segments; self.stacks = stacks;
+            }
+            Primitive::Cylinder { r, h, sides } => {
+                self.kind = Draw3dKind::Cylinder;
+                self.r = r; self.h = h; self.segments = sides;
+            }
+            Primitive::Frustum { r_bottom, r_top, h, sides } => {
+                self.r = r_bottom; self.r_top = r_top; self.h = h;
+                self.sides = sides; self.segments = sides;
+                self.kind = if r_top <= 1e-6 {
+                    if sides == 4 { Draw3dKind::Pyramid } else { Draw3dKind::Cone }
+                } else if (r_top - r_bottom).abs() <= 1e-6 {
+                    Draw3dKind::Prism
+                } else {
+                    Draw3dKind::Cone // a true frustum edits via the cone controllers (bottom/top/height)
+                };
+            }
+            Primitive::Torus { major_r, minor_r, seg_major, seg_minor } => {
+                self.kind = Draw3dKind::Torus;
+                self.major_r = major_r; self.minor_r = minor_r;
+                self.seg_major = seg_major; self.seg_minor = seg_minor;
+            }
+            Primitive::Capsule { r, h, segments, stacks } => {
+                self.kind = Draw3dKind::Capsule;
+                self.r = r; self.h = h; self.segments = segments; self.stacks = stacks;
+            }
+            Primitive::Tube { r_outer, r_inner, h, sides } => {
+                self.kind = Draw3dKind::Tube;
+                self.r = r_outer; self.r_inner = r_inner; self.h = h; self.segments = sides;
+            }
+            Primitive::Ellipsoid { rx, ry, rz, segments, stacks } => {
+                self.kind = Draw3dKind::Ellipsoid;
+                self.rx = rx; self.ry = ry; self.rz = rz;
+                self.segments = segments; self.stacks = stacks;
+            }
+        }
+    }
+
     /// Build the primitive from the current controllers.
     ///
     /// Cone / Prism / Pyramid all map onto ONE `Primitive::Frustum` — they are the
@@ -348,7 +409,6 @@ impl Default for FactoryState {
             cam_target: [0.0, 0.0, 0.0],
             session: None,
             pending_face: None,
-            next_op: BoolOp::Union,
             box_w: 2.0,
             box_d: 2.0,
             box_h: 1.0,
@@ -356,6 +416,8 @@ impl Default for FactoryState {
             cyl_h: 2.0,
             cyl_sides: 24,
             draw3d: None,
+            draw3d_edit: None,
+            wall_height: 2.7,
             modify: None,
             queued: None,
             status: String::new(),
@@ -368,22 +430,46 @@ impl Default for FactoryState {
 impl FactoryState {
     pub fn add_box(&mut self) {
         let p = Primitive::Box { w: self.box_w, d: self.box_d, h: self.box_h };
-        let id = self.model.push(self.next_op, Plane::default(), Placement::default(), p);
+        let id = self.model.push(BoolOp::Union, Plane::default(), Placement::default(), p);
         self.selection = vec![id];
         self.dirty = true;
     }
 
     /// DRAW3D: commit the dialog's primitive into the model.
     pub fn add_primitive(&mut self, p: Primitive) {
-        let id = self.model.push(self.next_op, Plane::default(), Placement::default(), p);
+        let id = self.model.push(BoolOp::Union, Plane::default(), Placement::default(), p);
         self.selection = vec![id];
         self.dirty = true;
     }
 
     pub fn add_cylinder(&mut self) {
         let p = Primitive::Cylinder { r: self.cyl_r, h: self.cyl_h, sides: self.cyl_sides.max(3) };
-        let id = self.model.push(self.next_op, Plane::default(), Placement::default(), p);
+        let id = self.model.push(BoolOp::Union, Plane::default(), Placement::default(), p);
         self.selection = vec![id];
+        self.dirty = true;
+    }
+
+    // ── 2D → 3D wall promotion ──────────────────────────────────────────────────────
+    // The practical journey (owner, 2026-07-17): draft the wall in 2D with the real
+    // `wall` tool (snapping / ortho / corner-join), select it, right-click → Make 3D
+    // wall. Each selected `Geom::Wall`'s centerline becomes placed Boxes here.
+
+    /// Build ONE wall segment as a placed Box — the 2D→3D promotion primitive. `a`,`b`
+    /// are centerline endpoints on the ground plane (a 2D wall's coords ARE the ground
+    /// uv); the Box keeps the wall's OWN thickness and rises to `height`. Pure Box +
+    /// Placement (see `Plane::world_matrix`), so no `cad_solid` change is needed.
+    pub fn add_wall_segment(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) {
+        let d = b - a;
+        let len = d.length();
+        if len < 1e-4 || thickness <= 0.0 || height <= 0.0 {
+            return; // ignore degenerate input
+        }
+        let mid = (a + b) * 0.5;
+        let p = Primitive::Box { w: len, d: thickness, h: height };
+        let placement = Placement {
+            u: mid.x, v: mid.y, lift: 0.0, spin_deg: d.y.atan2(d.x).to_degrees(),
+        };
+        let _ = self.model.push(BoolOp::Union, Plane::default(), placement, p);
         self.dirty = true;
     }
 
@@ -724,5 +810,82 @@ mod pick_tests {
         let mvp = view(&st, rect);
         let f = st.pick_face(rect.center(), rect, &mvp);
         assert!(f.is_some(), "centre ray must hit a face of the centred solid");
+    }
+}
+
+#[cfg(test)]
+mod draw3d_edit_tests {
+    use super::*;
+
+    /// EDIT-MODE invariant (owner, 2026-07-17: "if one 3d dobject selected, with these
+    /// controllers we should be able to change its dimension"). Selecting a solid loads
+    /// it into the dialog via `load_from`; editing then rebuilds via `build`. If the two
+    /// are not inverses, tweaking one field would silently corrupt the others. This
+    /// proves `load_from → build` reproduces the primitive for every shape (compared by
+    /// Debug, since `Primitive` isn't `PartialEq`). The Frustum family is the tricky one:
+    /// cone / prism / pyramid all share one variant but different controllers.
+    #[test]
+    fn load_from_then_build_round_trips() {
+        let cases = [
+            Primitive::Box { w: 3.0, d: 4.0, h: 2.5 },
+            Primitive::Cylinder { r: 1.2, h: 5.0, sides: 20 },
+            Primitive::Sphere { r: 2.0, segments: 40, stacks: 18 },
+            Primitive::Frustum { r_bottom: 2.0, r_top: 0.0, h: 3.0, sides: 24 }, // cone
+            Primitive::Frustum { r_bottom: 1.5, r_top: 1.5, h: 2.0, sides: 6 },  // prism
+            Primitive::Frustum { r_bottom: 2.0, r_top: 0.0, h: 3.0, sides: 4 },  // pyramid
+            Primitive::Torus { major_r: 3.0, minor_r: 0.8, seg_major: 36, seg_minor: 18 },
+            Primitive::Capsule { r: 0.7, h: 2.0, segments: 24, stacks: 12 },
+            Primitive::Tube { r_outer: 2.0, r_inner: 1.0, h: 3.0, sides: 28 },
+            Primitive::Ellipsoid { rx: 1.0, ry: 2.0, rz: 0.5, segments: 32, stacks: 16 },
+        ];
+        for p in cases {
+            let mut dlg = Draw3dDialog::new(Draw3dKind::Box);
+            dlg.load_from(&p);
+            let rebuilt = dlg.build();
+            assert_eq!(
+                format!("{rebuilt:?}"), format!("{p:?}"),
+                "load_from → build must reproduce the primitive"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod wall_tests {
+    use super::*;
+
+    /// 2D→3D wall promotion (owner, 2026-07-17): a centerline segment → ONE wall solid,
+    /// a Box of length × thickness × height placed at the midpoint, spun along the run.
+    #[test]
+    fn wall_segment_is_a_placed_box() {
+        let mut st = FactoryState::default();
+        st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), 0.3, 2.5); // 4 m along +X
+        assert_eq!(st.model.features.len(), 1, "one segment → one solid");
+
+        let f = &st.model.features[0];
+        match f.primitive {
+            Primitive::Box { w, d, h } => {
+                assert!((w - 4.0).abs() < 1e-4, "length spans the centerline");
+                assert!((d - 0.3).abs() < 1e-4, "depth = the wall's own thickness");
+                assert!((h - 2.5).abs() < 1e-4, "height = the 3D wall height");
+            }
+            other => panic!("wall segment must be a Box, got {other:?}"),
+        }
+        assert!((f.placement.u - 2.0).abs() < 1e-4, "placed at the midpoint u");
+        assert!(f.placement.v.abs() < 1e-4, "placed at the midpoint v");
+        assert!(f.placement.spin_deg.abs() < 1e-4, "run along +X → spin 0°");
+    }
+
+    /// Orientation: a +Y run spins 90°; degenerate input is ignored.
+    #[test]
+    fn wall_segment_orientation_and_degenerate_guard() {
+        let mut st = FactoryState::default();
+        st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(0.0, 3.0), 0.2, 2.7); // +Y
+        assert_eq!(st.model.features.len(), 1);
+        assert!((st.model.features[0].placement.spin_deg - 90.0).abs() < 1e-3, "+Y run → spin 90°");
+
+        st.add_wall_segment(Vec2::new(1.0, 1.0), Vec2::new(1.0, 1.0), 0.2, 2.7); // zero length
+        st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0, 2.7); // zero thickness
+        assert_eq!(st.model.features.len(), 1, "degenerate segments are ignored");
     }
 }

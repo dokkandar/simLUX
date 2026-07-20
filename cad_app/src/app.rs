@@ -3285,6 +3285,42 @@ impl CadApp {
         }
     }
 
+    /// Promote every selected 2D wall into 3D Factory wall solids — the practical wall
+    /// journey (owner, 2026-07-17): draft with the real 2D `wall` tool (snapping / ortho
+    /// / corner-join), select, right-click → Make 3D wall. Each `Geom::Wall`'s centerline
+    /// (straight OR curved, via `centerline_polyline`) becomes placed Boxes of the wall's
+    /// OWN thickness, extruded to the Factory wall height, on the ground plane — the
+    /// floor-plan → room journey. (Non-ground sketch planes are a follow-up.) Returns the
+    /// number of walls promoted.
+    fn make_3d_wall_from_selection(&mut self) -> usize {
+        let h = self.factory.wall_height;
+        let mut walls = 0usize;
+        let mut segs: Vec<(glam::Vec2, glam::Vec2, f32)> = Vec::new();
+        for &i in &self.selection {
+            if let Some(Geom::Wall(w)) = self.doc.dobjects.get(i).map(|d| &d.geom) {
+                walls += 1;
+                let t = w.thickness as f32;
+                for seg in w.centerline_polyline(16).windows(2) {
+                    segs.push((
+                        glam::Vec2::new(seg[0].x as f32, seg[0].y as f32),
+                        glam::Vec2::new(seg[1].x as f32, seg[1].y as f32),
+                        t,
+                    ));
+                }
+            }
+        }
+        if segs.is_empty() {
+            return 0;
+        }
+        self.factory.open = true;
+        for (a, b, t) in segs {
+            self.factory.add_wall_segment(a, b, t, h);
+        }
+        self.factory.recompute();
+        self.factory.fit();
+        walls
+    }
+
     /// Reset every piece of **doc-relative** interactive state.
     ///
     /// Swapping `self.doc` (enter/leave a sketch) instantly invalidates anything holding
@@ -3438,19 +3474,58 @@ impl CadApp {
     /// first-class "accuracy" controllers, not hidden constants.
     fn render_draw3d_dialog(&mut self, ctx: &egui::Context) {
         let Some(mut dlg) = self.factory.draw3d.clone() else { return };
+
+        // ── EDIT vs CREATE ───────────────────────────────────────────────
+        // Exactly one solid selected → the SAME controllers edit THAT solid live: the
+        // dialog loads its real dimensions and every tweak flows back to the feature.
+        // `Create` stays available (it always makes a NEW independent solid), so there
+        // is no mode to get stuck in — the fields simply mirror "the current solid"
+        // when one is picked, and act as the template for Create when none is.
+        let edit_id: Option<u32> = match self.factory.selection.as_slice() {
+            [only] if self.factory.model.features.iter().any(|f| f.id == *only) => Some(*only),
+            _ => None,
+        };
+        if let Some(id) = edit_id {
+            // Load the picked solid's dimensions only when the binding CHANGES — never
+            // every frame, or it would stomp the edits the user is making right now.
+            if self.factory.draw3d_edit != Some(id) {
+                if let Some(f) = self.factory.model.features.iter().find(|f| f.id == id) {
+                    dlg.load_from(&f.primitive);
+                    self.factory.draw3d_edit = Some(id);
+                }
+            }
+        } else {
+            self.factory.draw3d_edit = None;
+        }
+
         let mut open = true;      // the window's own ✕
         let mut close_btn = false; // our Close button (separate: egui holds `open`)
         let mut create = false;
-        egui::Window::new(format!("{}  {}", dlg.kind.icon(), dlg.kind.label()))
+        let changed = std::cell::Cell::new(false); // did any dimension control change this frame?
+        let title = match edit_id {
+            Some(id) => format!("{}  {} · editing #{id}", dlg.kind.icon(), dlg.kind.label()),
+            None => format!("{}  {}", dlg.kind.icon(), dlg.kind.label()),
+        };
+        egui::Window::new(title)
+            .id(egui::Id::new("draw3d_dialog")) // stable id ⇒ the window keeps its place when the title changes
             .open(&mut open)
             .resizable(false)
             .default_width(320.0)
             .show(ctx, |ui| {
                 // ── the shape's own controllers ─────────────────────────────
                 egui::Grid::new("draw3d_params").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    // Every dimension is a SLIDER (drag for a feel of the size) paired with
+                    // a DragValue (type any value, unbounded past the 20 m drag range) — the
+                    // same control the Hatch dialog uses. One helper ⇒ every primitive's
+                    // L/W/H/radius gets the slider, which is what "all these dialogs" means.
                     let mut len = |ui: &mut egui::Ui, label: &str, v: &mut f32, min: f32| {
                         ui.label(label);
-                        ui.add(egui::DragValue::new(v).speed(0.05).range(min..=1e4).suffix(" m"));
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().slider_width = 132.0;
+                            let s = ui.add(egui::Slider::new(v, min..=20.0).show_value(false));
+                            let d = ui.add(egui::DragValue::new(v).speed(0.05).range(min..=1e4).suffix(" m"));
+                            if s.changed() || d.changed() { changed.set(true); }
+                        });
                         ui.end_row();
                     };
                     match dlg.kind {
@@ -3504,7 +3579,9 @@ impl CadApp {
                 egui::Grid::new("draw3d_tess").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
                     let mut cnt = |ui: &mut egui::Ui, label: &str, v: &mut u32, min: u32| {
                         ui.label(label);
-                        ui.add(egui::DragValue::new(v).speed(1.0).range(min..=512));
+                        if ui.add(egui::DragValue::new(v).speed(1.0).range(min..=512)).changed() {
+                            changed.set(true);
+                        }
                         ui.end_row();
                     };
                     use crate::factory::Draw3dKind as K;
@@ -3530,25 +3607,17 @@ impl CadApp {
                     }
                 });
 
-                // ── boolean for this solid ──────────────────────────────────
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("boolean:").small().weak());
-                    for (op, name) in [
-                        (cad_solid::BoolOp::Union, "∪ Union"),
-                        (cad_solid::BoolOp::Difference, "∖ Difference"),
-                        (cad_solid::BoolOp::Intersection, "∩ Intersect"),
-                    ] {
-                        if ui.selectable_label(self.factory.next_op == op, name).clicked() {
-                            self.factory.next_op = op;
-                        }
-                    }
-                });
-
                 ui.separator();
                 let problem = dlg.problem();
                 if let Some(p) = problem {
                     ui.label(egui::RichText::new(format!("⚠ {p}")).color(egui::Color32::from_rgb(255, 158, 30)));
+                }
+                if edit_id.is_some() {
+                    ui.label(
+                        egui::RichText::new("editing the selected solid — changes apply live")
+                            .small()
+                            .color(egui::Color32::from_rgb(120, 200, 140)),
+                    );
                 }
                 ui.horizontal(|ui| {
                     if ui
@@ -3573,6 +3642,17 @@ impl CadApp {
                 });
             });
 
+        // EDIT MODE: a dimension changed → rebuild the primitive and write it back to
+        // the selected feature. Recompute is deferred to render_factory_panel (idle
+        // only, never mid-drag — the existing csgrs perf guard), so dragging a slider
+        // resizes the solid on release rather than re-evaluating the CSG per frame.
+        if let (Some(id), true) = (edit_id, changed.get()) {
+            let p = dlg.build();
+            if let Some(f) = self.factory.model.get_mut(id) {
+                f.primitive = p;
+            }
+            self.factory.dirty = true;
+        }
         if create {
             let p = dlg.build();
             self.factory.open = true;
@@ -3661,20 +3741,12 @@ impl CadApp {
                         self.factory.clear();
                     }
                 });
+                // 3D wall height — the one thing a 2D wall lacks. Draw walls in 2D, then
+                // right-click a selection → "Make 3D wall"; they rise to this height and
+                // keep their own thickness. Kept in the 3D layer, not cad_kernel's core.
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("next op:").small().weak());
-                    for (op, name) in [
-                        (cad_solid::BoolOp::Union, "Union"),
-                        (cad_solid::BoolOp::Difference, "Difference"),
-                        (cad_solid::BoolOp::Intersection, "Intersect"),
-                    ] {
-                        if ui
-                            .selectable_label(self.factory.next_op == op, name)
-                            .clicked()
-                        {
-                            self.factory.next_op = op;
-                        }
-                    }
+                    ui.label(egui::RichText::new("wall height").small().weak());
+                    ui.add(egui::Slider::new(&mut self.factory.wall_height, 0.5..=6.0).suffix(" m"));
                 });
                 ui.label(
                     egui::RichText::new(format!(
@@ -4337,8 +4409,18 @@ impl CadApp {
         // `factory.open`. A visible panel says nothing about what you are editing;
         // gating on it hijacked `m` out of the 2D drawing (twice). With `TwoD` active
         // this whole block is skipped and the established 2D command runs untouched,
-        // whatever the 3D panel is doing. A sketch counts as 2D: it IS 2D drafting.
-        if self.active_view == ActiveView::ThreeD && self.factory.session.is_none() {
+        // whatever the 3D panel is doing.
+        //
+        // A sketch does NOT force 2D here. While you draft ON the plane you are clicking
+        // the 2D canvas, which sets `active_view = TwoD`, so this block is already
+        // skipped — drafting stays 2D. `active_view` becomes `ThreeD` only when you
+        // interact with the 3D viewport (pick or orbit a solid), and then you DO want the
+        // 3D move, sketch open or not. An earlier `&& session.is_none()` clause here was
+        // WRONG: it fired only in that exact state (sketch open + working in the 3D view)
+        // and sent `move` down the dead 2D path, so a picked solid never moved
+        // (`select_mode → ForSelect`, `NOTE: 3D select` forever). Dispatch on
+        // `active_view` ALONE — that is the whole rule.
+        if self.active_view == ActiveView::ThreeD {
             // (1) a running op consumes typed values (degrees / factor / R / C)
             if let Some(mut md) = self.factory.modify.take() {
                 let plane = cad_solid::Plane::default();
@@ -24320,21 +24402,6 @@ impl eframe::App for CadApp {
                         }
                     }
                     ui.separator();
-                    ui.label(
-                        egui::RichText::new("  Boolean for the next solid")
-                            .small()
-                            .color(egui::Color32::from_rgb(150, 165, 185)),
-                    );
-                    for (op, name) in [
-                        (cad_solid::BoolOp::Union, "  ∪  Union"),
-                        (cad_solid::BoolOp::Difference, "  ∖  Difference"),
-                        (cad_solid::BoolOp::Intersection, "  ∩  Intersection"),
-                    ] {
-                        if ui.radio(self.factory.next_op == op, name).clicked() {
-                            self.factory.next_op = op;
-                        }
-                    }
-                    ui.separator();
                     if ui.button("  ⌖  Frame (zoom extents)").clicked() {
                         if self.factory.dirty {
                             self.factory.recompute();
@@ -25109,6 +25176,25 @@ impl eframe::App for CadApp {
                             }
                         });
                     });
+                    // Make 3D wall — promote selected 2D walls into Factory solids. The
+                    // practical wall journey: draft in 2D, then extrude here. Shown only
+                    // when the selection actually contains a wall.
+                    let has_wall = self.selection.iter().any(|&i| {
+                        matches!(self.doc.dobjects.get(i).map(|d| &d.geom), Some(Geom::Wall(_)))
+                    });
+                    if has_wall {
+                        ui.separator();
+                        if ui
+                            .button("⬒ Make 3D wall")
+                            .on_hover_text("Extrude the selected 2D wall(s) into 3D Factory solids — thickness from the wall, height from the Factory 'wall height'")
+                            .clicked()
+                        {
+                            let n = self.make_3d_wall_from_selection();
+                            self.history.push(format!("  {n} wall(s) → 3D Factory"));
+                            self.factory_note(format!("{n} wall(s) promoted to 3D"));
+                            ui.close_menu();
+                        }
+                    }
                     ui.separator();
                     if ui.button("Inspector").clicked() {
                         self.info_window_open = true;
@@ -33396,14 +33482,37 @@ mod active_view_dispatch_tests {
         }
     }
 
-    /// A sketch IS 2D drafting — the 3D branch must never claim it.
+    /// Drafting on the plane IS 2D. While you sketch you click the 2D canvas, which sets
+    /// `active_view = TwoD`, so `move` is the established 2D command — sketch or not. The
+    /// sketch is not what makes it 2D; the active view is.
     #[test]
-    fn a_sketch_counts_as_2d() {
+    fn sketch_open_and_drafting_2d_is_the_2d_move() {
         let mut app = app_3d();
         app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
-        app.active_view = ActiveView::ThreeD; // even with 3D "active"
+        app.active_view = ActiveView::TwoD; // you are drafting on the 2D canvas
+        app.selection.clear();
         app.run_command("move");
-        assert!(app.factory.modify.is_none(), "a sketch routes to the 2D move");
+        assert_eq!(app.select_mode, SelectMode::ForSelect, "2D drafting → the 2D move");
+        assert!(app.factory.modify.is_none() && app.factory.queued.is_none(),
+                "the 3D branch must not claim a draft");
+    }
+
+    /// ⭐ THE FIX (user, 2026-07-17: "move is not doing anything in moving 3d dobject …
+    /// app should [know] 3d is active [and] make proper adjustment in move"). A sketch
+    /// being OPEN must not block moving a solid you picked in the 3D viewport. When
+    /// `active_view` is `ThreeD` you are working in the 3D view, so `move` is the 3D move
+    /// — sketch open or not. Regression guard: the old `&& session.is_none()` gate sent
+    /// this down the dead 2D path (`select_mode → ForSelect`) and the solid never moved.
+    #[test]
+    fn sketch_open_but_working_in_3d_moves_the_solid() {
+        let mut app = app_3d();
+        app.factory_enter_sketch(crate::factory::FactoryState::ground_frame());
+        app.factory.selection = vec![app.factory.model.features[0].id]; // picked in 3D
+        app.active_view = ActiveView::ThreeD;
+        app.run_command("move");
+        assert_eq!(app.select_mode, SelectMode::Off, "the 2D session must NOT open");
+        assert!(app.factory.modify.is_some(),
+                "picked solid + 3D active → straight to the first point, sketch open or not");
     }
 }
 
