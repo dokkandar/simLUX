@@ -123,13 +123,26 @@ fn sample_lux(grid: &LuxGrid, plane: &cad_light::CalcPlane, p: Vec3) -> f64 {
 }
 
 /// Orbit-camera MVP: yaw/pitch around `target`, `dist` away, GL depth convention.
-pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32) -> [f32; 16] {
+pub fn mvp(yaw: f32, pitch: f32, dist: f32, target: [f32; 3], aspect: f32, ortho: bool) -> [f32; 16] {
     let t = Vec3::from(target);
     let (cp, sp) = (pitch.cos(), pitch.sin());
     let (cy, sy) = (yaw.cos(), yaw.sin());
     let eye = t + Vec3::new(cp * cy, cp * sy, sp) * dist.max(0.1);
-    let view = Mat4::look_at_rh(eye, t, Vec3::Z);
-    let proj = Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), 0.05, (dist * 6.0).max(80.0));
+    // Up = Z, but flip to Y when looking (near-)straight down/up so the Top/Bottom nav
+    // views don't hit the look_at degeneracy (view dir ∥ up → NaN matrix).
+    let up = if sp.abs() > 0.999 { Vec3::Y } else { Vec3::Z };
+    let view = Mat4::look_at_rh(eye, t, up);
+    let proj = if ortho {
+        // PARALLEL projection — a true CAD Top/Front/… view (a cylinder is a perfect
+        // circle in Top, no perspective barrel). Framed to match the perspective's
+        // apparent size at the target so switching modes doesn't jump the zoom.
+        let hh = dist.max(0.1) * (45f32.to_radians() * 0.5).tan();
+        let hw = hh * aspect.max(0.01);
+        let z = (dist * 20.0).max(200.0);
+        Mat4::orthographic_rh_gl(-hw, hw, -hh, hh, -z, z)
+    } else {
+        Mat4::perspective_rh_gl(45f32.to_radians(), aspect.max(0.01), 0.05, (dist * 6.0).max(80.0))
+    };
     (proj * view).to_cols_array()
 }
 

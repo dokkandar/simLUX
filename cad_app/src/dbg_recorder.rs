@@ -75,6 +75,18 @@ pub enum DbgEvent {
         elapsed_us:    Option<u64>,
     },
 
+    /// A ZOOM operation (2D or 3D-Factory) — everything needed to judge "is zoom
+    /// proper": the command as typed, the CHOICES the command line offers for it, the
+    /// resolved sub-command, and the screen zoom status BEFORE vs AFTER. Without this,
+    /// a zoom bug is invisible — the dump only showed a bare CMD line and a note.
+    ZoomOp {
+        cmd:      String, // raw: "zoom", "z", "zoom w", "zoom 2"
+        choices:  String, // what the command line offers as zoom sub-commands
+        action:   String, // resolved sub-command: "window armed", "extents", "in", …
+        before:   String, // screen zoom status before
+        after:    String, // screen zoom status after
+    },
+
     /// Canvas mouse click — fully decoded.
     CanvasClick {
         screen:        (f32, f32),
@@ -661,6 +673,12 @@ pub fn format_event_oneline(e: &DbgEvent) -> String {
                 None => String::new(),
             };
             format!("⌨ CMD \"{}\" → {}  [{:?}]{}", raw, parsed_debug, source, t)
+        }
+        DbgEvent::ZoomOp { cmd, choices, action, before, after } => {
+            let delta = if before == after { "  (view UNCHANGED)" } else { "" };
+            format!(
+                "🔍 ZOOM \"{cmd}\" → {action}{delta}\n        choices: [{choices}]\n        before: {before}\n        after : {after}"
+            )
         }
         DbgEvent::CanvasClick { world, hit_dobject, active_tool, active_state, .. } =>
             format!("🖱 CLICK world=({:.3},{:.3})  hit={:?}  tool={}  state={}",

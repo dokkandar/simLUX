@@ -41,6 +41,11 @@ pub struct SimluxConfig {
     pub plane_height: f32,
     #[serde(default)]
     pub cell_size: f32,
+    /// APP-LAYER wall-style extension: wall-style NAME → centerline linetype NAME.
+    /// Keyed by name (like everything else here) so it survives save/reopen even though
+    /// style/linetype ids are positional. Kept out of cad_kernel's `WallStyle` (D5).
+    #[serde(default)]
+    pub wall_centerline: BTreeMap<String, String>,
 }
 
 /// The sidecar path for a drawing: `foo.rsm` → `foo.simlux.json`.

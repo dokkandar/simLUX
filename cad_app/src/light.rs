@@ -363,6 +363,9 @@ impl LightState {
             room_height: self.room_height,
             plane_height: self.plane_height,
             cell_size: self.cell_size,
+            // App-layer wall centerline linetypes are filled in by the caller
+            // (write_simlux_sidecar) — `light` doesn't own that map.
+            wall_centerline: BTreeMap::new(),
         }
     }
 

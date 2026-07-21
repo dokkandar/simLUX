@@ -1578,6 +1578,10 @@ pub struct CadApp {
     wall_style_manager_open: bool,
     wall_style_manager_sel:  u32,
     wall_style_dialog:       Option<WallStyleDialog>,
+    /// APP-LAYER wall-style extension: wall-style id → centerline linetype id. Kept here
+    /// (not in cad_kernel's `WallStyle`) so core stays byte-identical to RUST_CAD. A style
+    /// absent from the map draws no centerline (faces only). Sidecar-persisted.
+    wall_centerline_ltype:   std::collections::HashMap<u32, u32>,
     /// Text input popup — drives the discoverable Enter-Text dialog
     /// that opens at the click anchor when the user picks a text
     /// position. Without this the body capture happens silently in
@@ -2523,6 +2527,10 @@ pub struct WallStyleDialog {
     /// Draw the batt-insulation sine wave in the cavity.
     pub insulation:  bool,
     pub description: String,
+    /// Centerline linetype id (APP-LAYER — deliberately NOT in cad_kernel's `WallStyle`,
+    /// so core stays byte-identical to RUST_CAD). `None` = don't draw a centerline (faces
+    /// only, as before). Loaded from / saved to the app's `wall_centerline_ltype` map.
+    pub centerline_ltype: Option<u32>,
 }
 
 impl WallStyleDialog {
@@ -2536,6 +2544,7 @@ impl WallStyleDialog {
             face_aci:    None,
             insulation:  false,
             description: String::new(),
+            centerline_ltype: None,
         }
     }
     pub fn from_existing(id: u32, s: &cad_kernel::WallStyle) -> Self {
@@ -2548,6 +2557,7 @@ impl WallStyleDialog {
             face_aci:    aci(s.face_color),
             insulation:  s.insulation,
             description: s.description.clone(),
+            centerline_ltype: None, // set by the caller from the app-layer map
         }
     }
 }
@@ -2998,6 +3008,7 @@ impl Default for CadApp {
             wall_style_manager_open: false,
             wall_style_manager_sel:  0,
             wall_style_dialog:       None,
+            wall_centerline_ltype:   std::collections::HashMap::new(),
             text_input_dialog_open:     false,
             text_input_dialog_buf:      String::new(),
             text_input_dialog_anchor:   None,
@@ -3234,6 +3245,72 @@ impl CadApp {
     /// undebuggable by design.
     fn factory_note(&mut self, msg: String) {
         crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::Note { message: msg });
+    }
+
+    /// Record a ZOOM operation for the session recorder: the command, the CHOICES the
+    /// command line offers, the resolved sub-command, and the screen zoom status BEFORE →
+    /// AFTER. "Without proper data it's not possible to bring [the zoom bug] up."
+    fn dbg_zoom(&mut self, cmd: &str, choices: &str, action: String, before: String, after: String) {
+        crate::dbg_event!(self, crate::dbg_recorder::DbgEvent::ZoomOp {
+            cmd: cmd.to_string(),
+            choices: choices.to_string(),
+            action,
+            before,
+            after,
+        });
+    }
+
+    /// Handle one zoom OPTION while a 3D zoom is live — the 3D analog of the 2D
+    /// `zoom_input_text`. Returns true if the token was a zoom option (handled), false if
+    /// it wasn't (the caller then exits zoom and re-dispatches the token as a command).
+    fn zoom3d_option(&mut self, input: &str) -> bool {
+        use crate::factory::ZoomMode;
+        let before = self.factory.zoom_status();
+        let (action, done): (String, bool) = match input.trim().to_ascii_lowercase().as_str() {
+            "r" | "real" | "realtime" => {
+                self.factory.zoom_mode = ZoomMode::RealTime;
+                self.factory.zoom_drag = None;
+                self.factory.zoom_cur = None;
+                self.factory.status = "ZOOM real-time — drag up/down to zoom  [Esc]".into();
+                ("real-time (drag up/down)".into(), false)
+            }
+            "" | "w" | "window" => {
+                self.factory.zoom_mode = ZoomMode::Window;
+                self.factory.zoom_drag = None;
+                self.factory.zoom_cur = None;
+                self.factory.status = "ZOOM window — drag a box (or click two corners)  [Esc]".into();
+                ("window (drag a box / click two corners)".into(), false)
+            }
+            "e" | "extents" | "a" | "all" => {
+                self.factory.zoom_save_prev();
+                if self.factory.dirty { self.factory.recompute(); }
+                self.factory.fit();
+                ("extents (fit all)".into(), true)
+            }
+            "p" | "prev" | "previous" => {
+                self.factory.zoom_restore_previous();
+                ("previous (restored the pre-zoom view)".into(), true)
+            }
+            other => match other.trim_end_matches('x').parse::<f32>() {
+                Ok(f) if f > 0.0 => {
+                    self.factory.zoom_save_prev();
+                    self.factory.zoom_by(1.0 / f); // "2" ⇒ 2× closer, like AutoCAD nX
+                    (format!("scale {f}x"), true)
+                }
+                _ => return false, // not a zoom option → caller re-dispatches
+            },
+        };
+        if done {
+            self.factory.zoom_mode = ZoomMode::Off;
+            self.factory.status.clear();
+        }
+        let after = self.factory.zoom_status();
+        self.dbg_zoom(
+            "zoom opt",
+            "W=window(click) · E=extents · P=previous · nX=scale · drag=real-time",
+            action, before, after,
+        );
+        true
     }
 
     /// Start the 3D op's pick phase against the current 3D selection (step 4).
@@ -3748,6 +3825,32 @@ impl CadApp {
                     ui.label(egui::RichText::new("wall height").small().weak());
                     ui.add(egui::Slider::new(&mut self.factory.wall_height, 0.5..=6.0).suffix(" m"));
                 });
+                if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
+                    ui.label(
+                        egui::RichText::new(&self.factory.status)
+                            .small()
+                            .color(egui::Color32::from_rgb(120, 200, 255)),
+                    );
+                }
+                // Selected wall — a live editor: promoted walls stay ALIVE, so re-select
+                // one and its height re-derives on the fly. (Rake/lean waits on a kernel
+                // tilt DOF — a Feature is axis-aligned today.)
+                if self.factory.selection.len() == 1 {
+                    let fid = self.factory.selection[0];
+                    if let Some(wi) = self.factory.wall_index(fid) {
+                        let mut h = self.factory.walls[wi].height;
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("▸ this wall")
+                                    .small()
+                                    .color(egui::Color32::from_rgb(120, 200, 140)),
+                            );
+                            if ui.add(egui::Slider::new(&mut h, 0.5..=6.0).suffix(" m")).changed() {
+                                self.factory.set_wall_height(fid, h);
+                            }
+                        });
+                    }
+                }
                 ui.label(
                     egui::RichText::new(format!(
                         "{} feature(s) · {} tris · {} selected",
@@ -3788,6 +3891,7 @@ impl CadApp {
                     self.factory.cam_yaw -= d.x * 0.01;
                     self.factory.cam_pitch =
                         (self.factory.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
+                    self.factory.ortho = false; // free orbit → back to perspective
                 }
                 if resp.hovered() {
                     let scroll = ui.input(|i| i.smooth_scroll_delta.y);
@@ -3797,6 +3901,203 @@ impl CadApp {
                     }
                 }
 
+                // Record 3D-viewport pointer activity WHILE a zoom is live — the 3D view
+                // doesn't emit the 2D canvas press/click events, so without this a zoom
+                // that "does nothing" is invisible (can't tell a drag from a click).
+                if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
+                    if resp.drag_started() {
+                        self.factory_note(format!(
+                            "3D vp: DRAG start (primary={})",
+                            resp.dragged_by(egui::PointerButton::Primary)
+                        ));
+                    }
+                    if resp.drag_stopped() { self.factory_note("3D vp: DRAG stop".into()); }
+                    if resp.clicked() { self.factory_note("3D vp: CLICK".into()); }
+                }
+
+                // ---- ZOOM interaction (mirrors 2D). RealTime: a LEFT drag up/down dollies
+                // smoothly (drag UP = zoom in). Window: DRAG a box OR click two corners,
+                // reframing on release / second click. Both suppress the pick while zooming.
+                match self.factory.zoom_mode {
+                    crate::factory::ZoomMode::Window => {
+                        // WINDOW — the 2D default: DRAG a box (press one corner, drag, release
+                        // the other) OR click two corners. Amber rubber-band + "zoom window"
+                        // label, IDENTICAL to the 2D zoom-window preview.
+                        if resp.dragged_by(egui::PointerButton::Primary) {
+                            let pos = resp.interact_pointer_pos();
+                            if self.factory.zoom_drag.is_none() { self.factory.zoom_drag = pos; }
+                            self.factory.zoom_cur = pos;
+                        } else if self.factory.zoom_drag.is_some() {
+                            if let Some(p) = resp.hover_pos() { self.factory.zoom_cur = Some(p); }
+                        }
+
+                        // Commit on drag-release, or on the SECOND corner click.
+                        let commit: Option<egui::Pos2> = if resp.drag_stopped() {
+                            self.factory.zoom_cur
+                        } else if resp.clicked() {
+                            match (resp.interact_pointer_pos(), self.factory.zoom_drag) {
+                                (Some(pos), None) => {
+                                    self.factory.zoom_drag = Some(pos); // FIRST corner
+                                    self.factory.zoom_cur = Some(pos);
+                                    self.factory.status =
+                                        "ZOOM window — click the OPPOSITE corner  [Esc]".into();
+                                    let s = self.factory.zoom_status();
+                                    self.dbg_zoom("window corner 1", "(click the opposite corner)",
+                                        "first corner placed".into(), s.clone(), s);
+                                    None
+                                }
+                                (Some(pos), Some(_)) => Some(pos), // SECOND corner
+                                _ => None,
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let (Some(e), Some(s)) = (commit, self.factory.zoom_drag) {
+                            if (e - s).length() > 4.0 {
+                                let before = self.factory.zoom_status();
+                                self.factory.zoom_window(rect, s, e);
+                                let after = self.factory.zoom_status();
+                                self.dbg_zoom("window", "(drag a box OR click two corners → reframe)",
+                                    format!("reframe to {:.0}×{:.0} px box", (e.x - s.x).abs(), (e.y - s.y).abs()),
+                                    before, after);
+                                self.factory.zoom_drag = None;
+                                self.factory.zoom_cur = None;
+                                self.factory.zoom_mode = crate::factory::ZoomMode::Off;
+                                self.factory.status.clear();
+                            } else {
+                                self.factory_note("3D zoom window: box too small — pick the opposite corner".into());
+                            }
+                        }
+
+                        // Amber rubber-band + "zoom window" label — EXACTLY like 2D. Painted
+                        // on a FOREGROUND layer, because the 3D scene is an opaque texture
+                        // drawn AFTER this in the same painter and was hiding the preview
+                        // (the gizmo shows for the same reason — it's a foreground Area).
+                        if let (Some(s), Some(e)) = (self.factory.zoom_drag, self.factory.zoom_cur) {
+                            let r = egui::Rect::from_two_pos(s, e);
+                            let fg = ui.ctx().layer_painter(egui::LayerId::new(
+                                egui::Order::Foreground,
+                                egui::Id::new("factory_zoom_preview"),
+                            ));
+                            fg.rect_filled(r, 0.0,
+                                egui::Color32::from_rgba_unmultiplied(255, 200, 100, 26));
+                            fg.rect_stroke(r, 0.0,
+                                egui::Stroke::new(1.2, egui::Color32::from_rgb(255, 200, 100)));
+                            fg.text(
+                                e + egui::vec2(12.0, 12.0),
+                                egui::Align2::LEFT_TOP,
+                                "zoom window",
+                                crate::theme::typ::data_code(),
+                                egui::Color32::from_rgb(255, 220, 140),
+                            );
+                            ui.ctx().request_repaint(); // keep the preview tracking the cursor
+                        }
+                        return_after_click = true;
+                    }
+                    crate::factory::ZoomMode::RealTime => {
+                        if resp.drag_started() {
+                            self.factory.zoom_rt_before = Some(self.factory.zoom_status());
+                        }
+                        if resp.dragged_by(egui::PointerButton::Primary) {
+                            let dy = resp.drag_delta().y;
+                            if dy != 0.0 {
+                                // drag UP (dy<0) zooms in, DOWN zooms out — AutoCAD real-time
+                                self.factory.cam_dist =
+                                    (self.factory.cam_dist * (1.0 + dy * 0.006)).clamp(0.4, 400.0);
+                            }
+                        }
+                        if resp.drag_stopped() {
+                            if let Some(before) = self.factory.zoom_rt_before.take() {
+                                let after = self.factory.zoom_status();
+                                self.dbg_zoom("real-time drag", "(drag up = in · down = out)",
+                                    "real-time dolly".into(), before, after);
+                            }
+                        }
+                        return_after_click = true;
+                    }
+                    crate::factory::ZoomMode::Off => {}
+                }
+
+                // ---- corner NAV GIZMO — standard views + zoom, like every 3D app ----
+                // A foreground Area top-right of the viewport, so its buttons take clicks
+                // before the orbit/select handler underneath. Views snap the camera;
+                // ＋/－/⌖ are zoom in / out / extents (the wheel already dollies).
+                egui::Area::new(egui::Id::new("factory_nav_gizmo"))
+                    .order(egui::Order::Foreground)
+                    .fixed_pos(egui::pos2(rect.right() - 130.0, rect.top() + 8.0))
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::popup(ui.style())
+                            .inner_margin(egui::Margin::symmetric(5.0, 4.0))
+                            .show(ui, |ui| {
+                                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
+                                ui.spacing_mut().button_padding = egui::vec2(4.0, 1.0);
+                                use crate::factory::StdView::*;
+
+                                // THE VIEW CUBE — the orientation control IS the cube now:
+                                // click a FACE to snap to that view (Top/Bottom/Front/Back/
+                                // Left/Right — the face under the cursor lights up), DRAG to
+                                // orbit, DOUBLE-CLICK for isometric. The ring + dot show the
+                                // live heading.
+                                let (crect, cresp) = ui.allocate_exact_size(
+                                    egui::vec2(120.0, 112.0),
+                                    egui::Sense::click_and_drag(),
+                                );
+                                let (cyaw, cpitch) = (self.factory.cam_yaw, self.factory.cam_pitch);
+                                if cresp.dragged() {
+                                    let d = cresp.drag_delta();
+                                    self.factory.cam_yaw -= d.x * 0.01;
+                                    self.factory.cam_pitch =
+                                        (self.factory.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
+                                    self.factory.ortho = false; // free orbit → perspective
+                                } else if cresp.clicked() {
+                                    if let Some(pos) = cresp.interact_pointer_pos() {
+                                        if let Some(v) = nav_cube_pick(crect, cyaw, cpitch, pos) {
+                                            self.factory.set_view(v);
+                                        }
+                                    }
+                                }
+                                if cresp.double_clicked() {
+                                    self.factory.set_view(Iso);
+                                }
+                                let hover = cresp.hover_pos()
+                                    .and_then(|pos| nav_cube_pick(crect, cyaw, cpitch, pos));
+                                draw_nav_cube(ui.painter(), crect, cyaw, cpitch, hover);
+
+                                // Zoom controls (view orientation lives on the cube now).
+                                ui.horizontal(|ui| {
+                                    if ui.small_button("▣").on_hover_text("Zoom window — drag a box").clicked() {
+                                        let before = self.factory.zoom_status();
+                                        self.factory.zoom_mode = crate::factory::ZoomMode::Window;
+                                        self.factory.zoom_drag = None;
+                                        self.factory.zoom_cur = None;
+                                        self.factory.status = "ZOOM window — drag a box (or click two corners)  [Esc]".into();
+                                        let after = self.factory.zoom_status();
+                                        self.dbg_zoom("gizmo ▣", "window", "window (drag a box)".into(), before, after);
+                                    }
+                                    if ui.small_button("＋").on_hover_text("Zoom in").clicked() {
+                                        let before = self.factory.zoom_status();
+                                        self.factory.zoom_by(0.8);
+                                        let after = self.factory.zoom_status();
+                                        self.dbg_zoom("gizmo ＋", "in", "in (×0.8 dolly)".into(), before, after);
+                                    }
+                                    if ui.small_button("－").on_hover_text("Zoom out").clicked() {
+                                        let before = self.factory.zoom_status();
+                                        self.factory.zoom_by(1.25);
+                                        let after = self.factory.zoom_status();
+                                        self.dbg_zoom("gizmo －", "out", "out (×1.25 dolly)".into(), before, after);
+                                    }
+                                    if ui.small_button("⌖").on_hover_text("Zoom extents").clicked() {
+                                        let before = self.factory.zoom_status();
+                                        if self.factory.dirty { self.factory.recompute(); }
+                                        self.factory.fit();
+                                        let after = self.factory.zoom_status();
+                                        self.dbg_zoom("gizmo ⌖", "extents", "extents (fit all)".into(), before, after);
+                                    }
+                                });
+                            });
+                    });
+
                 let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.0 };
                 let mvp = crate::light3d::mvp(
                     self.factory.cam_yaw,
@@ -3804,6 +4105,7 @@ impl CadApp {
                     self.factory.cam_dist,
                     self.factory.cam_target,
                     aspect,
+                    self.factory.ortho,
                 );
                 // ---- LEFT CLICK = SELECT (never camera) ----------------------
                 // Part B of the mouse rule: the left button is the selector. Shift
@@ -4118,6 +4420,7 @@ impl CadApp {
                     self.light.cam_dist,
                     self.light.cam_target,
                     aspect,
+                    false, // SIMLUX room view keeps perspective
                 );
                 let verts = self.build_scene3d_verts();
 
@@ -4432,6 +4735,53 @@ impl CadApp {
                     return;
                 }
                 self.factory.modify = Some(md); // not a value → may be a new command
+            }
+            // ZOOM in 3D — the 2D zoom, on the camera (dispatched by active_view). Bare
+            // `zoom`/`z` (or `zoom w`) arms a WINDOW: drag a box in the view and the camera
+            // reframes to it — the 2D default, NOT a jump to extents. Explicit verbs still
+            // work: e/a extents, in/out dolly, a bare factor scales.
+            // ---- ZOOM in 3D — MIRRORS the 2D zoom command. ----
+            // If a zoom is already live, the next typed token is an OPTION (w/e/p/nX);
+            // an unrecognised token exits zoom and falls through to normal dispatch —
+            // exactly like the 2D `zoom_state` machine.
+            if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
+                if self.zoom3d_option(trimmed) {
+                    return;
+                }
+                self.factory.zoom_mode = crate::factory::ZoomMode::Off;
+                self.factory.status.clear();
+                // fall through — the token was a real command, not a zoom option
+            }
+            let lc = trimmed.to_ascii_lowercase();
+            if lc == "zoom" || lc == "z" || lc.starts_with("zoom ") || lc.starts_with("z ") {
+                let arg = lc.split_whitespace().nth(1).unwrap_or("").to_string();
+                if arg.is_empty() {
+                    // Bare `zoom`/`z` → WINDOW (the 2D default): drag a box, or click two
+                    // corners, with the amber "zoom window" rubber-band. `z r` = real-time.
+                    self.factory.zoom_mode = crate::factory::ZoomMode::Window;
+                    self.factory.zoom_drag = None;
+                    self.factory.zoom_cur = None;
+                    self.factory.zoom_rt_before = None;
+                    self.factory.status =
+                        "ZOOM window — drag a box (or click two corners) · [R]eal-time [E]xtents [P]revious · nX scale  [Esc]".into();
+                    let s = self.factory.zoom_status();
+                    self.dbg_zoom(
+                        trimmed,
+                        "WINDOW (default: drag a box / click 2 corners) · R=real-time · E=extents · P=previous · nX=scale",
+                        "window ARMED — drag a box or click two corners".into(),
+                        s.clone(), s,
+                    );
+                    self.history.push(
+                        "  ZOOM window — drag a box (or click two corners) · [R]eal-time [E]xtents [P]revious · nX scale".into());
+                } else {
+                    // Inline arg (`z r`, `z e`, `z 2`): arm window, then apply the option.
+                    self.factory.zoom_mode = crate::factory::ZoomMode::Window;
+                    if !self.zoom3d_option(&arg) {
+                        self.factory.zoom_mode = crate::factory::ZoomMode::Off;
+                        self.factory.status.clear();
+                    }
+                }
+                return;
             }
             use cad_solid::modify::ModifyOp as MO;
             let op3d = match trimmed.to_ascii_lowercase().as_str() {
@@ -9391,6 +9741,10 @@ impl CadApp {
         let sel_name  = name_of(sel);
         let sel_style = self.doc.wall_styles.get(sel).cloned()
             .unwrap_or_else(cad_kernel::WallStyle::standard);
+        // Selected style's centerline linetype pattern (app-layer), for the preview.
+        let sel_cl_pat: Option<Vec<f32>> = self.wall_centerline_ltype.get(&sel)
+            .and_then(|id| self.doc.linetypes.get(*id))
+            .map(|lt| lt.pattern.clone());
 
         egui::Window::new("Wall Style Manager")
             .id(egui::Id::new("wall_style_manager"))
@@ -9429,7 +9783,7 @@ impl CadApp {
                             egui::Color32::from_rgb(40, 42, 47));
                         painter.rect_stroke(resp.rect, 4.0,
                             egui::Stroke::new(1.0, egui::Color32::from_rgb(70, 80, 95)));
-                        draw_wall_style_preview(&painter, resp.rect, &sel_style);
+                        draw_wall_style_preview(&painter, resp.rect, &sel_style, sel_cl_pat.as_deref());
                     });
                     ui.vertical(|ui| {
                         ui.add_space(18.0);
@@ -9472,7 +9826,11 @@ impl CadApp {
             self.history.push(format!("  wall style: '{}' set current", name_of(target)));
         }
         if do_new    { self.wall_style_dialog = Some(WallStyleDialog::new_blank()); }
-        if do_modify { self.wall_style_dialog = Some(WallStyleDialog::from_existing(sel, &sel_style)); }
+        if do_modify {
+            let mut dlg = WallStyleDialog::from_existing(sel, &sel_style);
+            dlg.centerline_ltype = self.wall_centerline_ltype.get(&sel).copied();
+            self.wall_style_dialog = Some(dlg);
+        }
         if !open || do_close { self.wall_style_manager_open = false; }
     }
 
@@ -9483,6 +9841,10 @@ impl CadApp {
         let mut do_ok = false;
         let mut do_cancel = false;
         let mut pick_slot: Option<WallColorSlot> = None;
+        // Snapshot linetypes for the centerline picker (avoids borrowing self.doc inside
+        // the window closure).
+        let lt_list: Vec<(u32, String)> = self.doc.linetypes.linetypes.iter().enumerate()
+            .map(|(i, lt)| (i as u32, lt.name.clone())).collect();
         egui::Window::new(if dialog.editing_id.is_some() {
                 "Edit Wall Style" } else { "New Wall Style" })
             .id(egui::Id::new("wall_style_dialog"))
@@ -9517,6 +9879,22 @@ impl CadApp {
                         ui.checkbox(&mut dialog.insulation, "batt symbol in cavity")
                             .on_hover_text("Draw the architectural insulation \
                                             (sine-wave batt) symbol along the wall cavity.");
+                        ui.end_row();
+                        ui.label("Centerline");
+                        egui::ComboBox::from_id_salt("wall_centerline_lt")
+                            .width(220.0)
+                            .selected_text(match dialog.centerline_ltype {
+                                Some(id) => lt_list.iter().find(|(i, _)| *i == id)
+                                    .map(|(_, n)| n.as_str()).unwrap_or("?"),
+                                None => "— none (faces only) —",
+                            })
+                            .show_ui(ui, |ui| {
+                                ui.selectable_value(&mut dialog.centerline_ltype, None,
+                                    "— none (faces only) —");
+                                for (id, name) in &lt_list {
+                                    ui.selectable_value(&mut dialog.centerline_ltype, Some(*id), name);
+                                }
+                            });
                         ui.end_row();
                         ui.label("Description");
                         ui.add(egui::TextEdit::singleline(&mut dialog.description)
@@ -9555,19 +9933,26 @@ impl CadApp {
                 insulation:  dialog.insulation,
                 description: dialog.description.clone(),
             };
-            match dialog.editing_id {
+            let saved_id = match dialog.editing_id {
                 Some(id) => {
                     if let Some(s) = self.doc.wall_styles.styles.get_mut(id as usize) {
                         *s = new_style;
                         self.history.push(format!("  ⊛ wall style #{} '{}' updated", id, name));
                     }
-                    self.gpu_dirty = true;
+                    id
                 }
                 None => {
                     let id = self.doc.wall_styles.add(new_style);
                     self.history.push(format!("  + wall style #{} '{}' created", id, name));
+                    id
                 }
+            };
+            // App-layer centerline linetype (cad_kernel WallStyle untouched).
+            match dialog.centerline_ltype {
+                Some(lt) => { self.wall_centerline_ltype.insert(saved_id, lt); }
+                None     => { self.wall_centerline_ltype.remove(&saved_id); }
             }
+            self.gpu_dirty = true;
             return;
         }
         self.wall_style_dialog = Some(dialog);
@@ -13560,7 +13945,15 @@ impl CadApp {
 
     /// Write the SIMLUX sidecar (`<drawing>.simlux.json`) next to `drawing`.
     fn write_simlux_sidecar(&mut self, drawing: &std::path::Path) {
-        let cfg = self.light.to_config(&self.doc);
+        let mut cfg = self.light.to_config(&self.doc);
+        // App-layer wall centerline linetypes, keyed by STABLE names (style → linetype).
+        cfg.wall_centerline = self.wall_centerline_ltype.iter()
+            .filter_map(|(&sid, &lid)| {
+                let sname = self.doc.wall_styles.styles.get(sid as usize)?.name.clone();
+                let lname = self.doc.linetypes.linetypes.get(lid as usize)?.name.clone();
+                Some((sname, lname))
+            })
+            .collect();
         match crate::simlux_io::save(drawing, &cfg) {
             Ok(p) => self.history.push(format!("  SIMLUX setup → '{}'", p.display())),
             Err(e) => self.history.push(format!("  ! SIMLUX save: {}", e)),
@@ -13571,6 +13964,15 @@ impl CadApp {
     fn load_simlux_sidecar(&mut self, drawing: &std::path::Path) {
         match crate::simlux_io::load(drawing) {
             Ok(Some(cfg)) => {
+                // Resolve wall centerline linetypes by NAME → current ids (positional).
+                self.wall_centerline_ltype.clear();
+                for (sname, lname) in &cfg.wall_centerline {
+                    if let (Some(sid), Some(lid)) =
+                        (self.doc.wall_styles.find(sname), self.doc.linetypes.find(lname))
+                    {
+                        self.wall_centerline_ltype.insert(sid, lid);
+                    }
+                }
                 self.light.apply_config(cfg, &self.doc);
                 self.history.push("  SIMLUX setup loaded (sidecar)".into());
             }
@@ -23231,6 +23633,16 @@ impl eframe::App for CadApp {
 
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // 3D zoom: Esc exits any zoom mode, before the 2D cancel-everything below.
+            if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
+                self.factory.zoom_mode = crate::factory::ZoomMode::Off;
+                self.factory.zoom_drag = None;
+                self.factory.zoom_cur = None;
+                self.factory.zoom_rt_before = None;
+                self.factory.status.clear();
+                self.factory_note("3D zoom: exited".into());
+                return;
+            }
             // PLINE/SPLINE: Esc removes ONLY the last placed vertex (the last
             // segment), never the whole run. Whatever is already drawn stays
             // live and commits when the command ends/interrupts (see
@@ -27567,15 +27979,32 @@ impl eframe::App for CadApp {
                                             ox, oy, half_w, face_packed);
                                     }
                                 }
-                                // Centerline (solid on GPU for now).
-                                if self.env.WlCnL {
+                                // Centerline — in the wall style's linetype (app map) when
+                                // set (dashed via the GPU dash-walker); else solid.
+                                let cl_ltype = self.wall_centerline_ltype.get(&w.style).copied();
+                                if cl_ltype.is_some() || self.env.WlCnL {
                                     let n_face = left_faces.iter().chain(right_faces.iter())
                                         .map(|p| p.len()).max().unwrap_or(2);
                                     let clp = pack_rgba(egui::Color32::from_rgba_unmultiplied(
                                         color.r(), color.g(), color.b(), 110));
                                     let cl = w.centerline_polyline(n_face.max(3) - 1);
-                                    for s in cl.windows(2) {
-                                        gpu_push_seg(&mut lines, s[0], s[1], ox, oy, half_w, clp);
+                                    let pattern = cl_ltype
+                                        .and_then(|id| self.doc.linetypes.get(id))
+                                        .filter(|lt| !lt.is_continuous())
+                                        .map(|lt| lt.pattern.clone());
+                                    match pattern {
+                                        Some(pat) => {
+                                            let mut dashes = Vec::new();
+                                            dash_world_segments(&cl, &pat, &mut dashes);
+                                            for (a, b) in dashes {
+                                                gpu_push_seg(&mut lines, a, b, ox, oy, half_w, clp);
+                                            }
+                                        }
+                                        _ => {
+                                            for s in cl.windows(2) {
+                                                gpu_push_seg(&mut lines, s[0], s[1], ox, oy, half_w, clp);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -30572,7 +31001,10 @@ fn draw_dobject_thick(
                 }
             }
 
-            if app.env.WlCnL {
+            // Centerline — in the wall STYLE's centerline linetype (app-layer map) when
+            // set, else the `WlCnL` toggle's default dashed line. Neither → faces only.
+            let cl_ltype = app.wall_centerline_ltype.get(&w.style).copied();
+            if cl_ltype.is_some() || app.env.WlCnL {
                 let cl_col = egui::Color32::from_rgba_unmultiplied(
                     color.r(), color.g(), color.b(), 110);
                 let cl_stroke = egui::Stroke::new(width * 0.8, cl_col);
@@ -30580,8 +31012,22 @@ fn draw_dobject_thick(
                 let clpts: Vec<egui::Pos2> =
                     w.centerline_polyline(n_face.max(3) - 1).iter()
                         .map(|p| app.w2s(*p, rect)).collect();
-                for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
-                    painter.add(s);
+                let pattern = cl_ltype
+                    .and_then(|id| app.doc.linetypes.get(id))
+                    .filter(|lt| !lt.is_continuous())
+                    .map(|lt| lt.pattern.clone());
+                match pattern {
+                    Some(pat) => paint_pattern_polyline(painter, &clpts, &pat, app.scale, cl_stroke),
+                    None if cl_ltype.is_some() => {
+                        // explicit CONTINUOUS centerline → solid line
+                        if clpts.len() >= 2 { painter.add(egui::Shape::line(clpts, cl_stroke)); }
+                    }
+                    None => {
+                        // no per-style linetype, WlCnL on → the original default dashed
+                        for s in egui::Shape::dashed_line(&clpts, cl_stroke, 6.0, 4.0) {
+                            painter.add(s);
+                        }
+                    }
                 }
             }
         }
@@ -31008,7 +31454,12 @@ fn dim_color_swatch(ui: &mut egui::Ui, val: &mut Option<u8>) -> bool {
 /// maps a fixed sample-world box into `rect` (no global camera).
 /// Sample preview for the Wall Style Manager — a short wall segment showing
 /// the style's thickness, poché fill, and face color.
-fn draw_wall_style_preview(painter: &egui::Painter, rect: egui::Rect, style: &cad_kernel::WallStyle) {
+fn draw_wall_style_preview(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    style: &cad_kernel::WallStyle,
+    centerline_pattern: Option<&[f32]>,
+) {
     let cx = rect.center().x;
     let cy = rect.center().y;
     let half_len = rect.width() * 0.32;
@@ -31029,9 +31480,20 @@ fn draw_wall_style_preview(painter: &egui::Painter, rect: egui::Rect, style: &ca
     painter.line_segment([r.left_top(), r.right_top()], s);
     painter.line_segment([r.left_bottom(), r.right_bottom()], s);
     let cl = egui::Stroke::new(1.0, egui::Color32::from_rgb(120, 140, 160));
-    for seg in egui::Shape::dashed_line(
-        &[egui::pos2(r.left() - 12.0, cy), egui::pos2(r.right() + 12.0, cy)], cl, 6.0, 4.0) {
-        painter.add(seg);
+    let clpts = [egui::pos2(r.left() - 12.0, cy), egui::pos2(r.right() + 12.0, cy)];
+    match centerline_pattern {
+        // Dashed/center/hidden linetype → show it (fit ~3 repeats across the preview).
+        Some(pat) if !pat.is_empty() => {
+            let total: f32 = pat.iter().map(|x| x.abs()).sum::<f32>().max(1e-4);
+            let scale = (r.width() * 0.5) / (total * 3.0);
+            paint_pattern_polyline(painter, &clpts, pat, scale, cl);
+        }
+        // Explicit CONTINUOUS centerline → solid.
+        Some(_) => { painter.line_segment(clpts, cl); }
+        // No centerline linetype set → the reference dashed middle line, as before.
+        None => {
+            for seg in egui::Shape::dashed_line(&clpts, cl, 6.0, 4.0) { painter.add(seg); }
+        }
     }
     painter.text(egui::pos2(cx, r.bottom() + 14.0), egui::Align2::CENTER_TOP,
         format!("t = {:.3}", style.thickness),
@@ -33378,6 +33840,161 @@ pub fn draw_viewport_active_frame(painter: &egui::Painter, rect: egui::Rect, act
     if active {
         // a soft ring so the live one reads at a glance in peripheral vision
         painter.circle_stroke(c, 6.5, egui::Stroke::new(1.0, col.gamma_multiply(0.5)));
+    }
+}
+
+/// The 3D-Factory nav-cube gizmo (the "VIEW" icon): a glowing wireframe cube shown in the
+/// LIVE camera orientation, inside an orbit ring with a heading dot. Purely painted — the
+/// caller senses the drag (horizontal = yaw, vertical = pitch) and orbits the camera.
+pub fn draw_nav_cube(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    yaw: f32,
+    pitch: f32,
+    highlight: Option<crate::factory::StdView>,
+) {
+    use glam::Vec3;
+    let c = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.5) - 3.0;
+
+    // Camera basis → orthographic projection of the cube as the eye sees it (so the cube
+    // turns exactly as you orbit — a true orientation indicator).
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let f = Vec3::new(cp * cy, cp * sy, sp);
+    let r = { let x = f.cross(Vec3::Z); if x.length() < 1e-4 { Vec3::X } else { x.normalize() } };
+    let u = r.cross(f).normalize();
+
+    // Orbit ring + heading dot.
+    let ring = egui::Color32::from_rgba_unmultiplied(120, 200, 255, 170);
+    painter.circle_stroke(c, radius, egui::Stroke::new(1.6, ring));
+    let ha = -yaw - std::f32::consts::FRAC_PI_2;
+    let dot = egui::pos2(c.x + radius * ha.cos(), c.y + radius * ha.sin());
+    painter.circle_filled(dot, 3.0, egui::Color32::from_rgb(150, 215, 255));
+
+    // Wireframe cube.
+    let s = radius * 0.60;
+    let corners = [
+        Vec3::new(-1., -1., -1.), Vec3::new(1., -1., -1.), Vec3::new(1., 1., -1.), Vec3::new(-1., 1., -1.),
+        Vec3::new(-1., -1.,  1.), Vec3::new(1., -1.,  1.), Vec3::new(1., 1.,  1.), Vec3::new(-1., 1.,  1.),
+    ];
+    let p: Vec<(egui::Pos2, f32)> = corners
+        .iter()
+        .map(|&v| (egui::pos2(c.x + v.dot(r) * s, c.y - v.dot(u) * s), v.dot(f)))
+        .collect();
+    // Hover highlight — fill the face the cursor is over, so it reads as clickable.
+    if let Some(hv) = highlight {
+        use crate::factory::StdView as V;
+        let fc: &[usize] = match hv {
+            V::Top => &[4, 5, 6, 7], V::Bottom => &[0, 1, 2, 3],
+            V::Front => &[0, 1, 5, 4], V::Back => &[3, 2, 6, 7],
+            V::Right => &[1, 2, 6, 5], V::Left => &[0, 3, 7, 4],
+            V::Iso => &[],
+        };
+        if !fc.is_empty() {
+            let poly: Vec<egui::Pos2> = fc.iter().map(|&k| p[k].0).collect();
+            painter.add(egui::Shape::convex_polygon(
+                poly,
+                egui::Color32::from_rgba_unmultiplied(120, 200, 255, 70),
+                egui::Stroke::NONE,
+            ));
+        }
+    }
+
+    // Face visibility: a face is front-facing when its outward normal points toward the
+    // eye (`normal · f > 0`, `f` = target→eye). An edge is VISIBLE if EITHER of its two
+    // faces is front-facing; HIDDEN only when both face away.
+    // Face order: 0=-Z 1=+Z 2=-Y 3=+Y 4=-X 5=+X.
+    let face_n = [
+        Vec3::new(0., 0., -1.), Vec3::new(0., 0., 1.),
+        Vec3::new(0., -1., 0.), Vec3::new(0., 1., 0.),
+        Vec3::new(-1., 0., 0.), Vec3::new(1., 0., 0.),
+    ];
+    let front = |k: usize| face_n[k].dot(f) > 0.0;
+    // ((corner_i, corner_j), (face_a, face_b))
+    let edges: [((usize, usize), (usize, usize)); 12] = [
+        ((0, 1), (0, 2)), ((1, 2), (0, 5)), ((2, 3), (0, 3)), ((3, 0), (0, 4)),
+        ((4, 5), (1, 2)), ((5, 6), (1, 5)), ((6, 7), (1, 3)), ((7, 4), (1, 4)),
+        ((0, 4), (2, 4)), ((1, 5), (2, 5)), ((2, 6), (3, 5)), ((3, 7), (3, 4)),
+    ];
+    // Draw HIDDEN first (thin gray), so the VISIBLE (thick, bright) sit on top.
+    for pass_visible in [false, true] {
+        for ((i, j), (fa, fb)) in edges {
+            let visible = front(fa) || front(fb);
+            if visible != pass_visible { continue; }
+            let (a, _) = p[i];
+            let (b, _) = p[j];
+            if visible {
+                painter.line_segment([a, b], egui::Stroke::new(4.0,
+                    egui::Color32::from_rgba_unmultiplied(60, 140, 230, 90))); // soft glow
+                painter.line_segment([a, b], egui::Stroke::new(2.2,
+                    egui::Color32::from_rgb(150, 215, 255)));                  // thick bright core
+            } else {
+                painter.line_segment([a, b], egui::Stroke::new(1.0,
+                    egui::Color32::from_rgb(110, 120, 135)));                  // thin gray
+            }
+        }
+    }
+}
+
+/// Which standard view a point over the nav cube lands on — the nearest FRONT-facing face
+/// whose projected centre the point is near, or `None` if it misses the faces (ring / gap).
+/// Used for both the click (snap) and the hover highlight, and mirrors `draw_nav_cube`'s
+/// projection so the pick lines up with what's drawn.
+pub fn nav_cube_pick(
+    rect: egui::Rect,
+    yaw: f32,
+    pitch: f32,
+    at: egui::Pos2,
+) -> Option<crate::factory::StdView> {
+    use glam::Vec3;
+    use crate::factory::StdView;
+    let c = rect.center();
+    let radius = (rect.width().min(rect.height()) * 0.5) - 3.0;
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let f = Vec3::new(cp * cy, cp * sy, sp);
+    let r = { let x = f.cross(Vec3::Z); if x.length() < 1e-4 { Vec3::X } else { x.normalize() } };
+    let u = r.cross(f).normalize();
+    let s = radius * 0.60;
+    // (face outward normal, the view that looks straight at that face)
+    let faces = [
+        (Vec3::new(0., 0., 1.), StdView::Top),
+        (Vec3::new(0., 0., -1.), StdView::Bottom),
+        (Vec3::new(0., -1., 0.), StdView::Front),
+        (Vec3::new(0., 1., 0.), StdView::Back),
+        (Vec3::new(1., 0., 0.), StdView::Right),
+        (Vec3::new(-1., 0., 0.), StdView::Left),
+    ];
+    let mut best: Option<(f32, StdView)> = None;
+    for (n, v) in faces {
+        if n.dot(f) <= 0.05 { continue; } // back-facing → not pickable
+        let ctr = egui::pos2(c.x + n.dot(r) * s, c.y - n.dot(u) * s);
+        let d = (at - ctr).length();
+        if d <= s * 0.9 && best.map_or(true, |(bd, _)| d < bd) {
+            best = Some((d, v));
+        }
+    }
+    best.map(|(_, v)| v)
+}
+
+#[cfg(test)]
+mod nav_cube_tests {
+    use super::*;
+    use crate::factory::StdView;
+
+    #[test]
+    fn clicking_the_front_face_centre_snaps_to_that_view() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(120.0, 120.0));
+        // yaw=0, pitch=0 → camera on +X looking at the origin = the RIGHT view; the +X
+        // face is the only front face and projects onto the cube centre.
+        assert_eq!(nav_cube_pick(rect, 0.0, 0.0, rect.center()), Some(StdView::Right));
+    }
+
+    #[test]
+    fn a_point_out_on_the_ring_picks_nothing() {
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(120.0, 120.0));
+        assert_eq!(nav_cube_pick(rect, 0.0, 0.0, egui::pos2(2.0, 2.0)), None);
     }
 }
 

@@ -13,6 +13,37 @@ use glam::{Mat4, Vec2, Vec3};
 
 use crate::light3d::V3;
 
+/// The standard camera orientations the nav gizmo snaps to — the six orthographic
+/// faces plus an isometric, exactly the set every 3D solid app puts in its corner cube.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StdView {
+    Top, Bottom, Front, Back, Left, Right, Iso,
+}
+
+/// The 3D-Factory zoom mode — mirrors the 2D zoom command. Bare `z` → `Window` (the 2D
+/// default: DRAG a box, or click two corners, with an amber "zoom window" rubber-band);
+/// `z r` → `RealTime` (drag up/down dollies). `Off` = idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZoomMode {
+    Off,
+    Window,
+    RealTime,
+}
+
+/// A promoted wall kept ALIVE — the Factory remembers its parameters so the wall stays
+/// editable after promotion (change its height and it re-derives). `feature_id` links it
+/// to its Box in the model. `rake` (lean-from-vertical) is stored for the day the kernel
+/// gains a tilt DOF — today a `Feature` is axis-aligned only, so it is not applied yet.
+#[derive(Clone, Copy, Debug)]
+pub struct WallInst {
+    pub feature_id: u32,
+    pub a: Vec2,
+    pub b: Vec2,
+    pub thickness: f32,
+    pub height: f32,
+    pub rake_deg: f32,
+}
+
 /// An open sketch-on-plane session.
 ///
 /// **The core trick of 3D_Factory:** while this is live, the app's active `doc` IS the
@@ -90,6 +121,10 @@ pub struct FactoryState {
     pub cam_pitch: f32,
     pub cam_dist: f32,
     pub cam_target: [f32; 3],
+    /// Parallel (orthographic) projection — TRUE after a standard-view snap (Top/Front/…/
+    /// Iso) so a cylinder reads as a true CIRCLE in Top (no perspective barrel); FALSE while
+    /// free-orbiting (perspective depth). CAD convention: standard views are orthographic.
+    pub ortho: bool,
 
     /// Live sketch-on-plane session (the app's `doc` is swapped while `Some`).
     pub session: Option<SketchSession>,
@@ -118,6 +153,20 @@ pub struct FactoryState {
     /// its own (per-wall) thickness and rises to this height. Kept in the 3D layer, NOT
     /// cad_kernel's `WallStyle` (that's CORE, shared with the 2D app / RUST_CAD).
     pub wall_height: f32,
+    /// Live wall records — every promoted wall, so its height stays editable after the
+    /// fact (the "walls are alive" requirement). Keyed to model features by `feature_id`.
+    pub walls: Vec<WallInst>,
+
+    /// Zoom, mirroring the 2D command. `zoom`/`z` arms `RealTime` (drag to dolly) and
+    /// shows the choice menu; typing `w` switches to `Window` (a left drag rubber-bands a
+    /// box that reframes on release). `zoom_drag`/`zoom_cur` are the live box corners.
+    pub zoom_mode: ZoomMode,
+    pub zoom_drag: Option<egui::Pos2>,
+    pub zoom_cur: Option<egui::Pos2>,
+    /// Camera snapshot before the last zoom, for `zoom previous`: (yaw,pitch,dist,tx,ty,tz).
+    pub cam_prev: Option<[f32; 6]>,
+    /// Screen-zoom status captured at the start of a real-time drag, for the recorder.
+    pub zoom_rt_before: Option<String>,
 
     /// An in-flight 3D modifier over `selection`. This is the SAME `move` command as
     /// 2D — only the objects and the algorithm differ ("check 2d or 3d, take the right
@@ -407,6 +456,7 @@ impl Default for FactoryState {
             cam_pitch: 0.5,
             cam_dist: 12.0,
             cam_target: [0.0, 0.0, 0.0],
+            ortho: false,
             session: None,
             pending_face: None,
             box_w: 2.0,
@@ -418,6 +468,12 @@ impl Default for FactoryState {
             draw3d: None,
             draw3d_edit: None,
             wall_height: 2.7,
+            walls: Vec::new(),
+            zoom_mode: ZoomMode::Off,
+            zoom_drag: None,
+            zoom_cur: None,
+            cam_prev: None,
+            zoom_rt_before: None,
             modify: None,
             queued: None,
             status: String::new(),
@@ -469,8 +525,30 @@ impl FactoryState {
         let placement = Placement {
             u: mid.x, v: mid.y, lift: 0.0, spin_deg: d.y.atan2(d.x).to_degrees(),
         };
-        let _ = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
+        // Keep the wall ALIVE: record its params so its height stays editable.
+        self.walls.push(WallInst { feature_id: id, a, b, thickness, height, rake_deg: 0.0 });
         self.dirty = true;
+    }
+
+    /// Index of the live-wall record for a feature id, if it is a promoted wall.
+    pub fn wall_index(&self, feature_id: u32) -> Option<usize> {
+        self.walls.iter().position(|w| w.feature_id == feature_id)
+    }
+
+    /// Change a live wall's height and re-derive its Box — the "walls are alive" edit.
+    /// Keeps the wall's centerline length and thickness; only the rise changes.
+    pub fn set_wall_height(&mut self, feature_id: u32, height: f32) {
+        let h = height.max(0.01);
+        if let Some(i) = self.wall_index(feature_id) {
+            self.walls[i].height = h;
+            let len = (self.walls[i].b - self.walls[i].a).length();
+            let t = self.walls[i].thickness;
+            if let Some(f) = self.model.get_mut(feature_id) {
+                f.primitive = Primitive::Box { w: len, d: t, h };
+                self.dirty = true;
+            }
+        }
     }
 
     pub fn erase_selection(&mut self) {
@@ -483,6 +561,7 @@ impl FactoryState {
     pub fn clear(&mut self) {
         self.model = Model::default();
         self.selection.clear();
+        self.walls.clear();
         self.dirty = true;
     }
 
@@ -513,6 +592,88 @@ impl FactoryState {
             self.cam_target = [0.0, 0.0, 0.0];
             self.cam_dist = 12.0;
         }
+    }
+
+    /// Snap the orbit camera to a standard view — the nav-gizmo action. Sets `(yaw,
+    /// pitch)`; `cam_target`/`cam_dist` are left alone (Zoom-extents is the only thing
+    /// that moves the target). `mvp` flips its up-vector near ±90° so Top/Bottom are
+    /// stable even though the free-orbit drag clamps pitch to ±1.45.
+    pub fn set_view(&mut self, v: StdView) {
+        use std::f32::consts::{FRAC_PI_2, FRAC_PI_4, PI};
+        let (yaw, pitch) = match v {
+            StdView::Top    => (-FRAC_PI_2,  FRAC_PI_2),
+            StdView::Bottom => (-FRAC_PI_2, -FRAC_PI_2),
+            StdView::Front  => (-FRAC_PI_2,  0.0),
+            StdView::Back   => ( FRAC_PI_2,  0.0),
+            StdView::Right  => ( 0.0,        0.0),
+            StdView::Left   => ( PI,         0.0),
+            StdView::Iso    => (-FRAC_PI_4,  0.6155), // 35.26° — the classic SE isometric
+        };
+        self.cam_yaw = yaw;
+        self.cam_pitch = pitch;
+        self.ortho = true; // standard views are orthographic (true CAD Top/Front/…)
+    }
+
+    /// Dolly the camera by a factor: `<1` zooms in (closer), `>1` zooms out. The same
+    /// clamp as the scroll wheel, so command / gizmo / wheel all agree.
+    pub fn zoom_by(&mut self, factor: f32) {
+        self.cam_dist = (self.cam_dist * factor).clamp(0.4, 400.0);
+    }
+
+    /// Reframe the camera to a screen rectangle — the 2D "zoom window", in 3D. Moves the
+    /// target under the box centre (on the target's view plane) and dollies in so the box
+    /// fills the viewport height. `vp` is the viewport rect; `p0`,`p1` the drag corners.
+    /// Snapshot the camera so `zoom previous` can restore it.
+    pub fn zoom_save_prev(&mut self) {
+        self.cam_prev = Some([
+            self.cam_yaw, self.cam_pitch, self.cam_dist,
+            self.cam_target[0], self.cam_target[1], self.cam_target[2],
+        ]);
+    }
+
+    /// Restore the camera saved before the last zoom (`zoom previous`). No-op if none.
+    pub fn zoom_restore_previous(&mut self) {
+        if let Some(p) = self.cam_prev.take() {
+            self.cam_yaw = p[0];
+            self.cam_pitch = p[1];
+            self.cam_dist = p[2];
+            self.cam_target = [p[3], p[4], p[5]];
+        }
+    }
+
+    pub fn zoom_window(&mut self, vp: egui::Rect, p0: egui::Pos2, p1: egui::Pos2) {
+        self.zoom_save_prev();
+        let bh = (p1.y - p0.y).abs().max(1.0);
+        let bc = egui::pos2((p0.x + p1.x) * 0.5, (p0.y + p1.y) * 0.5);
+        // box centre → normalised device coords (y up)
+        let ndc_x = (bc.x - vp.center().x) / (vp.width() * 0.5).max(1.0);
+        let ndc_y = -(bc.y - vp.center().y) / (vp.height() * 0.5).max(1.0);
+        // camera basis — matches `light3d::mvp`
+        let (cp, sp) = (self.cam_pitch.cos(), self.cam_pitch.sin());
+        let (cy, sy) = (self.cam_yaw.cos(), self.cam_yaw.sin());
+        let fwd = -Vec3::new(cp * cy, cp * sy, sp); // eye → target
+        let up_world = if sp.abs() > 0.999 { Vec3::Y } else { Vec3::Z };
+        let right = fwd.cross(up_world).normalize();
+        let up = right.cross(fwd).normalize();
+        // world half-extents on the target's view plane (45° vertical FOV, as in mvp)
+        let half_h = (45f32.to_radians() * 0.5).tan() * self.cam_dist;
+        let half_w = half_h * (vp.width() / vp.height().max(1.0));
+        let t = Vec3::from(self.cam_target) + right * (ndc_x * half_w) + up * (ndc_y * half_h);
+        self.cam_target = [t.x, t.y, t.z];
+        let factor = (bh / vp.height().max(1.0)).clamp(0.02, 1.0);
+        self.cam_dist = (self.cam_dist * factor).clamp(0.4, 400.0);
+    }
+
+    /// One-line screen-zoom status for the session recorder: how zoomed-in the camera is
+    /// (`dist`), what it is centred on (`target`), and the orbit angles. Comparing this
+    /// before vs after a zoom is how we tell whether the zoom actually did anything.
+    pub fn zoom_status(&self) -> String {
+        format!(
+            "dist={:.2} target=({:.1},{:.1},{:.1}) yaw={:.0}° pitch={:.0}°",
+            self.cam_dist,
+            self.cam_target[0], self.cam_target[1], self.cam_target[2],
+            self.cam_yaw.to_degrees(), self.cam_pitch.to_degrees(),
+        )
     }
 
     /// The SELECTED features' own geometry, as a mesh.
@@ -766,7 +927,7 @@ mod pick_tests {
 
     fn view(st: &FactoryState, rect: egui::Rect) -> [f32; 16] {
         let aspect = rect.width() / rect.height();
-        crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, aspect)
+        crate::light3d::mvp(st.cam_yaw, st.cam_pitch, st.cam_dist, st.cam_target, aspect, st.ortho)
     }
 
     /// The user reports "3D dobject not selecting". Picking is pure math (screen →
@@ -887,5 +1048,81 @@ mod wall_tests {
         st.add_wall_segment(Vec2::new(1.0, 1.0), Vec2::new(1.0, 1.0), 0.2, 2.7); // zero length
         st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(1.0, 0.0), 0.0, 2.7); // zero thickness
         assert_eq!(st.model.features.len(), 1, "degenerate segments are ignored");
+    }
+
+    /// Walls stay ALIVE (owner, 2026-07-17): a promotion records a live wall whose height
+    /// re-derives the Box on the fly, keeping its length and thickness.
+    #[test]
+    fn wall_stays_alive_height_re_derives() {
+        let mut st = FactoryState::default();
+        st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), 0.3, 2.5);
+        assert_eq!(st.walls.len(), 1, "promotion records a live wall");
+        let fid = st.walls[0].feature_id;
+
+        st.set_wall_height(fid, 3.2);
+        assert!((st.walls[0].height - 3.2).abs() < 1e-4, "registry height updated");
+        match st.model.get_mut(fid).unwrap().primitive {
+            Primitive::Box { w, d, h } => {
+                assert!((h - 3.2).abs() < 1e-4, "box height re-derived");
+                assert!((w - 4.0).abs() < 1e-4 && (d - 0.3).abs() < 1e-4, "length & thickness kept");
+            }
+            _ => panic!("a wall is a Box"),
+        }
+        st.clear();
+        assert!(st.walls.is_empty(), "clear drops the live-wall records too");
+    }
+}
+
+#[cfg(test)]
+mod zoom_tests {
+    use super::*;
+
+    /// Zoom-window (owner, 2026-07-17: "we need zoom as it is in 2d"): a CENTERED box keeps
+    /// the target where it is and dollies in by the box/viewport height ratio.
+    #[test]
+    fn zoom_window_centered_box_keeps_target_and_dollies_in() {
+        let mut st = FactoryState::default();
+        st.cam_target = [5.0, 5.0, 0.0];
+        st.cam_dist = 20.0;
+        let vp = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let c = vp.center();
+        // a centered box, half the viewport height (300 px) → target unchanged, dist halved
+        st.zoom_window(vp, egui::pos2(c.x - 100.0, c.y - 150.0), egui::pos2(c.x + 100.0, c.y + 150.0));
+        assert!((st.cam_target[0] - 5.0).abs() < 1e-3 && (st.cam_target[1] - 5.0).abs() < 1e-3,
+                "a centered box keeps the target");
+        assert!((st.cam_dist - 10.0).abs() < 1e-2, "a half-height box halves the distance");
+    }
+
+    /// An off-centre box shifts the target toward it (here: box to the RIGHT of centre).
+    #[test]
+    fn zoom_window_offcentre_box_shifts_target() {
+        let mut st = FactoryState::default();
+        st.cam_dist = 20.0; // Iso-ish default yaw/pitch
+        let vp = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(800.0, 600.0));
+        let c = vp.center();
+        let before = st.cam_target;
+        st.zoom_window(vp, egui::pos2(c.x + 100.0, c.y - 50.0), egui::pos2(c.x + 300.0, c.y + 50.0));
+        let moved = (st.cam_target[0] - before[0]).abs()
+            + (st.cam_target[1] - before[1]).abs()
+            + (st.cam_target[2] - before[2]).abs();
+        assert!(moved > 1e-3, "an off-centre window must move the target");
+    }
+
+    /// `zoom previous` restores the camera saved before the last zoom.
+    #[test]
+    fn zoom_previous_restores_the_pre_zoom_camera() {
+        let mut st = FactoryState::default();
+        st.cam_dist = 20.0;
+        st.cam_target = [1.0, 2.0, 3.0];
+        st.zoom_save_prev();
+        st.cam_dist = 5.0;
+        st.cam_target = [9.0, 9.0, 9.0];
+        st.zoom_restore_previous();
+        assert!((st.cam_dist - 20.0).abs() < 1e-4, "distance restored");
+        assert!((st.cam_target[0] - 1.0).abs() < 1e-4 && (st.cam_target[2] - 3.0).abs() < 1e-4,
+                "target restored");
+        // a second restore is a no-op (the snapshot was consumed)
+        st.zoom_restore_previous();
+        assert!((st.cam_dist - 20.0).abs() < 1e-4, "second restore is harmless");
     }
 }
