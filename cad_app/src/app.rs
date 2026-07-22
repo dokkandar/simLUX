@@ -3371,31 +3371,36 @@ impl CadApp {
     /// number of walls promoted.
     fn make_3d_wall_from_selection(&mut self) -> usize {
         let h = self.factory.wall_height;
-        let mut walls = 0usize;
-        let mut segs: Vec<(glam::Vec2, glam::Vec2, f32)> = Vec::new();
+        // Each selected 2D wall → ONE alive wall carrying its whole centerline as a
+        // footprint (straight = 2 pts, curved = sampled polyline). Keeping it as one
+        // footprint is what makes the wall editable as a unit — add/move/delete vertices.
+        let mut footprints: Vec<(Vec<glam::Vec2>, f32)> = Vec::new();
         for &i in &self.selection {
             if let Some(Geom::Wall(w)) = self.doc.dobjects.get(i).map(|d| &d.geom) {
-                walls += 1;
                 let t = w.thickness as f32;
-                for seg in w.centerline_polyline(16).windows(2) {
-                    segs.push((
-                        glam::Vec2::new(seg[0].x as f32, seg[0].y as f32),
-                        glam::Vec2::new(seg[1].x as f32, seg[1].y as f32),
-                        t,
-                    ));
+                let fp: Vec<glam::Vec2> = w
+                    .centerline_polyline(16)
+                    .iter()
+                    .map(|p| glam::Vec2::new(p.x as f32, p.y as f32))
+                    .collect();
+                if fp.len() >= 2 {
+                    footprints.push((fp, t));
                 }
             }
         }
-        if segs.is_empty() {
+        if footprints.is_empty() {
             return 0;
         }
         self.factory.open = true;
-        for (a, b, t) in segs {
-            self.factory.add_wall_segment(a, b, t, h);
+        let mut promoted = 0usize;
+        for (fp, t) in footprints {
+            if self.factory.add_wall(fp, t, h).is_some() {
+                promoted += 1;
+            }
         }
         self.factory.recompute();
         self.factory.fit();
-        walls
+        promoted
     }
 
     /// Reset every piece of **doc-relative** interactive state.
@@ -3731,13 +3736,14 @@ impl CadApp {
             self.factory.dirty = true;
         }
         if create {
+            // Create no longer drops the solid at the origin — it ARMS a placement: the
+            // next click in the 3D view sets the point (a Box's near corner / others
+            // centred). The dialog stays open so you can place several.
             let p = dlg.build();
             self.factory.open = true;
-            self.factory.add_primitive(p);
-            if self.factory.dirty {
-                self.factory.recompute();
-            }
-            self.factory.fit();
+            self.factory.place_pending = Some(p);
+            self.factory.status = format!(
+                "Place {} — click a point in the 3D view  [Esc cancels]", dlg.kind.label());
         }
         self.factory.draw3d = if open && !close_btn { Some(dlg) } else { None };
     }
@@ -3825,7 +3831,9 @@ impl CadApp {
                     ui.label(egui::RichText::new("wall height").small().weak());
                     ui.add(egui::Slider::new(&mut self.factory.wall_height, 0.5..=6.0).suffix(" m"));
                 });
-                if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
+                if self.factory.zoom_mode != crate::factory::ZoomMode::Off
+                    || self.factory.place_pending.is_some()
+                {
                     ui.label(
                         egui::RichText::new(&self.factory.status)
                             .small()
@@ -4116,9 +4124,23 @@ impl CadApp {
                 }
                 if resp.clicked() {
                     if let Some(pos) = resp.interact_pointer_pos() {
+                        // PLACEMENT owns the click first: a dialog-built primitive waiting
+                        // for its point. The click places it (Box corner / others centred);
+                        // a missed plane stays armed.
+                        if let Some(prim) = self.factory.place_pending.take() {
+                            let snapped = self.factory.snap_vertex(pos, rect, &mvp).map(|(w, _)| w);
+                            if let Some(w) = snapped.or_else(|| self.factory.cursor_on_plane(pos, rect, &mvp)) {
+                                self.factory.place_primitive(prim, w);
+                                self.factory.status.clear();
+                                self.factory_note(format!("3D place ✓ ({:.2},{:.2})", w.x, w.y));
+                            } else {
+                                self.factory.place_pending = Some(prim); // missed the plane
+                            }
+                            return_after_click = true;
+                        }
                         // A running op owns the click — it is a POINT (step 4/5), not a
                         // selection. Same cascade rule as the 2D canvas.
-                        if let Some(mut md) = self.factory.modify.take() {
+                        else if let Some(mut md) = self.factory.modify.take() {
                             let snapped = self.factory.snap_vertex(pos, rect, &mvp).map(|(w, _)| w);
                             let w = snapped.or_else(|| self.factory.cursor_on_plane(pos, rect, &mvp));
                             if let Some(w) = w {
@@ -23633,6 +23655,13 @@ impl eframe::App for CadApp {
 
         // global Esc: cancel any in-progress draw or pick / intersect / select mode
         if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            // 3D placement: Esc cancels a primitive waiting for its point.
+            if self.factory.place_pending.is_some() {
+                self.factory.place_pending = None;
+                self.factory.status.clear();
+                self.factory_note("3D place: cancelled".into());
+                return;
+            }
             // 3D zoom: Esc exits any zoom mode, before the 2D cancel-everything below.
             if self.factory.zoom_mode != crate::factory::ZoomMode::Off {
                 self.factory.zoom_mode = crate::factory::ZoomMode::Off;

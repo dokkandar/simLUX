@@ -30,15 +30,27 @@ pub enum ZoomMode {
     RealTime,
 }
 
-/// A promoted wall kept ALIVE — the Factory remembers its parameters so the wall stays
-/// editable after promotion (change its height and it re-derives). `feature_id` links it
-/// to its Box in the model. `rake` (lean-from-vertical) is stored for the day the kernel
-/// gains a tilt DOF — today a `Feature` is axis-aligned only, so it is not applied yet.
-#[derive(Clone, Copy, Debug)]
+/// A promoted wall kept ALIVE — the Factory owns its **footprint** (the ground-plane
+/// polyline) so the wall stays fully editable after promotion: change its height, or
+/// move / add / delete a footprint vertex, and it re-derives.
+///
+/// The floor ring (`z = 0`) and the ceiling ring (`z = height`) are BOTH derived from the
+/// SAME `footprint` points — so a vertex is a vertical edge present on *both* rings by
+/// construction; they can never drift apart. This is why "add a vertex in Top view → it
+/// lands on top AND bottom" is automatic (owner, 2026-07-22), not a special case: there is
+/// only one set of points driving both rings.
+///
+/// Each consecutive footprint pair extrudes to one Box `Feature`; `segments[i]` is the
+/// feature id of the i-th segment (`footprint.len() − 1` of them), in order. `rake`
+/// (lean-from-vertical) is stored for the day the kernel gains a tilt DOF — today a
+/// `Feature` is axis-aligned only, so it is not applied yet (and only then can top ≠
+/// bottom, relaxing the "both rings" coupling).
+#[derive(Clone, Debug)]
 pub struct WallInst {
-    pub feature_id: u32,
-    pub a: Vec2,
-    pub b: Vec2,
+    /// Ground-plane footprint, ≥ 2 points. Shared by the floor and ceiling rings.
+    pub footprint: Vec<Vec2>,
+    /// One Box feature id per segment (`footprint.len() − 1` of them), in order.
+    pub segments: Vec<u32>,
     pub thickness: f32,
     pub height: f32,
     pub rake_deg: f32,
@@ -148,6 +160,10 @@ pub struct FactoryState {
     /// dialog reloads its fields only when the selection changes — not every frame,
     /// which would stomp the user's edits mid-drag.
     pub draw3d_edit: Option<u32>,
+    /// A primitive built in the Draw3D dialog and awaiting a placement CLICK in the 3D
+    /// view — created at the picked point (a Box's corner / everything else centred),
+    /// not at the origin. `None` = nothing waiting to be placed.
+    pub place_pending: Option<Primitive>,
 
     /// 3D wall extrusion height — the ONE thing a 2D wall lacks. A promoted wall keeps
     /// its own (per-wall) thickness and rises to this height. Kept in the 3D layer, NOT
@@ -467,6 +483,7 @@ impl Default for FactoryState {
             cyl_sides: 24,
             draw3d: None,
             draw3d_edit: None,
+            place_pending: None,
             wall_height: 2.7,
             walls: Vec::new(),
             zoom_mode: ZoomMode::Off,
@@ -491,9 +508,24 @@ impl FactoryState {
         self.dirty = true;
     }
 
-    /// DRAW3D: commit the dialog's primitive into the model.
+    /// DRAW3D: commit the dialog's primitive into the model (at the origin).
     pub fn add_primitive(&mut self, p: Primitive) {
         let id = self.model.push(BoolOp::Union, Plane::default(), Placement::default(), p);
+        self.selection = vec![id];
+        self.dirty = true;
+    }
+
+    /// DRAW3D: place a dialog-built primitive at a picked point. The click is a CORNER for
+    /// a Box (it extends +w,+d,+h from there) and the CENTRE for everything else.
+    pub fn place_primitive(&mut self, p: Primitive, at: Vec3) {
+        let plane = Plane::default();
+        let uv = plane.to_uv(at);
+        let (ox, oy) = match p {
+            Primitive::Box { w, d, .. } => (w * 0.5, d * 0.5), // click = the near corner
+            _ => (0.0, 0.0),                                   // click = the centre
+        };
+        let placement = Placement { u: uv.x + ox, v: uv.y + oy, lift: 0.0, spin_deg: 0.0 };
+        let id = self.model.push(BoolOp::Union, plane, placement, p);
         self.selection = vec![id];
         self.dirty = true;
     }
@@ -510,45 +542,137 @@ impl FactoryState {
     // `wall` tool (snapping / ortho / corner-join), select it, right-click → Make 3D
     // wall. Each selected `Geom::Wall`'s centerline becomes placed Boxes here.
 
-    /// Build ONE wall segment as a placed Box — the 2D→3D promotion primitive. `a`,`b`
-    /// are centerline endpoints on the ground plane (a 2D wall's coords ARE the ground
-    /// uv); the Box keeps the wall's OWN thickness and rises to `height`. Pure Box +
-    /// Placement (see `Plane::world_matrix`), so no `cad_solid` change is needed.
-    pub fn add_wall_segment(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) {
+    /// Extrude ONE footprint edge `a→b` to a placed Box and push it, returning its feature
+    /// id (or `None` if degenerate). `a`,`b` are ground-plane centerline points (a 2D
+    /// wall's coords ARE the ground uv); the Box keeps `thickness` and rises to `height`.
+    /// Pure Box + Placement (see `Plane::world_matrix`), so no `cad_solid` change is needed.
+    fn push_wall_box(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) -> Option<u32> {
         let d = b - a;
         let len = d.length();
         if len < 1e-4 || thickness <= 0.0 || height <= 0.0 {
-            return; // ignore degenerate input
+            return None; // ignore degenerate input
         }
         let mid = (a + b) * 0.5;
         let p = Primitive::Box { w: len, d: thickness, h: height };
         let placement = Placement {
             u: mid.x, v: mid.y, lift: 0.0, spin_deg: d.y.atan2(d.x).to_degrees(),
         };
-        let id = self.model.push(BoolOp::Union, Plane::default(), placement, p);
-        // Keep the wall ALIVE: record its params so its height stays editable.
-        self.walls.push(WallInst { feature_id: id, a, b, thickness, height, rake_deg: 0.0 });
+        Some(self.model.push(BoolOp::Union, Plane::default(), placement, p))
+    }
+
+    /// Promote a **footprint** (≥ 2 ground-plane points) to a live wall: one Box per edge,
+    /// all sharing `thickness` and `height`. The wall stays ALIVE — its footprint and
+    /// height are remembered so vertices and rise can be edited later. Degenerate edges are
+    /// skipped; returns the new wall's index, or `None` if every edge was degenerate.
+    pub fn add_wall(&mut self, footprint: Vec<Vec2>, thickness: f32, height: f32) -> Option<usize> {
+        if footprint.len() < 2 {
+            return None;
+        }
+        let mut segments = Vec::new();
+        for w in footprint.windows(2) {
+            if let Some(id) = self.push_wall_box(w[0], w[1], thickness, height) {
+                segments.push(id);
+            }
+        }
+        if segments.is_empty() {
+            return None;
+        }
+        self.walls.push(WallInst { footprint, segments, thickness, height, rake_deg: 0.0 });
+        self.dirty = true;
+        Some(self.walls.len() - 1)
+    }
+
+    /// Back-compat + simplest promotion: a single centerline segment → a 2-point wall.
+    pub fn add_wall_segment(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) {
+        self.add_wall(vec![a, b], thickness, height);
+    }
+
+    /// Index of the live-wall record OWNING `feature_id` (any of its segments), if any.
+    pub fn wall_index(&self, feature_id: u32) -> Option<usize> {
+        self.walls.iter().position(|w| w.segments.contains(&feature_id))
+    }
+
+    /// Rebuild every segment Box of wall `wi` from its current footprint + params. The old
+    /// Boxes are dropped and fresh ones pushed (the segment count changes when a vertex is
+    /// added or removed). Both rings follow the one footprint, so they stay coincident.
+    /// Segment feature ids change — callers that track a selection must refresh it.
+    fn rederive_wall(&mut self, wi: usize) {
+        if wi >= self.walls.len() {
+            return;
+        }
+        for id in std::mem::take(&mut self.walls[wi].segments) {
+            self.model.remove(id);
+        }
+        let fp = self.walls[wi].footprint.clone();
+        let (t, h) = (self.walls[wi].thickness, self.walls[wi].height);
+        let mut segments = Vec::new();
+        for w in fp.windows(2) {
+            if let Some(id) = self.push_wall_box(w[0], w[1], t, h) {
+                segments.push(id);
+            }
+        }
+        self.walls[wi].segments = segments;
         self.dirty = true;
     }
 
-    /// Index of the live-wall record for a feature id, if it is a promoted wall.
-    pub fn wall_index(&self, feature_id: u32) -> Option<usize> {
-        self.walls.iter().position(|w| w.feature_id == feature_id)
-    }
-
-    /// Change a live wall's height and re-derive its Box — the "walls are alive" edit.
-    /// Keeps the wall's centerline length and thickness; only the rise changes.
+    /// Change a live wall's height and re-derive — the "walls are alive" edit. Updates each
+    /// segment Box IN PLACE (feature ids stay stable, so a selection survives), keeping each
+    /// segment's length and thickness; only the rise changes.
     pub fn set_wall_height(&mut self, feature_id: u32, height: f32) {
         let h = height.max(0.01);
         if let Some(i) = self.wall_index(feature_id) {
             self.walls[i].height = h;
-            let len = (self.walls[i].b - self.walls[i].a).length();
             let t = self.walls[i].thickness;
-            if let Some(f) = self.model.get_mut(feature_id) {
-                f.primitive = Primitive::Box { w: len, d: t, h };
-                self.dirty = true;
+            let fp = self.walls[i].footprint.clone();
+            let segs = self.walls[i].segments.clone();
+            for (k, w) in fp.windows(2).enumerate() {
+                if let Some(&fid) = segs.get(k) {
+                    let len = (w[1] - w[0]).length();
+                    if let Some(f) = self.model.get_mut(fid) {
+                        f.primitive = Primitive::Box { w: len, d: t, h };
+                    }
+                }
             }
+            self.dirty = true;
         }
+    }
+
+    /// Move footprint vertex `vi` of wall `wi` to `to`, then re-derive — this is how a 3D
+    /// handle drag "shifts the surface". Because both rings share the footprint, the whole
+    /// vertical edge moves together.
+    pub fn wall_move_vertex(&mut self, wi: usize, vi: usize, to: Vec2) {
+        let ok = matches!(self.walls.get(wi), Some(w) if vi < w.footprint.len());
+        if !ok {
+            return;
+        }
+        self.walls[wi].footprint[vi] = to;
+        self.rederive_wall(wi);
+    }
+
+    /// Insert a vertex at `at` into wall `wi`, splitting the segment between
+    /// `footprint[seg]` and `footprint[seg + 1]`. The new corner exists on BOTH the floor
+    /// and ceiling rings by construction (they share the footprint). Returns the new
+    /// vertex index, or `None` if `seg` is out of range.
+    pub fn wall_insert_vertex(&mut self, wi: usize, seg: usize, at: Vec2) -> Option<usize> {
+        let n = self.walls.get(wi)?.footprint.len();
+        if seg + 1 >= n {
+            return None;
+        }
+        self.walls[wi].footprint.insert(seg + 1, at);
+        self.rederive_wall(wi);
+        Some(seg + 1)
+    }
+
+    /// Delete footprint vertex `vi` of wall `wi`, then re-derive. A wall keeps a minimum of
+    /// 2 points (one segment); returns `false` if the delete was rejected.
+    pub fn wall_delete_vertex(&mut self, wi: usize, vi: usize) -> bool {
+        match self.walls.get(wi) {
+            Some(w) if w.footprint.len() > 2 && vi < w.footprint.len() => {}
+            _ => return false,
+        }
+        self.walls[wi].footprint.remove(vi);
+        self.rederive_wall(wi);
+        true
     }
 
     pub fn erase_selection(&mut self) {
@@ -1057,7 +1181,7 @@ mod wall_tests {
         let mut st = FactoryState::default();
         st.add_wall_segment(Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), 0.3, 2.5);
         assert_eq!(st.walls.len(), 1, "promotion records a live wall");
-        let fid = st.walls[0].feature_id;
+        let fid = st.walls[0].segments[0];
 
         st.set_wall_height(fid, 3.2);
         assert!((st.walls[0].height - 3.2).abs() < 1e-4, "registry height updated");
@@ -1070,6 +1194,54 @@ mod wall_tests {
         }
         st.clear();
         assert!(st.walls.is_empty(), "clear drops the live-wall records too");
+    }
+
+    /// Footprint editing (owner, 2026-07-22): a wall is driven by ONE ground-plane
+    /// footprint, so N points → N−1 Box segments, and adding/moving/deleting a vertex
+    /// re-derives. The new corner is on BOTH rings by construction: every segment Box
+    /// rises the full height from z=0, so the vertex exists at the floor AND the ceiling.
+    #[test]
+    fn footprint_wall_add_vertex_couples_rings_and_reshapes() {
+        let mut st = FactoryState::default();
+        // An L-shaped footprint: (0,0)-(4,0)-(4,3) → 2 segments.
+        let wi = st
+            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0)], 0.3, 2.7)
+            .expect("L footprint promotes");
+        assert_eq!(st.walls[wi].footprint.len(), 3);
+        assert_eq!(st.walls[wi].segments.len(), 2, "N points → N−1 segments");
+        assert_eq!(st.model.features.len(), 2);
+
+        // Add a corner mid first edge, at (2,0): 4 points / 3 segments.
+        let vi = st.wall_insert_vertex(wi, 0, Vec2::new(2.0, 0.0)).expect("split edge 0");
+        assert_eq!(vi, 1);
+        assert_eq!(st.walls[wi].footprint.len(), 4);
+        assert_eq!(st.walls[wi].segments.len(), 3, "add vertex → +1 segment");
+
+        // Both rings share the footprint: EVERY segment Box rises the full height from the
+        // ground, so the new corner is present on both the floor (z=0) and ceiling (z=h).
+        for &fid in &st.walls[wi].segments {
+            match st.model.get_mut(fid).expect("segment feature").primitive {
+                Primitive::Box { h, .. } => {
+                    assert!((h - 2.7).abs() < 1e-4, "segment rises full height → vertex on floor & ceiling")
+                }
+                _ => panic!("a wall segment must be a Box"),
+            }
+        }
+
+        // Drag the corner → the surface shifts; still 3 segments.
+        st.wall_move_vertex(wi, 1, Vec2::new(2.0, 1.0));
+        assert_eq!(st.walls[wi].segments.len(), 3);
+        assert!((st.walls[wi].footprint[1] - Vec2::new(2.0, 1.0)).length() < 1e-6, "vertex moved");
+
+        // Delete the corner → back to 3 points / 2 segments.
+        assert!(st.wall_delete_vertex(wi, 1), "delete a corner");
+        assert_eq!(st.walls[wi].footprint.len(), 3);
+        assert_eq!(st.walls[wi].segments.len(), 2);
+        // Delete down to the 2-point minimum (one segment), then reject any further delete.
+        assert!(st.wall_delete_vertex(wi, 0), "delete down to a single segment");
+        assert_eq!(st.walls[wi].footprint.len(), 2);
+        assert_eq!(st.walls[wi].segments.len(), 1);
+        assert!(!st.wall_delete_vertex(wi, 0), "a wall never drops below 2 points");
     }
 }
 
@@ -1124,5 +1296,29 @@ mod zoom_tests {
         // a second restore is a no-op (the snapshot was consumed)
         st.zoom_restore_previous();
         assert!((st.cam_dist - 20.0).abs() < 1e-4, "second restore is harmless");
+    }
+}
+
+#[cfg(test)]
+mod place_tests {
+    use super::*;
+
+    /// Point placement (owner, 2026-07-22): a Box places its NEAR CORNER at the click
+    /// (extends +w,+d from there); every other primitive places its CENTRE at the click.
+    #[test]
+    fn box_corner_and_cylinder_centre() {
+        let mut st = FactoryState::default();
+        // Box 2×2×1, corner at (10, 20) → centre offset by half-extents (+1, +1).
+        st.place_primitive(Primitive::Box { w: 2.0, d: 2.0, h: 1.0 }, Vec3::new(10.0, 20.0, 0.0));
+        assert_eq!(st.model.features.len(), 1);
+        let pl = st.model.features[0].placement;
+        assert!((pl.u - 11.0).abs() < 1e-4 && (pl.v - 21.0).abs() < 1e-4,
+                "box's near corner sits at the click");
+
+        // Cylinder centred at the click.
+        st.place_primitive(Primitive::Cylinder { r: 1.0, h: 2.0, sides: 24 }, Vec3::new(5.0, -5.0, 0.0));
+        let pl2 = st.model.features[1].placement;
+        assert!((pl2.u - 5.0).abs() < 1e-4 && (pl2.v + 5.0).abs() < 1e-4,
+                "cylinder centre sits at the click");
     }
 }
