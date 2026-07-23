@@ -3369,38 +3369,75 @@ impl CadApp {
     /// OWN thickness, extruded to the Factory wall height, on the ground plane — the
     /// floor-plan → room journey. (Non-ground sketch planes are a follow-up.) Returns the
     /// number of walls promoted.
-    fn make_3d_wall_from_selection(&mut self) -> usize {
+    fn make_3d_wall_from_selection(&mut self) -> (usize, &'static str) {
         let h = self.factory.wall_height;
-        // Each selected 2D wall → ONE alive wall carrying its whole centerline as a
-        // footprint (straight = 2 pts, curved = sampled polyline). Keeping it as one
-        // footprint is what makes the wall editable as a unit — add/move/delete vertices.
-        let mut footprints: Vec<(Vec<glam::Vec2>, f32)> = Vec::new();
+
+        // WHICH PLANE (owner bug, 2026-07-23: "walls insert in the wrong plane").
+        // While a sketch is open the app's `doc` IS the sketch's document, so the wall's 2D
+        // coords are that sketch FRAME's (u,v) — NOT world ground x,y. A ground frame is
+        // u = −Y, v = +X, so treating the two as the same both ROTATES the run 90° and drops
+        // it to z=0. Convert through the frame, and target the plane the sketch actually
+        // sits on. In model space there is no frame: 2D coords already ARE world XY.
+        let sketch_frame: Option<cad_solid::Frame> = self
+            .factory
+            .session
+            .as_ref()
+            .map(|s| self.factory.model.sketches[s.idx].frame);
+        let plane = match sketch_frame {
+            Some(f) => match crate::factory::plane_from_frame(&f) {
+                Some(p) => p,
+                // A tilted sketch face can't be expressed as Feature.plane (XY/XZ/YZ only).
+                // Refuse rather than silently flattening the run onto the ground.
+                None => return (0, "tilted (unsupported)"),
+            },
+            None => cad_solid::Plane::default(),
+        };
+        let plane_label = match plane.kind {
+            cad_solid::PlaneKind::XY => "XY",
+            cad_solid::PlaneKind::XZ => "XZ",
+            cad_solid::PlaneKind::YZ => "YZ",
+        };
+
+        // Each selected 2D wall contributes its centerline as a piece (straight = 2 pts,
+        // curved = sampled polyline), mapped into the target plane's (u,v)...
+        let mut pieces: Vec<(Vec<glam::Vec2>, f32)> = Vec::new();
         for &i in &self.selection {
             if let Some(Geom::Wall(w)) = self.doc.dobjects.get(i).map(|d| &d.geom) {
                 let t = w.thickness as f32;
                 let fp: Vec<glam::Vec2> = w
                     .centerline_polyline(16)
                     .iter()
-                    .map(|p| glam::Vec2::new(p.x as f32, p.y as f32))
+                    .map(|p| {
+                        let q = glam::Vec2::new(p.x as f32, p.y as f32);
+                        match sketch_frame {
+                            Some(f) => plane.to_uv(f.from_uv(q)), // sketch uv → world → plane uv
+                            None => q,                            // model space: already world XY
+                        }
+                    })
                     .collect();
                 if fp.len() >= 2 {
-                    footprints.push((fp, t));
+                    pieces.push((fp, t));
                 }
             }
         }
-        if footprints.is_empty() {
-            return 0;
+        if pieces.is_empty() {
+            return (0, plane_label);
         }
+        // ...and connected pieces are STITCHED into one run first. A 2D run is N independent
+        // dobjects sharing endpoints (the mitre is re-derived, never stored), so promoting
+        // them separately would give disconnected 3D walls whose shared corner tears apart
+        // when dragged. One run → one alive wall → a corner is ONE footprint vertex.
+        let runs = crate::factory::chain_wall_runs(pieces);
         self.factory.open = true;
         let mut promoted = 0usize;
-        for (fp, t) in footprints {
-            if self.factory.add_wall(fp, t, h).is_some() {
+        for (fp, t) in runs {
+            if self.factory.add_wall(fp, t, h, plane).is_some() {
                 promoted += 1;
             }
         }
         self.factory.recompute();
         self.factory.fit();
-        promoted
+        (promoted, plane_label)
     }
 
     /// Reset every piece of **doc-relative** interactive state.
@@ -4027,83 +4064,45 @@ impl CadApp {
                     crate::factory::ZoomMode::Off => {}
                 }
 
-                // ---- corner NAV GIZMO — standard views + zoom, like every 3D app ----
-                // A foreground Area top-right of the viewport, so its buttons take clicks
-                // before the orbit/select handler underneath. Views snap the camera;
-                // ＋/－/⌖ are zoom in / out / extents (the wheel already dollies).
+                // ---- corner NAV GIZMO — THE VIEW CUBE ----
+                // A foreground Area top-right of the viewport, so it takes clicks before the
+                // orbit/select handler underneath. Click a FACE to snap to that view
+                // (Top/Bottom/Front/Back/Left/Right — the face under the cursor lights up and
+                // carries its name), DRAG to orbit, DOUBLE-CLICK for isometric. The ring + dot
+                // show the live heading.
+                //
+                // Just the circle, floating (owner, 2026-07-23): no panel chrome and no button
+                // row. Zoom is not lost — it lives on the `z` command (window / extents /
+                // previous / scale) and the wheel dolly, exactly as in 2D.
                 egui::Area::new(egui::Id::new("factory_nav_gizmo"))
                     .order(egui::Order::Foreground)
-                    .fixed_pos(egui::pos2(rect.right() - 130.0, rect.top() + 8.0))
+                    .fixed_pos(egui::pos2(rect.right() - 128.0, rect.top() + 8.0))
                     .show(ui.ctx(), |ui| {
-                        egui::Frame::popup(ui.style())
-                            .inner_margin(egui::Margin::symmetric(5.0, 4.0))
-                            .show(ui, |ui| {
-                                ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-                                ui.spacing_mut().button_padding = egui::vec2(4.0, 1.0);
-                                use crate::factory::StdView::*;
-
-                                // THE VIEW CUBE — the orientation control IS the cube now:
-                                // click a FACE to snap to that view (Top/Bottom/Front/Back/
-                                // Left/Right — the face under the cursor lights up), DRAG to
-                                // orbit, DOUBLE-CLICK for isometric. The ring + dot show the
-                                // live heading.
-                                let (crect, cresp) = ui.allocate_exact_size(
-                                    egui::vec2(120.0, 112.0),
-                                    egui::Sense::click_and_drag(),
-                                );
-                                let (cyaw, cpitch) = (self.factory.cam_yaw, self.factory.cam_pitch);
-                                if cresp.dragged() {
-                                    let d = cresp.drag_delta();
-                                    self.factory.cam_yaw -= d.x * 0.01;
-                                    self.factory.cam_pitch =
-                                        (self.factory.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
-                                    self.factory.ortho = false; // free orbit → perspective
-                                } else if cresp.clicked() {
-                                    if let Some(pos) = cresp.interact_pointer_pos() {
-                                        if let Some(v) = nav_cube_pick(crect, cyaw, cpitch, pos) {
-                                            self.factory.set_view(v);
-                                        }
-                                    }
+                        use crate::factory::StdView::*;
+                        let (crect, cresp) = ui.allocate_exact_size(
+                            egui::vec2(120.0, 112.0),
+                            egui::Sense::click_and_drag(),
+                        );
+                        let (cyaw, cpitch) = (self.factory.cam_yaw, self.factory.cam_pitch);
+                        if cresp.dragged() {
+                            let d = cresp.drag_delta();
+                            self.factory.cam_yaw -= d.x * 0.01;
+                            self.factory.cam_pitch =
+                                (self.factory.cam_pitch + d.y * 0.01).clamp(-1.45, 1.45);
+                            self.factory.ortho = false; // free orbit → perspective
+                        } else if cresp.clicked() {
+                            if let Some(pos) = cresp.interact_pointer_pos() {
+                                if let Some(v) = nav_cube_pick(crect, cyaw, cpitch, pos) {
+                                    self.factory.set_view(v);
                                 }
-                                if cresp.double_clicked() {
-                                    self.factory.set_view(Iso);
-                                }
-                                let hover = cresp.hover_pos()
-                                    .and_then(|pos| nav_cube_pick(crect, cyaw, cpitch, pos));
-                                draw_nav_cube(ui.painter(), crect, cyaw, cpitch, hover);
-
-                                // Zoom controls (view orientation lives on the cube now).
-                                ui.horizontal(|ui| {
-                                    if ui.small_button("▣").on_hover_text("Zoom window — drag a box").clicked() {
-                                        let before = self.factory.zoom_status();
-                                        self.factory.zoom_mode = crate::factory::ZoomMode::Window;
-                                        self.factory.zoom_drag = None;
-                                        self.factory.zoom_cur = None;
-                                        self.factory.status = "ZOOM window — drag a box (or click two corners)  [Esc]".into();
-                                        let after = self.factory.zoom_status();
-                                        self.dbg_zoom("gizmo ▣", "window", "window (drag a box)".into(), before, after);
-                                    }
-                                    if ui.small_button("＋").on_hover_text("Zoom in").clicked() {
-                                        let before = self.factory.zoom_status();
-                                        self.factory.zoom_by(0.8);
-                                        let after = self.factory.zoom_status();
-                                        self.dbg_zoom("gizmo ＋", "in", "in (×0.8 dolly)".into(), before, after);
-                                    }
-                                    if ui.small_button("－").on_hover_text("Zoom out").clicked() {
-                                        let before = self.factory.zoom_status();
-                                        self.factory.zoom_by(1.25);
-                                        let after = self.factory.zoom_status();
-                                        self.dbg_zoom("gizmo －", "out", "out (×1.25 dolly)".into(), before, after);
-                                    }
-                                    if ui.small_button("⌖").on_hover_text("Zoom extents").clicked() {
-                                        let before = self.factory.zoom_status();
-                                        if self.factory.dirty { self.factory.recompute(); }
-                                        self.factory.fit();
-                                        let after = self.factory.zoom_status();
-                                        self.dbg_zoom("gizmo ⌖", "extents", "extents (fit all)".into(), before, after);
-                                    }
-                                });
-                            });
+                            }
+                        }
+                        if cresp.double_clicked() {
+                            self.factory.set_view(Iso);
+                        }
+                        let hover = cresp.hover_pos()
+                            .and_then(|pos| nav_cube_pick(crect, cyaw, cpitch, pos));
+                        draw_nav_cube(ui.painter(), crect, cyaw, cpitch, hover);
                     });
 
                 let aspect = if rect.height() > 0.0 { rect.width() / rect.height() } else { 1.0 };
@@ -5186,7 +5185,12 @@ impl CadApp {
         // (standard AutoCAD DDE). Must precede the main parser.
         {
             let dde_anchor: Option<Vec2> =
-                if self.tool == Tool::Line && self.pending.len() == 1 {
+                // WALL joins LINE here (owner, 2026-07-23): a chained wall run always waits
+                // with exactly one pending point (the previous corner), the same shape as a
+                // line's first point — so "3000 ⏎" with CARD on drops the next corner exactly
+                // 3 m along the locked axis. Without this the wall tool silently ignored a
+                // typed length.
+                if matches!(self.tool, Tool::Line | Tool::Wall) && self.pending.len() == 1 {
                     Some(self.pending[0])
                 } else if let MoveState::WaitingForDest(base) = self.move_state {
                     Some(base)
@@ -5203,7 +5207,11 @@ impl CadApp {
                             let dir = constrained - anchor;
                             if dir.len() > EPS {
                                 let p = anchor + dir / dir.len() * dist;
-                                if self.tool == Tool::Line {
+                                if matches!(self.tool, Tool::Line | Tool::Wall) {
+                                    // Identical commit path: push the point and let
+                                    // `try_finalise` do the normal (Tool, 2) commit — for a
+                                    // wall that also re-chains `pending = [end]`, so the run
+                                    // continues and you can type the next length straight away.
                                     self.last_point = Some(p);
                                     self.pending.push(p);
                                     self.try_finalise();
@@ -25630,9 +25638,11 @@ impl eframe::App for CadApp {
                             .on_hover_text("Extrude the selected 2D wall(s) into 3D Factory solids — thickness from the wall, height from the Factory 'wall height'")
                             .clicked()
                         {
-                            let n = self.make_3d_wall_from_selection();
-                            self.history.push(format!("  {n} wall(s) → 3D Factory"));
-                            self.factory_note(format!("{n} wall(s) promoted to 3D"));
+                            let (n, plane) = self.make_3d_wall_from_selection();
+                            self.history.push(format!("  {n} wall(s) → 3D Factory on {plane}"));
+                            // The PLANE is in the note on purpose: "wrong plane" was invisible
+                            // in a session dump until it was recorded here.
+                            self.factory_note(format!("{n} wall(s) promoted to 3D on plane {plane}"));
                             ui.close_menu();
                         }
                     }
@@ -33875,6 +33885,30 @@ pub fn draw_viewport_active_frame(painter: &egui::Painter, rect: egui::Rect, act
 /// The 3D-Factory nav-cube gizmo (the "VIEW" icon): a glowing wireframe cube shown in the
 /// LIVE camera orientation, inside an orbit ring with a heading dot. Purely painted — the
 /// caller senses the drag (horizontal = yaw, vertical = pitch) and orbits the camera.
+/// The nav cube's screen basis — `(f, right, up)`, where `f` points target→eye.
+///
+/// This MUST match `light3d::mvp`'s camera, or the cube shows a MIRROR IMAGE of the scene.
+/// `mvp` builds `Mat4::look_at_rh`, whose screen-right is `cross(forward, up)` with
+/// `forward = −f`. The cube used to compute `f × Z` — the **opposite sign** — so every view
+/// was flipped left-for-right. On a bare wireframe that is invisible (a mirrored cube still
+/// looks like a cube); it only became obvious once the faces were labelled and RIGHT showed
+/// up on the left (owner, 2026-07-23). The `up` flip near the poles mirrors `mvp`'s own
+/// look_at degeneracy guard, so Top and Bottom agree with the scene too.
+fn nav_cube_basis(yaw: f32, pitch: f32) -> (glam::Vec3, glam::Vec3, glam::Vec3) {
+    use glam::Vec3;
+    let (cp, sp) = (pitch.cos(), pitch.sin());
+    let (cy, sy) = (yaw.cos(), yaw.sin());
+    let f = Vec3::new(cp * cy, cp * sy, sp); // target → eye
+    let fwd = -f; // the direction the camera looks
+    let up_ref = if sp.abs() > 0.999 { Vec3::Y } else { Vec3::Z }; // same guard as light3d::mvp
+    let r = {
+        let x = fwd.cross(up_ref);
+        if x.length() < 1e-4 { Vec3::X } else { x.normalize() }
+    };
+    let u = r.cross(fwd).normalize();
+    (f, r, u)
+}
+
 pub fn draw_nav_cube(
     painter: &egui::Painter,
     rect: egui::Rect,
@@ -33888,16 +33922,14 @@ pub fn draw_nav_cube(
 
     // Camera basis → orthographic projection of the cube as the eye sees it (so the cube
     // turns exactly as you orbit — a true orientation indicator).
-    let (cp, sp) = (pitch.cos(), pitch.sin());
-    let (cy, sy) = (yaw.cos(), yaw.sin());
-    let f = Vec3::new(cp * cy, cp * sy, sp);
-    let r = { let x = f.cross(Vec3::Z); if x.length() < 1e-4 { Vec3::X } else { x.normalize() } };
-    let u = r.cross(f).normalize();
+    let (f, r, u) = nav_cube_basis(yaw, pitch);
 
     // Orbit ring + heading dot.
     let ring = egui::Color32::from_rgba_unmultiplied(120, 200, 255, 170);
     painter.circle_stroke(c, radius, egui::Stroke::new(1.6, ring));
-    let ha = -yaw - std::f32::consts::FRAC_PI_2;
+    // Mirrored along with the cube basis above, so the heading marker stays on the same side
+    // as the face it belongs to.
+    let ha = yaw - std::f32::consts::FRAC_PI_2;
     let dot = egui::pos2(c.x + radius * ha.cos(), c.y + radius * ha.sin());
     painter.circle_filled(dot, 3.0, egui::Color32::from_rgb(150, 215, 255));
 
@@ -33964,6 +33996,42 @@ pub fn draw_nav_cube(
             }
         }
     }
+
+    // FACE LABELS (owner, 2026-07-23) — the cube names the side you are looking at, so the
+    // click target is unambiguous. Drawn LAST so they sit on top of the edges. Only
+    // front-facing faces are labelled: you cannot read a hidden face, and a face that is
+    // nearly edge-on is skipped because its projection is too thin to hold the text. The
+    // face centre in cube-local space IS its unit normal (the cube spans [-1,1]³), so it
+    // projects with the same basis as the corners — labels track the orbit exactly.
+    let labels: [(usize, &str); 6] = [
+        (1, "TOP"), (0, "BOTTOM"), (2, "FRONT"), (3, "BACK"), (5, "RIGHT"), (4, "LEFT"),
+    ];
+    let hl_face = highlight.map(|hv| {
+        use crate::factory::StdView as V;
+        match hv {
+            V::Bottom => 0usize, V::Top => 1, V::Front => 2,
+            V::Back => 3, V::Left => 4, V::Right => 5,
+            V::Iso => usize::MAX,
+        }
+    });
+    for (k, name) in labels {
+        let d = face_n[k].dot(f);
+        if d <= 0.30 {
+            continue; // back-facing, or too oblique to read
+        }
+        let n = face_n[k];
+        let pos = egui::pos2(c.x + n.dot(r) * s, c.y - n.dot(u) * s);
+        // Shrink the longer names so they stay inside the face at this gizmo size.
+        let fs = (s * 0.30).clamp(7.0, 12.0) * if name.len() > 4 { 0.82 } else { 1.0 };
+        let col = if hl_face == Some(k) {
+            egui::Color32::from_rgb(240, 250, 255) // the hovered face reads brightest
+        } else {
+            // Fade with obliquity so a face turning away dims out instead of popping.
+            let a = (120.0 + 135.0 * d).min(255.0) as u8;
+            egui::Color32::from_rgba_unmultiplied(190, 230, 255, a)
+        };
+        painter.text(pos, egui::Align2::CENTER_CENTER, name, egui::FontId::monospace(fs), col);
+    }
 }
 
 /// Which standard view a point over the nav cube lands on — the nearest FRONT-facing face
@@ -33980,11 +34048,8 @@ pub fn nav_cube_pick(
     use crate::factory::StdView;
     let c = rect.center();
     let radius = (rect.width().min(rect.height()) * 0.5) - 3.0;
-    let (cp, sp) = (pitch.cos(), pitch.sin());
-    let (cy, sy) = (yaw.cos(), yaw.sin());
-    let f = Vec3::new(cp * cy, cp * sy, sp);
-    let r = { let x = f.cross(Vec3::Z); if x.length() < 1e-4 { Vec3::X } else { x.normalize() } };
-    let u = r.cross(f).normalize();
+    // Same basis as `draw_nav_cube` (shared helper), so the pick lands on the face you see.
+    let (f, r, u) = nav_cube_basis(yaw, pitch);
     let s = radius * 0.60;
     // (face outward normal, the view that looks straight at that face)
     let faces = [
@@ -34024,6 +34089,42 @@ mod nav_cube_tests {
     fn a_point_out_on_the_ring_picks_nothing() {
         let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(120.0, 120.0));
         assert_eq!(nav_cube_pick(rect, 0.0, 0.0, egui::pos2(2.0, 2.0)), None);
+    }
+
+    /// The cube must not MIRROR the scene. Its basis has to match `light3d::mvp`
+    /// (`look_at_rh`, screen-right = `cross(forward, up)`); the old `f × Z` was the opposite
+    /// sign, which put RIGHT on the left in isometric (owner, 2026-07-23).
+    #[test]
+    fn basis_matches_the_scene_camera_not_its_mirror() {
+        use glam::Vec3;
+        for &(yaw, pitch) in &[(0.0f32, 0.0f32), (-0.785, 0.6155), (1.2, -0.4)] {
+            let (f, r, u) = nav_cube_basis(yaw, pitch);
+            // Reproduce mvp's camera independently.
+            let fwd = -f;
+            let up_ref = if f.z.abs() > 0.999 { Vec3::Y } else { Vec3::Z };
+            let want_r = fwd.cross(up_ref).normalize();
+            assert!((r - want_r).length() < 1e-5, "screen-right must match look_at_rh");
+            assert!((u - want_r.cross(fwd).normalize()).length() < 1e-5, "screen-up too");
+            assert!(r.dot(f).abs() < 1e-5, "right ⟂ view direction");
+        }
+    }
+
+    /// In the default isometric, RIGHT sits on the RIGHT and FRONT on the LEFT — the
+    /// standard SE-iso reading. This is the exact symptom that exposed the mirror.
+    #[test]
+    fn iso_puts_right_on_the_right_and_front_on_the_left() {
+        use glam::Vec3;
+        let mut st = crate::factory::FactoryState::default();
+        st.set_view(StdView::Iso);
+        let (f, r, _u) = nav_cube_basis(st.cam_yaw, st.cam_pitch);
+        let screen_x = |n: Vec3| n.dot(r);
+        // All three are front-facing in iso...
+        for n in [Vec3::X, -Vec3::Y, Vec3::Z] {
+            assert!(n.dot(f) > 0.0, "{n:?} should face the eye in iso");
+        }
+        // ...and RIGHT (+X) is to the right of FRONT (−Y).
+        assert!(screen_x(Vec3::X) > 0.0, "RIGHT face must project to the right");
+        assert!(screen_x(-Vec3::Y) < 0.0, "FRONT face must project to the left");
     }
 }
 

@@ -8,7 +8,7 @@
 //! The app already has all of those. We reuse [`crate::light3d`]'s `Scene3dRenderer` + `mvp`
 //! (the sandbox had duplicated both) and drive them with a `cad_solid::Model`.
 
-use cad_solid::{BoolOp, Frame, Model, Placement, Plane, Primitive, SolidMesh};
+use cad_solid::{BoolOp, Frame, Model, Placement, Plane, PlaneKind, Primitive, SolidMesh};
 use glam::{Mat4, Vec2, Vec3};
 
 use crate::light3d::V3;
@@ -54,6 +54,104 @@ pub struct WallInst {
     pub thickness: f32,
     pub height: f32,
     pub rake_deg: f32,
+    /// The plane the footprint lives on — the wall rises along its normal. Stored so a
+    /// re-derive stays where the wall was built instead of snapping back to the ground.
+    pub plane: Plane,
+}
+
+/// Map an axis-aligned [`Frame`] to the [`Plane`] a `Feature` can actually sit on.
+///
+/// A sketch sits on a free `Frame` (any picked face), but `Feature.plane` is locked to
+/// XY/XZ/YZ + offset — so a **tilted** frame cannot be represented and returns `None`
+/// rather than being silently flattened onto the ground. (Lifting that needs a frame DOF
+/// in `cad_solid`; same blocker as wall rake.)
+///
+/// The offset is signed against each plane's OWN normal, which is not always the positive
+/// axis: `Plane::axes()` gives XY → (X,Y) so n = +Z, XZ → (X,Z) so **n = −Y**, YZ → (Y,Z)
+/// so n = +X. Getting that sign wrong mirrors the wall to the far side of the origin.
+pub fn plane_from_frame(f: &Frame) -> Option<Plane> {
+    const AXIS: f32 = 0.999;
+    let (n, o) = (f.normal(), f.origin);
+    if n.z.abs() >= AXIS {
+        Some(Plane { kind: PlaneKind::XY, offset: o.z })
+    } else if n.y.abs() >= AXIS {
+        Some(Plane { kind: PlaneKind::XZ, offset: -o.y })
+    } else if n.x.abs() >= AXIS {
+        Some(Plane { kind: PlaneKind::YZ, offset: o.x })
+    } else {
+        None
+    }
+}
+
+/// Stitch centerline pieces into connected **runs** by endpoint coincidence — the 2D→3D
+/// mirror of how a wall run is actually drafted.
+///
+/// A 2D wall run is N *independent* `Geom::Wall` dobjects that merely share endpoint
+/// coordinates; `cad_wall` re-derives the mitres every frame from that coincidence and keeps
+/// **no persistent node graph**. So promoting each dobject on its own would hand 3D a pile of
+/// disconnected walls, and dragging a shared corner would tear the run open. Stitching first
+/// makes a corner **one shared footprint vertex**, so moving it moves both sides — matching
+/// the 2D behaviour instead of re-implementing a join solver in 3D.
+///
+/// Uses `cad_wall::JOIN_TOL` — the SAME tolerance 2D uses to call two endpoints one node — so
+/// the two views can never disagree about what is joined.
+///
+/// Only pieces of EQUAL thickness merge: a [`WallInst`] carries one thickness for its whole
+/// footprint, and in practice a thickness change means a different wall type. A run whose
+/// thickness changes mid-way promotes as separate walls at that boundary.
+///
+/// A closed loop (a rectangular room) chains into a footprint whose last point equals its
+/// first — a sealed ring, which is exactly what the room shell wants later.
+pub fn chain_wall_runs(pieces: Vec<(Vec<Vec2>, f32)>) -> Vec<(Vec<Vec2>, f32)> {
+    let tol = cad_wall::JOIN_TOL as f32;
+    let near = |a: Vec2, b: Vec2| (a - b).length() <= tol;
+    let mut used = vec![false; pieces.len()];
+    let mut runs: Vec<(Vec<Vec2>, f32)> = Vec::new();
+
+    for i in 0..pieces.len() {
+        if used[i] || pieces[i].0.len() < 2 {
+            continue;
+        }
+        used[i] = true;
+        let (mut fp, t) = pieces[i].clone();
+        // Grow this run at BOTH ends, in either direction, until nothing else connects.
+        loop {
+            let mut grew = false;
+            for j in 0..pieces.len() {
+                if used[j] || pieces[j].0.len() < 2 || (pieces[j].1 - t).abs() > 1e-6 {
+                    continue;
+                }
+                let other = &pieces[j].0;
+                let (os, oe) = (other[0], other[other.len() - 1]);
+                let (rs, re) = (fp[0], fp[fp.len() - 1]);
+                if near(re, os) {
+                    fp.extend(other.iter().skip(1).copied()); // run END → other START
+                } else if near(re, oe) {
+                    fp.extend(other.iter().rev().skip(1).copied()); // → other END, reversed
+                } else if near(rs, oe) {
+                    let mut nf = other.clone(); // other END → run START
+                    nf.pop();
+                    nf.extend(fp.iter().copied());
+                    fp = nf;
+                } else if near(rs, os) {
+                    let mut nf: Vec<Vec2> = other.iter().rev().copied().collect(); // reversed
+                    nf.pop();
+                    nf.extend(fp.iter().copied());
+                    fp = nf;
+                } else {
+                    continue;
+                }
+                used[j] = true;
+                grew = true;
+                break;
+            }
+            if !grew {
+                break;
+            }
+        }
+        runs.push((fp, t));
+    }
+    runs
 }
 
 /// An open sketch-on-plane session.
@@ -546,7 +644,14 @@ impl FactoryState {
     /// id (or `None` if degenerate). `a`,`b` are ground-plane centerline points (a 2D
     /// wall's coords ARE the ground uv); the Box keeps `thickness` and rises to `height`.
     /// Pure Box + Placement (see `Plane::world_matrix`), so no `cad_solid` change is needed.
-    fn push_wall_box(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) -> Option<u32> {
+    fn push_wall_box(
+        &mut self,
+        a: Vec2,
+        b: Vec2,
+        thickness: f32,
+        height: f32,
+        plane: Plane,
+    ) -> Option<u32> {
         let d = b - a;
         let len = d.length();
         if len < 1e-4 || thickness <= 0.0 || height <= 0.0 {
@@ -557,34 +662,45 @@ impl FactoryState {
         let placement = Placement {
             u: mid.x, v: mid.y, lift: 0.0, spin_deg: d.y.atan2(d.x).to_degrees(),
         };
-        Some(self.model.push(BoolOp::Union, Plane::default(), placement, p))
+        Some(self.model.push(BoolOp::Union, plane, placement, p))
     }
 
     /// Promote a **footprint** (≥ 2 ground-plane points) to a live wall: one Box per edge,
+    /// (see also [`chain_wall_runs`], which stitches a selection into runs first)
     /// all sharing `thickness` and `height`. The wall stays ALIVE — its footprint and
     /// height are remembered so vertices and rise can be edited later. Degenerate edges are
     /// skipped; returns the new wall's index, or `None` if every edge was degenerate.
-    pub fn add_wall(&mut self, footprint: Vec<Vec2>, thickness: f32, height: f32) -> Option<usize> {
+    /// `footprint` is in **`plane`'s (u,v)** — a sketch's own frame coords must be converted
+    /// first (frame → world → `plane.to_uv`), or the wall lands rotated and/or on the ground.
+    pub fn add_wall(
+        &mut self,
+        footprint: Vec<Vec2>,
+        thickness: f32,
+        height: f32,
+        plane: Plane,
+    ) -> Option<usize> {
         if footprint.len() < 2 {
             return None;
         }
         let mut segments = Vec::new();
         for w in footprint.windows(2) {
-            if let Some(id) = self.push_wall_box(w[0], w[1], thickness, height) {
+            if let Some(id) = self.push_wall_box(w[0], w[1], thickness, height, plane) {
                 segments.push(id);
             }
         }
         if segments.is_empty() {
             return None;
         }
-        self.walls.push(WallInst { footprint, segments, thickness, height, rake_deg: 0.0 });
+        self.walls.push(WallInst {
+            footprint, segments, thickness, height, rake_deg: 0.0, plane,
+        });
         self.dirty = true;
         Some(self.walls.len() - 1)
     }
 
-    /// Back-compat + simplest promotion: a single centerline segment → a 2-point wall.
+    /// Back-compat + simplest promotion: a single centerline segment on the ground plane.
     pub fn add_wall_segment(&mut self, a: Vec2, b: Vec2, thickness: f32, height: f32) {
-        self.add_wall(vec![a, b], thickness, height);
+        self.add_wall(vec![a, b], thickness, height, Plane::default());
     }
 
     /// Index of the live-wall record OWNING `feature_id` (any of its segments), if any.
@@ -605,9 +721,10 @@ impl FactoryState {
         }
         let fp = self.walls[wi].footprint.clone();
         let (t, h) = (self.walls[wi].thickness, self.walls[wi].height);
+        let plane = self.walls[wi].plane; // rebuild WHERE it was built, not on the ground
         let mut segments = Vec::new();
         for w in fp.windows(2) {
-            if let Some(id) = self.push_wall_box(w[0], w[1], t, h) {
+            if let Some(id) = self.push_wall_box(w[0], w[1], t, h, plane) {
                 segments.push(id);
             }
         }
@@ -1205,7 +1322,12 @@ mod wall_tests {
         let mut st = FactoryState::default();
         // An L-shaped footprint: (0,0)-(4,0)-(4,3) → 2 segments.
         let wi = st
-            .add_wall(vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0)], 0.3, 2.7)
+            .add_wall(
+                vec![Vec2::new(0.0, 0.0), Vec2::new(4.0, 0.0), Vec2::new(4.0, 3.0)],
+                0.3,
+                2.7,
+                Plane::default(),
+            )
             .expect("L footprint promotes");
         assert_eq!(st.walls[wi].footprint.len(), 3);
         assert_eq!(st.walls[wi].segments.len(), 2, "N points → N−1 segments");
@@ -1242,6 +1364,156 @@ mod wall_tests {
         assert_eq!(st.walls[wi].footprint.len(), 2);
         assert_eq!(st.walls[wi].segments.len(), 1);
         assert!(!st.wall_delete_vertex(wi, 0), "a wall never drops below 2 points");
+    }
+
+    // ── chain_wall_runs: a 2D run promotes as ONE alive wall ────────────────────────────
+    fn v(x: f32, y: f32) -> Vec2 {
+        Vec2::new(x, y)
+    }
+
+    /// A chained 2D run is N independent dobjects sharing endpoints. Stitching turns them
+    /// into ONE footprint, so a shared corner is a single vertex (drag it and both sides
+    /// follow) instead of two vertices that tear apart.
+    #[test]
+    fn connected_pieces_chain_into_one_run() {
+        let runs = chain_wall_runs(vec![
+            (vec![v(0.0, 0.0), v(4.0, 0.0)], 0.3),
+            (vec![v(4.0, 0.0), v(4.0, 3.0)], 0.3),
+        ]);
+        assert_eq!(runs.len(), 1, "two joined segments → one run");
+        assert_eq!(runs[0].0, vec![v(0.0, 0.0), v(4.0, 0.0), v(4.0, 3.0)], "shared corner once");
+    }
+
+    /// Order and direction are irrelevant — pieces stitch head-to-tail either way round.
+    #[test]
+    fn reversed_and_out_of_order_pieces_still_chain() {
+        let runs = chain_wall_runs(vec![
+            (vec![v(4.0, 3.0), v(4.0, 0.0)], 0.3), // reversed middle
+            (vec![v(0.0, 0.0), v(4.0, 0.0)], 0.3),
+            (vec![v(4.0, 3.0), v(8.0, 3.0)], 0.3),
+        ]);
+        assert_eq!(runs.len(), 1, "all three belong to one run");
+        assert_eq!(runs[0].0.len(), 4, "4 points for 3 segments — no duplicated node");
+    }
+
+    /// A thickness change means a different wall type: the run splits there rather than
+    /// silently averaging, because a WallInst carries one thickness for its whole footprint.
+    #[test]
+    fn differing_thickness_does_not_merge() {
+        let runs = chain_wall_runs(vec![
+            (vec![v(0.0, 0.0), v(4.0, 0.0)], 0.3),
+            (vec![v(4.0, 0.0), v(4.0, 3.0)], 0.5), // thicker → its own wall
+        ]);
+        assert_eq!(runs.len(), 2, "different thickness → separate walls");
+    }
+
+    /// A rectangular room chains into a SEALED ring (last point == first) — what the room
+    /// shell wants. Disconnected pieces stay separate runs.
+    #[test]
+    fn closed_loop_seals_and_islands_stay_apart() {
+        let sq = chain_wall_runs(vec![
+            (vec![v(0.0, 0.0), v(4.0, 0.0)], 0.2),
+            (vec![v(4.0, 0.0), v(4.0, 3.0)], 0.2),
+            (vec![v(4.0, 3.0), v(0.0, 3.0)], 0.2),
+            (vec![v(0.0, 3.0), v(0.0, 0.0)], 0.2),
+        ]);
+        assert_eq!(sq.len(), 1, "a closed room is one run");
+        let fp = &sq[0].0;
+        assert_eq!(fp.len(), 5, "4 segments → 5 points, the last closing the ring");
+        assert!((fp[0] - fp[fp.len() - 1]).length() < 1e-6, "ring is sealed");
+
+        let apart = chain_wall_runs(vec![
+            (vec![v(0.0, 0.0), v(1.0, 0.0)], 0.2),
+            (vec![v(9.0, 9.0), v(10.0, 9.0)], 0.2), // nowhere near
+        ]);
+        assert_eq!(apart.len(), 2, "disconnected pieces stay separate");
+    }
+
+    /// End to end: a 3-segment L-run promotes to ONE alive wall with 3 Box segments, and its
+    /// shared corner is a single footprint vertex that moves both sides at once.
+    #[test]
+    fn chained_run_promotes_to_one_alive_wall() {
+        let runs = chain_wall_runs(vec![
+            (vec![v(0.0, 0.0), v(4.0, 0.0)], 0.3),
+            (vec![v(4.0, 0.0), v(4.0, 3.0)], 0.3),
+            (vec![v(4.0, 3.0), v(7.0, 3.0)], 0.3),
+        ]);
+        assert_eq!(runs.len(), 1);
+        let mut st = FactoryState::default();
+        let wi = st
+            .add_wall(runs[0].0.clone(), runs[0].1, 2.7, Plane::default())
+            .expect("run promotes");
+        assert_eq!(st.walls.len(), 1, "the whole run is ONE alive wall");
+        assert_eq!(st.walls[wi].footprint.len(), 4);
+        assert_eq!(st.walls[wi].segments.len(), 3, "3 segments → 3 Boxes");
+
+        // The corner at (4,0) is ONE vertex — moving it re-derives both adjoining segments,
+        // which is precisely what stops the run tearing open.
+        st.wall_move_vertex(wi, 1, v(5.0, -1.0));
+        assert_eq!(st.walls[wi].footprint[1], v(5.0, -1.0));
+        assert_eq!(st.walls[wi].segments.len(), 3, "still one connected run");
+    }
+
+    // ── plane_from_frame: promote onto the plane the sketch is ON ───────────────────────
+    // (owner bug 2026-07-23: "inserted walls are inserting in wrong plane")
+
+    /// An offset horizontal sketch (e.g. on top of a 2.5 m box) must promote to XY at that
+    /// height — not back down to the ground.
+    #[test]
+    fn horizontal_frame_maps_to_xy_at_its_height() {
+        let f = Frame::from_point_normal(Vec3::new(0.0, 0.0, 2.5), Vec3::Z);
+        let p = plane_from_frame(&f).expect("axis-aligned");
+        assert!(matches!(p.kind, PlaneKind::XY));
+        assert!((p.offset - 2.5).abs() < 1e-5, "keeps the sketch height");
+        // A point on the frame round-trips to the same world position through the plane.
+        let world = f.from_uv(Vec2::new(1.0, 2.0));
+        let back = p.from_uv(p.to_uv(world));
+        assert!((world - back).length() < 1e-4, "frame → plane conversion is lossless");
+    }
+
+    /// The vertical planes carry a SIGNED offset against their own normal (XZ's normal is
+    /// −Y, not +Y). A sign slip here mirrors the wall to the far side of the origin.
+    #[test]
+    fn vertical_frames_keep_their_position() {
+        for (normal, at) in [
+            (Vec3::Y, Vec3::new(0.0, 3.0, 0.0)),  // → XZ
+            (Vec3::X, Vec3::new(4.0, 0.0, 0.0)),  // → YZ
+        ] {
+            let f = Frame::from_point_normal(at, normal);
+            let p = plane_from_frame(&f).expect("axis-aligned");
+            let world = f.from_uv(Vec2::new(0.5, 1.5));
+            let back = p.from_uv(p.to_uv(world));
+            assert!(
+                (world - back).length() < 1e-4,
+                "plane must sit where the frame sits (normal {normal:?})"
+            );
+        }
+    }
+
+    /// A TILTED sketch face cannot be expressed as `Feature.plane` (XY/XZ/YZ only), so it is
+    /// refused rather than silently flattened onto the ground. Needs a cad_solid frame DOF.
+    #[test]
+    fn tilted_frame_is_refused() {
+        let f = Frame::from_point_normal(Vec3::ZERO, Vec3::new(0.0, 1.0, 1.0));
+        assert!(plane_from_frame(&f).is_none(), "tilted frames are not representable");
+    }
+
+    /// A wall re-derives onto ITS OWN plane, not the ground — otherwise editing a wall built
+    /// on an upper storey would teleport it to z=0.
+    #[test]
+    fn rederive_keeps_the_wall_on_its_plane() {
+        let mut st = FactoryState::default();
+        let upper = Plane { kind: PlaneKind::XY, offset: 3.0 };
+        let wi = st
+            .add_wall(vec![v(0.0, 0.0), v(4.0, 0.0), v(4.0, 2.0)], 0.3, 2.5, upper)
+            .expect("promotes");
+        st.wall_move_vertex(wi, 1, v(5.0, 0.0)); // forces a full re-derive
+        assert!((st.walls[wi].plane.offset - 3.0).abs() < 1e-5, "wall stays on its plane");
+        for &fid in &st.walls[wi].segments {
+            let f = st.model.get_mut(fid).expect("segment");
+            assert!(matches!(f.plane.kind, PlaneKind::XY));
+            assert!((f.plane.offset - 3.0).abs() < 1e-5, "each Box rebuilt on the same plane");
+        }
     }
 }
 
